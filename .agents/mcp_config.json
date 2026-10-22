@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "openproject": {
+      "command": "python",
+      "args": ["c:/HocTap/QLDA/MCP/openproject_mcp.py"], // SỬA LẠI PATH CHO ĐÚNG VỚI CHỖ CLONE
+      "env": {
+        "OPENPROJECT_URL": "http://26.65.103.140/api/v3",
+        "OPENPROJECT_API_KEY": "ACCESS TOKEN HERE"
+      }
+    }
+  }
+}
