@@ -15,7 +15,7 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh | bash \
     && chmod 755 /usr/local/bin/agy-bin
 
 COPY agy-wrapper.sh /usr/local/bin/agy
-RUN chmod 755 /usr/local/bin/agy
+RUN sed -i 's/\r$//' /usr/local/bin/agy && chmod 755 /usr/local/bin/agy
 
 # Apply customized frontend overrides (3D Virtual Office, skills selector, custom UI)
 COPY frontend-overrides/ /usr/local/lib/node_modules/crewly/frontend/dist/
@@ -27,11 +27,12 @@ RUN node /tmp/patch-crewly.js && rm /tmp/patch-crewly.js
 # Setup directories for non-root node user and copy seed configuration
 RUN mkdir -p /home/node/.crewly /home/node/project /home/node/seed-crewly
 COPY seed-crewly/ /home/node/seed-crewly/
-RUN chown -R node:node /home/node
+RUN find /home/node/seed-crewly -type f \( -name "*.sh" -o -name "*.cjs" \) -exec sed -i 's/\r$//' {} + \
+    && chown -R node:node /home/node
 
 # Copy container entrypoint
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 755 /usr/local/bin/entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod 755 /usr/local/bin/entrypoint.sh
 
 USER node
 WORKDIR /home/node/project

@@ -72,8 +72,12 @@ tmp/
 temp/
 output.log
 
-# Large 3D model files (not needed for production API server)
-frontend/public/models/
+# Large 3D model files and unused source trees (Dockerfile installs crewly globally and only copies frontend-overrides/ + seed-crewly/)
+frontend/
+backend/
+cli/
+packages/
+AtelierX/
 
 # Misc
 *.tgz
