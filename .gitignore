@@ -208,3 +208,5 @@ node_modules
 # Python bytecode (skills with Python helpers)
 __pycache__/
 *.pyc
+
+AtelierX/

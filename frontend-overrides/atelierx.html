@@ -1,174 +1,1731 @@
-<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>AtelierX · Xưởng thời trang & Giám sát Token Agent</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;background:#f5f3ed;color:#243a38;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
-header,footer{display:flex;align-items:center;justify-content:space-between;padding:12px 3%;gap:12px;border-bottom:1px solid #cccfc5;background:#fffdf6}
-header strong{font:bold 22px Georgia,serif;letter-spacing:-0.5px}
-header span{border-left:1px solid #b7b9ad;padding-left:14px;margin-left:12px;color:#526b61;font-size:13px}
-.header-actions{display:flex;align-items:center;gap:10px}
-#token-summary-btn{display:flex;align-items:center;gap:8px;background:#f1f5f0;border:1px solid #a3b899;border-radius:20px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s ease}
-#token-summary-btn:hover{background:#e2ece0;box-shadow:0 2px 6px rgba(0,0,0,.08)}
-#status{font-size:12px;color:#385046;background:#edf3ee;padding:5px 12px;border-radius:14px;font-weight:600}
+<!doctype html>
+<html lang="vi" data-studio-theme="day">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AtelierX Grand Studio · Tổ Hợp Thời Trang Số 3D &amp; Điều Hành Phòng Ban</title>
+  <style>
+    @font-face {
+      font-family: "Nunito";
+      font-style: normal;
+      font-display: swap;
+      font-weight: 400;
+      src: url("/assets/nunito-vietnamese-400-normal-2a755616.woff2") format("woff2"),
+           url("/assets/nunito-vietnamese-400-normal-9c01ea9f.woff") format("woff");
+      unicode-range: U+0102-0103,U+0110-0111,U+0128-0129,U+0168-0169,U+01A0-01A1,U+01AF-01B0,U+0300-0301,U+0303-0304,U+0308-0309,U+0323,U+0329,U+1EA0-1EF9,U+20AB;
+    }
+    @font-face {
+      font-family: "Nunito";
+      font-style: normal;
+      font-display: swap;
+      font-weight: 400;
+      src: url("/assets/nunito-latin-ext-400-normal-67250a41.woff2") format("woff2"),
+           url("/assets/nunito-latin-ext-400-normal-d7e2415e.woff") format("woff");
+      unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF;
+    }
+    @font-face {
+      font-family: "Nunito";
+      font-style: normal;
+      font-display: swap;
+      font-weight: 400;
+      src: url("/assets/nunito-latin-400-normal-a5906e15.woff2") format("woff2"),
+           url("/assets/nunito-latin-400-normal-b51e7635.woff") format("woff");
+      unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+    }
+    @font-face {
+      font-family: "Nunito";
+      font-style: normal;
+      font-display: swap;
+      font-weight: 600;
+      src: url("/assets/nunito-vietnamese-600-normal-cf95b95d.woff2") format("woff2"),
+           url("/assets/nunito-vietnamese-600-normal-2ffbb85f.woff") format("woff");
+      unicode-range: U+0102-0103,U+0110-0111,U+0128-0129,U+0168-0169,U+01A0-01A1,U+01AF-01B0,U+0300-0301,U+0303-0304,U+0308-0309,U+0323,U+0329,U+1EA0-1EF9,U+20AB;
+    }
+    @font-face {
+      font-family: "Nunito";
+      font-style: normal;
+      font-display: swap;
+      font-weight: 600;
+      src: url("/assets/nunito-latin-ext-600-normal-a7ba5f4f.woff2") format("woff2"),
+           url("/assets/nunito-latin-ext-600-normal-5a8efd17.woff") format("woff");
+      unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF;
+    }
+    @font-face {
+      font-family: "Nunito";
+      font-style: normal;
+      font-display: swap;
+      font-weight: 600;
+      src: url("/assets/nunito-latin-600-normal-45f437de.woff2") format("woff2"),
+           url("/assets/nunito-latin-600-normal-06a9c8b3.woff") format("woff");
+      unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+    }
+    @font-face {
+      font-family: "Nunito";
+      font-style: normal;
+      font-display: swap;
+      font-weight: 700;
+      src: url("/assets/nunito-vietnamese-700-normal-0e29c28c.woff2") format("woff2"),
+           url("/assets/nunito-vietnamese-700-normal-7793b75e.woff") format("woff");
+      unicode-range: U+0102-0103,U+0110-0111,U+0128-0129,U+0168-0169,U+01A0-01A1,U+01AF-01B0,U+0300-0301,U+0303-0304,U+0308-0309,U+0323,U+0329,U+1EA0-1EF9,U+20AB;
+    }
+    @font-face {
+      font-family: "Nunito";
+      font-style: normal;
+      font-display: swap;
+      font-weight: 700;
+      src: url("/assets/nunito-latin-ext-700-normal-0a4e4a02.woff2") format("woff2"),
+           url("/assets/nunito-latin-ext-700-normal-0c607961.woff") format("woff");
+      unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF;
+    }
+    @font-face {
+      font-family: "Nunito";
+      font-style: normal;
+      font-display: swap;
+      font-weight: 700;
+      src: url("/assets/nunito-latin-700-normal-fa89300b.woff2") format("woff2"),
+           url("/assets/nunito-latin-700-normal-ce9107dc.woff") format("woff");
+      unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+    }
+    @font-face {
+      font-family: "Nunito";
+      font-style: normal;
+      font-display: swap;
+      font-weight: 800;
+      src: url("/assets/nunito-vietnamese-800-normal-fac6740e.woff2") format("woff2"),
+           url("/assets/nunito-vietnamese-800-normal-5baf507e.woff") format("woff");
+      unicode-range: U+0102-0103,U+0110-0111,U+0128-0129,U+0168-0169,U+01A0-01A1,U+01AF-01B0,U+0300-0301,U+0303-0304,U+0308-0309,U+0323,U+0329,U+1EA0-1EF9,U+20AB;
+    }
+    @font-face {
+      font-family: "Nunito";
+      font-style: normal;
+      font-display: swap;
+      font-weight: 800;
+      src: url("/assets/nunito-latin-ext-800-normal-39f54b55.woff2") format("woff2"),
+           url("/assets/nunito-latin-ext-800-normal-466d0211.woff") format("woff");
+      unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF;
+    }
+    @font-face {
+      font-family: "Nunito";
+      font-style: normal;
+      font-display: swap;
+      font-weight: 800;
+      src: url("/assets/nunito-latin-800-normal-2363d3ed.woff2") format("woff2"),
+           url("/assets/nunito-latin-800-normal-0ca02785.woff") format("woff");
+      unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+    }
 
-main{display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,30%);min-height:76vh}
-.floor{position:relative;background:radial-gradient(ellipse at 50% 60%,#e1eee5,#f2f2e9 76%);overflow:hidden}
-.floor svg{display:block;width:100%;height:100%;min-height:500px}
-.room{cursor:pointer;transition:filter .15s ease}
-.room:focus,.room:hover{outline:none;filter:brightness(1.08)}
+    :root,
+    [data-studio-theme="day"] {
+      --bg-app: #edf3fc;
+      --bg-topbar: rgba(255, 255, 255, 0.94);
+      --bg-sidebar: #f5f8fd;
+      --bg-card: #ffffff;
+      --bg-card-hover: #fafcff;
+      --bg-card-selected: #eef5ff;
+      --bg-subtle: #eaf0fa;
+      --bg-canvas: radial-gradient(ellipse at 50% 42%, #ffffff 0%, #e4effc 46%, #cde0f7 86%, #bdd3f0 100%);
+      --bg-hud: rgba(255, 255, 255, 0.9);
+      --border-main: #d3dfef;
+      --border-strong: #b4c5e2;
+      --border-selected: #2563eb;
+      --text-1: #101d38;
+      --text-2: #3d4f73;
+      --text-3: #66789c;
+      --accent: #2563eb;
+      --accent-soft: rgba(37, 99, 235, 0.11);
+      --active-bg: linear-gradient(135deg, #eff6ff 0%, #ecfdf5 100%);
+      --active-border: #2563eb;
+      --active-text: #1d4ed8;
+      --queued-bg: #fffbeb;
+      --queued-border: #f59e0b;
+      --queued-text: #b45309;
+      --review-bg: #fff1f2;
+      --review-border: #f43f5e;
+      --review-text: #be123c;
+      --done-bg: #f4fbf7;
+      --done-border: #bbf7d0;
+      --done-text: #15803d;
+      --shadow-sm: 0 2px 8px rgba(16, 29, 56, 0.06);
+      --shadow-md: 0 8px 24px rgba(16, 29, 56, 0.11);
+      --shadow-lg: 0 22px 50px rgba(15, 23, 42, 0.2);
+      --grid-dot: #6682ad;
+      --grid-dot-opacity: 0.2;
+    }
 
-/* Token Indicator Badge on 3D SVG */
-.token-badge-svg{transition:transform .2s ease}
-.room:hover .token-badge-svg{transform:scale(1.12)}
-@keyframes pulse-red{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(1.25)}}
-.pulse-out{animation:pulse-red 1.4s infinite;transform-origin:center}
+    [data-studio-theme="night"] {
+      --bg-app: #080d1c;
+      --bg-topbar: rgba(13, 20, 40, 0.94);
+      --bg-sidebar: #0c1328;
+      --bg-card: #131d3a;
+      --bg-card-hover: #182548;
+      --bg-card-selected: #192952;
+      --bg-subtle: #0e1731;
+      --bg-canvas: radial-gradient(ellipse at 50% 44%, #1d2d5c 0%, #101936 52%, #070c1b 100%);
+      --bg-hud: rgba(13, 20, 42, 0.88);
+      --border-main: #24325c;
+      --border-strong: #374c85;
+      --border-selected: #60a5fa;
+      --text-1: #eef4ff;
+      --text-2: #aec2eb;
+      --text-3: #7b91bf;
+      --accent: #60a5fa;
+      --accent-soft: rgba(96, 165, 250, 0.16);
+      --active-bg: linear-gradient(135deg, rgba(37, 99, 235, 0.26) 0%, rgba(16, 185, 129, 0.18) 100%);
+      --active-border: #60a5fa;
+      --active-text: #93c5fd;
+      --queued-bg: rgba(245, 158, 11, 0.15);
+      --queued-border: #f59e0b;
+      --queued-text: #fcd34d;
+      --review-bg: rgba(244, 63, 94, 0.16);
+      --review-border: #fb7185;
+      --review-text: #fda4af;
+      --done-bg: rgba(16, 185, 129, 0.11);
+      --done-border: rgba(52, 211, 153, 0.32);
+      --done-text: #6ee7b7;
+      --shadow-sm: 0 4px 12px rgba(2, 6, 23, 0.38);
+      --shadow-md: 0 12px 30px rgba(2, 6, 23, 0.52);
+      --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.68);
+      --grid-dot: #7ea5e6;
+      --grid-dot-opacity: 0.16;
+    }
 
-aside{padding:22px 20px;background:#fffdf6;border-left:1px solid #cccfc5;display:flex;flex-direction:column;gap:14px;overflow-y:auto;max-height:calc(100vh - 120px)}
-h1{font:bold 24px Georgia,serif;margin:4px 0 10px;color:#1e322b}
-small{letter-spacing:.12em;text-transform:uppercase;color:#526b61;font-size:11px;font-weight:700}
-button{font:inherit;color:inherit;cursor:pointer;background:white;border:1px solid #c6cec2;border-radius:6px;padding:6px 12px;transition:all .15s ease}
-button:hover{background:#f4f6f1}
-nav{display:grid;gap:6px}
-nav button{text-align:left;background:#fcfdfa;border:1px solid #dfe5db;border-radius:8px;padding:8px 12px;display:flex;justify-content:space-between;align-items:center;transition:all .15s ease}
-nav button:hover{background:#edf3ea;border-color:#b4c5b0}
-nav button[aria-pressed=true]{background:#deeadf;border-color:#8eab97;box-shadow:inset 3px 0 0 #3a624f}
+    * {
+      box-sizing: border-box;
+    }
 
-#info{line-height:1.55;border-top:1px solid #d5d9ce;padding-top:14px;display:flex;flex-direction:column;gap:10px}
-.info-title{font-size:18px;font-weight:bold;margin:0;color:#1d322c}
-.info-role{font-size:12px;color:#596d62;text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: var(--bg-app);
+      color: var(--text-1);
+      font-family: "Nunito", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 13.5px;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+    }
 
-/* Token Box Details inside #info */
-.token-card{background:#ffffff;border:1px solid #ccd6c7;border-radius:10px;padding:12px 14px;box-shadow:0 2px 6px rgba(0,0,0,.04);margin-top:4px}
-.token-card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.token-card-title{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:#395045}
-.token-pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700}
-.token-pill.ok{background:#e7f5e8;color:#1e7e34;border:1px solid #a7dfb2}
-.token-pill.warn{background:#fff9e6;color:#b27b00;border:1px solid #ffd480}
-.token-pill.out{background:#fde8e8;color:#d32f2f;border:1px solid #f8b4b4;animation:blink 1.5s infinite}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.5}}
+    body {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      height: 100vh;
+      height: 100dvh;
+      overflow: hidden;
+    }
 
-.token-bar-bg{height:8px;background:#e5ebe3;border-radius:4px;overflow:hidden;margin:8px 0 10px}
-.token-bar-fill{height:100%;border-radius:4px;transition:width .4s ease}
-.token-bar-fill.ok{background:linear-gradient(90deg,#48bb78,#2e7d32)}
-.token-bar-fill.warn{background:linear-gradient(90deg,#ecc94b,#b7791f)}
-.token-bar-fill.out{background:linear-gradient(90deg,#f56565,#c53030)}
+    button {
+      font: inherit;
+      color: inherit;
+      cursor: pointer;
+      border: 1px solid var(--border-main);
+      background: var(--bg-card);
+      border-radius: 9px;
+      padding: 5px 10px;
+      transition: all 0.16s ease;
+    }
 
-.token-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px}
-.token-stat-item{background:#f8faf6;padding:7px 9px;border-radius:6px;border:1px solid #e2eae0}
-.token-stat-label{font-size:10px;color:#6b7e73;text-transform:uppercase;font-weight:600}
-.token-stat-val{font-weight:700;color:#1b2d28;margin-top:2px}
-.token-alert{margin-top:10px;padding:9px 12px;border-radius:6px;font-size:11.5px;line-height:1.45}
-.token-alert.out{background:#fef2f2;border-left:4px solid #ef4444;color:#991b1b}
-.token-alert.ok{background:#f0fdf4;border-left:4px solid #22c55e;color:#166534}
+    button:hover {
+      border-color: var(--border-strong);
+      background: var(--bg-card-hover);
+    }
 
-footer{border-top:1px solid #cccfc5;font-size:12px;color:#526b61}
+    button:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
 
-/* Modal Quota 6 Agents */
-.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(20,30,25,.55);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;z-index:9999}
-.modal-overlay.open{display:flex}
-.modal-box{background:#fffdf8;width:90%;max-width:760px;border-radius:12px;border:1px solid #bcc7b6;box-shadow:0 12px 35px rgba(0,0,0,.18);overflow:hidden;max-height:88vh;display:flex;flex-direction:column}
-.modal-header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid #d8dfd4;background:#f6faf4}
-.modal-header h3{margin:0;font:bold 20px Georgia,serif;color:#1a2e28}
-.modal-close{background:none;border:none;font-size:22px;cursor:pointer;color:#586d63;padding:0 6px}
-.modal-body{padding:18px 20px;overflow-y:auto}
-.modal-tabs{display:flex;gap:8px;margin-bottom:14px}
-.modal-tab-btn{background:#edf2eb;border:1px solid #c9d6c5;border-radius:16px;padding:4px 12px;font-size:12px;font-weight:600}
-.modal-tab-btn.active{background:#304a40;color:#fff;border-color:#304a40}
+    /* ================= TOP COMMAND BAR (SINGLE-ROW RESPONSIVE) ================= */
+    .studio-topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 14px;
+      background: var(--bg-topbar);
+      border-bottom: 1px solid var(--border-main);
+      backdrop-filter: blur(14px);
+      z-index: 30;
+      flex-wrap: nowrap;
+      min-width: 0;
+    }
 
-.token-table{width:100%;border-collapse:collapse;font-size:12px;text-align:left}
-.token-table th{background:#eef4ec;padding:9px 10px;border-bottom:2px solid #ccd8c8;font-weight:600;color:#33483f}
-.token-table td{padding:10px;border-bottom:1px solid #e3eae0;vertical-align:middle}
-.token-table tr:hover td{background:#f7faf5}
+    .brand-cluster {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-width: 0;
+      flex-shrink: 1;
+    }
 
-.sim-switch{display:flex;align-items:center;gap:10px;margin-top:14px;padding:10px 14px;background:#f3f7f1;border-radius:8px;font-size:12px;border:1px solid #d1dfcf}
+    .brand-crest {
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #1e293b 0%, #334155 46%, #d99b43 100%);
+      color: #fffbeb;
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      font-size: 15px;
+      box-shadow: 0 4px 10px rgba(15, 23, 42, 0.22);
+      flex-shrink: 0;
+    }
 
-@media(max-width:760px){
-  main{display:block}
-  .floor svg{height:55vh;min-height:320px}
-  aside{padding:14px;max-height:none}
-  nav{grid-template-columns:1fr 1fr}
-  header span{display:none}
-}
-</style>
-<style>.floor{background:radial-gradient(ellipse at center,#eaf6ff,#d8eefb)!important}#scene{touch-action:none}#scene rect[fill="url(#dots)"]{opacity:.14}.room:focus-visible{outline:2px solid #355d81}.room:hover{filter:brightness(1.05)}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}</style><style>h1,h2,header strong{font-family:"Times New Roman",serif!important;font-variant-ligatures:none;letter-spacing:0}#scene text{font-family:Arial,sans-serif}</style></head>
+    .brand-titles {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    .brand-row {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+    }
+
+    .brand-row strong {
+      font-size: 15.5px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      color: var(--text-1);
+      white-space: nowrap;
+    }
+
+    .brand-edition {
+      font-size: 9.5px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 1.5px 6px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, rgba(217, 155, 67, 0.2), rgba(59, 130, 246, 0.16));
+      color: var(--text-1);
+      border: 1px solid rgba(217, 155, 67, 0.38);
+      white-space: nowrap;
+    }
+
+    .brand-sub {
+      font-size: 11px;
+      color: var(--text-3);
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .kpi-ribbon {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .kpi-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-main);
+      font-size: 11.5px;
+      font-weight: 700;
+      color: var(--text-1);
+      white-space: nowrap;
+    }
+
+    .kpi-chip.kpi-active {
+      background: var(--active-bg);
+      border-color: var(--active-border);
+      color: var(--active-text);
+    }
+
+    .kpi-chip .kpi-dot {
+      width: 7.5px;
+      height: 7.5px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    #token-summary-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      padding: 5px 11px;
+      font-size: 11.5px;
+      font-weight: 700;
+      background: var(--bg-card);
+      border: 1px solid var(--border-strong);
+      box-shadow: var(--shadow-sm);
+      white-space: nowrap;
+    }
+
+    #status {
+      font-size: 11.5px;
+      font-weight: 700;
+      padding: 4.5px 10px;
+      border-radius: 999px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-main);
+      color: var(--text-2);
+      white-space: nowrap;
+    }
+
+    .icon-pill-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 11.5px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    @media (max-width: 1420px) {
+      .brand-sub {
+        display: none;
+      }
+    }
+
+    @media (max-width: 1180px) {
+      .brand-edition {
+        display: none;
+      }
+      #status {
+        display: none;
+      }
+    }
+
+    /* ================= WORKSPACE SPLIT ================= */
+    .studio-workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(390px, 35%);
+      min-height: 0;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    body.sidebar-wide .studio-workspace {
+      grid-template-columns: minmax(0, 1fr) minmax(465px, 43%);
+    }
+
+    /* ================= LEFT ISOMETRIC CITADEL FLOOR (h1) ================= */
+    .floor {
+      position: relative;
+      background: var(--bg-canvas);
+      overflow: hidden;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      user-select: none;
+    }
+
+    .floor svg#scene {
+      display: block;
+      width: 100%;
+      height: 100%;
+      flex: 1;
+      touch-action: none;
+      cursor: grab;
+    }
+
+    .floor svg#scene:active {
+      cursor: grabbing;
+    }
+
+    #scene text {
+      font-family: "Nunito", -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    }
+
+    .room {
+      cursor: pointer;
+      transition: filter 0.18s ease;
+    }
+
+    .room:hover,
+    .room:focus-visible {
+      outline: none;
+      filter: brightness(1.06) drop-shadow(0 6px 14px rgba(37, 99, 235, 0.22));
+    }
+
+    .token-badge-svg,
+    .task-callout-svg {
+      transition: transform 0.2s ease;
+    }
+
+    .room:hover .token-badge-svg,
+    .room:hover .task-callout-svg {
+      transform: translateY(-2px);
+    }
+
+    @keyframes pulse-ring {
+      0%, 100% { opacity: 0.92; transform: scale(1); }
+      50% { opacity: 0.32; transform: scale(1.18); }
+    }
+
+    @keyframes flow-dash {
+      to { stroke-dashoffset: -28; }
+    }
+
+    @keyframes blink-dot {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.34; }
+    }
+
+    .pulse-out {
+      animation: pulse-ring 1.5s infinite ease-in-out;
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+
+    .bridge-energy-active {
+      stroke-dasharray: 9 6;
+      animation: flow-dash 1.05s linear infinite;
+    }
+
+    .bridge-energy-queued {
+      stroke-dasharray: 5 7;
+      animation: flow-dash 1.9s linear infinite;
+    }
+
+    .live-beacon {
+      animation: blink-dot 1.2s infinite ease-in-out;
+    }
+
+    /* Floating HUD overlays on Canvas */
+    .canvas-hud-top {
+      position: absolute;
+      top: 10px;
+      left: 12px;
+      right: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      pointer-events: none;
+      z-index: 12;
+    }
+
+    .hud-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      pointer-events: auto;
+    }
+
+    .hud-pill {
+      background: var(--bg-hud);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-main);
+      box-shadow: var(--shadow-sm);
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-2);
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      white-space: nowrap;
+    }
+
+    .hud-pill.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #ffffff;
+    }
+
+    .canvas-hud-bottom {
+      position: absolute;
+      bottom: 10px;
+      left: 12px;
+      right: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      pointer-events: none;
+      z-index: 12;
+      flex-wrap: nowrap;
+    }
+
+    .canvas-legend {
+      pointer-events: auto;
+      background: var(--bg-hud);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-main);
+      box-shadow: var(--shadow-sm);
+      border-radius: 10px;
+      padding: 5px 10px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-2);
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 4.5px;
+      white-space: nowrap;
+    }
+
+    .legend-dot {
+      width: 7.5px;
+      height: 7.5px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .camera-dock {
+      pointer-events: auto;
+      background: var(--bg-hud);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-main);
+      box-shadow: var(--shadow-md);
+      border-radius: 10px;
+      padding: 3.5px;
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      flex-shrink: 0;
+    }
+
+    .camera-dock button {
+      border-radius: 7px;
+      padding: 4px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      border-color: transparent;
+      background: transparent;
+      white-space: nowrap;
+    }
+
+    .camera-dock button:hover {
+      background: var(--bg-subtle);
+      border-color: var(--border-main);
+    }
+
+    .camera-dock .dock-primary {
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-color: rgba(37, 99, 235, 0.25);
+    }
+
+    @media (max-width: 1220px) {
+      .canvas-legend .legend-hide-compact {
+        display: none;
+      }
+    }
+
+    /* ================= RIGHT DEPARTMENT & TASK SIDEBAR (h2) ================= */
+    aside.command-sidebar {
+      background: var(--bg-sidebar);
+      border-left: 1px solid var(--border-main);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    .sidebar-head {
+      padding: 11px 14px 10px;
+      background: var(--bg-topbar);
+      border-bottom: 1px solid var(--border-main);
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .sidebar-eyebrow-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .sidebar-eyebrow {
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+      color: var(--text-3);
+    }
+
+    .sync-pill {
+      font-size: 10.5px;
+      font-weight: 700;
+      color: var(--text-2);
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .sidebar-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .sidebar-title-row h1 {
+      margin: 0;
+      font-size: 17.5px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      color: var(--text-1);
+      white-space: nowrap;
+    }
+
+    .sidebar-head-actions {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .tiny-btn {
+      padding: 3.5px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      border-radius: 7px;
+      background: var(--bg-subtle);
+      color: var(--text-2);
+      white-space: nowrap;
+    }
+
+    .tiny-btn.is-active {
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-color: rgba(37, 99, 235, 0.3);
+    }
+
+    .dept-filter-bar {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 5px;
+    }
+
+    .dept-filter-btn {
+      padding: 4.5px 5px;
+      font-size: 11px;
+      font-weight: 700;
+      border-radius: 8px;
+      text-align: center;
+      background: var(--bg-subtle);
+      border: 1px solid transparent;
+      color: var(--text-2);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .dept-filter-btn.active {
+      background: var(--bg-card);
+      border-color: var(--accent);
+      color: var(--accent);
+      box-shadow: var(--shadow-sm);
+    }
+
+    .sidebar-scroll {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 11px 13px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      scrollbar-width: thin;
+    }
+
+    /* Active Tasks Spotlight Box */
+    .active-spotlight {
+      background: var(--active-bg);
+      border: 1.5px solid var(--active-border);
+      border-radius: 13px;
+      padding: 10px 11px;
+      box-shadow: var(--shadow-sm);
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .active-spotlight.idle-state {
+      background: var(--bg-card);
+      border: 1px dashed var(--border-strong);
+    }
+
+    .spotlight-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .spotlight-title {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--active-text);
+    }
+
+    .spotlight-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .spotlight-item {
+      width: 100%;
+      text-align: left;
+      background: var(--bg-card);
+      border: 1px solid var(--border-main);
+      border-left: 4px solid var(--active-border);
+      border-radius: 9px;
+      padding: 7px 9px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
+    }
+
+    .spotlight-item:hover {
+      border-color: var(--active-border);
+      transform: translateX(2px);
+    }
+
+    .spotlight-item-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 10.5px;
+      font-weight: 700;
+      flex-wrap: wrap;
+    }
+
+    .spotlight-dept-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 1.5px 7px;
+      border-radius: 999px;
+      font-weight: 800;
+      font-size: 10.5px;
+      background: var(--bg-subtle);
+      color: var(--text-1);
+    }
+
+    .spotlight-item-main {
+      font-size: 12.2px;
+      font-weight: 700;
+      color: var(--text-1);
+      line-height: 1.35;
+    }
+
+    .spotlight-item-sub {
+      font-size: 11px;
+      color: var(--text-2);
+      line-height: 1.35;
+    }
+
+    /* Department Cards (#rooms) */
+    nav#rooms {
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+    }
+
+    .dept-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-main);
+      border-radius: 13px;
+      padding: 11px 12px 11px 14px;
+      box-shadow: var(--shadow-sm);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .dept-card::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 4.5px;
+      background: var(--dept-color, #64748b);
+      opacity: 0.9;
+    }
+
+    .dept-card:hover {
+      border-color: var(--border-strong);
+      box-shadow: var(--shadow-md);
+    }
+
+    .dept-card.has-active-work {
+      border-color: rgba(37, 99, 235, 0.55);
+      box-shadow: 0 4px 16px rgba(37, 99, 235, 0.09);
+    }
+
+    .dept-card.is-selected {
+      background: var(--bg-card-selected);
+      border-color: var(--border-selected);
+      box-shadow: 0 0 0 1px var(--border-selected), var(--shadow-md);
+    }
+
+    .dept-card-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
+      cursor: pointer;
+    }
+
+    .dept-identity {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .dept-emblem {
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      display: grid;
+      place-items: center;
+      font-size: 16px;
+      flex-shrink: 0;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-main);
+    }
+
+    .dept-titles {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .dept-name-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .dept-name {
+      font-size: 14.5px;
+      font-weight: 800;
+      color: var(--text-1);
+      line-height: 1.2;
+    }
+
+    .agent-state-dot {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 6.5px;
+      border-radius: 999px;
+      background: var(--bg-subtle);
+      color: var(--text-2);
+    }
+
+    .agent-state-dot.online {
+      background: rgba(16, 185, 129, 0.14);
+      color: #059669;
+    }
+
+    [data-studio-theme="night"] .agent-state-dot.online {
+      color: #6ee7b7;
+    }
+
+    .dept-subrole {
+      font-size: 11px;
+      color: var(--text-3);
+      font-weight: 600;
+      margin-top: 1.5px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .dept-badges {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 3.5px;
+      flex-shrink: 0;
+    }
+
+    .mini-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 10px;
+      font-weight: 800;
+      padding: 2px 7.5px;
+      border-radius: 999px;
+      white-space: nowrap;
+      border: 1px solid transparent;
+    }
+
+    .mini-pill.tok-ok {
+      background: rgba(16, 185, 129, 0.13);
+      color: #047857;
+      border-color: rgba(16, 185, 129, 0.3);
+    }
+
+    [data-studio-theme="night"] .mini-pill.tok-ok {
+      color: #6ee7b7;
+    }
+
+    .mini-pill.tok-unlimited {
+      background: var(--bg-subtle);
+      color: var(--text-2);
+      border-color: var(--border-main);
+    }
+
+    .mini-pill.tok-warn {
+      background: var(--queued-bg);
+      color: var(--queued-text);
+      border-color: var(--queued-border);
+    }
+
+    .mini-pill.tok-out {
+      background: #fee2e2;
+      color: #b91c1c;
+      border-color: #f87171;
+      animation: blink-dot 1.4s infinite;
+    }
+
+    .mini-pill.work-active {
+      background: #2563eb;
+      color: #ffffff;
+      border-color: #1d4ed8;
+      box-shadow: 0 2px 8px rgba(37, 99, 235, 0.25);
+    }
+
+    .mini-pill.work-queued {
+      background: var(--queued-bg);
+      color: var(--queued-text);
+      border-color: var(--queued-border);
+    }
+
+    .mini-pill.work-done {
+      background: var(--done-bg);
+      color: var(--done-text);
+      border-color: var(--done-border);
+    }
+
+    /* Workload Progress Bar inside Department */
+    .dept-progress-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 10.5px;
+      color: var(--text-2);
+      font-weight: 700;
+    }
+
+    .dept-progress-track {
+      flex: 1;
+      height: 5px;
+      background: var(--bg-subtle);
+      border-radius: 999px;
+      overflow: hidden;
+      display: flex;
+    }
+
+    .dept-progress-seg {
+      height: 100%;
+      transition: width 0.3s ease;
+    }
+
+    /* Department Task Items Container */
+    .dept-tasks-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .dept-task-card {
+      border-radius: 10px;
+      padding: 8px 10px;
+      border: 1px solid var(--border-main);
+      background: var(--bg-subtle);
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      transition: all 0.15s ease;
+    }
+
+    .dept-task-card.bucket-active {
+      background: var(--active-bg);
+      border: 1.5px solid var(--active-border);
+      border-left-width: 4.5px;
+      box-shadow: 0 4px 14px rgba(37, 99, 235, 0.12);
+    }
+
+    .dept-task-card.bucket-review {
+      background: var(--review-bg);
+      border: 1px solid var(--review-border);
+      border-left: 4px solid var(--review-border);
+    }
+
+    .dept-task-card.bucket-queued {
+      background: var(--queued-bg);
+      border: 1px solid var(--queued-border);
+      border-left: 4px solid var(--queued-border);
+    }
+
+    .dept-task-card.bucket-done {
+      background: var(--done-bg);
+      border: 1px solid var(--done-border);
+      padding: 6px 9px;
+      gap: 3px;
+    }
+
+    .task-card-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .task-code-cluster {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-width: 0;
+    }
+
+    .task-id-badge {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10.5px;
+      font-weight: 800;
+      padding: 1px 5.5px;
+      border-radius: 5px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-strong);
+      color: var(--text-1);
+      flex-shrink: 0;
+    }
+
+    .task-priority-badge {
+      font-size: 9.5px;
+      font-weight: 800;
+      padding: 1px 4.5px;
+      border-radius: 4px;
+      background: rgba(100, 116, 139, 0.15);
+      color: var(--text-2);
+    }
+
+    .task-time-chip {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--text-3);
+    }
+
+    .task-status-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4.5px;
+      font-size: 10px;
+      font-weight: 800;
+      padding: 2px 8px;
+      border-radius: 999px;
+    }
+
+    .task-status-tag.tag-active {
+      background: #2563eb;
+      color: #ffffff;
+    }
+
+    .task-status-tag.tag-review {
+      background: #e11d48;
+      color: #ffffff;
+    }
+
+    .task-status-tag.tag-queued {
+      background: #d97706;
+      color: #ffffff;
+    }
+
+    .task-status-tag.tag-done {
+      background: rgba(22, 163, 74, 0.15);
+      color: var(--done-text);
+    }
+
+    .task-title-text {
+      font-size: 12.8px;
+      font-weight: 700;
+      color: var(--text-1);
+      line-height: 1.36;
+      word-break: break-word;
+    }
+
+    .bucket-done .task-title-text {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-2);
+    }
+
+    .task-brief-box {
+      font-size: 11.2px;
+      color: var(--text-2);
+      line-height: 1.42;
+      background: rgba(255, 255, 255, 0.62);
+      border-radius: 7px;
+      padding: 5.5px 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 2.5px;
+    }
+
+    [data-studio-theme="night"] .task-brief-box {
+      background: rgba(10, 15, 32, 0.48);
+    }
+
+    .task-brief-line strong {
+      color: var(--text-1);
+      font-weight: 700;
+    }
+
+    .task-blocker-note {
+      font-size: 10.8px;
+      line-height: 1.38;
+      padding: 5px 8px;
+      border-radius: 6px;
+      background: var(--review-bg);
+      border-left: 3px solid var(--review-border);
+      color: var(--review-text);
+      font-weight: 700;
+    }
+
+    .task-meta-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 10.5px;
+      color: var(--text-3);
+      font-weight: 700;
+      flex-wrap: wrap;
+    }
+
+    .task-log-snippet {
+      font-size: 10.8px;
+      color: var(--text-2);
+      border-top: 1px dashed var(--border-main);
+      padding-top: 4.5px;
+      line-height: 1.38;
+    }
+
+    .dept-empty-note {
+      font-size: 11.2px;
+      color: var(--text-3);
+      font-style: italic;
+      padding: 3px 2px;
+    }
+
+    .more-done-btn {
+      align-self: flex-start;
+      font-size: 10.5px;
+      font-weight: 700;
+      padding: 2.5px 9px;
+      border-radius: 999px;
+      background: var(--bg-subtle);
+      color: var(--text-2);
+      border: 1px solid var(--border-main);
+    }
+
+    /* Selected Department Extended Telemetry Box */
+    .dept-inspector-extra {
+      border-top: 1px solid var(--border-main);
+      padding-top: 8px;
+      margin-top: 2px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .inspector-meta-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+    }
+
+    .inspector-stat {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-main);
+      border-radius: 8px;
+      padding: 5.5px 8px;
+    }
+
+    .inspector-stat-label {
+      font-size: 9.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-3);
+      font-weight: 700;
+    }
+
+    .inspector-stat-val {
+      font-size: 11.5px;
+      font-weight: 800;
+      color: var(--text-1);
+      margin-top: 1px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Runway 6-stage Pipeline inside Sàn Trưng Bày */
+    .pipeline-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 5px;
+    }
+
+    .pipeline-step {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-main);
+      border-radius: 8px;
+      padding: 5.5px 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      width: 100%;
+      text-align: left;
+    }
+
+    .pipeline-step:hover {
+      border-color: var(--accent);
+      background: var(--bg-card-hover);
+    }
+
+    /* Studio Summary Footer Card inside Sidebar */
+    .studio-overview-footer {
+      background: var(--bg-card);
+      border: 1px solid var(--border-main);
+      border-radius: 12px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      font-size: 11.2px;
+      color: var(--text-2);
+    }
+
+    /* Token Bar inside Inspector / Modal */
+    .token-bar-bg {
+      height: 6.5px;
+      background: var(--bg-subtle);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+
+    .token-bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      transition: width 0.35s ease;
+    }
+
+    .token-bar-fill.ok { background: linear-gradient(90deg, #34d399, #059669); }
+    .token-bar-fill.warn { background: linear-gradient(90deg, #fbbf24, #d97706); }
+    .token-bar-fill.out { background: linear-gradient(90deg, #f87171, #dc2626); }
+
+    /* ================= MODAL QUOTA 6 AGENTS ================= */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(9, 14, 28, 0.62);
+      backdrop-filter: blur(5px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      padding: 16px;
+    }
+
+    .modal-overlay.open {
+      display: flex;
+    }
+
+    .modal-box {
+      background: var(--bg-card);
+      color: var(--text-1);
+      width: 100%;
+      max-width: 880px;
+      border-radius: 16px;
+      border: 1px solid var(--border-strong);
+      box-shadow: var(--shadow-lg);
+      overflow: hidden;
+      max-height: 88vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border-main);
+      background: var(--bg-topbar);
+    }
+
+    .modal-header h3 {
+      margin: 0;
+      font-size: 17.5px;
+      font-weight: 800;
+    }
+
+    .modal-close {
+      background: transparent;
+      border: none;
+      font-size: 22px;
+      line-height: 1;
+      padding: 2px 8px;
+      color: var(--text-2);
+    }
+
+    .modal-body {
+      padding: 15px 20px 20px;
+      overflow-y: auto;
+    }
+
+    .modal-runtime-banner {
+      margin-bottom: 12px;
+      padding: 8px 12px;
+      border-radius: 9px;
+      background: var(--queued-bg);
+      border: 1px solid var(--queued-border);
+      color: var(--queued-text);
+      font-size: 11.5px;
+      font-weight: 700;
+    }
+
+    .modal-runtime-banner[hidden] {
+      display: none;
+    }
+
+    .modal-tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+
+    .modal-tab-btn {
+      border-radius: 999px;
+      padding: 5px 13px;
+      font-size: 12px;
+      font-weight: 700;
+      background: var(--bg-subtle);
+    }
+
+    .modal-tab-btn.active {
+      background: var(--accent);
+      color: #ffffff;
+      border-color: var(--accent);
+    }
+
+    .token-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      text-align: left;
+    }
+
+    .token-table th {
+      background: var(--bg-subtle);
+      padding: 8.5px 10px;
+      border-bottom: 2px solid var(--border-main);
+      font-weight: 800;
+      font-size: 10.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-2);
+    }
+
+    .token-table td {
+      padding: 9.5px 10px;
+      border-bottom: 1px solid var(--border-main);
+      vertical-align: middle;
+    }
+
+    .token-table tr:hover td {
+      background: var(--bg-card-hover);
+    }
+
+    /* Responsive Tablet / Narrow Screens */
+    @media (max-width: 980px) {
+      .studio-topbar {
+        flex-wrap: wrap;
+      }
+      body {
+        height: auto;
+        min-height: 100vh;
+        overflow-y: auto;
+      }
+      .studio-workspace,
+      body.sidebar-wide .studio-workspace {
+        grid-template-columns: 1fr;
+        height: auto;
+        overflow: visible;
+      }
+      .floor {
+        height: 56vh;
+        min-height: 390px;
+      }
+      .canvas-hud-bottom {
+        flex-wrap: wrap;
+      }
+      aside.command-sidebar {
+        border-left: none;
+        border-top: 1px solid var(--border-main);
+        height: auto;
+        overflow: visible;
+      }
+      .sidebar-scroll {
+        overflow: visible;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+  </style>
+</head>
 <body>
-<header>
-  <div><strong>AtelierX</strong><span>Digital Fashion House · Quota Tracker</span></div>
-  <div class="header-actions">
-    <button id="token-summary-btn" title="Bấm để xem danh sách Quota chi tiết của 6 Agents">
-      <span id="token-summary-indicator">⚡ Đang tải token…</span>
-    </button>
-    <div id="status">Đang kết nối Crewly…</div>
-  </div>
-</header>
-
-<main>
-  <section class="floor">
-    <svg id="scene" viewBox="-550 -285 1100 710" role="group" aria-label="Sơ đồ xưởng thời trang tương tác">
-      <defs>
-        <pattern id="dots" width="17" height="17" patternUnits="userSpaceOnUse">
-          <circle cx="1" cy="1" r=".9" fill="#879b89" opacity=".28"/>
-        </pattern>
-        <filter id="shadow" x="-40%" y="-40%" width="180%" height="180%">
-          <feGaussianBlur stdDeviation="6"/>
-        </filter>
-      </defs>
-      <rect x="-1500" y="-1000" width="3000" height="2000" fill="url(#dots)"/>
-      <g id="world"></g>
-    </svg>
-  </section>
-
-  <aside>
-    <small>ATELIERX / STUDIO</small>
-    <h1>Xưởng thiết kế</h1>
-    <nav id="rooms"></nav>
-    <section id="info" aria-live="polite"></section>
-    <section id="task-flow" aria-live="polite"></section>
-  </aside>
-</main>
-
-<footer>
-  <span>Sơ đồ xưởng & Giám sát Token 6 Agent theo thời gian thực</span>
-  <div>
-    <button id="btn-open-token-modal">⚡ Bảng Quota 6 Agent</button>
-    <button id="minus" aria-label="Thu nhỏ">−</button>
-    <button id="reset">Toàn cảnh</button>
-    <button id="plus" aria-label="Phóng to">+</button>
-  </div>
-</footer>
-
-<!-- Modal Quota 6 Agents -->
-<div id="token-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-title">
-  <div class="modal-box">
-    <div class="modal-header">
-      <h3 id="modal-title">⚡ Giám sát Token & Quota 6 Agents</h3>
-      <button class="modal-close" id="modal-close-btn" aria-label="Đóng">&times;</button>
+  <header class="studio-topbar">
+    <div class="brand-cluster">
+      <div class="brand-crest" aria-hidden="true">✦</div>
+      <div class="brand-titles">
+        <div class="brand-row">
+          <strong>ATELIERX</strong>
+          <span class="brand-edition">Grand Citadel 3D</span>
+        </div>
+        <span class="brand-sub">Tổ hợp Xưởng Thiết kế Thời trang Số &amp; Điều hành Đa Phòng Ban</span>
+      </div>
     </div>
-    <div class="modal-body">
-      <div class="modal-tabs">
-        <button class="modal-tab-btn active" data-filter="all">Tất cả (6)</button>
-        <button class="modal-tab-btn" data-filter="ok">🟢 Còn token</button>
-        <button class="modal-tab-btn" data-filter="out">🔴 Hết token</button>
+
+    <div class="kpi-ribbon" id="kpi-ribbon" aria-label="Chỉ số vận hành toàn xưởng">
+      <div class="kpi-chip kpi-active" id="kpi-active-work">
+        <span class="kpi-dot live-beacon" style="background:#2563eb"></span>
+        <span>Đang làm: <strong>--</strong></span>
+      </div>
+      <div class="kpi-chip" id="kpi-queued-work">
+        <span class="kpi-dot" style="background:#f59e0b"></span>
+        <span>Chờ / Duyệt: <strong>--</strong></span>
+      </div>
+      <div class="kpi-chip" id="kpi-done-work">
+        <span class="kpi-dot" style="background:#10b981"></span>
+        <span>Xong: <strong>--</strong></span>
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <button id="token-summary-btn" type="button" title="Xem bảng Quota, Runtime &amp; công việc của 6 Agent">
+        <span id="token-summary-indicator">⚡ Đang tải hạn mức…</span>
+      </button>
+      <div id="status" role="status">Đang kết nối…</div>
+      <button id="btn-theme-toggle" class="icon-pill-btn" type="button" title="Chuyển đổi ánh sáng Sáng Atelier / Đêm Runway">
+        🌙 Đêm
+      </button>
+      <button id="btn-sync-now" class="icon-pill-btn" type="button" title="Đồng bộ dữ liệu tức thì">
+        ↻ Đồng bộ
+      </button>
+    </div>
+  </header>
+
+  <main class="studio-workspace">
+    <!-- LEFT: MONUMENTAL ISOMETRIC FASHION CITADEL (h1) -->
+    <section class="floor" aria-label="Không gian kiến trúc đại bản doanh thời trang 3D">
+      <div class="canvas-hud-top">
+        <div class="hud-group">
+          <button type="button" class="hud-pill active" id="btn-toggle-links" title="Ẩn/hiện dòng năng lượng phối hợp giữa các ban">
+            🔗 Luồng phối hợp
+          </button>
+          <button type="button" class="hud-pill active" id="btn-toggle-callouts" title="Ẩn/hiện bảng tác vụ nổi trên nóc từng tòa nhà">
+            🏷️ Nhãn việc trực tiếp
+          </button>
+        </div>
+        <div class="hud-group">
+          <span class="hud-pill" id="zoom-indicator">🔍 100%</span>
+        </div>
       </div>
 
-      <table class="token-table">
-        <thead>
-          <tr>
-            <th>Agent & Vai trò</th>
-            <th>Model</th>
-            <th>Trạng thái Token</th>
-            <th>Tiêu thụ</th>
-            <th>Hạn mức còn lại</th>
-          </tr>
-        </thead>
-        <tbody id="token-table-body">
-        </tbody>
-      </table>
+      <svg id="scene" viewBox="-660 -450 1320 880" preserveAspectRatio="xMidYMid meet" role="group" aria-label="Sơ đồ đại bản doanh thời trang 3D tương tác">
+        <defs>
+          <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+            <circle cx="2" cy="2" r="1.1" fill="var(--grid-dot)" opacity="var(--grid-dot-opacity)"/>
+          </pattern>
+          <filter id="shadow" x="-35%" y="-35%" width="170%" height="170%">
+            <feGaussianBlur stdDeviation="10"/>
+          </filter>
+          <filter id="glow-blue" x="-40%" y="-40%" width="180%" height="180%">
+            <feGaussianBlur stdDeviation="4" result="blur"/>
+            <feMerge>
+              <feMergeNode in="blur"/>
+              <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+          </filter>
+          <linearGradient id="plazaTopDay" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#fbfdff"/>
+            <stop offset="52%" stop-color="#ebf2fb"/>
+            <stop offset="100%" stop-color="#d6e4f5"/>
+          </linearGradient>
+          <linearGradient id="plazaTopNight" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#1b284d"/>
+            <stop offset="52%" stop-color="#131d3a"/>
+            <stop offset="100%" stop-color="#0b1226"/>
+          </linearGradient>
+          <linearGradient id="waterPool" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#67e8f9" stop-opacity="0.62"/>
+            <stop offset="100%" stop-color="#0284c7" stop-opacity="0.32"/>
+          </linearGradient>
+          <linearGradient id="spotlightBeam" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#fef08a" stop-opacity="0.48"/>
+            <stop offset="100%" stop-color="#fde047" stop-opacity="0"/>
+          </linearGradient>
+          <linearGradient id="spotlightCyan" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.38"/>
+            <stop offset="100%" stop-color="#818cf8" stop-opacity="0"/>
+          </linearGradient>
+          <linearGradient id="holoCone" x1="0%" y1="100%" x2="0%" y2="0%">
+            <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.5"/>
+            <stop offset="100%" stop-color="#818cf8" stop-opacity="0.04"/>
+          </linearGradient>
+          <linearGradient id="beaconSpire" x1="0%" y1="100%" x2="0%" y2="0%">
+            <stop offset="0%" stop-color="#2563eb" stop-opacity="0.55"/>
+            <stop offset="100%" stop-color="#60a5fa" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <rect x="-3200" y="-2400" width="6400" height="4800" fill="url(#dots)"/>
+        <g id="world"></g>
+      </svg>
 
+      <div class="canvas-hud-bottom">
+        <div class="canvas-legend" aria-label="Chú giải trạng thái trên sơ đồ">
+          <span class="legend-item"><span class="legend-dot" style="background:#2563eb"></span>Đang làm</span>
+          <span class="legend-item"><span class="legend-dot" style="background:#f59e0b"></span>Chờ<span class="legend-hide-compact"> / Duyệt</span></span>
+          <span class="legend-item"><span class="legend-dot" style="background:#10b981"></span>Hoàn thành</span>
+          <span class="legend-item"><span class="legend-dot" style="background:#ef4444"></span>Hết quota</span>
+        </div>
 
+        <div class="camera-dock" role="toolbar" aria-label="Điều khiển camera xưởng">
+          <button id="btn-open-token-modal" class="dock-primary" type="button">⚡ Quota 6 Ban</button>
+          <button id="btn-focus-active" type="button" title="Di chuyển camera tới phòng ban đang làm việc">🎯 Tới ban đang làm</button>
+          <button id="minus" type="button" aria-label="Thu nhỏ">−</button>
+          <button id="reset" type="button">Toàn cảnh</button>
+          <button id="plus" type="button" aria-label="Phóng to">+</button>
+          <button id="btn-wide-sidebar" type="button" title="Mở rộng / thu gọn bảng phòng ban bên phải">⇔ Rộng</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT: DEPARTMENT-CENTRIC TASK & QUOTA COMMAND PANEL (h2) -->
+    <aside class="command-sidebar" aria-label="Bảng điều hành phòng ban và công việc">
+      <div class="sidebar-head">
+        <div class="sidebar-eyebrow-row">
+          <span class="sidebar-eyebrow">ATELIERX · ĐIỀU HÀNH PHÒNG BAN</span>
+          <span class="sync-pill" id="sync-badge">● Đang đồng bộ…</span>
+        </div>
+        <div class="sidebar-title-row">
+          <h1>Ban chuyên môn &amp; Task</h1>
+          <div class="sidebar-head-actions">
+            <button type="button" class="tiny-btn is-active" id="btn-sort-mode" title="Đưa các ban đang có task lên đầu danh sách">⚡ Ưu tiên việc</button>
+            <button type="button" class="tiny-btn" id="btn-expand-all">Mở chi tiết</button>
+          </div>
+        </div>
+        <div class="dept-filter-bar" id="dept-filter-tabs" role="tablist" aria-label="Lọc phòng ban theo trạng thái việc">
+          <button type="button" class="dept-filter-btn active" data-dept-filter="all">Tất cả (7)</button>
+          <button type="button" class="dept-filter-btn" data-dept-filter="active">⚡ Đang làm</button>
+          <button type="button" class="dept-filter-btn" data-dept-filter="queued">⏳ Chờ / Duyệt</button>
+          <button type="button" class="dept-filter-btn" data-dept-filter="done">✅ Đã xong</button>
+        </div>
+      </div>
+
+      <div class="sidebar-scroll">
+        <!-- Prominent Active Work Spotlight -->
+        <section id="active-spotlight" class="active-spotlight" aria-live="polite"></section>
+
+        <!-- Department Cards: Each department contains its own tasks! -->
+        <nav id="rooms" aria-label="Danh sách phòng ban và công việc theo từng ban"></nav>
+
+        <!-- Hidden legacy hooks preserved for compatibility + Studio summary -->
+        <section id="info" aria-live="polite" hidden></section>
+        <section id="task-flow" class="studio-overview-footer" aria-live="polite"></section>
+      </div>
+    </aside>
+  </main>
+
+  <!-- Modal Quota & Task Telemetry 6 Agents -->
+  <div id="token-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 id="modal-title">⚡ Giám sát Quota, Runtime &amp; Phụ trách 6 Phòng Ban</h3>
+        <button class="modal-close" id="modal-close-btn" type="button" aria-label="Đóng">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="modal-runtime-banner" class="modal-runtime-banner" hidden></div>
+        <div class="modal-tabs">
+          <button class="modal-tab-btn active" type="button" data-filter="all">Tất cả (6)</button>
+          <button class="modal-tab-btn" type="button" data-filter="ok">🟢 Sẵn sàng / Còn quota</button>
+          <button class="modal-tab-btn" type="button" data-filter="out">🔴 Hết quota / Dừng</button>
+        </div>
+
+        <table class="token-table">
+          <thead>
+            <tr>
+              <th>Phòng ban &amp; Nhân sự</th>
+              <th>Việc đang phụ trách</th>
+              <th>Model &amp; Runtime</th>
+              <th>Trạng thái Quota</th>
+              <th>Đã dùng hôm nay</th>
+              <th>Còn lại / Ghi chú</th>
+            </tr>
+          </thead>
+          <tbody id="token-table-body"></tbody>
+        </table>
+      </div>
     </div>
   </div>
-</div>
 
-<script type="module" src="/assets/atelierx.js?v=20261113v2"></script>
+  <script type="module" src="/assets/atelierx.js?v=20261113v4"></script>
 </body>
 </html>
