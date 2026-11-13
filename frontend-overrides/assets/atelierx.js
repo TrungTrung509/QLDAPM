@@ -217,7 +217,7 @@ function renderNavButtons() {
     
     let tokenPill = '';
     if (tok) {
-      if (tok.status === "unknown") {tokenPill = `<span>Ch?a c? d? li?u token</span>`;} else if (tok.status === "unlimited") {tokenPill = `<span>Ch?a ??t h?n m?c</span>`;} else if (tok.hasToken) {
+      if (tok.status === "unknown") {tokenPill = `<span>Chưa có dữ liệu token</span>`;} else if (tok.status === "unlimited") {tokenPill = `<span>Chưa đặt hạn mức</span>`;} else if (tok.hasToken) {
         tokenPill = `<span style="font-size:10.5px;padding:3px 8px;border-radius:10px;font-weight:700;background:#e7f5e8;color:#1e7e34;border:1px solid #a7dfb2">🟢 Còn ${tok.pctRemaining ?? "--"}%</span>`;
       } else {
         tokenPill = `<span style="font-size:10.5px;padding:3px 8px;border-radius:10px;font-weight:800;background:#fde8e8;color:#d32f2f;border:1px solid #f8b4b4;animation:blink 1.4s infinite">🔴 HẾT TOKEN</span>`;
@@ -242,7 +242,7 @@ function updateTokenHeaderSummary() {
 
   const summaryEl = document.querySelector('#token-summary-indicator');
   if (summaryEl) {
-    if (unlimitedCount > 0 && !outCount && !unknownCount) {summaryEl.textContent = `${unlimitedCount} agent ch?a ??t h?n m?c`; } else if (unknownCount > 0) {summaryEl.textContent = `${okCount} c?n ? ${outCount} h?t ? ${unknownCount} ch?a c? d? li?u`;} else if (outCount > 0) {
+    if (unlimitedCount > 0 && !outCount && !unknownCount) {summaryEl.textContent = `${unlimitedCount} agent chưa đặt hạn mức`; } else if (unknownCount > 0) {summaryEl.textContent = `${okCount} còn · ${outCount} hết · ${unknownCount} chưa có dữ liệu`;} else if (outCount > 0) {
       summaryEl.innerHTML = `<span style="color:#2e7d32">🟢 ${okCount} Còn</span> · <span style="color:#d32f2f">🔴 ${outCount} Hết token</span>`;
     } else {
       summaryEl.innerHTML = `<span style="color:#2e7d32">🟢 6/6 Còn token</span>`;
@@ -267,7 +267,7 @@ function show(i,focus){
   if (r[1]) {
     const roleEl = document.createElement('div');
     roleEl.className = 'info-role';
-    roleEl.textContent = staffNames[i]+" ? "+r[1];
+    roleEl.textContent = staffNames[i] + " · " + r[1];
     info.append(roleEl);const action=document.createElement("p");action.textContent=staffAction(i);info.append(action);
     const assigned=tasksFor(i);for(const task of assigned.slice(0,3)){const note=document.createElement('p');note.textContent='Task Flow · '+flowLabel(task.status)+' · '+task.taskName;info.append(note)}
   }
