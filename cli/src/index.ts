@@ -1,0 +1,376 @@
+#!/usr/bin/env node
+
+import { Command } from 'commander';
+import chalk from 'chalk';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { startCommand } from './commands/start.js';
+import { stopCommand } from './commands/stop.js';
+import { statusCommand } from './commands/status.js';
+import { logsCommand } from './commands/logs.js';
+import { upgradeCommand } from './commands/upgrade.js';
+import { installCommand } from './commands/install.js';
+import { skillsCommand } from './commands/skills.js';
+import { searchCommand } from './commands/search.js';
+import { onboardCommand } from './commands/onboard.js';
+import { deployBundleCommand } from './commands/deploy-bundle.js';
+import { harnessCommand, loginCommand as harnessLoginCommand } from './commands/harness.js';
+import { mcpServerCommand } from './commands/mcp-server.js';
+import { publishCommand } from './commands/publish.js';
+import { seedMarketplaceCommand } from './commands/seed-marketplace.js';
+import { serviceCommand } from './commands/service.js';
+import { backupCommandAndExit } from './commands/backup.js';
+import { securityCommand, type SecurityOptions } from './commands/security.js';
+import { desktopCommand } from './commands/desktop.js';
+import { doctorCommand, inputGuardCommand } from './commands/doctor.js';
+import { updateStatusCommand } from './commands/update-status.js';
+import { pairCommand } from './commands/pair.js';
+import { tokenCommand } from './commands/token.js';
+import { ticketsCommand, type TicketsOptions } from './commands/tickets.js';
+import { teamMoveCommand, teamMovesCommand, teamMachinesCommand, teamMoveRollbackCommand, type TeamMoveOptions } from './commands/team-move.js';
+import { teamExportCommand, teamImportCommand, type TeamExportOptions, type TeamImportOptions } from './commands/team-export.js';
+import { loginCommand, statusCommand as cloudStatusCommand, logoutCommand, type LoginOptions } from './commands/cloud.js';
+import { DEFAULT_WEB_PORT } from './constants.js';
+import { getLocalVersion, registerCliModuleDir } from './utils/version-check.js';
+import { setCliModuleDir } from './utils/package-root.js';
+import { installOwnerTokenForLocalBackend } from './utils/owner-token-fetch.js';
+
+// Anchor package-root resolution on this module's own location so commands
+// like `crewly service install` work from any cwd after a global install.
+setCliModuleDir(path.dirname(fileURLToPath(import.meta.url)));
+
+// The CLI acts as the owner on its local backend (#999): owner-only routes
+// need the owner API token, not just a missing agent header.
+installOwnerTokenForLocalBackend();
+
+const program = new Command();
+
+// Anchor version lookups to this module's own location (works for global
+// installs, npx and dev checkouts alike) — never to process.cwd().
+registerCliModuleDir(path.dirname(fileURLToPath(import.meta.url)));
+
+let cliVersion = '1.0.0';
+try {
+  cliVersion = getLocalVersion();
+} catch {
+  // Fallback to hardcoded version if package.json lookup fails
+}
+
+program
+  .name('crewly')
+  .description('Crewly - Orchestrate multiple Claude Code instances as AI development teams')
+  .version(cliVersion);
+
+program
+  .command('start')
+  .description('Start Crewly backend (prints the dashboard URL; use --open to open it)')
+  .option('-p, --port <port>', 'Web server port', DEFAULT_WEB_PORT.toString())
+  .option('--open', 'Open the dashboard in your browser (or set CREWLY_OPEN_BROWSER=1); never opens when non-interactive')
+  .option('--no-browser', 'Never open the browser (this is already the default; kept for scripts)')
+  .option('--headless', 'Start in headless/API-only mode (no frontend, no browser)')
+  .option('--auto-upgrade', 'Automatically upgrade before starting if a new version is available')
+  .action(startCommand);
+
+program
+  .command('stop')
+  .description('Stop all Crewly services and sessions')
+  .option('--force', 'Force kill all processes')
+  .action(stopCommand);
+
+program
+  .command('status')
+  .description('Show status of running Crewly services')
+  .option('--verbose', 'Show detailed information')
+  .action(statusCommand);
+
+program
+  .command('logs')
+  .description('View aggregated logs from all services')
+  .option('-f, --follow', 'Follow log output')
+  .option('-n, --lines <number>', 'Number of lines to show', '50')
+  .action(logsCommand);
+
+program
+  .command('upgrade')
+  .description('Upgrade Crewly to the latest version')
+  .option('--check', 'Check for updates without installing')
+  .option('--pro', 'Install the Pro addon')
+  .option('--token <token>', 'Cloud API token for downloading Pro addon')
+  .option('--source <path>', 'Local path to a .tar.gz addon file')
+  .action(upgradeCommand);
+
+program
+  .command('install [id]')
+  .description('Install a skill from the Crewly marketplace and run its setup (tools, models, Python packages)')
+  .option('--all', 'Install all agent skills (without their setup)')
+  // Explicit arity: commander appends the Command object, which must not land in `deps`.
+  .action((id: string | undefined, options: { all?: boolean }) => installCommand(id, options));
+
+program
+  .command('skills <action> [id]')
+  .description('Skill setup: `crewly skills setup <id>` installs what a skill needs (tools, models, Python packages); add --check to only check')
+  .option('--check', 'Only check what is installed; change nothing')
+  .action(async (action: string, id: string | undefined, options: { check?: boolean }) => {
+    process.exitCode = await skillsCommand(action, id, options);
+  });
+
+program
+  .command('search [query]')
+  .description('Search the Crewly skill marketplace')
+  .option('--type <type>', 'Filter by type (skill, model, role)')
+  .action(searchCommand);
+
+program
+  .command('init')
+  .alias('onboard')
+  .description('Setup wizard for new Crewly users (web app or terminal)')
+  .option('-y, --yes', 'Non-interactive mode: use all defaults, never prompt (CI / agents); prints the login link for your phone')
+  .option('--template <id>', 'Team template by ID (default: personal-assistant-team)')
+  .option('--harness <id>', 'Harness for the orchestrator: claude (default), codex or antigravity')
+  .option('--task <text>', 'First task for the new team; sent to the orchestrator (with --yes; otherwise it is asked)')
+  .option('--web', 'Continue setup in the web app')
+  .option('--cli', 'Continue setup in this terminal')
+  .option('--answers <file>', 'Answers to a solution bundle\'s questions (JSON), for --template <bundle> with --yes')
+  .option('--runtime <id>', 'Runtime for a solution bundle\'s members (default: recommended if available, else the orchestrator\'s)')
+  .action((options: Parameters<typeof onboardCommand>[0]) => onboardCommand(options));
+
+/** Collect a repeatable option into an array. */
+const collect = (value: string, previous: string[] = []): string[] => [...previous, value];
+
+program
+  .command('deploy-bundle <templateId>')
+  .description('Deploy a solution bundle in one step: team, norms/SOPs, skills, Slack channels, schedules and first-week tasks')
+  .option('--answers <file>', 'JSON file with the answers to the bundle\'s questions, e.g. {"business_name": "…"}')
+  .option('--runtime <id>', 'Runtime for every member (claude-code, codex-cli, crewly-agent, …)')
+  .option('--templates-dir <dir>', 'Extra template directory, e.g. crewly-pro/config/templates (repeatable)', collect, [])
+  .option('--dry-run', 'Validate and print what would be set up, without deploying')
+  .option('--allow-draft', 'Deploy a bundle that is still marked draft')
+  .option('--json', 'Print the final deployment as JSON')
+  .action((templateId: string, options: Parameters<typeof deployBundleCommand>[1]) => deployBundleCommand(templateId, options));
+
+program
+  .command('harness')
+  .description('Show the AI harnesses (Claude Code, Codex, Antigravity CLI): installed version, updates, login state')
+  .action(async () => {
+    process.exitCode = await harnessCommand();
+  });
+
+program
+  .command('login <harness>')
+  .description('Log a harness in: crewly login claude | codex | antigravity (prints a link to open on any device; Antigravity takes a Gemini API key)')
+  .option('--method <method>', 'subscription | device | api_key (default: the harness\'s browser login)')
+  .option('--force', 'Log in again even when already logged in')
+  .option('-y, --yes', 'Never prompt: start the login for Crewly → Setup (web / phone) to finish')
+  .action(async (harness: string, options: Parameters<typeof harnessLoginCommand>[1]) => {
+    process.exitCode = await harnessLoginCommand(harness, options);
+  });
+
+program
+  .command('mcp-server')
+  .description('Start Crewly MCP server (for Claude Code, Cursor, etc. integration)')
+  .action(mcpServerCommand);
+
+program
+  .command('publish <path>')
+  .description('Validate and package a skill for the Crewly marketplace')
+  .option('--dry-run', 'Validate only, do not create archive')
+  .option('-o, --output <dir>', 'Output directory for the archive')
+  .option('--submit', 'Submit via your own GitHub (gh CLI) — opens a PR from your account')
+  .option('--cloud', 'Submit via Crewly Cloud — the cloud opens the PR for you (requires `crewly cloud login`)')
+  .option('--url <url>', 'Backend URL for submission (default: http://localhost:3000)')
+  .action(publishCommand);
+
+program
+  .command('seed-marketplace')
+  .description('Publish built-in skills to the local marketplace registry')
+  .option('--dry-run', 'Validate only, do not publish')
+  .option('--skills-dir <dir>', 'Skills directory to package from')
+  .action(seedMarketplaceCommand);
+
+program
+  .command('doctor')
+  .description('Check this install: package root, node, jq/curl, native modules, build toolchain, AI runtime login, marketplace, service environment')
+  .option('--input-guard', 'Release check: classify every live agent\'s input box with the new build\'s guard (exit 1 if an idle agent reads as unknown)')
+  .option('--build <path>', 'With --input-guard: build to check (package root or dist dir; default: the running install)')
+  .action(async (opts: { inputGuard?: boolean; build?: string }) => {
+    if (opts.inputGuard) await inputGuardCommand({ build: opts.build });
+    else await doctorCommand();
+  });
+
+program
+  .command('update-status')
+  .description('Show automatic self-update status: installed/running/latest version, on/off, last check, last result')
+  .action(async () => {
+    process.exitCode = await updateStatusCommand();
+  });
+
+program
+  .command('service <action>')
+  .description('Manage Crewly background service (install|uninstall|status|restart|stop|logs)')
+  .option('--force', 'Overwrite existing installation')
+  .option('--session <name>', 'Tail a specific agent session log (logs action)')
+  .option('--app', 'Tail today\'s app log (logs action)')
+  .option('-n, --lines <number>', 'Number of log lines to show (default: 50)')
+  .option('-f, --follow', 'Follow log output in real-time (logs action)')
+  .option('--now', 'restart/stop/upgrade: do not wait for agents to finish their current turn (they resume after the restart)')
+  .action(serviceCommand);
+
+program
+  .command('desktop <area> [action]')
+  .description('Remote desktop: `crewly desktop remote on|off|status` — allow watching and driving this machine from crewlyai.com and the phone (run it on the machine)')
+  .action(async (area: string, action: string | undefined) => {
+    process.exitCode = await desktopCommand(area, action);
+  });
+
+program
+  .command('backup <action> [target]')
+  .description('Workspace backup: create | restore <file>. Archive this machine to restore on another. Pro: cloud push/pull (soon)')
+  .option('-o, --out <file>', 'Output archive path (create)')
+  .option('--no-chat-db', 'Exclude chat.db from the archive (create)')
+  .option('--include-project-files', 'Also archive each project\'s own files under projects/<id>/files/ — .git kept, node_modules/.crewly/.DS_Store excluded by default (create)')
+  .option('--exclude <glob...>', 'Extra exclude pattern for project files, added to the defaults; no "/" = any path segment (e.g. dist, *.log), with "/" = project-relative path (e.g. build/**) (create, repeatable)')
+  .option('-y, --yes', 'Continue even when project files exceed the 2 GB warning threshold (create)')
+  .option('--mode <mode>', 'Restore conflict mode: abort (default) | overwrite. Project files are never written into a non-empty directory without overwrite')
+  .option('--map <mapping...>', 'Restore source→target path remap, OLD=NEW (repeatable); project files and .crewly follow the mapped path')
+  .option('--skip-slack', 'Restore without Slack credentials (slack-credentials.json). Two instances sharing one Slack app answer non-deterministically — use this when the source machine keeps Slack')
+  .option('--apply', 'Apply the restore (without this, restore is a dry-run preview)')
+  // Explicit arity: commander appends the Command object as a trailing
+  // argument, which must not land in backupCommandAndExit's `exit` parameter.
+  .action((action: string, target: string | undefined, options: Parameters<typeof backupCommandAndExit>[2]) =>
+    backupCommandAndExit(action, target, options),
+  );
+
+program
+  .command('pair')
+  .description('Pair two Crewly instances via Cloud Relay for remote collaboration')
+  .option('--cloud', 'Use Cloud Relay for pairing')
+  .option('--code <code>', 'Join an existing pairing session with this code')
+  .option('--role <role>', 'Node role: orchestrator or agent')
+  .option('--secret <secret>', 'Shared secret for E2EE (prompted if omitted)')
+  .option('--disconnect', 'Disconnect from active relay session')
+  .option('--devices', 'List paired devices')
+  .action(pairCommand);
+
+program
+  .command('token')
+  .description('Print the API token non-loopback callers must send (see README "Securing a server install")')
+  .option('--url', 'Print a ready-to-open dashboard link (http://<host>:<port>/?token=...) instead')
+  .option('--host <host>', 'Host to use in the --url link (default: first LAN IPv4)')
+  .option('--port <port>', 'Port to use in the --url link (default: WEB_PORT or 8787)')
+  .action(tokenCommand);
+
+program
+  .command('security <action>')
+  .description('Security maintenance: scrub-logs masks API keys/tokens in session logs and ~/.bash_history / ~/.zsh_history — a dry run (counts only) unless --apply')
+  .option('--apply', 'scrub-logs: rewrite the files (default: dry run)')
+  .option('--no-shell-history', 'scrub-logs: leave shell history files alone')
+  .action(async (action: string, options: SecurityOptions) => {
+    process.exitCode = await securityCommand(action, options);
+  });
+
+program
+  .command('tickets <action> [projectPath]')
+  .description('Project tickets (<project>/.crewly/tickets/): list | migrate. migrate imports unfinished v1 .crewly/tasks files as backlog tickets — a dry run unless --apply')
+  .option('--apply', 'migrate: write the tickets (default: dry run)')
+  .option('--milestone <name...>', 'migrate: only these v1 milestone folders (repeatable)')
+  .option('--status <status>', 'list: only this status')
+  .option('--name <name>', 'Project name for the ticket id prefix (default: the registered name, else the folder name)')
+  .option('--json', 'Print JSON')
+  .action(async (action: string, projectPath: string | undefined, options: TicketsOptions) => {
+    process.exitCode = await ticketsCommand(action, projectPath, options);
+  });
+
+const teamCmd = program
+  .command('team')
+  .description('Teams: move a team to another machine of your account, or export/import one as a portable package');
+
+teamCmd
+  .command('export <team>')
+  .description('Write a team (config, member prompts, norms, schedules) to one JSON file: running state stripped, secrets masked, connectors listed for reconnecting')
+  .option('--out <file>', 'File to write (default crewly-team-<name>-<date>.json)')
+  .option('--wiki', "Include the team's wiki pages (its knowledge); without it they are only counted")
+  .option('--json', 'Print the package as JSON')
+  .action(async (team: string, options: TeamExportOptions) => {
+    process.exitCode = await teamExportCommand(team, options);
+  });
+
+teamCmd
+  .command('import <file>')
+  .description('Recreate a team from a package written by `crewly team export`; members start inactive')
+  .option('--json', 'Print JSON')
+  .action(async (file: string, options: TeamImportOptions) => {
+    process.exitCode = await teamImportCommand(file, options);
+  });
+
+teamCmd
+  .command('move <team>')
+  .description('Move a team (members, memory, tickets, wiki, schedules, Slack identity) to another machine; code is cloned there. Cloud only carries ciphertext')
+  .requiredOption('--to <machine>', 'Target machine name (see `crewly team machines`)')
+  .option('--allow-dirty', 'Move although a repository has uncommitted or unpushed work')
+  .option('--skip-flagged', 'Leave out notes/project files that hold credentials instead of stopping')
+  .option('--json', 'Print JSON')
+  .action(async (team: string, options: TeamMoveOptions) => {
+    process.exitCode = await teamMoveCommand(team, options);
+  });
+
+teamCmd
+  .command('moves')
+  .description('List team moves and their progress')
+  .option('--json', 'Print JSON')
+  .action(async (options: { json?: boolean }) => {
+    process.exitCode = await teamMovesCommand(options);
+  });
+
+teamCmd
+  .command('machines')
+  .description('List the machines of your account a team can move to')
+  .action(async () => {
+    process.exitCode = await teamMachinesCommand();
+  });
+
+teamCmd
+  .command('move-rollback <moveId>')
+  .description('Roll a finished or failed move back: the team returns to the source machine (within 7 days)')
+  .action(async (moveId: string) => {
+    process.exitCode = await teamMoveRollbackCommand(moveId);
+  });
+
+const cloudCmd = program
+  .command('cloud')
+  .description('Manage CrewlyAI Cloud connection (login, status, logout)');
+
+cloudCmd
+  .command('login')
+  .description('Login to CrewlyAI Cloud: prints a link + code to approve from your phone (no token copying)')
+  .option('--token <token>', 'Login with a token directly')
+  .option('--no-browser', 'Do not open the approval link in a local browser (just print it)')
+  .option('--web', 'Old flow: Google sign-in in this machine\'s browser with a localhost callback')
+  .option('--paste', 'Old flow: sign in on the portal token page and paste the tokens here')
+  .action((options: LoginOptions) => loginCommand(options));
+
+cloudCmd
+  .command('status')
+  .description('Show CrewlyAI Cloud connection status')
+  .action(cloudStatusCommand);
+
+cloudCmd
+  .command('logout')
+  .description('Disconnect from CrewlyAI Cloud')
+  .action(logoutCommand);
+
+// Error handling
+program.exitOverride();
+
+try {
+  program.parse();
+} catch (err) {
+  // With exitOverride(), commander throws for --version / --help after it has
+  // already printed the output. Those are not errors — exit cleanly instead of
+  // echoing "Error: 1.13.1" to the terminal.
+  const code = (err as { code?: string } | null)?.code;
+  if (code === 'commander.version' || code === 'commander.helpDisplayed' || code === 'commander.help') {
+    process.exit(0);
+  }
+  console.error(chalk.red('Error:'), err instanceof Error ? err.message : 'Unknown error');
+  process.exit(1);
+}

@@ -1,0 +1,456 @@
+/**
+ * Decision cards — structured owner questions (specs/2026-10-01-decision-cards.md).
+ *
+ * An agent that needs the owner asks ONE question with 2–5 options, a default
+ * and a deadline. The responsible agent's own Slack bot posts it as a card in
+ * the team channel (ticket thread, or a new thread), and the owner answers
+ * with a button, a reaction or a thread reply. The decision is stored here
+ * until it is resolved, applied at its deadline, or parked.
+ *
+ * @module types/decision.types
+ */
+
+/** Sensitive asks are never auto-applied at the deadline. */
+export type DecisionSensitiveKind = 'email' | 'publish' | 'deploy' | 'spend' | 'browser_action' | 'runtime_terms' | 'app_access';
+
+/**
+ * Decisions Crewly asks itself (not through ask-owner). The kind's handler
+ * (see `DecisionService.registerKindHandler`) acts on the answer and returns
+ * the note the asking agent gets (none for harness-owned decisions).
+ *
+ * - `browser_action`: a held browser action, asked on an agent's behalf
+ * - `runtime_terms`: a runtime's Terms of Service, asked by the harness
+ *   (specs/2026-10-01-runtime-terms-consent.md)
+ * - `reply_question`: a question an agent asked the owner in a reply, turned
+ *   into a card on its behalf (specs/2026-10-01-reply-open-items.md)
+ * - `spend_cap`: an agent / team / all agents hit a daily token cap — boost it
+ *   for today (+X or unlimited) or keep it stopped (specs/2026-10-02-spend-cap.md)
+ * - `gmail_send`: a drafted email an agent wants sent (CREW-257,
+ *   specs/2026-10-06-gmail-approve-send-and-reply-wake.md)
+ * - `owner_receipt_format`: one real sample of the nightly receipt — turn it on
+ *   in this format, or keep the per-ask format (specs/owner-receipt.md, #856)
+ * - `private_share`: a reply the audience check moved to the owner DM because
+ *   it draws on someone's private data — post it in the room it was held
+ *   from, or keep it private (crewly#969, specs/per-person-access.md)
+ */
+export type DecisionKind = 'browser_action' | 'runtime_terms' | 'reply_question' | 'spend_cap' | 'owner_receipt_format' | 'retro_harness_gaps' | 'app_collaborator' | 'app_template' | 'model_tier_change' | 'gmail_send' | 'private_share';
+
+/** How a decision came to be: asked live, or carded by the open-items backfill. */
+export type DecisionSource = 'live' | 'backfill';
+
+/** The Request open item a `reply_question` decision tracks. */
+export interface DecisionRequestRef {
+  requestId: string;
+  itemId: string;
+}
+
+/**
+ * A decision the harness itself asks (not an agent): posted from this
+ * machine's orc bot in the owner's DM, handled by its kind's handler, never
+ * delivered to an agent. specs/2026-10-01-runtime-terms-consent.md
+ */
+export interface DecisionSystemRef {
+  /** Subject within the decision's kind (the runtime id) */
+  key: string;
+  /**
+   * The default is the declining option, so it IS applied at the deadline
+   * even when the decision is sensitive (declining is always safe).
+   */
+  defaultIsDecline?: boolean;
+}
+
+/**
+ * What an `app_collaborator` decision grants if the owner allows it. Fixed on
+ * this machine when the agent asks (from who the caller is); only the owner's
+ * tap acts on it.
+ */
+export interface AppCollaboratorSubject {
+  appId: string;
+  /** The app's name when known */
+  appName?: string;
+  /** Who would be added */
+  kind: 'team' | 'agent';
+  /** Team name (kind `team`) */
+  team?: string;
+  /** Agent session (kind `agent`) */
+  session?: string;
+  /** This instance's Cloud id (the grant is bound to it) */
+  instanceId: string;
+  /** The agent that asked, and its display name */
+  askerSession: string;
+  askerName: string;
+  /** Why, in the agent's words (shown to the owner) */
+  reason?: string;
+}
+
+/**
+ * What an `app_template` decision lists on the Crewly Marketplace if the owner
+ * says yes (specs/2026-10-08-app-templates.md). Fixed on this machine when the
+ * agent asks: the draft Cloud made (id + version) and the author name the
+ * agent proposed; only the owner's tap lists it.
+ */
+export interface AppTemplateSubject {
+  appId: string;
+  appName: string;
+  templateId: string;
+  /** The draft version the owner is shown (Cloud refuses another) */
+  version: number;
+  /** "by …" when the owner picks "Publish as <name>"; absent = only anonymous is offered */
+  authorName?: string;
+  /** The agent that asked, and its display name */
+  askerSession: string;
+  askerName: string;
+}
+
+/** One member's tier change inside a `model_tier_change` decision. */
+export interface TierChangeEntry {
+  memberId: string;
+  memberName: string;
+  /** The member's session (agent id) */
+  session: string;
+  /** Tier before (null = none set) */
+  from: import('./index.js').ModelTier | null;
+  to: import('./index.js').ModelTier;
+  /** Model the member ran before / will run (for the card) */
+  fromModel?: string;
+  toModel?: string;
+  /** The member's explicit modelId, cleared on apply (so the tier takes effect); restored by a revert */
+  clearsModelId?: string;
+  /** Explicit modelId a revert puts back */
+  restoreModelId?: string;
+  /** A revert to "no tier" (the member had none before): the tier is removed, `to` is only its rank */
+  clearTier?: boolean;
+  /** Why, in the lead's words */
+  reason: string;
+}
+
+/**
+ * What a `model_tier_change` decision applies if the owner says yes
+ * (crewly#1173). Fixed when the card is asked; only the owner's tap applies it.
+ */
+export interface TierChangeSubject {
+  teamId: string;
+  teamName: string;
+  /** Review id (`review` cards) or guard id (`revert` cards) */
+  reviewId: string;
+  /**
+   * What applying does. `review`: the lead's proposals (watched by the
+   * quality guard); `revert`: move a member back after the guard found worse
+   * work; `undo`: the owner's tap on an auto-mode notice — puts back exactly
+   * the changes the notice is about (not watched).
+   */
+  kind: 'review' | 'revert' | 'undo';
+  /**
+   * Set on auto-mode notices (the change already happened; the one action
+   * undoes it): `applied` — the lead's changes went in; `reverted` — the
+   * quality guard moved a member back.
+   */
+  notice?: 'applied' | 'reverted';
+  /** Id of the applied batch an `undo` reverses (its applied entries are marked `undone`) */
+  undoOf?: string;
+  changes: TierChangeEntry[];
+  /** Task routing rules the lead proposed */
+  routing: string[];
+  /** Routing rules an `undo` removes again (the ones the undone batch added) */
+  removeRouting?: string[];
+  askerSession: string;
+  askerName: string;
+}
+
+/** The held browser action a `browser_action` decision is about. */
+export interface BrowserActionSubject {
+  /** Agent whose action is held */
+  agentSession: string;
+  /** Display name ("Vera") */
+  agentName: string;
+  /** `PendingConfirmation.id` in the browser session service */
+  pendingId: string;
+  /** "visa.careerengine.us/subscribe", when known */
+  where?: string;
+  /** What it wants to do, e.g. `click "Submit"` */
+  target: string;
+  /** Why it was held ("submitting") */
+  matched: string;
+}
+
+/** The held email a `gmail_send` decision is about. */
+export interface GmailSendSubject {
+  /** Agent that drafted it */
+  agentSession: string;
+  /** Display name ("Lyra") */
+  agentName: string;
+  /** Hold id (`agent:draftId`) in the Gmail send gate */
+  holdId: string;
+  /** Gmail draft the owner is approving */
+  draftId: string;
+  to: string;
+  subject: string;
+}
+
+/**
+ * The held reply a `private_share` decision is about (crewly#969). Fixed when
+ * the reply is moved to the owner DM; only the owner's tap posts it.
+ */
+export interface PrivateShareSubject {
+  /** Agent whose reply it is */
+  agentSession: string;
+  /** Display name ("Owen") */
+  agentName: string;
+  /** The reply text as the owner saw it in the DM (without the held-from note) */
+  content: string;
+  /** Where it was going before the check moved it (a resolved reply destination, as JSON) */
+  destination: unknown;
+  /** The shared place in words ("#ce", "the CE-7 ticket thread") */
+  heldFrom: string;
+  /** People (ids) whose data it draws on */
+  people: string[];
+  /** The owner DM conversation the reply went to instead */
+  ownerDm: string;
+}
+
+/**
+ * What the owner needs to answer a card without opening the PR or the ticket
+ * (crewly#1369 §3). Every field is one short line in the owner's language.
+ * Required on a merge card: at least {@link DecisionContext.runtimeChanges}.
+ */
+export interface DecisionContext {
+  /** Who asked for the work, and when ("Ella, Oct 6") */
+  requestedBy?: string;
+  /** What the owner said last about it, when known (quoted) */
+  ownerLastSaid?: string;
+  /** What changes at runtime once this is done / merged (new background jobs, scopes, polling) */
+  runtimeChanges?: string;
+  /** The PR / doc link, shown in the card's short details line */
+  link?: string;
+}
+
+/** Languages the harness writes a card's own text in (buttons, context line, reminders). */
+export type DecisionLanguage = 'en' | 'zh';
+
+/** One answer the owner can pick. */
+export interface DecisionOption {
+  /** Stable key (`a`, `b`, `c`) carried in the button value */
+  key: string;
+  /** Short label (button text) */
+  label: string;
+  /** Optional one-line detail shown under the question */
+  detail?: string;
+  /**
+   * The agent's full question this option stands for (either/or cards derived
+   * from consecutive reply questions): quoted back to the agent when chosen.
+   */
+  question?: string;
+}
+
+/** Lifecycle of a decision. */
+export type DecisionStatus =
+  /** Card posted (or waiting to be posted), no answer yet */
+  | 'open'
+  /** The owner chose an option (button, reaction, reply, dashboard) */
+  | 'resolved'
+  /** The deadline passed and the default was applied */
+  | 'defaulted'
+  /** Sensitive ask with no answer after the re-ask: nothing happens until the owner reopens it */
+  | 'parked'
+  /** Withdrawn by the asking agent (or its ticket closed) */
+  | 'cancelled'
+  /** The thing asked about no longer exists (e.g. a held browser action lost to a restart) */
+  | 'expired'
+  /** The owner skipped it ("I don't care about this anymore"): the asker drops it and must not ask again */
+  | 'skipped';
+
+/**
+ * How an answer arrived. `thread`: the owner answered in the card's thread
+ * with a voice note, audio or another file and no text
+ * (specs/2026-10-02-decision-card-thread-answers.md §1). `voice`: spoken in
+ * Drive mode on the phone (specs/2026-10-08-drive-mode.md).
+ */
+export type DecisionAnswerVia = 'button' | 'reaction' | 'reply' | 'thread' | 'dashboard' | 'deadline' | 'bulk' | 'voice';
+
+/** A file the owner answered with in a card's thread. */
+export interface DecisionAnswerFile {
+  name: string;
+  mimetype?: string;
+  /** Slack permalink */
+  permalink?: string;
+  /** Slack's own transcript of a voice clip, when it sent one */
+  transcript?: string;
+}
+
+/** Where the card lives in Slack. */
+export interface DecisionCardRef {
+  slackChannelId: string;
+  /** The card message's own ts */
+  messageTs: string;
+  /** Thread the card was posted in (undefined = the card is the thread root) */
+  threadTs?: string;
+  /** Session whose bot posted it (`crewly` = the shared bot) */
+  postedBy: string;
+  /** True when the agent's own bot token was used */
+  ownBot: boolean;
+  /** `DECISION_CONSTANTS.CARD_RENDER_REV` the card was last drawn with (absent = before revisions existed) */
+  renderRev?: number;
+}
+
+/** A pending or settled owner decision. */
+export interface OwnerDecision {
+  /** `D-<n>` */
+  id: string;
+  question: string;
+  options: DecisionOption[];
+  /** An option key, or `wait` */
+  defaultKey: string;
+  /** ISO deadline */
+  deadline: string;
+  sensitive?: DecisionSensitiveKind;
+  /** Set for decisions Crewly asks itself (see {@link DecisionKind}) */
+  kind?: DecisionKind;
+  /** The held browser action (kind `browser_action`) */
+  browser?: BrowserActionSubject;
+  /** The held email (kind `gmail_send`) */
+  gmail?: GmailSendSubject;
+  /** The held reply (kind `private_share`) */
+  privateShare?: PrivateShareSubject;
+  /** What the owner would grant (kind `app_collaborator`) */
+  appCollaborator?: AppCollaboratorSubject;
+  /** The template the owner would list (kind `app_template`) */
+  appTemplate?: AppTemplateSubject;
+  /** The tier changes the owner would apply (kind `model_tier_change`) */
+  tierChange?: TierChangeSubject;
+  /** Option a plain "yes" / ✅ means (default: the default option, else the first) */
+  yesKey?: string;
+  /** Session that called ask-owner */
+  requestedBy: string;
+  /** Session that owns the question (assignee / lead / the caller) — its bot posts and it gets the answer */
+  asker: string;
+  /** Ticket the question belongs to */
+  ticket?: { projectId: string; projectPath: string; projectName?: string; id: string; title: string };
+  /** Team whose channel carries the card */
+  teamId?: string;
+  /** Work item the asker was on when it asked */
+  workItemId?: string;
+  /** Where the card goes when set (the thread the question was asked in) */
+  place?: { slackChannelId: string; threadTs?: string };
+  /** The Request open item it tracks (kind `reply_question`) */
+  requestRef?: DecisionRequestRef;
+  /**
+   * How the question was found: `backfill` = carded by the open-items
+   * backfill from an old reply (not asked live). Absent = asked live.
+   */
+  source?: DecisionSource;
+  /** When the agent asked it in its reply (ISO; `reply_question` cards), when known */
+  askedAt?: string;
+  /** Harness-owned decision (owner DM, no agent); set together with `kind` */
+  system?: DecisionSystemRef;
+  /** Card header instead of "Decision D-n" (system decisions) */
+  title?: string;
+  /** Extra mrkdwn sections shown under the question (system decisions) */
+  body?: string[];
+  /** Context the asker gave (who asked, what the owner said, what changes) — crewly#1369 §3 */
+  context?: DecisionContext;
+  /**
+   * Internal references taken out of the question at creation (PR numbers,
+   * links): shown only in the card's short details line (crewly#1367).
+   */
+  details?: string[];
+  /** The card asks the owner to merge a PR */
+  merge?: boolean;
+  /** The owner's language when the card was asked: the harness's own card text uses it (absent = English) */
+  ownerLanguage?: DecisionLanguage;
+  status: DecisionStatus;
+  card?: DecisionCardRef;
+  /** Why the card could not be posted (shown in the dashboard; retried on the next tick) */
+  postError?: string;
+  /**
+   * The Slack card still shows an older state (chat.update failed — e.g. live
+   * buttons on a closed decision). Retried on the tick until Slack takes it.
+   */
+  cardSyncPending?: boolean;
+  /**
+   * Response only, never stored: an ask that matched an open card from the
+   * same asker in the same place returns that card instead of posting a new one.
+   */
+  reused?: boolean;
+  createdAt: string;
+  updatedAt: string;
+  /** "Remind me tomorrow": when to remind */
+  remindAt?: string;
+  /** When the sensitive re-ask was posted */
+  reaskedAt?: string;
+  /** `wait` default: when the asker was told the deadline passed (nothing is posted to the owner then) */
+  deadlineNoticeAt?: string;
+  /** `wait` default: when the one "Still waiting on you" reminder was posted in the thread */
+  waitReminderAt?: string;
+  /** Last time the owner posted in the card's thread after the card went up */
+  ownerRepliedAt?: string;
+  /** Why the card was withdrawn (status `cancelled`): shown on the card */
+  closedReason?: string;
+  /** Files the owner answered with in the thread (`answeredVia: 'thread'`) */
+  answerFiles?: DecisionAnswerFile[];
+  /** Settlement */
+  chosenKey?: string;
+  /** Free-text answer, when the owner replied with words that matched no option */
+  answerText?: string;
+  /**
+   * The owner's whole reply when it chose an option in more words than the
+   * option itself ("go with Hold"): forwarded to the asker, so nothing the
+   * owner wrote beyond the choice is lost (specs/2026-10-03-one-responder-per-message.md §3).
+   */
+  ownerWords?: string;
+  answeredBy?: string;
+  answeredVia?: DecisionAnswerVia;
+  resolvedAt?: string;
+}
+
+/** Input of ask-owner (skill / API). */
+export interface AskOwnerInput {
+  question?: unknown;
+  /** `[{label, detail?}]`, or `["Label", "Label — detail"]` */
+  options?: unknown;
+  /** An option label/key/number, or `wait` */
+  default?: unknown;
+  /** ISO time, or omitted (next day 12:00 local) */
+  deadline?: unknown;
+  sensitive?: unknown;
+  /** Ticket id (with `project`) */
+  ticket?: unknown;
+  project?: unknown;
+  /** `{requestedBy?, ownerLastSaid?, runtimeChanges?, link?}` ({@link DecisionContext}) */
+  context?: unknown;
+}
+
+/** A validated ask. */
+export interface ValidatedAsk {
+  question: string;
+  options: DecisionOption[];
+  defaultKey: string;
+  deadline: Date;
+  sensitive?: DecisionSensitiveKind;
+  ticketId?: string;
+  project?: string;
+  context?: DecisionContext;
+  /** Internal references stripped from the question (PR numbers, links) */
+  details?: string[];
+  /** The ask is about merging a PR */
+  merge?: boolean;
+}
+
+/** Button `value` JSON (also read by Cloud: only `i`). */
+export interface DecisionButtonValue {
+  /** Decision id */
+  d: string;
+  /** Option key, `remind` or `skip` */
+  o: string;
+  /** Instance id the card belongs to (Cloud routes the click there) */
+  i: string;
+}
+
+/** A click / reaction / reply normalised for {@link OwnerDecision} resolution. */
+export type DecisionChoice =
+  | { kind: 'option'; key: string; words?: string }
+  | { kind: 'remind' }
+  /** "I don't care about this anymore" */
+  | { kind: 'skip' }
+  | { kind: 'text'; text: string }
+  /** A voice note / file in the card's thread (text optional: a transcript or words sent with it) */
+  | { kind: 'thread'; files: DecisionAnswerFile[]; text?: string };

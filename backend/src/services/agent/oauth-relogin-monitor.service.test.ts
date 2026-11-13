@@ -1,0 +1,1229 @@
+/**
+ * Tests for OAuthReloginMonitorService.
+ *
+ * Verifies OAuth token expiry detection, /login command sending,
+ * URL capture from PTY output, event emission, OAuth code callback,
+ * cooldown/rate-limiting, and session lifecycle management.
+ */
+
+import { OAuthReloginMonitorService, formatLoginNotice, loginScreenRegion } from './oauth-relogin-monitor.service.js';
+import type { LoginRequiredInfo } from './oauth-relogin-monitor.service.js';
+import { OAUTH_RELOGIN_CONSTANTS, LOGIN_SCREEN_REGION } from '../../constants.js';
+import { setRuntimeFallbackHooks } from '../runtime-fallback/effective-runtime.js';
+import { resetUsageLimitState, usageLimitOf } from '../runtime-fallback/usage-limit-state.js';
+import { USAGE_LIMIT_STATE_CONSTANTS } from '../../constants.js';
+
+const LOGIN_TAIL_LINES = LOGIN_SCREEN_REGION.TAIL_LINES;
+
+// =============================================================================
+// Mocks
+// =============================================================================
+
+/** Captured onData callback from mock session */
+let capturedOnDataCallback: ((data: string) => void) | null = null;
+
+/** Mock session write calls */
+const mockSessionWrite = jest.fn();
+
+/** Mock session */
+const mockSession = {
+	write: mockSessionWrite,
+	onData: jest.fn((callback: (data: string) => void) => {
+		capturedOnDataCallback = callback;
+		return () => {
+			capturedOnDataCallback = null;
+		};
+	}),
+};
+
+/** Mock session backend */
+const mockBackend = {
+	getSession: jest.fn().mockReturnValue(mockSession),
+	sessionExists: jest.fn().mockReturnValue(true),
+	captureOutput: jest.fn().mockReturnValue(''),
+	listSessions: jest.fn().mockReturnValue([]),
+};
+
+jest.mock('../session/index.js', () => ({
+	getSessionBackendSync: jest.fn(() => mockBackend),
+	createSessionCommandHelper: jest.fn(),
+}));
+
+jest.mock('../core/logger.service.js', () => ({
+	LoggerService: {
+		getInstance: () => ({
+			createComponentLogger: () => ({
+				info: jest.fn(),
+				warn: jest.fn(),
+				error: jest.fn(),
+				debug: jest.fn(),
+			}),
+		}),
+	},
+}));
+
+jest.mock('../../utils/terminal-output.utils.js', () => ({
+	stripAnsiCodes: (s: string) => s.replace(/\x1b\[[0-9;]*m/g, ''),
+}));
+
+/** Mock uuid */
+jest.mock('uuid', () => ({
+	v4: () => 'test-uuid-1234',
+}));
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+/**
+ * Advance through debounce + pre-command delay using the async timer API.
+ */
+async function advancePastRelogin(): Promise<void> {
+	await jest.advanceTimersByTimeAsync(
+		OAUTH_RELOGIN_CONSTANTS.DETECTION_DEBOUNCE_MS +
+		OAUTH_RELOGIN_CONSTANTS.PRE_COMMAND_DELAY_MS + 100
+	);
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+describe('OAuthReloginMonitorService', () => {
+	let service: OAuthReloginMonitorService;
+
+	beforeEach(() => {
+		jest.useFakeTimers();
+		OAuthReloginMonitorService.resetInstance();
+		service = OAuthReloginMonitorService.getInstance();
+		capturedOnDataCallback = null;
+		mockSessionWrite.mockClear();
+		mockSession.onData.mockClear();
+		mockBackend.getSession.mockClear();
+		mockBackend.getSession.mockReturnValue(mockSession);
+		mockBackend.sessionExists.mockReturnValue(true);
+		mockBackend.captureOutput.mockReset().mockReturnValue('');
+		mockBackend.listSessions.mockReset().mockReturnValue([]);
+	});
+
+	afterEach(() => {
+		OAuthReloginMonitorService.resetInstance();
+		jest.useRealTimers();
+	});
+
+	// =========================================================================
+	// Singleton
+	// =========================================================================
+
+	describe('singleton', () => {
+		it('returns the same instance', () => {
+			const a = OAuthReloginMonitorService.getInstance();
+			const b = OAuthReloginMonitorService.getInstance();
+			expect(a).toBe(b);
+		});
+
+		it('resets to a new instance', () => {
+			const a = OAuthReloginMonitorService.getInstance();
+			OAuthReloginMonitorService.resetInstance();
+			const b = OAuthReloginMonitorService.getInstance();
+			expect(a).not.toBe(b);
+		});
+	});
+
+	// =========================================================================
+	// Monitoring lifecycle
+	// =========================================================================
+
+	describe('startMonitoring', () => {
+		it('subscribes to PTY data', () => {
+			service.startMonitoring('test-session', 'claude-code');
+			expect(mockSession.onData).toHaveBeenCalledTimes(1);
+			expect(service.isMonitoring('test-session')).toBe(true);
+		});
+
+		it('replaces existing monitoring on double start', () => {
+			service.startMonitoring('test-session', 'claude-code');
+			service.startMonitoring('test-session', 'claude-code');
+			expect(service.isMonitoring('test-session')).toBe(true);
+		});
+
+		it('does not subscribe when backend is unavailable', () => {
+			const { getSessionBackendSync } = require('../session/index.js');
+			getSessionBackendSync.mockReturnValueOnce(null);
+			service.startMonitoring('test-session', 'claude-code');
+			expect(service.isMonitoring('test-session')).toBe(false);
+		});
+
+		it('does not subscribe when session is not found', () => {
+			mockBackend.getSession.mockReturnValueOnce(null);
+			service.startMonitoring('test-session', 'claude-code');
+			expect(service.isMonitoring('test-session')).toBe(false);
+		});
+	});
+
+	describe('stopMonitoring', () => {
+		it('unsubscribes from PTY data', () => {
+			service.startMonitoring('test-session', 'claude-code');
+			expect(service.isMonitoring('test-session')).toBe(true);
+			service.stopMonitoring('test-session');
+			expect(service.isMonitoring('test-session')).toBe(false);
+		});
+
+		it('is safe to call on non-monitored session', () => {
+			expect(() => service.stopMonitoring('nonexistent')).not.toThrow();
+		});
+	});
+
+	describe('destroy', () => {
+		it('stops all monitored sessions', () => {
+			service.startMonitoring('session-1', 'claude-code');
+			service.startMonitoring('session-2', 'claude-code');
+			service.destroy();
+			expect(service.isMonitoring('session-1')).toBe(false);
+			expect(service.isMonitoring('session-2')).toBe(false);
+		});
+	});
+
+	// =========================================================================
+	// OAuth error detection
+	// =========================================================================
+
+	describe('OAuth error detection', () => {
+		function feedData(data: string): void {
+			service.startMonitoring('test-session', 'claude-code');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback(data);
+			}
+		}
+
+		it('detects "authentication_error" + "OAuth token has expired"', async () => {
+			feedData('Error: authentication_error - Your OAuth token has expired. Please re-authenticate.');
+			await advancePastRelogin();
+			expect(mockSessionWrite).toHaveBeenCalledWith('\x1b');
+			expect(mockSessionWrite).toHaveBeenCalledWith('/login\r');
+		});
+
+		it('detects case-insensitive patterns', async () => {
+			feedData('AUTHENTICATION_ERROR: OAUTH TOKEN HAS EXPIRED');
+			await advancePastRelogin();
+			expect(mockSessionWrite).toHaveBeenCalledWith('/login\r');
+		});
+
+		it('detects "401" + "OAuth token has expired"', async () => {
+			feedData('HTTP 401 Unauthorized: OAuth token has expired');
+			await advancePastRelogin();
+			expect(mockSessionWrite).toHaveBeenCalledWith('/login\r');
+		});
+
+		it('detects "authentication_error" + "Invalid authentication credentials"', async () => {
+			feedData('API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"},"request_id":"req_test"} · Please run /login');
+			await advancePastRelogin();
+			expect(mockSessionWrite).toHaveBeenCalledWith('\x1b');
+			expect(mockSessionWrite).toHaveBeenCalledWith('/login\r');
+		});
+
+		it('detects "401" + "Invalid authentication credentials"', async () => {
+			feedData('HTTP 401: Invalid authentication credentials');
+			await advancePastRelogin();
+			expect(mockSessionWrite).toHaveBeenCalledWith('/login\r');
+		});
+
+		it('does not trigger on partial matches', async () => {
+			feedData('authentication_error: invalid credentials');
+			await advancePastRelogin();
+			expect(mockSessionWrite).not.toHaveBeenCalled();
+		});
+
+		it('does not trigger on unrelated output', async () => {
+			feedData('Successfully deployed version 1.2.3');
+			await advancePastRelogin();
+			expect(mockSessionWrite).not.toHaveBeenCalled();
+		});
+
+		it('does not trigger during startup grace period', async () => {
+			service.startMonitoring('test-session', 'claude-code');
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+			}
+			await advancePastRelogin();
+			expect(mockSessionWrite).not.toHaveBeenCalled();
+		});
+
+		// Detection runs on each incoming chunk only, not the rolling buffer: text
+		// from unrelated output events (agent logs, skill output) used to combine
+		// across the buffer into a false match. The real Claude Code auth error
+		// arrives as a single message (802c539dc).
+		it('does not combine error fragments from separate output chunks', async () => {
+			service.startMonitoring('test-session', 'claude-code');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('Error: authentication_error ');
+				capturedOnDataCallback('- OAuth token has expired');
+			}
+			await advancePastRelogin();
+			expect(mockSessionWrite).not.toHaveBeenCalled();
+		});
+
+		it('detects a complete error chunk that follows unrelated output', async () => {
+			service.startMonitoring('test-session', 'claude-code');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('Running tests...\n');
+				capturedOnDataCallback('Error: authentication_error - OAuth token has expired');
+			}
+			await advancePastRelogin();
+			expect(mockSessionWrite).toHaveBeenCalledWith('/login\r');
+		});
+	});
+
+	// =========================================================================
+	// URL capture mode
+	// =========================================================================
+
+	describe('URL capture mode', () => {
+		async function triggerLoginAndEnterCaptureMode(): Promise<void> {
+			service.startMonitoring('test-session', 'claude-code');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+			}
+			await advancePastRelogin();
+		}
+
+		it('enters capture mode after sending /login', async () => {
+			await triggerLoginAndEnterCaptureMode();
+
+			const state = service.getState('test-session');
+			expect(state).toBeDefined();
+			expect(state!.captureMode).toBe('capturing');
+		});
+
+		it('extracts OAuth URL from PTY output', async () => {
+			await triggerLoginAndEnterCaptureMode();
+
+			// Simulate OAuth URL appearing in PTY output
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('Open this URL to authenticate:\nhttps://console.anthropic.com/oauth/authorize?client_id=abc123&redirect_uri=...\n');
+			}
+
+			const state = service.getState('test-session');
+			expect(state).toBeDefined();
+			expect(state!.captureMode).toBe('idle');
+			expect(state!.lastCapturedUrl).toBe('https://console.anthropic.com/oauth/authorize?client_id=abc123&redirect_uri=...');
+		});
+
+		it('extracts URL with /login path', async () => {
+			await triggerLoginAndEnterCaptureMode();
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('Visit https://auth.example.com/login?token=xyz to sign in');
+			}
+
+			const state = service.getState('test-session');
+			expect(state!.lastCapturedUrl).toBe('https://auth.example.com/login?token=xyz');
+		});
+
+		it('extracts URL with /auth path', async () => {
+			await triggerLoginAndEnterCaptureMode();
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('Go to https://example.com/auth/callback?code=123');
+			}
+
+			const state = service.getState('test-session');
+			expect(state!.lastCapturedUrl).toBe('https://example.com/auth/callback?code=123');
+		});
+
+		it('ignores non-OAuth URLs during capture', async () => {
+			await triggerLoginAndEnterCaptureMode();
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('Documentation at https://docs.example.com/api/reference');
+			}
+
+			const state = service.getState('test-session');
+			expect(state!.captureMode).toBe('capturing');
+			expect(state!.lastCapturedUrl).toBeNull();
+		});
+
+		it('times out URL capture after timeout period', async () => {
+			await triggerLoginAndEnterCaptureMode();
+
+			const state = service.getState('test-session');
+			expect(state!.captureMode).toBe('capturing');
+
+			// Advance past capture timeout
+			await jest.advanceTimersByTimeAsync(OAUTH_RELOGIN_CONSTANTS.URL_CAPTURE_TIMEOUT_MS + 1);
+
+			expect(state!.captureMode).toBe('idle');
+			expect(state!.captureBuffer).toBe('');
+		});
+
+		it('accumulates capture data across chunks', async () => {
+			await triggerLoginAndEnterCaptureMode();
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('Visit https://console.anthropic');
+				capturedOnDataCallback('.com/oauth/authorize?id=abc');
+			}
+
+			const state = service.getState('test-session');
+			expect(state!.captureMode).toBe('idle');
+			expect(state!.lastCapturedUrl).toBe('https://console.anthropic.com/oauth/authorize?id=abc');
+		});
+	});
+
+	// =========================================================================
+	// Event emission
+	// =========================================================================
+
+	describe('event emission', () => {
+		it('publishes agent:oauth_url event via EventBus', async () => {
+			const mockPublish = jest.fn();
+			const mockEventBus = { publish: mockPublish } as any;
+			service.setEventBusService(mockEventBus);
+
+			service.startMonitoring('test-session', 'claude-code');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+			}
+			await advancePastRelogin();
+
+			// Feed OAuth URL
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('https://console.anthropic.com/oauth/authorize?id=test');
+			}
+
+			expect(mockPublish).toHaveBeenCalledTimes(1);
+			const event = mockPublish.mock.calls[0][0];
+			expect(event.type).toBe('agent:oauth_url');
+			expect(event.sessionName).toBe('test-session');
+			expect(event.newValue).toBe('https://console.anthropic.com/oauth/authorize?id=test');
+			expect(event.changedField).toBe('oauthUrl');
+		});
+
+		it('invokes onOAuthUrl callback', async () => {
+			const mockCallback = jest.fn();
+			service.setOnOAuthUrlCallback(mockCallback);
+
+			service.startMonitoring('test-session', 'claude-code');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+			}
+			await advancePastRelogin();
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('https://console.anthropic.com/oauth/authorize?id=test');
+			}
+
+			expect(mockCallback).toHaveBeenCalledWith(
+				'test-session',
+				'https://console.anthropic.com/oauth/authorize?id=test'
+			);
+		});
+
+		it('handles callback errors gracefully', async () => {
+			const errorCallback = jest.fn(() => { throw new Error('callback error'); });
+			service.setOnOAuthUrlCallback(errorCallback);
+
+			service.startMonitoring('test-session', 'claude-code');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+			}
+			await advancePastRelogin();
+
+			// Should not throw
+			expect(() => {
+				if (capturedOnDataCallback) {
+					capturedOnDataCallback('https://console.anthropic.com/oauth/authorize?id=test');
+				}
+			}).not.toThrow();
+		});
+	});
+
+	// =========================================================================
+	// OAuth code submission
+	// =========================================================================
+
+	describe('submitOAuthCode', () => {
+		it('writes code + Enter to the PTY session', () => {
+			service.startMonitoring('test-session', 'claude-code');
+
+			const result = OAuthReloginMonitorService.submitOAuthCode('test-session', 'my-auth-code-123');
+
+			expect(result).toBe(true);
+			expect(mockSessionWrite).toHaveBeenCalledWith('my-auth-code-123\r');
+		});
+
+		it('resets capture mode after code submission', async () => {
+			service.startMonitoring('test-session', 'claude-code');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+
+			// Trigger login to enter capture mode
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+			}
+			await advancePastRelogin();
+
+			const state = service.getState('test-session');
+			expect(state!.captureMode).toBe('capturing');
+
+			// Submit code
+			OAuthReloginMonitorService.submitOAuthCode('test-session', 'code-123');
+
+			expect(state!.captureMode).toBe('idle');
+			expect(state!.captureBuffer).toBe('');
+		});
+
+		it('returns false when backend is unavailable', () => {
+			const { getSessionBackendSync } = require('../session/index.js');
+			getSessionBackendSync.mockReturnValueOnce(null);
+
+			const result = OAuthReloginMonitorService.submitOAuthCode('test-session', 'code');
+			expect(result).toBe(false);
+		});
+
+		it('returns false when session is not found', () => {
+			mockBackend.getSession.mockReturnValueOnce(null);
+
+			const result = OAuthReloginMonitorService.submitOAuthCode('test-session', 'code');
+			expect(result).toBe(false);
+		});
+	});
+
+	// =========================================================================
+	// Cooldown and rate limiting
+	// =========================================================================
+
+	describe('cooldown and rate limiting', () => {
+		function startAndPassGrace(): void {
+			service.startMonitoring('test-session', 'claude-code');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+		}
+
+		it('respects cooldown between /login attempts', async () => {
+			startAndPassGrace();
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+			}
+			await advancePastRelogin();
+			expect(mockSessionWrite).toHaveBeenCalledWith('/login\r');
+			mockSessionWrite.mockClear();
+
+			// Second trigger within cooldown — should not fire
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+			}
+			await advancePastRelogin();
+			expect(mockSessionWrite).not.toHaveBeenCalled();
+
+			// Advance past cooldown
+			await jest.advanceTimersByTimeAsync(OAUTH_RELOGIN_CONSTANTS.RELOGIN_COOLDOWN_MS);
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+			}
+			await advancePastRelogin();
+			expect(mockSessionWrite).toHaveBeenCalledWith('/login\r');
+		});
+
+		it('limits attempts within the attempt window', async () => {
+			startAndPassGrace();
+
+			for (let i = 0; i < OAUTH_RELOGIN_CONSTANTS.MAX_ATTEMPTS_PER_WINDOW; i++) {
+				if (capturedOnDataCallback) {
+					capturedOnDataCallback('authentication_error - OAuth token has expired');
+				}
+				await advancePastRelogin();
+				await jest.advanceTimersByTimeAsync(OAUTH_RELOGIN_CONSTANTS.RELOGIN_COOLDOWN_MS);
+			}
+
+			const callCount = mockSessionWrite.mock.calls.filter(
+				(c: unknown[]) => c[0] === '/login\r'
+			).length;
+			expect(callCount).toBe(OAUTH_RELOGIN_CONSTANTS.MAX_ATTEMPTS_PER_WINDOW);
+			mockSessionWrite.mockClear();
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+			}
+			await advancePastRelogin();
+			expect(mockSessionWrite).not.toHaveBeenCalled();
+		});
+	});
+
+	// =========================================================================
+	// Gemini CLI handling
+	// =========================================================================
+
+	describe('Gemini CLI handling', () => {
+		it('skips Escape key for Gemini CLI', async () => {
+			service.startMonitoring('gemini-session', 'gemini-cli');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+			}
+
+			await advancePastRelogin();
+
+			expect(mockSessionWrite).not.toHaveBeenCalledWith('\x1b');
+			expect(mockSessionWrite).toHaveBeenCalledWith('/login\r');
+		});
+	});
+
+	describe('Antigravity CLI handling', () => {
+		it('never types /login (or anything) into an Antigravity session, whatever the output says', async () => {
+			service.startMonitoring('agy-session', 'antigravity-cli');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+				capturedOnDataCallback('HTTP 401 Unauthorized: Invalid authentication credentials');
+			}
+
+			await advancePastRelogin();
+
+			expect(mockSessionWrite).not.toHaveBeenCalledWith('/login\r');
+			expect(mockSessionWrite).not.toHaveBeenCalledWith('\x1b');
+		});
+	});
+
+	// =========================================================================
+	// Buffer management
+	// =========================================================================
+
+	describe('buffer management', () => {
+		it('caps buffer at MAX_BUFFER_SIZE', () => {
+			service.startMonitoring('test-session', 'claude-code');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+
+			const largeData = 'x'.repeat(OAUTH_RELOGIN_CONSTANTS.MAX_BUFFER_SIZE + 1000);
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback(largeData);
+			}
+
+			const state = service.getState('test-session');
+			expect(state).toBeDefined();
+			expect(state!.buffer.length).toBeLessThanOrEqual(OAUTH_RELOGIN_CONSTANTS.MAX_BUFFER_SIZE);
+		});
+
+		it('clears buffer after successful /login trigger', async () => {
+			service.startMonitoring('test-session', 'claude-code');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+
+			if (capturedOnDataCallback) {
+				capturedOnDataCallback('authentication_error - OAuth token has expired');
+			}
+			await advancePastRelogin();
+
+			const state = service.getState('test-session');
+			expect(state).toBeDefined();
+			expect(state!.buffer).toBe('');
+		});
+	});
+
+	// =========================================================================
+	// First-run / device-code login detection (server-install finding 7)
+	// =========================================================================
+
+	const CODEX_DEVICE_CODE_SCREEN = [
+		'  Welcome to Codex, OpenAI\'s command-line coding agent',
+		'',
+		'  Sign in with your ChatGPT account using a device code',
+		'',
+		'  1. Go to https://auth.openai.com/codex/device',
+		'  2. Enter the code: FBVZ-MJHKK',
+		'',
+		'  The code expires in 15 minutes.',
+		'',
+		'  Press esc to go back',
+	].join('\n');
+
+	const CODEX_BROWSER_SIGNIN_SCREEN = [
+		'  Welcome to Codex',
+		'',
+		'  Sign in with ChatGPT to use Codex as part of your paid ChatGPT plan',
+		'',
+		'› 1. Sign in with ChatGPT',
+		'  2. Provide your own API key',
+	].join('\n');
+
+	const CLAUDE_LOGIN_SCREEN = [
+		"  Browser didn't open? Use the url below to sign in:",
+		'',
+		'  https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a&response_type=code',
+		'',
+		'  Paste code here if prompted >',
+	].join('\n');
+
+	const CODEX_IDLE_SCREEN = [
+		'│ model:     gpt-5-codex   /model to change │',
+		'',
+		'› Ask Codex to do anything',
+		'',
+		'  ? for shortcuts                       gpt-5-codex · /root/.crewly',
+	].join('\n');
+
+	describe('detectLoginRequired', () => {
+		it('extracts the device URL and XXXX-XXXXX code from the Codex device-code screen', () => {
+			expect(service.detectLoginRequired(CODEX_DEVICE_CODE_SCREEN)).toEqual({
+				url: 'https://auth.openai.com/codex/device',
+				code: 'FBVZ-MJHKK',
+			});
+		});
+
+		it('detects the Codex browser sign-in screen (no URL, no code)', () => {
+			expect(service.detectLoginRequired(CODEX_BROWSER_SIGNIN_SCREEN)).toEqual({ url: null, code: null });
+		});
+
+		it('extracts the Claude Code OAuth URL from its login screen', () => {
+			expect(service.detectLoginRequired(CLAUDE_LOGIN_SCREEN)).toEqual({
+				url: 'https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a&response_type=code',
+				code: null,
+			});
+		});
+
+		it('returns null for an idle runtime screen', () => {
+			expect(service.detectLoginRequired(CODEX_IDLE_SCREEN)).toBeNull();
+		});
+
+		it('returns null once codex shows its post-login notice, even with the old sign-in screen still captured', () => {
+			const screen = `${CODEX_DEVICE_CODE_SCREEN}
+  >_ Welcome to Codex, OpenAI's command-line coding agent
+  ✓ Signed in with your ChatGPT account
+  Before you start:
+  Press enter to continue`;
+			expect(service.detectLoginRequired(screen)).toBeNull();
+		});
+
+		it('returns null for empty input', () => {
+			expect(service.detectLoginRequired('')).toBeNull();
+		});
+
+		it('ignores ANSI colour codes around the code', () => {
+			const withAnsi = CODEX_DEVICE_CODE_SCREEN.replace('FBVZ-MJHKK', '\x1b[1mFBVZ-MJHKK\x1b[0m');
+			expect(service.detectLoginRequired(withAnsi)?.code).toBe('FBVZ-MJHKK');
+		});
+
+		it('does not mistake lowercase hex or short segments for a device code', () => {
+			const screen = CODEX_DEVICE_CODE_SCREEN.replace('FBVZ-MJHKK', 'a1b2-c3d4e5').replace('code:', 'code: GPT-5 ');
+			expect(service.detectLoginRequired(screen)?.code).toBeNull();
+		});
+	});
+
+	describe('false positives: sign-in text the agent merely wrote (incident 2026-09-29)', () => {
+		/** Real screens from `services/monitoring/__fixtures__/agent-screens` (fs is not mocked for them). */
+		const fixture = (file: string): string => {
+			const realFs = jest.requireActual<typeof import('fs')>('fs');
+			const realPath = jest.requireActual<typeof import('path')>('path');
+			return realFs.readFileSync(realPath.join(__dirname, '..', 'monitoring', '__fixtures__', 'agent-screens', file), 'utf8');
+		};
+
+		/**
+		 * Atlas (claude-code) mid-reply summarising DevDay, with the busy footer.
+		 * Built on the real claude-busy screen.
+		 */
+		const atlasScreen = (): string => fixture('claude-busy.txt').replace(
+			'  that account leaves out something important.',
+			'  that account leaves out something important. OpenAI also showed the new Sign in with ChatGPT button,\n'
+			+ '  and third-party apps can now offer the ChatGPT sign-in. Please run /login style prompts are gone.',
+		);
+
+		it('does not detect Atlas\'s claude-code reply that quotes "Sign in with ChatGPT" (busy footer)', () => {
+			const screen = atlasScreen();
+			expect(screen.toLowerCase()).toContain('sign in with chatgpt');
+			expect(service.detectLoginRequired(screen, 'claude-code')).toBeNull();
+			expect(service.detectLoginRequired(screen, null)).toBeNull();
+		});
+
+		it('does not detect sign-in text inside a finished (idle) claude-code reply', () => {
+			const screen = [
+				'⏺ DevDay summary:',
+				'',
+				'  - Apps can add a Sign in with ChatGPT button; Provide your own API key still works.',
+				'  - Claude users: if you see "Please run /login", paste code here if prompted.',
+				'',
+				'────────────────────────────────────────',
+				'❯ ',
+				'────────────────────────────────────────',
+				'  ⏵⏵ auto mode on (shift+tab to cycle)',
+			].join('\n');
+			expect(service.detectLoginRequired(screen, 'claude-code')).toBeNull();
+			expect(service.detectLoginRequired(screen, null)).toBeNull();
+		});
+
+		it('does not detect sign-in text in a codex reply sitting at its idle prompt', () => {
+			const screen = fixture('codex-idle.txt').replace(
+				'  Understanding tides matters beyond curiosity.',
+				'  Sign in with ChatGPT, or Provide your own API key. Understanding tides matters beyond curiosity.',
+			);
+			expect(service.detectLoginRequired(screen, 'codex-cli')).toBeNull();
+		});
+
+		it('never applies a Codex pattern to a claude-code session', () => {
+			expect(service.detectLoginRequired(CODEX_BROWSER_SIGNIN_SCREEN, 'claude-code')).toBeNull();
+			expect(service.detectLoginRequired(CODEX_DEVICE_CODE_SCREEN, 'claude-code')).toBeNull();
+			// …while an unknown runtime still tries every runtime's patterns
+			expect(service.detectLoginRequired(CODEX_BROWSER_SIGNIN_SCREEN, null)).toEqual({ url: null, code: null });
+		});
+
+		it('still detects a real Claude Code sign-in screen', () => {
+			expect(service.detectLoginRequired(CLAUDE_LOGIN_SCREEN, 'claude-code')).toEqual({
+				url: 'https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a&response_type=code',
+				code: null,
+			});
+		});
+
+		it('still detects a real Codex device-code screen', () => {
+			expect(service.detectLoginRequired(CODEX_DEVICE_CODE_SCREEN, 'codex-cli')).toEqual({
+				url: 'https://auth.openai.com/codex/device',
+				code: 'FBVZ-MJHKK',
+			});
+		});
+
+		it('only looks at the bottom of the screen', () => {
+			const filler = Array.from({ length: LOGIN_TAIL_LINES }, (_, i) => `  line ${i}`);
+			expect(service.detectLoginRequired(`${CLAUDE_LOGIN_SCREEN}\n${filler.join('\n')}`, 'claude-code')).toBeNull();
+		});
+
+		it('takes the login URL from the sign-in prompt, not from a URL the agent printed above it', () => {
+			const screen = `⏺ See https://example.com/some/long/article/path for details\n❯ /login\n${CLAUDE_LOGIN_SCREEN}`;
+			expect(service.detectLoginRequired(screen, 'claude-code')?.url)
+				.toBe('https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a&response_type=code');
+		});
+
+		it('the live-PTY path: a busy claude-code reply in the rolling buffer is no sign-in, because the live screen decides', () => {
+			const screen = atlasScreen();
+			mockBackend.captureOutput.mockReturnValue(screen);
+			service.startMonitoring('think-tank-atlas-b4e166f6', 'claude-code');
+			capturedOnDataCallback?.('⏺ OpenAI also showed the new Sign in with ChatGPT button. Please run /login style prompts are gone.');
+			expect(service.getLoginRequired('think-tank-atlas-b4e166f6')).toBeUndefined();
+			mockBackend.captureOutput.mockReturnValue('');
+		});
+
+		it('loginScreenRegion keeps indented continuation lines of a transcript block out of the sign-in region', () => {
+			const { signInLines } = loginScreenRegion('⏺ reply\n  more reply\n\n  still reply\n❯ prompt');
+			expect(signInLines).toEqual(['❯ prompt']);
+		});
+	});
+
+	describe('formatLoginNotice (owner is on a phone)', () => {
+		const info = (overrides: Partial<LoginRequiredInfo>): LoginRequiredInfo => ({
+			sessionName: 'think-tank-atlas-b4e166f6',
+			runtimeType: 'claude-code',
+			url: null,
+			code: null,
+			detectedAt: '2026-09-29T00:58:00.000Z',
+			notifiedAt: null,
+			...overrides,
+		});
+
+		it('names the agent and gives the phone re-login reply for Claude Code', () => {
+			expect(formatLoginNotice(info({}), 'Atlas')).toBe(
+				'Atlas needs you to sign in to Claude Code. Reply "relogin claude" to Crewly and it will send you a sign-in link.',
+			);
+		});
+
+		it('never tells the owner to open a terminal', () => {
+			for (const runtimeType of ['claude-code', 'codex-cli', 'gemini-cli', null] as const) {
+				expect(formatLoginNotice(info({ runtimeType }), 'Atlas')).not.toMatch(/terminal/i);
+			}
+		});
+
+		it('includes the device URL and code when the screen showed them', () => {
+			expect(formatLoginNotice(info({ runtimeType: 'codex-cli', url: 'https://auth.openai.com/codex/device', code: 'FBVZ-MJHKK' }), 'Nova')).toBe(
+				'Nova needs you to sign in to Codex: https://auth.openai.com/codex/device code FBVZ-MJHKK.'
+				+ ' Or reply "relogin codex" to Crewly and it will send you a sign-in link.',
+			);
+		});
+
+		it('falls back to the session name when no display name is known', () => {
+			expect(formatLoginNotice(info({}), null)).toMatch(/^think-tank-atlas-b4e166f6 needs you to sign in/);
+		});
+
+		it('the Slack alert uses the resolved display name', async () => {
+			const slack = { isConnected: jest.fn().mockReturnValue(true), sendNotification: jest.fn().mockResolvedValue(undefined) };
+			service.setSlackProvider(async () => slack);
+			service.setAgentNameResolver(async (sessionName) => (sessionName === 'think-tank-atlas-b4e166f6' ? 'Atlas' : null));
+			service.inspectScreen('think-tank-atlas-b4e166f6', CLAUDE_LOGIN_SCREEN, 'claude-code');
+			for (let i = 0; i < 5; i++) await Promise.resolve();
+			expect(slack.sendNotification).toHaveBeenCalledWith(expect.objectContaining({
+				title: 'Agent needs you to sign in',
+				message: expect.stringMatching(/^Atlas needs you to sign in to Claude Code: https:\/\/claude\.ai\/oauth\/authorize.*"relogin claude"/),
+			}));
+			service.setAgentNameResolver(null);
+		});
+	});
+
+	describe('inspectScreen / notification path', () => {
+		const mockEventBus = { publish: jest.fn() };
+		const mockQueue = { enqueue: jest.fn() };
+		const mockSlack = { isConnected: jest.fn().mockReturnValue(true), sendNotification: jest.fn().mockResolvedValue(undefined) };
+		const mockChat = {
+			getActiveConversationId: jest.fn().mockReturnValue('conv-1'),
+			recordSystemTurn: jest.fn(),
+			broadcastSystemNotification: jest.fn(),
+		};
+
+		beforeEach(() => {
+			mockEventBus.publish.mockClear();
+			mockQueue.enqueue.mockClear();
+			mockSlack.isConnected.mockClear().mockReturnValue(true);
+			mockSlack.sendNotification.mockClear();
+			mockChat.getActiveConversationId.mockClear().mockReturnValue('conv-1');
+			mockChat.recordSystemTurn.mockClear();
+			mockChat.broadcastSystemNotification.mockClear();
+			service.setEventBusService(mockEventBus as any);
+			service.setNoticeQueue(mockQueue);
+			service.setSlackProvider(async () => mockSlack);
+			service.setChatProvider(() => mockChat);
+		});
+
+		it('flags the session, publishes agent:login_required, enqueues a [NOTIFY], surfaces in chat and Slack', async () => {
+			service.inspectScreen('agent-dev-001', CODEX_DEVICE_CODE_SCREEN, 'codex-cli');
+			await Promise.resolve(); await Promise.resolve();
+
+			const pending = service.getLoginRequired('agent-dev-001');
+			expect(pending).toMatchObject({
+				sessionName: 'agent-dev-001',
+				runtimeType: 'codex-cli',
+				url: 'https://auth.openai.com/codex/device',
+				code: 'FBVZ-MJHKK',
+			});
+			expect(pending!.detectedAt).toBeTruthy();
+
+			expect(mockEventBus.publish).toHaveBeenCalledWith(expect.objectContaining({
+				type: 'agent:login_required',
+				sessionName: 'agent-dev-001',
+				newValue: 'https://auth.openai.com/codex/device',
+				loginCode: 'FBVZ-MJHKK',
+				changedField: 'loginRequired',
+			}));
+
+			const expectedText = 'agent-dev-001 needs you to sign in to Codex: https://auth.openai.com/codex/device code FBVZ-MJHKK.'
+				+ ' Or reply "relogin codex" to Crewly and it will send you a sign-in link.';
+			expect(mockQueue.enqueue).toHaveBeenCalledWith(expect.objectContaining({
+				content: `[NOTIFY] ${expectedText}`,
+				source: 'system_event',
+				targetSession: 'crewly-orc',
+			}));
+			expect(mockChat.recordSystemTurn).toHaveBeenCalledWith('conv-1', `[Login required] ${expectedText}`);
+			expect(mockChat.broadcastSystemNotification).toHaveBeenCalledWith(expectedText, 'warning');
+			expect(mockSlack.sendNotification).toHaveBeenCalledWith(expect.objectContaining({
+				type: 'agent_error',
+				urgency: 'high',
+				message: expectedText,
+				metadata: { agentId: 'agent-dev-001' },
+			}));
+		});
+
+		it('does not enqueue to the orchestrator queue when the orchestrator itself needs login', async () => {
+			service.inspectScreen('crewly-orc', CODEX_DEVICE_CODE_SCREEN, 'codex-cli');
+			await Promise.resolve(); await Promise.resolve();
+
+			expect(service.getLoginRequired('crewly-orc')).toBeDefined();
+			expect(mockQueue.enqueue).not.toHaveBeenCalled();
+			expect(mockEventBus.publish).toHaveBeenCalled();
+			expect(mockSlack.sendNotification).toHaveBeenCalled();
+		});
+
+		it('skips Slack when not connected', async () => {
+			mockSlack.isConnected.mockReturnValue(false);
+			service.inspectScreen('agent-dev-001', CODEX_DEVICE_CODE_SCREEN, 'codex-cli');
+			await Promise.resolve(); await Promise.resolve();
+			expect(mockSlack.sendNotification).not.toHaveBeenCalled();
+		});
+
+		it('does not re-notify for the same url/code within the cooldown', async () => {
+			service.inspectScreen('agent-dev-001', CODEX_DEVICE_CODE_SCREEN, 'codex-cli');
+			await Promise.resolve(); await Promise.resolve();
+			service.inspectScreen('agent-dev-001', CODEX_DEVICE_CODE_SCREEN, 'codex-cli');
+			await Promise.resolve(); await Promise.resolve();
+			expect(mockEventBus.publish).toHaveBeenCalledTimes(1);
+			expect(mockSlack.sendNotification).toHaveBeenCalledTimes(1);
+		});
+
+		it('re-notifies when the device code changes', async () => {
+			service.inspectScreen('agent-dev-001', CODEX_DEVICE_CODE_SCREEN, 'codex-cli');
+			await Promise.resolve(); await Promise.resolve();
+			service.inspectScreen('agent-dev-001', CODEX_DEVICE_CODE_SCREEN.replace('FBVZ-MJHKK', 'QWER-TYUIO'), 'codex-cli');
+			await Promise.resolve(); await Promise.resolve();
+			expect(mockEventBus.publish).toHaveBeenCalledTimes(2);
+			expect(service.getLoginRequired('agent-dev-001')?.code).toBe('QWER-TYUIO');
+		});
+
+		it('clears the flag once the screen moves past the login prompt', () => {
+			service.inspectScreen('agent-dev-001', CODEX_DEVICE_CODE_SCREEN, 'codex-cli');
+			expect(service.getLoginRequired('agent-dev-001')).toBeDefined();
+			service.inspectScreen('agent-dev-001', CODEX_IDLE_SCREEN, 'codex-cli');
+			expect(service.getLoginRequired('agent-dev-001')).toBeUndefined();
+		});
+
+		it('survives a throwing sink without dropping the flag', async () => {
+			mockQueue.enqueue.mockImplementation(() => { throw new Error('queue full'); });
+			service.setSlackProvider(async () => { throw new Error('slack down'); });
+			service.inspectScreen('agent-dev-001', CODEX_DEVICE_CODE_SCREEN, 'codex-cli');
+			await Promise.resolve(); await Promise.resolve();
+			expect(service.getLoginRequired('agent-dev-001')).toBeDefined();
+			expect(mockEventBus.publish).toHaveBeenCalled();
+		});
+
+		it('formats a notice without url/code for the bare browser sign-in screen', async () => {
+			service.inspectScreen('agent-dev-001', CODEX_BROWSER_SIGNIN_SCREEN, 'codex-cli');
+			await Promise.resolve(); await Promise.resolve();
+			expect(mockChat.broadcastSystemNotification).toHaveBeenCalledWith(
+				'agent-dev-001 needs you to sign in to Codex. Reply "relogin codex" to Crewly and it will send you a sign-in link.',
+				'warning',
+			);
+		});
+	});
+
+	describe('startMonitoring initial screen inspection', () => {
+		it('flags a session whose sign-in screen was painted before monitoring began', () => {
+			mockBackend.captureOutput.mockReturnValue(CODEX_DEVICE_CODE_SCREEN);
+			service.startMonitoring('agent-dev-001', 'codex-cli');
+			expect(mockBackend.captureOutput).toHaveBeenCalledWith('agent-dev-001', expect.any(Number));
+			expect(service.getLoginRequired('agent-dev-001')?.code).toBe('FBVZ-MJHKK');
+		});
+
+		it('detects a sign-in screen that streams in during the startup grace period', () => {
+			service.startMonitoring('agent-dev-001', 'codex-cli');
+			mockBackend.captureOutput.mockReturnValue(CODEX_DEVICE_CODE_SCREEN);
+			// Well inside STARTUP_GRACE_PERIOD_MS — expiry patterns are muted here, login must not be
+			capturedOnDataCallback!('  1. Go to https://auth.openai.com/codex/device\n');
+			expect(service.getLoginRequired('agent-dev-001')?.url).toBe('https://auth.openai.com/codex/device');
+		});
+	});
+
+	describe('periodic sweep', () => {
+		it('scans every live session and clears flags for sessions that are gone', () => {
+			mockBackend.listSessions.mockReturnValue(['agent-a', 'agent-b']);
+			mockBackend.captureOutput.mockImplementation((name: string) =>
+				name === 'agent-a' ? CODEX_DEVICE_CODE_SCREEN : CODEX_IDLE_SCREEN
+			);
+
+			service.start(1000);
+			jest.advanceTimersByTime(1000);
+
+			expect(service.getLoginRequired('agent-a')?.code).toBe('FBVZ-MJHKK');
+			expect(service.getLoginRequired('agent-b')).toBeUndefined();
+			expect(service.getAllLoginRequired()).toHaveLength(1);
+
+			// agent-a disappears
+			mockBackend.listSessions.mockReturnValue(['agent-b']);
+			jest.advanceTimersByTime(1000);
+			expect(service.getLoginRequired('agent-a')).toBeUndefined();
+
+			service.stop();
+		});
+
+		it('start() is idempotent and stop() halts the sweep', () => {
+			mockBackend.listSessions.mockReturnValue(['agent-a']);
+			mockBackend.captureOutput.mockReturnValue(CODEX_DEVICE_CODE_SCREEN);
+			service.start(1000);
+			service.start(1000);
+			service.stop();
+			jest.advanceTimersByTime(5000);
+			expect(mockBackend.listSessions).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('submitOAuthCode clears the login-required flag', () => {
+		it('drops the flag once a code is written to the session', () => {
+			service.startMonitoring('agent-dev-001', 'codex-cli');
+			service.inspectScreen('agent-dev-001', CODEX_DEVICE_CODE_SCREEN, 'codex-cli');
+			expect(service.getLoginRequired('agent-dev-001')).toBeDefined();
+
+			OAuthReloginMonitorService.submitOAuthCode('agent-dev-001', 'FBVZ-MJHKK');
+			expect(service.getLoginRequired('agent-dev-001')).toBeUndefined();
+		});
+	});
+	// =========================================================================
+	// Slack re-login coordinator hand-off
+	// =========================================================================
+
+	describe('harness expiry handler (Slack re-login)', () => {
+		const CLAUDE_EXPIRED =
+			'API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired. ' +
+			'Please obtain a new token or refresh your existing token."}} · Please run /login';
+		const mockSlack = { isConnected: jest.fn().mockReturnValue(true), sendNotification: jest.fn().mockResolvedValue(undefined) };
+		const handler = jest.fn().mockReturnValue(true);
+
+		beforeEach(() => {
+			handler.mockReset().mockReturnValue(true);
+			mockSlack.sendNotification.mockClear();
+			service.setHarnessExpiryHandler(handler);
+			service.setSlackProvider(async () => mockSlack);
+		});
+
+		/** Start monitoring and feed one live chunk after the grace period. */
+		function feedLive(data: string, runtime: 'claude-code' | 'codex-cli' = 'claude-code'): void {
+			service.startMonitoring('agent-dev-001', runtime);
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+			capturedOnDataCallback?.(data);
+		}
+
+		it('hands a live expiry chunk to the handler instead of typing /login', async () => {
+			feedLive(CLAUDE_EXPIRED);
+			await advancePastRelogin();
+			expect(handler).toHaveBeenCalledWith({ harnessId: 'claude-code', sessionName: 'agent-dev-001', source: 'output' });
+			expect(mockSessionWrite).not.toHaveBeenCalledWith('/login\r');
+		});
+
+		it('hands a Codex refresh failure to the handler', async () => {
+			feedLive('■ Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.', 'codex-cli');
+			await advancePastRelogin();
+			expect(handler).toHaveBeenCalledWith({ harnessId: 'codex-cli', sessionName: 'agent-dev-001', source: 'output' });
+		});
+
+		it('falls back to /login when the handler declines or throws', async () => {
+			handler.mockReturnValue(false);
+			feedLive(CLAUDE_EXPIRED);
+			await advancePastRelogin();
+			expect(mockSessionWrite).toHaveBeenCalledWith('/login\r');
+
+			handler.mockImplementation(() => {
+				throw new Error('boom');
+			});
+			mockSessionWrite.mockClear();
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.RELOGIN_COOLDOWN_MS + 1);
+			capturedOnDataCallback?.(CLAUDE_EXPIRED);
+			await advancePastRelogin();
+			expect(mockSessionWrite).toHaveBeenCalledWith('/login\r');
+		});
+
+		it('an expired-login screen found by the sweep goes to the handler and sends no per-agent notice', async () => {
+			service.inspectScreen('agent-dev-001', '  ⎿  Login expired · Please run /login\n> ', 'claude-code');
+			await Promise.resolve(); await Promise.resolve();
+			expect(handler).toHaveBeenCalledWith({ harnessId: 'claude-code', sessionName: 'agent-dev-001', source: 'screen' });
+			expect(service.getLoginRequired('agent-dev-001')).toBeDefined();
+			expect(mockSlack.sendNotification).not.toHaveBeenCalled();
+		});
+
+		it('a sign-in screen of a runtime the coordinator can log in goes to it (one machine-routed DM), not a per-agent notice', async () => {
+			service.inspectScreen('agent-dev-001', CODEX_DEVICE_CODE_SCREEN, 'codex-cli');
+			await Promise.resolve(); await Promise.resolve();
+			expect(handler).toHaveBeenCalledWith({ harnessId: 'codex-cli', sessionName: 'agent-dev-001', source: 'screen' });
+			expect(service.getLoginRequired('agent-dev-001')).toBeDefined();
+			expect(mockSlack.sendNotification).not.toHaveBeenCalled();
+		});
+
+		it('first-run sign-in screens keep the old per-agent notice when the coordinator declines', async () => {
+			handler.mockReturnValue(false);
+			service.inspectScreen('agent-dev-001', CODEX_DEVICE_CODE_SCREEN, 'codex-cli');
+			await Promise.resolve(); await Promise.resolve();
+			expect(mockSlack.sendNotification).toHaveBeenCalled();
+		});
+
+		describe("a session on another of the owner's Claude Code accounts (#942)", () => {
+			afterEach(() => setRuntimeFallbackHooks(null));
+
+			function hooks(onAccount: Set<string>) {
+				const reportLoginExpiry = jest.fn((s: string) => onAccount.has(s));
+				setRuntimeFallbackHooks({
+					overrideFor: () => null,
+					accountFor: (s) => (onAccount.has(s) ? 'b' : null),
+					reportLoginExpiry,
+					resolveLaunch: async (i) => ({ runtime: i.configured, overridden: false }),
+					beforeDelivery: () => 'deliver',
+					reportOutput: () => false,
+					takeKickoffNote: () => null,
+				});
+				return reportLoginExpiry;
+			}
+
+			it('hands its expired login to the runtime fallback, not the re-login of the default login', async () => {
+				const reportLoginExpiry = hooks(new Set(['agent-dev-001']));
+				feedLive(CLAUDE_EXPIRED);
+				await advancePastRelogin();
+				expect(reportLoginExpiry).toHaveBeenCalledWith('agent-dev-001');
+				expect(handler).not.toHaveBeenCalled();
+				expect(mockSessionWrite).not.toHaveBeenCalledWith('/login\r');
+			});
+
+			it('hands its sign-in screen to the runtime fallback', async () => {
+				hooks(new Set(['agent-dev-001']));
+				service.inspectScreen('agent-dev-001', CODEX_DEVICE_CODE_SCREEN, 'codex-cli');
+				await Promise.resolve(); await Promise.resolve();
+				expect(handler).not.toHaveBeenCalled();
+				expect(mockSlack.sendNotification).not.toHaveBeenCalled();
+			});
+
+			it('a session on the default login still goes to the re-login', async () => {
+				hooks(new Set());
+				feedLive(CLAUDE_EXPIRED);
+				await advancePastRelogin();
+				expect(handler).toHaveBeenCalledWith({ harnessId: 'claude-code', sessionName: 'agent-dev-001', source: 'output' });
+			});
+		});
+
+		it('without a handler the old behaviour is unchanged', async () => {
+			service.setHarnessExpiryHandler(null);
+			feedLive(CLAUDE_EXPIRED);
+			await advancePastRelogin();
+			expect(mockSessionWrite).toHaveBeenCalledWith('/login\r');
+		});
+	});
+
+	describe('usage limit in live output (2026-10-16 weekly-limit incident)', () => {
+		const SESSION = 'agent-dev-001';
+		const UNDATED_LIMIT = "  ⎿  You've hit your session limit · resets 8pm (America/New_York)";
+		const WORK = '⏺ Read(src/app.ts)\n  ⎿  Read 120 lines\n⏺ Updating the request handler now';
+
+		beforeEach(() => resetUsageLimitState());
+		afterEach(() => resetUsageLimitState());
+
+		/** Start monitoring and step past the startup grace period. */
+		function startLive(): void {
+			service.startMonitoring(SESSION, 'claude-code');
+			jest.advanceTimersByTime(OAUTH_RELOGIN_CONSTANTS.STARTUP_GRACE_PERIOD_MS + 1);
+		}
+
+		it('an undated limit line counts when it arrives as new live output', () => {
+			startLive();
+			capturedOnDataCallback?.(UNDATED_LIMIT);
+			expect(usageLimitOf(SESSION)).toMatchObject({ source: 'output', runtime: 'claude-code' });
+		});
+
+		it('the same undated line on a swept screen (resumed history) does not count', () => {
+			mockBackend.listSessions.mockReturnValue([SESSION]);
+			mockBackend.captureOutput.mockReturnValue(['> earlier request', UNDATED_LIMIT, '', '> next', '⏺ Done.', '│ >      │'].join('\n'));
+			service.startMonitoring(SESSION, 'claude-code');
+			service.sweepAllSessions();
+			expect(usageLimitOf(SESSION)).toBeNull();
+		});
+
+		it('an undated limit line repainted during the startup grace period (resume) does not count', () => {
+			service.startMonitoring(SESSION, 'claude-code');
+			capturedOnDataCallback?.(UNDATED_LIMIT);
+			expect(usageLimitOf(SESSION)).toBeNull();
+		});
+
+		it('fresh non-limit output lifts the state, but not within the grace after the limit was seen', () => {
+			startLive();
+			capturedOnDataCallback?.(UNDATED_LIMIT);
+			capturedOnDataCallback?.(WORK);
+			expect(usageLimitOf(SESSION)).not.toBeNull();
+			jest.advanceTimersByTime(USAGE_LIMIT_STATE_CONSTANTS.LIFT_GRACE_MS);
+			capturedOnDataCallback?.(WORK);
+			expect(usageLimitOf(SESSION)).toBeNull();
+		});
+
+		it('a repaint of the limit screen does not lift the state', () => {
+			startLive();
+			capturedOnDataCallback?.(UNDATED_LIMIT);
+			jest.advanceTimersByTime(USAGE_LIMIT_STATE_CONSTANTS.LIFT_GRACE_MS);
+			capturedOnDataCallback?.('   ❯ 2. Wait here, then continue automatically at 8pm   ');
+			expect(usageLimitOf(SESSION)).not.toBeNull();
+		});
+	});
+});

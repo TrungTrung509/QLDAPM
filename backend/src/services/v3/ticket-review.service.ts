@@ -1,0 +1,727 @@
+/**
+ * TicketReviewService — the back half of the ticket loop
+ * (specs/ticket-loop.md, Phase 2).
+ *
+ * Phase 1 files a ticket for every "please do X". This service decides when
+ * a ticket is answered and what the owner does about it:
+ *
+ * - **Answered.** An agent message in the ticket's own conversation (matched
+ *   through the chat-v2 turn that opened it, {@link TicketReviewService.noteChatTurn})
+ *   is recorded as the ticket's `reply`. Once that agent is idle again (or the
+ *   reply has settled for {@link TICKET_CONSTANTS.REVIEW.SUBMIT_SETTLE_MS}) and
+ *   no WorkItem of the ticket is still open, the ticket is submitted: it goes
+ *   to 待验收 (`waiting_confirmation`), or straight to done for origins that
+ *   need no review. This replaces the old blind "close any open Request 3–10
+ *   minutes old" sweep, which closed tickets that nobody had answered.
+ * - **验过了** → done. **打回 + reason** → back to work; the reason becomes an
+ *   acceptance criterion (#763: criteria grow from real review) and, when the
+ *   owner sent it back from the board rather than the thread, a rework
+ *   WorkItem is queued for whoever answered.
+ * - **Only deliverables wait.** An answer closes the ticket at once (tagged
+ *   `answered`) unless {@link answerNeedsOwner} says the owner has to look at
+ *   something — a document, an email, a draft, a form, code, a deploy,
+ *   money — or the answer asks him a question (2026-09-28).
+ * - **Silence accepts.** 待验收 for {@link TICKET_CONSTANTS.REVIEW.AUTO_ACCEPT_MS}
+ *   (24h, a hard deadline from the answer) with no word → done, tagged
+ *   `auto_accepted` and `acceptedBy: 'silence'` (#813: accepted, not
+ *   verified — the board labels it so). The owner is never pinged; the agent
+ *   is nudged once before that to ask in its own words.
+ * - **Stale closes.** open / running with no activity for
+ *   {@link TICKET_CONSTANTS.STALE.AFTER_MS} → cancelled, tagged `stale`, with a
+ *   note; the agent answering in its thread reopens it.
+ *
+ * The `done` gate itself lives in {@link RequestService.update}: without
+ * `accepted`, a ticket that needs review cannot become done by any path.
+ *
+ * @module services/v3/ticket-review.service
+ */
+
+import { LoggerService, type ComponentLogger } from '../core/logger.service.js';
+import { TICKET_CONSTANTS } from '../../constants.js';
+import { isInterim } from '../slack/slack-typing-placeholder.service.js';
+import { detectStatedIntent } from '../agent/stated-intent.js';
+import {
+  type Request,
+  type RequestPriority,
+  REQUEST_PRIORITIES,
+  TERMINAL_REQUEST_STATUSES,
+  isValidRequestTransition,
+} from '../../types/v2/request.types.js';
+import {
+  type TicketAcceptance,
+  type TicketAcceptanceCheck,
+  type TicketKind,
+  TICKET_KINDS,
+  activeAcceptance,
+  formatTicketNumber,
+  parseTicketNumber,
+  ticketNeedsReview,
+} from '../../types/v2/ticket.types.js';
+import { answerNeedsOwner, isStaleTicket, ownerMovedOn, staleCloseUpdate } from './ticket-hygiene.js';
+import { ACTIVE_OPEN_ITEM_STATUSES } from '../../types/v2/open-item.types.js';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** Request store surface the review needs (narrow for tests). */
+export interface ReviewRequestStore {
+  getById(id: string): Promise<Request | null>;
+  listAll(): Promise<Request[]>;
+  update(id: string, updates: Parameters<import('./request.service.js').RequestService['update']>[1]): Promise<Request>;
+}
+
+/** The slice of a chat-v2 message the review reads. */
+export interface ReviewChatMessage {
+  id: string;
+  channelId: string;
+  senderType: string;
+  senderId: string;
+  content: string;
+  threadId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+/** A rework request for {@link TicketReviewServiceDeps.createRework}. */
+export interface ReworkInput {
+  ticket: Request;
+  reason: string;
+  /** Agent session to hand it to */
+  target: string;
+}
+
+/** Constructor dependencies. */
+export interface TicketReviewServiceDeps {
+  requests: ReviewRequestStore;
+  /** Number of the ticket's WorkItems that are not terminal */
+  openWorkItemCount?: (requestId: string) => Promise<number>;
+  /** Queue a rework WorkItem; returns its id */
+  createRework?: (input: ReworkInput) => Promise<string | null>;
+  /** Swap the receipt to "done" (🎫 → ✅) */
+  markReceiptDone?: (ticket: Request) => Promise<void>;
+  /**
+   * Deliver a note to the agent that answered, asking it to follow up with
+   * the owner itself. Absent → silence accepts after AUTO_ACCEPT_MS.
+   */
+  nudgeAgent?: (agentSession: string, text: string) => Promise<void>;
+  /** Session the rework goes to when nobody answered (the orchestrator) */
+  fallbackAgent: string;
+  /**
+   * Agent messages this agent sent that are still unanswered: an agent that
+   * handed the work on has not answered the ticket yet. Absent → 0.
+   */
+  openAsksBy?: (session: string) => number;
+  /** Names of the agents (display names), to tell a hand-off from an answer. Absent → no hand-off check. */
+  agentNames?: () => Promise<string[]>;
+  now?: () => Date;
+}
+
+/** Result of an owner action. */
+export type ReviewActionResult =
+  | { ok: true; ticket: Request }
+  | { ok: false; reason: 'not_found' | 'not_in_review' | 'already_done' | 'cancelled' | 'open_work' | 'invalid' ; ticket?: Request };
+
+/** Where a 打回 came from. */
+export type RejectVia = 'thread' | 'board';
+
+/** Fields the owner may change from the board. */
+export interface TicketPatch {
+  title?: string;
+  priority?: RequestPriority;
+  kind?: TicketKind;
+  assignee?: string | null;
+}
+
+/** The agent still owes the owner something (a question or a promise): the done gate would park the ticket. */
+function hasActiveOpenItem(t: Request): boolean {
+  return (t.openItems ?? []).some((i) => ACTIVE_OPEN_ITEM_STATUSES.has(i.status));
+}
+
+/**
+ * Whether an agent message passes the work to a colleague: it @-mentions
+ * another agent by name ("@Pia please take this"). The sender's own name
+ * and anyone who is not an agent (the owner) do not count.
+ *
+ * @param content - Message text
+ * @param agentNames - Display names of the agents
+ * @param senderId - The posting agent's session (its own name is ignored)
+ * @returns True when another agent is addressed
+ *
+ * @example
+ * handsWorkOn('@Pia 请你接这件', ['Pia', 'Ella'], 'crewly-marketing-ella-e6a6b8ea') // true
+ */
+export function handsWorkOn(content: string, agentNames: readonly string[], senderId: string): boolean {
+  if (!content.includes('@') || agentNames.length === 0) return false;
+  const sender = senderId.toLowerCase();
+  const names = agentNames
+    .map((n) => n.trim())
+    .filter((n) => n.length > 0 && !sender.includes(`-${n.toLowerCase()}-`) && sender !== n.toLowerCase());
+  return names.some((n) => new RegExp(`@${escapeRegExp(n)}(?![A-Za-z0-9_])`, 'i').test(content));
+}
+
+/** Escape a string for use inside a RegExp. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Statuses in which an agent answer can submit a ticket. */
+const SUBMITTABLE = new Set(['open', 'ready', 'running']);
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+/**
+ * Review lifecycle of tickets. See module docs.
+ */
+export class TicketReviewService {
+  private readonly logger: ComponentLogger;
+  private chain: Promise<unknown> = Promise.resolve();
+
+  /**
+   * @param deps - Store and optional pool / receipt hooks
+   */
+  constructor(private readonly deps: TicketReviewServiceDeps) {
+    this.logger = LoggerService.getInstance().createComponentLogger('TicketReview');
+  }
+
+  /**
+   * Run one state change at a time, so an idle event and the sweep cannot
+   * submit the same ticket twice.
+   *
+   * @param fn - The change
+   * @returns Its result
+   */
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.chain.then(fn);
+    this.chain = run.catch(() => undefined);
+    return run;
+  }
+
+  // -------------------------------------------------------------------------
+  // Answer detection
+  // -------------------------------------------------------------------------
+
+  /**
+   * Remember the chat-v2 turn that opened a ticket, so agent answers in the
+   * same thread can be matched to it. Only the first turn counts.
+   *
+   * @param ticketId - The ticket
+   * @param message - The owner's persisted message
+   */
+  async noteChatTurn(ticketId: string, message: Pick<ReviewChatMessage, 'id' | 'channelId' | 'threadId'>): Promise<void> {
+    await this.serial(async () => {
+      const ticket = await this.deps.requests.getById(ticketId);
+      if (!ticket || ticket.chatRef) return;
+      await this.deps.requests.update(ticketId, {
+        chatRef: { channelId: message.channelId, messageId: message.id, threadRootId: message.threadId ?? message.id },
+      });
+    });
+  }
+
+  /**
+   * An agent posted in chat-v2: record it as the answer of the ticket whose
+   * thread it is in. Top-level agent messages (no thread) count for the newest
+   * open ticket in that channel that the agent could be answering.
+   *
+   * @param message - The chat-v2 message
+   * @returns The ticket it was recorded on, or null
+   */
+  async onChatMessage(message: ReviewChatMessage): Promise<Request | null> {
+    if (message.senderType !== 'agent') return null;
+    // "Got it — here is my plan" is not the answer.
+    if (isInterim(message)) return null;
+    // "I'm building it now" is a promise, not the answer: submitting the ticket
+    // on it let a request die as 待验收 with nothing made (2026-10-10).
+    if (detectStatedIntent(message.content)) return null;
+    return this.serial(async () => {
+      // "@Pia please take this" passes the work on: the answer is still to
+      // come (TKT-524, 2026-10-14: closed two minutes after it was asked).
+      if (this.deps.agentNames && handsWorkOn(message.content, await this.deps.agentNames().catch(() => []), message.senderId)) {
+        this.logger.debug('Agent message hands the work on; not an answer', { by: message.senderId });
+        return null;
+      }
+      const all = await this.deps.requests.listAll();
+      const inChannel = all.filter(
+        (r) =>
+          typeof r.ticketNumber === 'number' &&
+          r.chatRef?.channelId === message.channelId &&
+          !TERMINAL_REQUEST_STATUSES.has(r.status) &&
+          (!r.assignee || r.assignee === message.senderId || message.threadId !== undefined),
+      );
+      const inThread = (r: Request): boolean =>
+        r.chatRef?.threadRootId === message.threadId || r.chatRef?.messageId === message.threadId;
+      const excerpt = message.content.trim().slice(0, TICKET_CONSTANTS.REVIEW.REPLY_EXCERPT_MAX);
+      const reply = { at: this.now().toISOString(), by: message.senderId, messageId: message.id, excerpt };
+      // The agent answered a ticket that was closed as stale: it is back on.
+      const stale = message.threadId
+        ? all.find(
+            (r) =>
+              typeof r.ticketNumber === 'number' &&
+              r.status === 'cancelled' &&
+              r.tags.includes(TICKET_CONSTANTS.STALE.TAG) &&
+              r.chatRef?.channelId === message.channelId &&
+              inThread(r),
+          )
+        : undefined;
+      if (stale && !inChannel.some(inThread)) {
+        this.logger.info('Stale ticket reopened by its agent', { tkt: tkt(stale), by: message.senderId });
+        return this.deps.requests.update(stale.id, { status: 'running', reopenStale: true, reply });
+      }
+      if (inChannel.length === 0) return null;
+      const ticket = message.threadId ? inChannel.find(inThread) ?? null : inChannel[0]; // listAll is newest-first
+      if (!ticket) return null;
+      const updated = await this.deps.requests.update(ticket.id, {
+        reply,
+        // Somebody is on it.
+        ...(ticket.status === 'open' || ticket.status === 'ready' ? { status: 'running' as const } : {}),
+      });
+      return updated;
+    });
+  }
+
+  /**
+   * An agent finished its turn: submit the tickets it answered.
+   *
+   * @param sessionName - The agent
+   * @returns Tickets submitted
+   */
+  async onAgentIdle(sessionName: string): Promise<Request[]> {
+    return this.serial(() => this.submitAnswered((t) => t.reply?.by === sessionName));
+  }
+
+  /**
+   * Periodic pass: submit answers that have settled (in case no idle event
+   * came), and auto-accept 待验收 tickets nobody objected to.
+   *
+   * @returns What changed
+   */
+  async sweep(): Promise<{ submitted: number; autoAccepted: number; staleClosed: number }> {
+    return this.serial(async () => {
+      const settleBefore = this.now().getTime() - TICKET_CONSTANTS.REVIEW.SUBMIT_SETTLE_MS;
+      const submitted = await this.submitAnswered((t) => !!t.reply && Date.parse(t.reply.at) <= settleBefore);
+      const now = this.now().getTime();
+      let autoAccepted = 0;
+      let nudged = 0;
+      let staleClosed = 0;
+      for (const t of await this.deps.requests.listAll()) {
+        if (typeof t.ticketNumber === 'number' && isStaleTicket(t, now)) {
+          if (await this.closeStale(t, now)) staleClosed += 1;
+          continue;
+        }
+        if (t.status !== 'waiting_confirmation' || !ticketNeedsReview(t) || !t.submittedAt) continue;
+        // Silence accepts: a hard deadline from the answer, whatever the nudges
+        // did — or sooner, once the owner has moved on in the thread without
+        // an objection (no ticket mechanics are ever shown to the owner).
+        const expired = now - Date.parse(t.submittedAt) >= TICKET_CONSTANTS.REVIEW.AUTO_ACCEPT_MS;
+        const movedOn = !expired && ownerMovedOn(t) && !hasActiveOpenItem(t);
+        if (expired || movedOn) {
+          const tags = [...new Set([...t.tags, TICKET_CONSTANTS.REVIEW.AUTO_ACCEPTED_TAG])];
+          const r = await this.accept(t, tags, TICKET_CONSTANTS.REVIEW.AUTO_ACCEPT_REASON);
+          if (r.ok) autoAccepted += 1;
+          else this.logger.debug('Auto-accept refused', { id: t.id, reason: r.reason });
+          continue;
+        }
+        // Before that, the agent asks the owner itself (up to MAX_NUDGES times) —
+        // unless its question is already on a decision card (reply-open-items).
+        const agent = t.reply?.by ?? t.assignee;
+        if (!this.deps.nudgeAgent || !agent) continue;
+        if ((t.openItems ?? []).some((i) => i.type === 'question' && !!i.decisionId && ACTIVE_OPEN_ITEM_STATUSES.has(i.status))) continue;
+        if ((t.nudgeCount ?? 0) >= TICKET_CONSTANTS.REVIEW.MAX_NUDGES) continue;
+        if (now - Date.parse(t.lastNudgeAt ?? t.submittedAt) < TICKET_CONSTANTS.REVIEW.NUDGE_AFTER_MS) continue;
+        const ok = await this.deps
+          .nudgeAgent(agent, nudgeText(t, now))
+          .then(() => true)
+          .catch((err: unknown) => {
+            this.logger.debug('Nudge could not be delivered', { id: t.id, error: errText(err) });
+            return false;
+          });
+        if (ok) {
+          await this.deps.requests.update(t.id, { nudgeCount: (t.nudgeCount ?? 0) + 1, lastNudgeAt: new Date(now).toISOString() });
+          nudged += 1;
+        }
+      }
+      if (submitted.length > 0 || autoAccepted > 0 || nudged > 0 || staleClosed > 0) {
+        this.logger.info('Ticket review sweep', { submitted: submitted.length, autoAccepted, nudged, staleClosed });
+      }
+      return { submitted: submitted.length, autoAccepted, staleClosed };
+    });
+  }
+
+  /**
+   * Close a ticket nobody touched for {@link TICKET_CONSTANTS.STALE.AFTER_MS}
+   * (cancelled + `stale` + a note). Skipped while one of its WorkItems is
+   * still live — then somebody is on it.
+   *
+   * @param t - The ticket
+   * @param now - Current time (ms)
+   * @returns True when it was closed
+   */
+  private async closeStale(t: Request, now: number): Promise<boolean> {
+    try {
+      if (this.deps.openWorkItemCount && (await this.deps.openWorkItemCount(t.id)) > 0) return false;
+      await this.deps.requests.update(t.id, staleCloseUpdate(t, new Date(now).toISOString()));
+      this.logger.info('Ticket closed as stale', { tkt: tkt(t), status: t.status });
+      return true;
+    } catch (err) {
+      this.logger.debug('Stale ticket could not be closed', { id: t.id, error: errText(err) });
+      return false;
+    }
+  }
+
+  /**
+   * Submit every answered ticket that matches and has no open work.
+   *
+   * @param match - Which answered tickets to look at
+   * @returns Tickets submitted
+   */
+  private async submitAnswered(match: (t: Request) => boolean): Promise<Request[]> {
+    const out: Request[] = [];
+    for (const t of await this.deps.requests.listAll()) {
+      if (typeof t.ticketNumber !== 'number' || !SUBMITTABLE.has(t.status) || !t.reply) continue;
+      // Answered since the last submit only.
+      if (t.submittedAt && Date.parse(t.reply.at) <= Date.parse(t.submittedAt)) continue;
+      if (!match(t)) continue;
+      if (this.deps.openWorkItemCount && (await this.deps.openWorkItemCount(t.id)) > 0) continue;
+      // It asked a colleague and is still waiting: not answered yet.
+      if ((this.deps.openAsksBy?.(t.reply.by) ?? 0) > 0) continue;
+      try {
+        // `done` without `accepted`: the RequestService gate turns it into
+        // 待验收 when the ticket needs review. A plain answer (nothing for the
+        // owner to look at) closes right here (2026-09-28).
+        const base = t.status === 'ready' ? await this.deps.requests.update(t.id, { status: 'running' }) : t;
+        const closeNow = ticketNeedsReview(t) && !answerNeedsOwner(t);
+        const updated = await this.deps.requests.update(
+          base.id,
+          closeNow
+            ? {
+                status: 'done',
+                result: t.reply.excerpt,
+                accepted: true,
+                ignoreDeadChildren: true,
+                tags: [...new Set([...t.tags, TICKET_CONSTANTS.REVIEW.ANSWERED_TAG])],
+              }
+            : { status: 'done', result: t.reply.excerpt },
+        );
+        out.push(updated);
+        this.logger.info('Ticket answered', { tkt: tkt(updated), status: updated.status, by: t.reply.by });
+        if (updated.status === 'done') await this.receiptDone(updated);
+      } catch (err) {
+        this.logger.debug('Ticket could not be submitted', { id: t.id, error: errText(err) });
+      }
+    }
+    return out;
+  }
+
+  // -------------------------------------------------------------------------
+  // Owner actions
+  // -------------------------------------------------------------------------
+
+  /**
+   * 验过了 — the owner accepts. Works from any open status (the owner may
+   * accept before the agent says it is finished), but not while WorkItems
+   * are still running.
+   *
+   * @param ref - `TKT-123`, `123` or id
+   * @returns The accepted ticket, or why not
+   */
+  async verify(ref: string): Promise<ReviewActionResult> {
+    return this.serial(async () => {
+      const ticket = await this.resolve(ref);
+      if (!ticket) return { ok: false, reason: 'not_found' };
+      return this.accept(ticket, ticket.tags);
+    });
+  }
+
+  /**
+   * Move a ticket to done with the owner's (or the auto-accept's) blessing.
+   *
+   * @param ticket - The ticket
+   * @param tags - Tags to store
+   * @param reason - Why it was accepted without the owner's word: written to the
+   *   ticket's discussion and the log, never sent to the owner
+   * @returns Result
+   */
+  private async accept(ticket: Request, tags: string[], reason?: string): Promise<ReviewActionResult> {
+    if (ticket.status === 'done') return { ok: false, reason: 'already_done', ticket };
+    if (ticket.status === 'cancelled') return { ok: false, reason: 'cancelled', ticket };
+    try {
+      let current = ticket;
+      if (!isValidRequestTransition(current.status, 'done') && isValidRequestTransition(current.status, 'running')) {
+        current = await this.deps.requests.update(current.id, { status: 'running' });
+      }
+      // #813: silence is recorded as acceptance, never as a review.
+      const acceptedBy = tags.includes(TICKET_CONSTANTS.REVIEW.AUTO_ACCEPTED_TAG) ? 'silence' : 'owner';
+      const note = reason
+        ? [
+            ...(current.discussion ?? []),
+            {
+              at: this.now().toISOString(),
+              author: TICKET_CONSTANTS.REVIEW.AUTO_ACCEPT_NOTE_AUTHOR,
+              text: reason,
+              ref: `auto-accept-${this.now().toISOString()}`,
+            },
+          ]
+        : undefined;
+      const updated = await this.deps.requests.update(current.id, {
+        status: 'done',
+        accepted: true,
+        ignoreDeadChildren: true,
+        acceptedBy,
+        tags,
+        ...(note ? { discussion: note } : {}),
+      });
+      this.logger.info('Ticket accepted', { tkt: tkt(updated), auto: tags.includes(TICKET_CONSTANTS.REVIEW.AUTO_ACCEPTED_TAG), ...(reason ? { reason } : {}) });
+      await this.receiptDone(updated);
+      return { ok: true, ticket: updated };
+    } catch (err) {
+      if (err instanceof Error && err.name === 'RequestStillHasOpenChildrenError') {
+        return { ok: false, reason: 'open_work', ticket };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * 打回 — the owner sends it back. The reason becomes an acceptance
+   * criterion; from the board (not the thread, where the agent already sees
+   * the owner's words) a rework WorkItem is queued for whoever answered.
+   *
+   * @param ref - `TKT-123`, `123` or id
+   * @param reason - Why (required; the thread path fills a placeholder)
+   * @param via - `thread` or `board`
+   * @returns The reopened ticket, or why not
+   */
+  async reject(ref: string, reason: string, via: RejectVia): Promise<ReviewActionResult> {
+    const why = reason.trim();
+    if (!why) return { ok: false, reason: 'invalid' };
+    return this.serial(async () => {
+      const ticket = await this.resolve(ref);
+      if (!ticket) return { ok: false, reason: 'not_found' };
+      if (ticket.status !== 'waiting_confirmation') return { ok: false, reason: 'not_in_review', ticket };
+      const at = this.now().toISOString();
+      const acceptance: TicketAcceptance[] = [
+        ...(ticket.acceptance ?? []),
+        { text: why, source: 'reject', check: 'judgment', addedAt: at },
+      ];
+      const discussion = [...(ticket.discussion ?? []), { at, author: 'owner', text: `Sent back: ${why}`, ref: `reject-${at}` }];
+      const updated = await this.deps.requests.update(ticket.id, {
+        status: 'running',
+        rejectCount: (ticket.rejectCount ?? 0) + 1,
+        acceptance,
+        discussion,
+      });
+      this.logger.info('Ticket sent back', { tkt: tkt(updated), via, rejectCount: updated.rejectCount });
+      if (via === 'board' && this.deps.createRework) {
+        const target = ticket.reply?.by ?? ticket.assignee ?? ticket.ownerAgent ?? this.deps.fallbackAgent;
+        await this.deps.createRework({ ticket: updated, reason: why, target }).catch((err: unknown) => {
+          this.logger.warn('Rework could not be queued', { id: ticket.id, error: errText(err) });
+        });
+      }
+      return { ok: true, ticket: updated };
+    });
+  }
+
+  /**
+   * A follow-up from the owner in a 待验收 ticket's thread that is neither
+   * 验过了 nor 打回: the agent is working again, so the ticket leaves 待验收
+   * (no reject counted).
+   *
+   * @param ticketId - The ticket
+   * @returns The ticket after the change
+   */
+  async reopenOnFollowUp(ticketId: string): Promise<Request | null> {
+    return this.serial(async () => {
+      const ticket = await this.deps.requests.getById(ticketId);
+      if (!ticket || ticket.status !== 'waiting_confirmation') return ticket;
+      return this.deps.requests.update(ticketId, { status: 'running' });
+    });
+  }
+
+  /**
+   * Replace the live acceptance list. Criteria not in `items` are marked
+   * removed (kept for history); new texts are added as the owner's.
+   *
+   * @param ref - Ticket reference
+   * @param items - The list the owner wants, in order
+   * @returns The ticket
+   */
+  async setAcceptance(ref: string, items: ReadonlyArray<{ text: string; check?: TicketAcceptanceCheck }>): Promise<ReviewActionResult> {
+    return this.serial(async () => {
+      const ticket = await this.resolve(ref);
+      if (!ticket) return { ok: false, reason: 'not_found' };
+      const at = this.now().toISOString();
+      const wanted = items.map((i) => ({ text: i.text.trim(), check: i.check })).filter((i) => i.text.length > 0);
+      const wantedTexts = new Set(wanted.map((w) => w.text));
+      const existing = ticket.acceptance ?? [];
+      const kept = existing.map((a) => (!a.removedAt && !wantedTexts.has(a.text) ? { ...a, removedAt: at } : a));
+      const liveTexts = new Set(activeAcceptance(kept).map((a) => a.text));
+      const updatedList = kept.map((a) => {
+        const w = wanted.find((x) => x.text === a.text);
+        return !a.removedAt && w?.check ? { ...a, check: w.check } : a;
+      });
+      for (const w of wanted) {
+        if (liveTexts.has(w.text)) continue;
+        updatedList.push({ text: w.text, source: 'owner', check: w.check ?? 'judgment', addedAt: at });
+        liveTexts.add(w.text);
+      }
+      const updated = await this.deps.requests.update(ticket.id, { acceptance: updatedList });
+      return { ok: true, ticket: updated };
+    });
+  }
+
+  /**
+   * An agent's self-check against one live criterion.
+   *
+   * @param ref - Ticket reference
+   * @param index - Position in the live list (0-based)
+   * @param result - pass / fail
+   * @param evidence - What it looked at
+   * @returns The ticket
+   */
+  async selfCheck(ref: string, index: number, result: 'pass' | 'fail', evidence?: string): Promise<ReviewActionResult> {
+    return this.serial(async () => {
+      const ticket = await this.resolve(ref);
+      if (!ticket) return { ok: false, reason: 'not_found' };
+      const live = activeAcceptance(ticket.acceptance);
+      const target = live[index];
+      if (!target) return { ok: false, reason: 'invalid', ticket };
+      const acceptance = (ticket.acceptance ?? []).map((a) =>
+        a === target ? { ...a, selfCheck: result, ...(evidence ? { evidence } : {}) } : a,
+      );
+      const updated = await this.deps.requests.update(ticket.id, { acceptance });
+      return { ok: true, ticket: updated };
+    });
+  }
+
+  /**
+   * Board edits: title, priority, kind, assignee.
+   *
+   * @param ref - Ticket reference
+   * @param patch - Changes
+   * @returns The ticket
+   */
+  async patch(ref: string, patch: TicketPatch): Promise<ReviewActionResult> {
+    if (patch.priority !== undefined && !REQUEST_PRIORITIES.includes(patch.priority)) return { ok: false, reason: 'invalid' };
+    if (patch.kind !== undefined && !TICKET_KINDS.includes(patch.kind)) return { ok: false, reason: 'invalid' };
+    if (patch.title !== undefined && patch.title.trim().length === 0) return { ok: false, reason: 'invalid' };
+    return this.serial(async () => {
+      const ticket = await this.resolve(ref);
+      if (!ticket) return { ok: false, reason: 'not_found' };
+      const updated = await this.deps.requests.update(ticket.id, {
+        ...(patch.title !== undefined ? { title: patch.title.trim() } : {}),
+        ...(patch.priority !== undefined ? { priority: patch.priority } : {}),
+        ...(patch.kind !== undefined ? { kind: patch.kind } : {}),
+        ...(patch.assignee !== undefined ? { assignee: patch.assignee ?? '' } : {}),
+      });
+      return { ok: true, ticket: updated };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Helpers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Find a ticket by `TKT-123`, `123` or id.
+   *
+   * @param ref - Reference
+   * @returns The ticket, or null
+   */
+  private async resolve(ref: string): Promise<Request | null> {
+    const trimmed = (ref ?? '').trim();
+    if (!trimmed) return null;
+    const byId = await this.deps.requests.getById(trimmed);
+    if (byId) return byId;
+    const n = parseTicketNumber(trimmed);
+    if (n === null) return null;
+    return (await this.deps.requests.listAll()).find((r) => r.ticketNumber === n) ?? null;
+  }
+
+  /**
+   * Best-effort receipt swap.
+   *
+   * @param ticket - The done ticket
+   */
+  private async receiptDone(ticket: Request): Promise<void> {
+    if (!this.deps.markReceiptDone || !ticket.receipt) return;
+    await this.deps.markReceiptDone(ticket).catch((err: unknown) => {
+      this.logger.debug('Receipt could not be marked done', { id: ticket.id, error: errText(err) });
+    });
+  }
+
+  /**
+   * Current time (injectable for tests).
+   *
+   * @returns Now
+   */
+  private now(): Date {
+    return this.deps.now ? this.deps.now() : new Date();
+  }
+}
+
+/**
+ * The note an agent gets when the owner has not answered its question yet.
+ * Written for the agent, not the owner: it must not say "ticket" to them.
+ *
+ * @param t - The ticket
+ * @param now - Current time (ms)
+ * @returns Message text
+ */
+export function nudgeText(t: Request, now: number): string {
+  const hours = Math.max(1, Math.round((now - Date.parse(t.lastNudgeAt ?? t.submittedAt ?? t.updatedAt)) / 3_600_000));
+  const marker = typeof t.ticketNumber === 'number' ? `[TICKET:${formatTicketNumber(t.ticketNumber)} ${t.id}] ` : '';
+  const cmd = t.chatRef
+    ? ` Reply command: bash config/skills/agent/core/reply-channel/execute.sh --channel ${t.chatRef.channelId} --thread ${t.chatRef.threadRootId} --content "<one or two sentences>"`
+    : '';
+  return (
+    `${marker}You answered "${t.title}" about ${hours} hours ago and they have not responded yet. ` +
+    `If this needs their confirmation of the result (a deliverable, a change, something to decide), ask in the original conversation, in a sentence or two of natural language, whether this works — do not mention tickets, numbers or the word "acceptance"; ` +
+    `if you only answered a question and no confirmation is needed, do nothing.` +
+    cmd
+  );
+}
+
+/**
+ * Display number of a ticket.
+ *
+ * @param t - Ticket
+ * @returns `TKT-123` or null
+ */
+function tkt(t: Request): string | null {
+  return typeof t.ticketNumber === 'number' ? formatTicketNumber(t.ticketNumber) : null;
+}
+
+/**
+ * Error message of anything thrown.
+ *
+ * @param err - Thrown value
+ * @returns Message
+ */
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+// ---------------------------------------------------------------------------
+// Singleton
+// ---------------------------------------------------------------------------
+
+let instance: TicketReviewService | null = null;
+
+/**
+ * Install the process-wide review service (composition root).
+ *
+ * @param service - The service, or null to clear (tests)
+ */
+export function setTicketReviewService(service: TicketReviewService | null): void {
+  instance = service;
+}
+
+/**
+ * The process-wide review service, or null before boot wired it.
+ *
+ * @returns The service or null
+ */
+export function getTicketReviewService(): TicketReviewService | null {
+  return instance;
+}

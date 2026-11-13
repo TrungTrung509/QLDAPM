@@ -1,0 +1,612 @@
+/**
+ * MentionComposer — chip-pattern composer for the Slack-like surfaces.
+ *
+ * Wraps composer behavior with the @-mention chip + suggestion popover
+ * described in design §7 (sealed 2026-04-25). Phase B does NOT route
+ * mentions to the backend — that lands in Phase C alongside the @team
+ * → TL resolver. This component is the UX shell:
+ *
+ *  - The textarea behaves like MessageInput (Enter to send, Shift+Enter
+ *    for newline). It does NOT re-use MessageInput directly because
+ *    MessageInput owns its own value state and ships via the chat API
+ *    client; the team-chat surfaces want a mention-aware composer
+ *    decoupled from the existing single-channel send path.
+ *  - Typing `@` opens a suggestion popover, split into Teams + Agents
+ *    groups per §7.2. Each suggestion row shows the label, a routing
+ *    hint, and (for agents) a presence dot.
+ *  - Selecting a suggestion adds the target to the `mentions` array and
+ *    inserts `@<label>` text into the textarea (§7.3). The chip strip
+ *    below the textarea is the structured view — chips are removable.
+ *  - Routing-hint helper text under the textarea explains the next
+ *    selected chip's behavior.
+ *
+ * Visuals follow the approved Material-3 prototype: a frosted glass panel
+ * wrapping the textarea, a toolbar of icon buttons, and an accent Send.
+ *
+ * @module components/MentionComposer
+ */
+
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type KeyboardEvent,
+} from 'react';
+import { AtSign, Code, Paperclip, Plus, Send, Smile } from 'lucide-react';
+import type { MentionTarget } from '../types/team-chat.types';
+import type { ChatPresenceStatus } from './AgentStatusBadge';
+
+export interface MentionComposerSendPayload {
+  content: string;
+  mentions: MentionTarget[];
+}
+
+export interface MentionComposerProps {
+  /** Pool of @-mention targets — both teams and agents in a flat list. */
+  mentionables: MentionTarget[];
+  placeholder?: string;
+  disabled?: boolean;
+  /** Helper text shown when the agent recipient is inactive (§9.4). */
+  inactiveHelper?: string;
+  /** Phase B handler — Phase C wires this to the chat API. */
+  onSend?(payload: MentionComposerSendPayload): void;
+  className?: string;
+  /**
+   * Layout (additive — default keeps today's composer). `'compact'` is the
+   * simplified OSS chat's one-line pill: attach · text · @ · send, growing
+   * to a few lines only when the message does. Enter sends, Shift+Enter
+   * adds a line, `@` mentions — same behaviour as the default.
+   */
+  variant?: 'default' | 'compact';
+}
+
+const DEFAULT_PLACEHOLDER = 'Message — try @ to mention a team or agent';
+/** Tallest the compact composer grows before it scrolls (about six lines). */
+const COMPACT_MAX_HEIGHT_PX = 160;
+const PRESENCE_DOT: Record<ChatPresenceStatus, string> = {
+  online: 'bg-emerald-400',
+  busy: 'bg-amber-400',
+  idle: 'bg-amber-400',
+  offline: 'bg-text-secondary-dark/50',
+  inactive: 'bg-text-secondary-dark/50',
+};
+
+export function MentionComposer({
+  mentionables,
+  placeholder = DEFAULT_PLACEHOLDER,
+  disabled = false,
+  inactiveHelper,
+  onSend,
+  className = '',
+  variant = 'default',
+}: MentionComposerProps): JSX.Element {
+  const [value, setValue] = useState('');
+  const [mentions, setMentions] = useState<MentionTarget[]>([]);
+  const [popoverOpen, setPopoverOpen] = useState(false);
+  /** Filter text inside the suggestion popover — what comes after the `@`. */
+  const [filter, setFilter] = useState('');
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // True while an IME composition is active (e.g. typing Chinese/Japanese/
+  // Korean). Pressing Enter to COMMIT a composition must NOT send — otherwise a
+  // half-composed message fires early. Tracked via composition events because
+  // `KeyboardEvent.isComposing` alone is unreliable across browsers/IMEs for
+  // the committing keystroke.
+  const isComposingRef = useRef(false);
+
+  const grouped = useMemo(() => groupMentionables(mentionables, filter), [mentionables, filter]);
+  const totalSuggestions = grouped.teams.length + grouped.agents.length;
+
+  const handleChange = useCallback(
+    (e: ChangeEvent<HTMLTextAreaElement>) => {
+      const next = e.target.value;
+      setValue(next);
+      // Find the most recent unclosed `@token` chunk; popover stays open
+      // and filters by the partial.
+      const trigger = findActiveTrigger(next, e.target.selectionStart ?? next.length);
+      if (trigger) {
+        setPopoverOpen(true);
+        setFilter(trigger.partial);
+      } else {
+        setPopoverOpen(false);
+        setFilter('');
+      }
+    },
+    [],
+  );
+
+  const handleSelectSuggestion = useCallback(
+    (target: MentionTarget) => {
+      setMentions((prev) => (prev.find((m) => m.id === target.id) ? prev : [...prev, target]));
+      // Replace the active `@partial` with `@<label> ` in the textarea.
+      const cursor = textareaRef.current?.selectionStart ?? value.length;
+      const trigger = findActiveTrigger(value, cursor);
+      if (trigger) {
+        const before = value.slice(0, trigger.start);
+        const after = value.slice(cursor);
+        const inserted = `@${target.label} `;
+        setValue(before + inserted + after);
+      } else {
+        setValue((v) => `${v}@${target.label} `);
+      }
+      setPopoverOpen(false);
+      setFilter('');
+      // Return focus to the textarea so users can keep typing after a click.
+      textareaRef.current?.focus();
+    },
+    [value],
+  );
+
+  const removeMention = useCallback((id: string) => {
+    setMentions((prev) => prev.filter((m) => m.id !== id));
+  }, []);
+
+  const canSend = !disabled && (value.trim().length > 0 || mentions.length > 0);
+
+  const handleSend = useCallback(() => {
+    if (!canSend) return;
+    onSend?.({ content: value.trim(), mentions });
+    setValue('');
+    setMentions([]);
+    setPopoverOpen(false);
+    setFilter('');
+  }, [canSend, mentions, onSend, value]);
+
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.key === 'Escape' && popoverOpen) {
+        e.preventDefault();
+        setPopoverOpen(false);
+        return;
+      }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        // Don't send mid-IME-composition — Enter is committing the candidate,
+        // not submitting the message. `isComposingRef` (composition events) +
+        // the native `isComposing` flag together cover all browsers/IMEs.
+        if (isComposingRef.current || e.nativeEvent.isComposing) return;
+        e.preventDefault();
+        handleSend();
+      }
+    },
+    [handleSend, popoverOpen],
+  );
+
+  const handleCompositionStart = useCallback(() => {
+    isComposingRef.current = true;
+  }, []);
+  const handleCompositionEnd = useCallback(() => {
+    isComposingRef.current = false;
+  }, []);
+
+  // The @ toolbar button inserts an `@` at the caret and opens the popover so
+  // the mention flow is reachable without the keyboard.
+  const handleAtButton = useCallback(() => {
+    if (disabled) return;
+    setValue((v) => {
+      const needsSpace = v.length > 0 && !/\s$/.test(v);
+      return `${v}${needsSpace ? ' ' : ''}@`;
+    });
+    setFilter('');
+    setPopoverOpen(true);
+    textareaRef.current?.focus();
+  }, [disabled]);
+
+  const helperText = useMemo(() => {
+    if (inactiveHelper) return inactiveHelper;
+    const last = mentions[mentions.length - 1];
+    if (!last) return null;
+    if (last.routingHint) return last.routingHint;
+    return last.kind === 'team'
+      ? 'Sent to team channel; TL is primary responder'
+      : `Directly notifies ${last.label}`;
+  }, [inactiveHelper, mentions]);
+
+  const compact = variant === 'compact';
+
+  // Compact: grow with the text up to a few lines, back to one when cleared.
+  useEffect(() => {
+    if (!compact) return;
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, COMPACT_MAX_HEIGHT_PX)}px`;
+  }, [compact, value]);
+
+  const chipStrip =
+    mentions.length > 0 ? (
+      <ul
+        className={`mb-2 flex flex-wrap gap-1.5 ${compact ? 'mx-auto max-w-[696px]' : ''}`}
+        aria-label="Pending mentions"
+        data-testid="mention-chip-strip"
+      >
+        {mentions.map((m) => (
+          <li key={m.id}>
+            <MentionChip target={m} onRemove={() => removeMention(m.id)} />
+          </li>
+        ))}
+      </ul>
+    ) : null;
+
+  if (compact) {
+    return (
+      <div
+        className={`relative px-4 pb-4 pt-2 md:px-8 md:pb-6 ${className}`}
+        data-testid="mention-composer"
+        data-variant="compact"
+      >
+        {chipStrip}
+        <div className="mx-auto flex max-w-[696px] items-end gap-1 rounded-[24px] border border-border bg-surface p-1.5 focus-within:border-primary">
+          <CompactIconButton label="Attach a file" disabled>
+            <Paperclip size={18} />
+          </CompactIconButton>
+          <textarea
+            ref={textareaRef}
+            value={value}
+            onChange={handleChange}
+            onKeyDown={handleKeyDown}
+            onCompositionStart={handleCompositionStart}
+            onCompositionEnd={handleCompositionEnd}
+            disabled={disabled}
+            placeholder={placeholder}
+            title="Markdown supported · Shift+Enter for a new line"
+            aria-label={placeholder}
+            rows={1}
+            data-testid="mention-textarea"
+            className="min-h-[36px] min-w-0 flex-1 resize-none border-none bg-transparent px-1 py-[6px] text-[15px] leading-6 text-text placeholder:text-text-3 focus:outline-none focus:ring-0 disabled:opacity-50"
+          />
+          <CompactIconButton label="Mention" onClick={handleAtButton} disabled={disabled}>
+            <AtSign size={18} />
+          </CompactIconButton>
+          <button
+            type="button"
+            onClick={handleSend}
+            disabled={!canSend}
+            aria-label="Send"
+            title="Send"
+            data-testid="mention-send"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary text-on-primary transition hover:bg-primary/90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Send size={16} />
+          </button>
+        </div>
+
+        {helperText && (
+          <p className="mx-auto mt-1 max-w-[696px] px-3 text-xs text-text-2" data-testid="mention-helper">
+            {helperText}
+          </p>
+        )}
+
+        {popoverOpen && totalSuggestions > 0 && (
+          <SuggestionPopover
+            teams={grouped.teams}
+            agents={grouped.agents}
+            onSelect={handleSelectSuggestion}
+          />
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className={`relative px-4 pb-4 pt-2 ${className}`} data-testid="mention-composer">
+      {mentions.length > 0 && (
+        <ul
+          className="mb-2 flex flex-wrap gap-1.5"
+          aria-label="Pending mentions"
+          data-testid="mention-chip-strip"
+        >
+          {mentions.map((m) => (
+            <li key={m.id}>
+              <MentionChip target={m} onRemove={() => removeMention(m.id)} />
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="glass-panel flex flex-col gap-2 rounded-2xl bg-background-dark/50 p-2 focus-within:ring-1 focus-within:ring-primary/50">
+        <textarea
+          ref={textareaRef}
+          value={value}
+          onChange={handleChange}
+          onKeyDown={handleKeyDown}
+          onCompositionStart={handleCompositionStart}
+          onCompositionEnd={handleCompositionEnd}
+          disabled={disabled}
+          placeholder={placeholder}
+          rows={1}
+          data-testid="mention-textarea"
+          className="min-h-[44px] w-full resize-none border-none bg-transparent px-4 py-2 text-sm text-text-primary-dark placeholder:text-text-secondary-dark focus:outline-none focus:ring-0 disabled:opacity-50"
+        />
+        <div className="flex items-center justify-between px-2 pb-1">
+          <div className="flex items-center gap-1">
+            <ToolbarButton label="Attach" disabled>
+              <Plus size={16} />
+            </ToolbarButton>
+            <ToolbarButton label="Mention" onClick={handleAtButton} disabled={disabled}>
+              <AtSign size={16} />
+            </ToolbarButton>
+            <ToolbarButton label="Emoji" disabled>
+              <Smile size={16} />
+            </ToolbarButton>
+            <ToolbarButton label="Code" disabled>
+              <Code size={16} />
+            </ToolbarButton>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-[11px] text-text-secondary-dark">Markdown supported</span>
+            <button
+              type="button"
+              onClick={handleSend}
+              disabled={!canSend}
+              data-testid="mention-send"
+              className="flex h-8 items-center gap-2 rounded-lg bg-primary px-4 text-[13px] font-bold text-white transition hover:bg-primary/90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Send size={14} />
+              Send
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {helperText && (
+        <p className="mt-1 text-[11px] text-text-secondary-dark" data-testid="mention-helper">
+          {helperText}
+        </p>
+      )}
+
+      {popoverOpen && totalSuggestions > 0 && (
+        <SuggestionPopover
+          teams={grouped.teams}
+          agents={grouped.agents}
+          onSelect={handleSelectSuggestion}
+        />
+      )}
+    </div>
+  );
+}
+
+/** A round icon button inside the compact composer pill. */
+function CompactIconButton({
+  label,
+  onClick,
+  disabled,
+  children,
+}: {
+  label: string;
+  onClick?: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={label}
+      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-text-2 transition hover:text-text disabled:opacity-40"
+    >
+      {children}
+    </button>
+  );
+}
+
+/** A small toolbar icon button in the composer (mostly visual affordances). */
+function ToolbarButton({
+  label,
+  onClick,
+  disabled,
+  children,
+}: {
+  label: string;
+  onClick?: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={label}
+      className="flex h-8 w-8 items-center justify-center rounded-lg text-text-secondary-dark transition hover:bg-white/5 disabled:opacity-40"
+    >
+      {children}
+    </button>
+  );
+}
+
+// =============================================================================
+// Suggestion popover
+// =============================================================================
+
+function SuggestionPopover({
+  teams,
+  agents,
+  onSelect,
+}: {
+  teams: MentionTarget[];
+  agents: MentionTarget[];
+  onSelect: (t: MentionTarget) => void;
+}): JSX.Element {
+  return (
+    <div
+      role="listbox"
+      data-testid="mention-suggestions"
+      className="absolute bottom-[110%] left-4 right-4 z-10 max-h-72 overflow-y-auto rounded-xl border border-border-dark bg-surface-dark shadow-lg"
+    >
+      {teams.length > 0 && (
+        <SuggestionGroup label="Teams" items={teams} onSelect={onSelect} testid="teams" />
+      )}
+      {agents.length > 0 && (
+        <SuggestionGroup label="Agents" items={agents} onSelect={onSelect} testid="agents" />
+      )}
+    </div>
+  );
+}
+
+function SuggestionGroup({
+  label,
+  items,
+  onSelect,
+  testid,
+}: {
+  label: string;
+  items: MentionTarget[];
+  onSelect: (t: MentionTarget) => void;
+  testid: string;
+}): JSX.Element {
+  return (
+    <div data-testid={`mention-group-${testid}`}>
+      <div className="border-b border-border-dark bg-background-dark px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-text-secondary-dark">
+        {label}
+      </div>
+      <ul role="list">
+        {items.map((it) => (
+          <li key={it.id}>
+            <button
+              type="button"
+              onClick={() => onSelect(it)}
+              data-testid={`mention-suggestion-${it.id}`}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-white/5"
+            >
+              <MentionKindGlyph target={it} />
+              <span className="min-w-0 flex-1 truncate text-text-primary-dark">{it.label}</span>
+              {it.routingHint && (
+                <span className="shrink-0 text-[11px] text-text-secondary-dark">
+                  {it.routingHint}
+                </span>
+              )}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// =============================================================================
+// Chip + glyph
+// =============================================================================
+
+function MentionChip({
+  target,
+  onRemove,
+}: {
+  target: MentionTarget;
+  onRemove: () => void;
+}): JSX.Element {
+  const isTeam = target.kind === 'team';
+  return (
+    <span
+      data-testid={`mention-chip-${target.id}`}
+      data-kind={target.kind}
+      className={[
+        'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ring-1',
+        isTeam
+          ? 'bg-primary/15 text-primary ring-primary/30'
+          : 'bg-emerald-500/15 text-emerald-300 ring-emerald-500/30',
+      ].join(' ')}
+    >
+      <MentionKindGlyph target={target} compact />
+      <span>@{target.label}</span>
+      <button
+        type="button"
+        onClick={onRemove}
+        aria-label={`Remove mention of ${target.label}`}
+        className="text-current opacity-60 hover:opacity-100"
+      >
+        ×
+      </button>
+    </span>
+  );
+}
+
+function MentionKindGlyph({
+  target,
+  compact = false,
+}: {
+  target: MentionTarget;
+  compact?: boolean;
+}): JSX.Element {
+  if (target.kind === 'team') {
+    return (
+      <span
+        aria-hidden="true"
+        className={`inline-flex items-center justify-center rounded ${
+          compact ? 'h-3 w-3 text-[8px]' : 'h-5 w-5 text-[10px]'
+        } bg-primary/20 font-semibold text-primary`}
+      >
+        T
+      </span>
+    );
+  }
+  return (
+    <span
+      aria-hidden="true"
+      className={`relative inline-flex items-center justify-center rounded-full bg-emerald-500/20 font-semibold text-emerald-300 ${
+        compact ? 'h-3 w-3 text-[8px]' : 'h-5 w-5 text-[10px]'
+      }`}
+    >
+      {target.label[0]?.toUpperCase() ?? '?'}
+      {target.presence && (
+        <span
+          aria-hidden="true"
+          className={`absolute -bottom-0.5 -right-0.5 inline-block h-1.5 w-1.5 rounded-full ring-2 ring-surface-dark ${
+            PRESENCE_DOT[target.presence]
+          }`}
+        />
+      )}
+    </span>
+  );
+}
+
+// =============================================================================
+// Helpers — mention-trigger detection + filter / group
+// =============================================================================
+
+interface MentionTrigger {
+  /** Position of the `@` character in the textarea content. */
+  start: number;
+  /** Text typed after the `@` (used to filter the popover). */
+  partial: string;
+}
+
+/**
+ * Find the most recent unclosed `@token` immediately preceding the
+ * caret. Returns null if the caret is not on or after an `@` at a word
+ * boundary, or if a whitespace already closes the trigger.
+ */
+function findActiveTrigger(value: string, caret: number): MentionTrigger | null {
+  const slice = value.slice(0, caret);
+  const at = slice.lastIndexOf('@');
+  if (at < 0) return null;
+  // The `@` must be at start-of-string or preceded by whitespace.
+  if (at > 0 && !/\s/.test(slice[at - 1])) return null;
+  const after = slice.slice(at + 1);
+  // Whitespace closes the trigger — popover stays closed once the user
+  // types a space after the partial.
+  if (/\s/.test(after)) return null;
+  return { start: at, partial: after };
+}
+
+interface GroupedMentionables {
+  teams: MentionTarget[];
+  agents: MentionTarget[];
+}
+
+/**
+ * Split the flat `mentionables` list into the two suggestion sections.
+ * `filter` is matched case-insensitively against `label`.
+ */
+function groupMentionables(input: MentionTarget[], filter: string): GroupedMentionables {
+  const f = filter.trim().toLowerCase();
+  const matches = (t: MentionTarget) => !f || t.label.toLowerCase().includes(f);
+  return {
+    teams: input.filter((t) => t.kind === 'team' && matches(t)),
+    agents: input.filter((t) => t.kind === 'agent' && matches(t)),
+  };
+}

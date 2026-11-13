@@ -1,0 +1,688 @@
+/**
+ * Tests for backend/src/constants.ts.
+ *
+ * `constants.ts` is a large central config file. Rather than asserting on
+ * every value (which would just duplicate the source), this test focuses on
+ * the constants where wrong values would silently break a flow — most
+ * critically the OAuth scope set used to issue new Google credentials.
+ */
+import {
+	MEETING_CONSTANTS,
+  HANDOVER_CONSTANTS,
+  OPEN_ITEMS_CONSTANTS,
+  ORC_WAKE_CONSTANTS,
+  CONVERSATION_LOG_CONSTANTS,
+  CONVERSATION_SYNC_CONSTANTS,
+  ANTIGRAVITY_CONSTANTS,
+  ANTIGRAVITY_EFFORT_LEVELS,
+  API_SECURITY_CONSTANTS,
+  BROWSER_PROXY_CONSTANTS,
+  CLOUD_SYNC_CONSTANTS,
+  GOOGLE_OAUTH_CONSTANTS,
+  GOOGLE_WORKSPACE_CONSTANTS,
+  HARNESS_CONSTANTS,
+  ONBOARDING_CONSTANTS,
+  LOGIN_REQUIRED_PATTERN_SETS,
+  MICROSOFT_TODO_CONSTANTS,
+  RUNTIME_COMPACT_COMMANDS,
+  RUNTIME_INPUT_READY_PATTERNS,
+  RUNTIME_TYPES,
+  SLACK_CLOUD_CONSTANTS,
+  TRIGGER_ENGINE_CONSTANTS,
+  CRON_SCHEDULE_CONSTANTS,
+  WHATSAPP_CONSTANTS,
+  WORKTREE_JANITOR_CONSTANTS,
+  WAITING_SYNC_CONSTANTS,
+  CREWLY_CHANNEL_CONSTANTS,
+  STALL_WATCHER_CONSTANTS,
+  VERIFIED_SPOT_CHECK_CONSTANTS,
+  TL_DELEGATION_CONSTANTS,
+  TRACE_CONSTANTS,
+} from './constants.js';
+
+describe('WORKTREE_JANITOR_CONSTANTS', () => {
+  it('runs every 30 min, first run 10 min after boot, 2 h idle minimum', () => {
+    expect(WORKTREE_JANITOR_CONSTANTS.INTERVAL_MS).toBe(30 * 60 * 1000);
+    expect(WORKTREE_JANITOR_CONSTANTS.FIRST_RUN_DELAY_MS).toBe(10 * 60 * 1000);
+    expect(WORKTREE_JANITOR_CONSTANTS.MIN_IDLE_MS).toBe(2 * 60 * 60 * 1000);
+  });
+
+  it('uses the documented kill switch and never deletes main/master', () => {
+    expect(WORKTREE_JANITOR_CONSTANTS.ENV_VAR).toBe('CREWLY_WORKTREE_JANITOR');
+    expect(WORKTREE_JANITOR_CONSTANTS.DISABLED_VALUES).toContain('0');
+    expect(WORKTREE_JANITOR_CONSTANTS.PROTECTED_BRANCHES).toEqual(expect.arrayContaining(['main', 'master']));
+  });
+
+  it('leaves the #814 per-WorkItem worktree directory alone and only claims agent locations', () => {
+    expect(WORKTREE_JANITOR_CONSTANTS.MANAGED_WORKTREE_DIR).toBe('.crewly/worktrees');
+    expect(WORKTREE_JANITOR_CONSTANTS.AGENT_WORKTREE_DIR).toBe('.claude/worktrees');
+    expect(WORKTREE_JANITOR_CONSTANTS.AGENT_BRANCH_PREFIXES).toEqual(['worktree-agent-']);
+  });
+
+  it('tiers and retention (crewly#1354): 3 d strip / 14 d archive, 14 d transcripts, 7 d tmp, 300/100 MB logs, 8 % low disk', () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    expect(WORKTREE_JANITOR_CONSTANTS.STRIP_MIN_IDLE_MS).toBe(3 * DAY);
+    expect(WORKTREE_JANITOR_CONSTANTS.STRIP_MIN_IDLE_LOW_DISK_MS).toBe(DAY);
+    expect(WORKTREE_JANITOR_CONSTANTS.ARCHIVE_MIN_IDLE_MS).toBe(14 * DAY);
+    expect(WORKTREE_JANITOR_CONSTANTS.ARCHIVE_DIR).toBe('worktree-archive');
+    expect(WORKTREE_JANITOR_CONSTANTS.RECLAIM_DIRS).toEqual(['node_modules', '.next', 'dist', '.turbo', '.cache']);
+    expect(WORKTREE_JANITOR_CONSTANTS.TRANSCRIPT_MAX_AGE_MS).toBe(14 * DAY);
+    expect(WORKTREE_JANITOR_CONSTANTS.TMP_MAX_AGE_MS).toBe(7 * DAY);
+    expect(WORKTREE_JANITOR_CONSTANTS.TMP_CHILD_POLICIES).toEqual({
+      'slack-files': 30 * DAY,
+      'slack-images': 30 * DAY,
+      'slack-pdfs': 30 * DAY,
+      'crewly-web-release': 2 * DAY,
+      'skill-output': 7 * DAY,
+    });
+    expect(WORKTREE_JANITOR_CONSTANTS.LOG_ARCHIVE_CAP_BYTES).toBe(300 * 1024 ** 2);
+    expect(WORKTREE_JANITOR_CONSTANTS.LOG_SESSIONS_CAP_BYTES).toBe(100 * 1024 ** 2);
+    expect(WORKTREE_JANITOR_CONSTANTS.LOW_DISK_FRACTION).toBe(0.08);
+    expect(WORKTREE_JANITOR_CONSTANTS.RETENTION_ARM_DELAY_MS).toBe(DAY);
+    expect(WORKTREE_JANITOR_CONSTANTS.PROMPT_HINT).toContain('symlink `node_modules`');
+  });
+});
+
+describe('GOOGLE_OAUTH_CONSTANTS', () => {
+  describe('DEFAULT_SCOPES', () => {
+    const scopes = GOOGLE_OAUTH_CONSTANTS.DEFAULT_SCOPES;
+
+    it('uses gmail.modify as the single Gmail scope so all 9 actions of the agent gmail skill work without re-auth', () => {
+      // gmail.modify is a Google-side functional superset that covers
+      // gmail.readonly + gmail.send + label/state mutations. Crewly's
+      // skill-executor does string-exact scope matching, so declaring
+      // gmail.modify alone is what makes the agent gmail skill (which
+      // requires gmail.modify) accept credentials minted via this flow.
+      const gmailScopes = scopes.filter((s) => s.includes('gmail'));
+      expect(gmailScopes).toEqual(['https://www.googleapis.com/auth/gmail.modify']);
+    });
+
+    it('does NOT request gmail.readonly or gmail.send separately (gmail.modify covers them)', () => {
+      expect(scopes).not.toContain('https://www.googleapis.com/auth/gmail.readonly');
+      expect(scopes).not.toContain('https://www.googleapis.com/auth/gmail.send');
+    });
+
+    it('includes openid + email for user identity resolution', () => {
+      expect(scopes).toContain('openid');
+      expect(scopes).toContain('email');
+    });
+
+    it('is non-empty (defaults must be populated)', () => {
+      expect(scopes.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('endpoint URLs', () => {
+    it('points AUTH_BASE_URL at Google production OAuth endpoint', () => {
+      expect(GOOGLE_OAUTH_CONSTANTS.AUTH_BASE_URL).toBe(
+        'https://accounts.google.com/o/oauth2/v2/auth',
+      );
+    });
+
+    it('points TOKEN_ENDPOINT at the Google token endpoint', () => {
+      expect(GOOGLE_OAUTH_CONSTANTS.TOKEN_ENDPOINT).toBe(
+        'https://oauth2.googleapis.com/token',
+      );
+    });
+
+    it('points USERINFO_ENDPOINT at the Google userinfo endpoint', () => {
+      expect(GOOGLE_OAUTH_CONSTANTS.USERINFO_ENDPOINT).toBe(
+        'https://www.googleapis.com/oauth2/v2/userinfo',
+      );
+    });
+  });
+
+  describe('WORKSPACE_SCOPES', () => {
+    it('exposes a broader workspace set for skills that need Drive/Calendar/Docs', () => {
+      // This is intentionally separate from DEFAULT_SCOPES — skills that
+      // need broader access can request these via the explicit override
+      // path on /credentials/oauth/google/start.
+      const ws = GOOGLE_OAUTH_CONSTANTS.WORKSPACE_SCOPES;
+      expect(Array.isArray(ws)).toBe(true);
+      expect(ws.length).toBeGreaterThan(0);
+    });
+  });
+});
+
+describe('BROWSER_PROXY_CONSTANTS', () => {
+  it('SWEEP_INTERVAL_MS is 60s — wall-clock cadence the relay-side stale watcher runs on', () => {
+    expect(BROWSER_PROXY_CONSTANTS.SWEEP_INTERVAL_MS).toBe(60_000);
+  });
+
+  it('STALE_PURGE_THRESHOLD_MS is 5 minutes — wide enough to absorb transient relay blips without evicting live ext connections', () => {
+    expect(BROWSER_PROXY_CONSTANTS.STALE_PURGE_THRESHOLD_MS).toBe(5 * 60 * 1000);
+  });
+
+  it('purge threshold strictly exceeds the sweep interval so each instance gets multiple sweep checks before being purged', () => {
+    // If the threshold equalled or undercut the interval, an instance could
+    // be purged on the very same tick that would have refreshed it via a
+    // pending heartbeat — that is the bug we are explicitly avoiding.
+    expect(BROWSER_PROXY_CONSTANTS.STALE_PURGE_THRESHOLD_MS).toBeGreaterThan(
+      BROWSER_PROXY_CONSTANTS.SWEEP_INTERVAL_MS,
+    );
+  });
+});
+
+describe('CLOUD_SYNC_CONSTANTS', () => {
+  it('REGISTER_INTERVAL_MS gives the relay a chance to evict stale Portal pairs within a minute', () => {
+    // The relay's stale-pair eviction only fires on register. If this
+    // interval grows too long, a Portal user who closes their tab and
+    // reopens in a new browser will sit `Cloud Active`-but-no-agents
+    // until OSS happens to re-register. One minute is the slow side of
+    // "tolerable" — keep it tight.
+    expect(CLOUD_SYNC_CONSTANTS.REGISTER_INTERVAL_MS).toBeGreaterThanOrEqual(30_000);
+    expect(CLOUD_SYNC_CONSTANTS.REGISTER_INTERVAL_MS).toBeLessThanOrEqual(120_000);
+  });
+});
+
+describe('API_SECURITY_CONSTANTS (backend re-export)', () => {
+  it('re-exports the cross-domain block so index.ts can read the bind host default', () => {
+    expect(API_SECURITY_CONSTANTS.DEFAULT_BIND_HOST).toBe('0.0.0.0');
+    expect(API_SECURITY_CONSTANTS.ENV.BIND_HOST).toBe('CREWLY_BIND_HOST');
+  });
+});
+
+describe('RUNTIME_TYPES (opencode-cli, issue #306)', () => {
+  it('registers OpenCode as a fourth PTY runtime next to claude/gemini/codex', () => {
+    expect(RUNTIME_TYPES.OPENCODE_CLI).toBe('opencode-cli');
+    expect(Object.values(RUNTIME_TYPES)).toEqual(
+      expect.arrayContaining(['claude-code', 'gemini-cli', 'codex-cli', 'opencode-cli', 'crewly-agent']),
+    );
+  });
+
+  it('has a compact command for every runtime type (Record<RuntimeType, string> is exhaustive)', () => {
+    for (const type of Object.values(RUNTIME_TYPES)) {
+      expect(typeof RUNTIME_COMPACT_COMMANDS[type]).toBe('string');
+    }
+    expect(RUNTIME_COMPACT_COMMANDS['opencode-cli']).toBe('/compact');
+  });
+
+  it('treats the OpenCode /connect provider dialog as a login-required screen', () => {
+    const lower = 'connect a provider\n  anthropic\n  openai\n  other  custom provider';
+    const matched = LOGIN_REQUIRED_PATTERN_SETS['opencode-cli'].some((set) =>
+      set.every((pattern) => lower.includes(pattern.toLowerCase())),
+    );
+    expect(matched).toBe(true);
+  });
+
+  it('treats the OpenCode "Get started /connect" footer as a login-required screen', () => {
+    const lower = '~/projects/demo                     get started /connect';
+    const matched = LOGIN_REQUIRED_PATTERN_SETS['opencode-cli'].some((set) =>
+      set.every((pattern) => lower.includes(pattern.toLowerCase())),
+    );
+    expect(matched).toBe(true);
+  });
+
+  it('marks the OpenCode busy hint and provider dialog as not-ready-for-input', () => {
+    const markers = RUNTIME_INPUT_READY_PATTERNS.OPENCODE_CLI.NOT_READY_MARKERS;
+    expect(markers).toContain('esc interrupt');
+    expect(markers).toContain('esc again to interrupt');
+    expect(markers).toContain('connect a provider');
+    // Markers are lower-case + whitespace-collapsed by contract (isReadyForInput normalises the screen that way)
+    for (const marker of markers) {
+      expect(marker).toBe(marker.toLowerCase());
+      expect(marker).not.toMatch(/\s{2,}/);
+    }
+  });
+});
+
+describe('RUNTIME_TYPES (antigravity-cli)', () => {
+  it('registers Antigravity CLI as a PTY runtime', () => {
+    expect(RUNTIME_TYPES.ANTIGRAVITY_CLI).toBe('antigravity-cli');
+  });
+
+  it('has no compact command: agy compacts by itself and has no slash command for it', () => {
+    expect(RUNTIME_COMPACT_COMMANDS['antigravity-cli']).toBe('');
+  });
+
+  it('keeps not-ready markers lower-case and whitespace-collapsed', () => {
+    const markers = RUNTIME_INPUT_READY_PATTERNS.ANTIGRAVITY_CLI.NOT_READY_MARKERS;
+    expect(markers).toEqual(expect.arrayContaining(['esc to cancel', 'generating...', 'select login method']));
+    for (const marker of markers) {
+      expect(marker).toBe(marker.toLowerCase());
+      expect(marker).not.toMatch(/\s{2,}/);
+    }
+  });
+
+  it('never adds an Antigravity sign-in screen to the login-required patterns (the owner must not be asked to sign in)', () => {
+    for (const marker of ANTIGRAVITY_CONSTANTS.SCREEN.ACCOUNT_LOGIN_MARKERS) {
+      const lower = marker.toLowerCase();
+      const matched = Object.values(LOGIN_REQUIRED_PATTERN_SETS)
+        .flat()
+        .some((set) => set.every((pattern) => lower.includes(pattern.toLowerCase())));
+      expect(matched).toBe(false);
+    }
+  });
+});
+
+describe('ANTIGRAVITY_CONSTANTS', () => {
+  it('launches agy approving tools and file edits', () => {
+    expect(ANTIGRAVITY_CONSTANTS.LAUNCH_COMMAND).toBe('agy --dangerously-skip-permissions --mode=accept-edits');
+  });
+
+  it('selects the Gemini API key provider the way the install docs describe', () => {
+    expect(ANTIGRAVITY_CONSTANTS.CONFIG_DIR_SEGMENTS).toEqual(['.gemini', 'antigravity-cli']);
+    expect(ANTIGRAVITY_CONSTANTS.SETTINGS_FILE).toBe('settings.json');
+    expect(ANTIGRAVITY_CONSTANTS.MODEL_PROVIDER_KEY).toBe('modelProvider');
+    expect(ANTIGRAVITY_CONSTANTS.MODEL_PROVIDER_GEMINI).toBe('gemini');
+    expect(ANTIGRAVITY_CONSTANTS.API_KEY_ENV).toBe('GEMINI_API_KEY');
+  });
+
+  it('fetches the installer only from the official https URL', () => {
+    const url = new URL(ANTIGRAVITY_CONSTANTS.INSTALL_SCRIPT_URL);
+    expect(url.protocol).toBe('https:');
+    expect(url.hostname).toBe('antigravity.google');
+  });
+
+  it('checks keys against the Gemini API with the key in a header', () => {
+    const url = new URL(ANTIGRAVITY_CONSTANTS.GEMINI_API.MODELS_URL);
+    expect(url.hostname).toBe('generativelanguage.googleapis.com');
+    expect(url.search).not.toContain('key=');
+    expect(ANTIGRAVITY_CONSTANTS.GEMINI_API.KEY_HEADER).toBe('x-goog-api-key');
+  });
+
+  it('lists the effort levels agy --help accepts', () => {
+    expect(ANTIGRAVITY_EFFORT_LEVELS).toEqual(['low', 'medium', 'high', 'max']);
+  });
+});
+
+describe('GOOGLE_WORKSPACE_CONSTANTS', () => {
+  it('points at the Cloud workspace-grant prefix the auth service mounts', () => {
+    expect(GOOGLE_WORKSPACE_CONSTANTS.CLOUD_PATH).toBe('/api/cloud/google/workspace');
+    expect(GOOGLE_WORKSPACE_CONSTANTS.CLOUD_ENDPOINTS.TOKEN).toBe('/token');
+    expect(GOOGLE_WORKSPACE_CONSTANTS.CLOUD_ENDPOINTS.DISCONNECT).toBe('');
+  });
+
+  it('refreshes ahead of expiry by the same 60 s margin Cloud caches with', () => {
+    expect(GOOGLE_WORKSPACE_CONSTANTS.TOKEN_REFRESH_MARGIN_MS).toBe(60_000);
+  });
+
+  it('talks to Google directly, never through Cloud', () => {
+    expect(GOOGLE_WORKSPACE_CONSTANTS.GMAIL_API_BASE).toMatch(/^https:\/\/gmail\.googleapis\.com\//);
+    expect(GOOGLE_WORKSPACE_CONSTANTS.CALENDAR_API_BASE).toMatch(/^https:\/\/www\.googleapis\.com\/calendar\//);
+  });
+
+  it('keeps defaults under their ceilings', () => {
+    expect(GOOGLE_WORKSPACE_CONSTANTS.GMAIL_DEFAULT_MAX_RESULTS).toBeLessThanOrEqual(
+      GOOGLE_WORKSPACE_CONSTANTS.GMAIL_MAX_RESULTS_CEILING,
+    );
+    expect(GOOGLE_WORKSPACE_CONSTANTS.CALENDAR_DEFAULT_MAX_RESULTS).toBeLessThanOrEqual(
+      GOOGLE_WORKSPACE_CONSTANTS.CALENDAR_MAX_RESULTS_CEILING,
+    );
+  });
+});
+
+describe('SLACK_CLOUD_CONSTANTS (Slack v3 — Cloud owns Slack)', () => {
+  it('uses the relay message type Cloud pushes Slack events with', () => {
+    expect(SLACK_CLOUD_CONSTANTS.MESSAGE_TYPE).toBe('slack_event');
+    expect(SLACK_CLOUD_CONSTANTS.CLOUD_DEVICE_NAME).toBe('crewly-cloud-slack');
+  });
+
+  it('refreshes the config every 10 minutes and heartbeats every 5', () => {
+    expect(SLACK_CLOUD_CONSTANTS.CONFIG_REFRESH_INTERVAL_MS).toBe(10 * 60 * 1000);
+    expect(SLACK_CLOUD_CONSTANTS.REGISTRY_HEARTBEAT_INTERVAL_MS).toBe(5 * 60 * 1000);
+    expect(SLACK_CLOUD_CONSTANTS.TEAM_SAVED_DEBOUNCE_MS).toBeLessThan(SLACK_CLOUD_CONSTANTS.REGISTRY_HEARTBEAT_INTERVAL_MS);
+  });
+
+  it('addresses the contract paths under /api/cloud/slack', () => {
+    expect(SLACK_CLOUD_CONSTANTS.CLOUD_PATH).toBe('/api/cloud/slack');
+    expect(SLACK_CLOUD_CONSTANTS.CONFIG_PATH).toBe('/config');
+    expect(SLACK_CLOUD_CONSTANTS.INSTANCES_PATH).toBe('/instances');
+    expect(SLACK_CLOUD_CONSTANTS.AGENTS_SYNC_PATH).toBe('/agents/sync');
+    expect(SLACK_CLOUD_CONSTANTS.INSTALL_PATH).toBe('/install');
+    expect(SLACK_CLOUD_CONSTANTS.INSTALL_RETURN_PATH).toBe('/connections?platform=slack');
+  });
+
+  it('keeps file-share and thread-broadcast subtypes routable and nothing else', () => {
+    expect([...SLACK_CLOUD_CONSTANTS.INBOUND_ALLOWED_SUBTYPES]).toEqual(['file_share', 'thread_broadcast']);
+  });
+});
+
+describe('TRIGGER_ENGINE_CONSTANTS', () => {
+  it('caps a single timer hop at exactly the Node 32-bit signed limit', () => {
+    // 2^31 - 1: one more and setTimeout overflows to 1 ms with a warning.
+    expect(TRIGGER_ENGINE_CONSTANTS.MAX_TIMER_DELAY_MS).toBe(2 ** 31 - 1);
+  });
+});
+
+describe('CRON_SCHEDULE_CONSTANTS', () => {
+  it('searches a full year so a once-a-year date is found, not fallen through', () => {
+    expect(CRON_SCHEDULE_CONSTANTS.NEXT_RUN_HORIZON_DAYS).toBe(366);
+  });
+
+  it('keeps the day-skip buffer larger than any DST shift (1 h)', () => {
+    expect(CRON_SCHEDULE_CONSTANTS.DAY_END_SKIP_BUFFER_MINUTES).toBeGreaterThan(60);
+    expect(CRON_SCHEDULE_CONSTANTS.DAY_END_SKIP_BUFFER_MINUTES).toBeLessThan(24 * 60);
+  });
+
+  it('falls back by exactly one day for an impossible expression', () => {
+    expect(CRON_SCHEDULE_CONSTANTS.IMPOSSIBLE_EXPRESSION_FALLBACK_MS).toBe(86_400_000);
+  });
+});
+
+describe('MICROSOFT_TODO_CONSTANTS', () => {
+  it('points at the Cloud `microsoft` grant and Graph v1.0, and returns to its Connections card', () => {
+    expect(MICROSOFT_TODO_CONSTANTS.CONNECTOR_ID).toBe('microsoft-todo');
+    expect(MICROSOFT_TODO_CONSTANTS.CLOUD_PATH).toBe('/api/cloud/microsoft');
+    expect(MICROSOFT_TODO_CONSTANTS.GRAPH_BASE).toBe('https://graph.microsoft.com/v1.0');
+    expect(MICROSOFT_TODO_CONSTANTS.SETTINGS_RETURN_PATH).toBe('/connections?platform=microsoft-todo');
+    expect(MICROSOFT_TODO_CONSTANTS.TASKS_DEFAULT_LIMIT).toBeLessThanOrEqual(MICROSOFT_TODO_CONSTANTS.TASKS_LIMIT_CEILING);
+  });
+});
+
+describe('SAFE_RESTART', () => {
+  it('extends the shared budget with backend-only drain settings', async () => {
+    const { SAFE_RESTART } = await import('./constants.js');
+    expect(SAFE_RESTART.DRAIN_TIMEOUT_MS).toBe(120_000);
+    expect(SAFE_RESTART.DRAIN_ENV_VAR).toBe('CREWLY_RESTART_DRAIN_MS');
+    expect(SAFE_RESTART.TURN_QUIET_MS).toBeGreaterThan(SAFE_RESTART.TURN_START_GRACE_MS);
+    expect(SAFE_RESTART.DRAIN_POLL_INTERVAL_MS).toBeLessThan(SAFE_RESTART.DRAIN_TIMEOUT_MS);
+    expect(SAFE_RESTART.INTERRUPTED_TURNS_FILE).toBe('interrupted-turns.json');
+    expect(SAFE_RESTART.RESUME_NOTICE_TEMPLATE).toBe('Crewly restarted while you were working on {work}. Continue where you left off and deliver.');
+    const note = SAFE_RESTART.RESUME_NOTICE_TEMPLATE.replace('{work}', 'TKT-194');
+    expect(SAFE_RESTART.RESUME_NOTICE_PATTERN.test(`${note}\nmore`)).toBe(true);
+  });
+});
+
+describe('TURN_STATE_CONSTANTS', () => {
+  it('bounds how long a runtime signal is trusted', async () => {
+    const { TURN_STATE_CONSTANTS, SAFE_RESTART } = await import('./constants.js');
+    expect(TURN_STATE_CONSTANTS.HOOK_SILENCE_MS).toBeGreaterThan(SAFE_RESTART.TURN_QUIET_MS);
+    expect(TURN_STATE_CONSTANTS.OPEN_WORK_MAX_MS).toBeGreaterThanOrEqual(SAFE_RESTART.BACKGROUND_DRAIN_TIMEOUT_MS);
+    expect(TURN_STATE_CONSTANTS.ID_PATTERN.test('toolu_01DCgEGybopgPqvXvaCDeSsY')).toBe(true);
+    expect(TURN_STATE_CONSTANTS.ID_PATTERN.test('../etc')).toBe(false);
+  });
+});
+
+describe('TICKET_CONSTANTS / POOL_ARCHIVE_CONSTANTS (ticket loop)', () => {
+  it('ticket numbering, counter file and receipt texts', async () => {
+    const { TICKET_CONSTANTS } = await import('./constants.js');
+    expect(TICKET_CONSTANTS.NUMBER_PREFIX).toBe('TKT-');
+    expect(TICKET_CONSTANTS.NUMBER_PAD).toBe(3);
+    // No `.json`: RequestService.listAll must never read the counter as a Request.
+    expect(TICKET_CONSTANTS.COUNTER_FILENAME.endsWith('.json')).toBe(false);
+    expect(TICKET_CONSTANTS.RECEIPT.RECORDED('TKT-001')).toBe('Recorded as TKT-001');
+    expect(TICKET_CONSTANTS.RECEIPT.DISMISSED('TKT-001')).toBe('TKT-001 is no longer tracked');
+    expect(TICKET_CONSTANTS.DISMISS_PATTERN.test('不用记')).toBe(true);
+    expect(TICKET_CONSTANTS.DISMISS_PATTERN.test('不用记这个')).toBe(false);
+    expect(TICKET_CONSTANTS.INTAKE_TIMEOUT_MS).toBeGreaterThan(0);
+  });
+
+  it('archive: 7 days, terminal statuses, marker file', async () => {
+    const { POOL_ARCHIVE_CONSTANTS } = await import('./constants.js');
+    expect(POOL_ARCHIVE_CONSTANTS.MIN_AGE_MS).toBe(7 * 24 * 60 * 60 * 1000);
+    expect([...POOL_ARCHIVE_CONSTANTS.TERMINAL_STATUSES].sort()).toEqual(['cancelled', 'done', 'failed', 'verified']);
+    expect(POOL_ARCHIVE_CONSTANTS.MARKER_FILENAME).toBe('.archived-2026-09-ticket-loop');
+  });
+});
+
+describe('WHATSAPP_CONSTANTS (inbox connector)', () => {
+  it('defaults dashboard connects to inbox mode (owner decision) and the env path to assistant', () => {
+    expect(WHATSAPP_CONSTANTS.DEFAULT_CONNECT_MODE).toBe(WHATSAPP_CONSTANTS.MODES.INBOX);
+    expect(WHATSAPP_CONSTANTS.LEGACY_ENV_MODE).toBe(WHATSAPP_CONSTANTS.MODES.ASSISTANT);
+  });
+
+  it('gives agents a 30-minute confirm window', () => {
+    expect(WHATSAPP_CONSTANTS.DRAFT_CONFIRM_WINDOW_MS).toBe(30 * 60 * 1000);
+  });
+
+  it('confirm pattern captures the draft code', () => {
+    const p = WHATSAPP_CONSTANTS.DRAFT_CONFIRM_PATTERN;
+    expect(p.exec('发 W12')?.[2]).toBe('W12');
+    expect(p.exec('确认发送 #12')?.[2]).toBe('12');
+    expect(p.test('发 W12 please')).toBe(false);
+  });
+
+  it('matches the Baileys FULL history-sync enum value', () => {
+    expect(WHATSAPP_CONSTANTS.HISTORY_SYNC_TYPE_FULL).toBe(2);
+  });
+});
+
+describe('HARNESS_CONSTANTS (onboarding harness login)', () => {
+  it('harness ids match the runtime types', () => {
+    expect(HARNESS_CONSTANTS.IDS.CLAUDE_CODE).toBe(RUNTIME_TYPES.CLAUDE_CODE);
+    expect(HARNESS_CONSTANTS.IDS.CODEX_CLI).toBe(RUNTIME_TYPES.CODEX_CLI);
+    expect(HARNESS_CONSTANTS.IDS.GEMINI_CLI).toBe(RUNTIME_TYPES.GEMINI_CLI);
+    expect(HARNESS_CONSTANTS.DEFAULT_ORC_HARNESS).toBe(RUNTIME_TYPES.CLAUDE_CODE);
+  });
+
+  it('keeps credentials owner-only and the login PTY wide enough for unwrapped URLs', () => {
+    expect(HARNESS_CONSTANTS.CREDENTIALS_FILE_MODE).toBe(0o600);
+    expect(HARNESS_CONSTANTS.LOGIN.PTY_COLS).toBeGreaterThanOrEqual(500);
+    expect(HARNESS_CONSTANTS.LOGIN.TIMEOUT_MS).toBe(15 * 60 * 1000);
+    expect(HARNESS_CONSTANTS.LOGIN.SCREEN_MAX_CHARS).toBe(2000);
+  });
+
+  it('points at the keychain item and env vars Claude Code uses', () => {
+    expect(HARNESS_CONSTANTS.CLAUDE.KEYCHAIN_SERVICE).toBe('Claude Code-credentials');
+    expect(HARNESS_CONSTANTS.CLAUDE.OAUTH_TOKEN_ENV).toBe('CLAUDE_CODE_OAUTH_TOKEN');
+    expect(HARNESS_CONSTANTS.CLAUDE.API_KEY_ENV).toBe('ANTHROPIC_API_KEY');
+  });
+
+  it('parses versions', () => {
+    expect(HARNESS_CONSTANTS.VERSION_PATTERN.exec('codex-cli 0.156.1')?.[0]).toBe('0.156.1');
+  });
+
+  it('re-login over Slack: reminds every few hours, code bounds fit Claude codes, both retry keywords', () => {
+    const { RELOGIN } = HARNESS_CONSTANTS;
+    expect(RELOGIN.REMIND_INTERVAL_MS).toBeGreaterThanOrEqual(60 * 60 * 1000);
+    expect(RELOGIN.STATUS_CHECK_INTERVAL_MS).toBeLessThan(RELOGIN.REMIND_INTERVAL_MS);
+    expect(RELOGIN.UNRECOGNISED_SCREEN_MS).toBeLessThan(HARNESS_CONSTANTS.LOGIN.TIMEOUT_MS);
+    expect(RELOGIN.CODE_MIN_LENGTH).toBeLessThan(RELOGIN.CODE_MAX_LENGTH);
+    expect(RELOGIN.RETRY_KEYWORDS).toEqual(expect.arrayContaining(['relogin', '重新登录']));
+  });
+});
+
+describe('ONBOARDING_CONSTANTS (first-run checklist)', () => {
+  it('lists the five steps in order, matching the step ids', () => {
+    expect(ONBOARDING_CONSTANTS.STEP_ORDER).toEqual(Object.values(ONBOARDING_CONSTANTS.STEP_IDS));
+    expect(ONBOARDING_CONSTANTS.STEP_ORDER).toEqual(['harness', 'team', 'first_task', 'cloud', 'slack']);
+  });
+
+  it('gives Blank three suggestions like the template starters', () => {
+    expect(ONBOARDING_CONSTANTS.BLANK_STARTER.SUGGESTIONS).toHaveLength(3);
+  });
+
+  it('points the phone sign-in at the portal token page', () => {
+    expect(ONBOARDING_CONSTANTS.CLOUD.CLI_TOKEN_PATH).toBe('/cloud/cli-token');
+    expect(ONBOARDING_CONSTANTS.CLOUD.GOOGLE_START_PATH).toBe('/api/cloud/google/start');
+  });
+
+  it('reads the portal URL from CLOUD_CONSOLE_URL', () => {
+    const saved = process.env['CLOUD_CONSOLE_URL'];
+    try {
+      delete process.env['CLOUD_CONSOLE_URL'];
+      expect(ONBOARDING_CONSTANTS.CLOUD.CONSOLE_URL).toBe('https://crewlyai.com');
+      process.env['CLOUD_CONSOLE_URL'] = 'https://portal.example';
+      expect(ONBOARDING_CONSTANTS.CLOUD.CONSOLE_URL).toBe('https://portal.example');
+    } finally {
+      if (saved === undefined) delete process.env['CLOUD_CONSOLE_URL'];
+      else process.env['CLOUD_CONSOLE_URL'] = saved;
+    }
+  });
+});
+
+describe('conversation log / sync constants', () => {
+	it('match the spec batching and pause values', () => {
+		expect(CONVERSATION_SYNC_CONSTANTS.BATCH_MAX_MESSAGES).toBe(50);
+		expect(CONVERSATION_SYNC_CONSTANTS.BATCH_MAX_BYTES).toBe(256 * 1024);
+		expect(CONVERSATION_SYNC_CONSTANTS.BACKOFF_MAX_MS).toBe(5 * 60 * 1000);
+		expect(CONVERSATION_SYNC_CONSTANTS.UNAVAILABLE_RETRY_MS).toBe(60 * 60 * 1000);
+		expect(CONVERSATION_SYNC_CONSTANTS.ENV_SWITCH).toBe('CREWLY_CONVERSATION_SYNC');
+	});
+
+	it('list every surface Cloud accepts', () => {
+		expect(CONVERSATION_LOG_CONSTANTS.SOURCES).toEqual(
+			expect.arrayContaining(['slack', 'crewly-chat', 'cloud-talk', 'google-chat', 'telegram', 'whatsapp', 'system', 'runtime']),
+		);
+	});
+});
+
+describe('WAITING_SYNC_CONSTANTS ("waiting on you" on Crewly Cloud)', () => {
+	it('match the Cloud routes, relay type and capability', () => {
+		expect(WAITING_SYNC_CONSTANTS.INGEST_PATH).toBe('/api/cloud/conversations/waiting/ingest');
+		expect(WAITING_SYNC_CONSTANTS.ACTIONS_PATH).toBe('/api/cloud/conversations/waiting/actions');
+		expect(WAITING_SYNC_CONSTANTS.RELAY_MESSAGE_TYPE).toBe('waiting_action');
+		expect(WAITING_SYNC_CONSTANTS.CAPABILITY).toBe('waiting_actions');
+	});
+
+	it('debounce changes, check often and resync fully every 5 minutes', () => {
+		expect(WAITING_SYNC_CONSTANTS.DEBOUNCE_MS).toBe(2_000);
+		expect(WAITING_SYNC_CONSTANTS.CHECK_INTERVAL_MS).toBeLessThan(WAITING_SYNC_CONSTANTS.FULL_SYNC_INTERVAL_MS);
+		expect(WAITING_SYNC_CONSTANTS.FULL_SYNC_INTERVAL_MS).toBe(5 * 60 * 1000);
+	});
+});
+
+describe('TICKET_AUTOPILOT_CONSTANTS', () => {
+	it('keeps the owner-approved cadences', async () => {
+		const { TICKET_AUTOPILOT_CONSTANTS: C } = await import('./constants.js');
+		expect(C.TRIAGE_MIN_INTERVAL_MS).toBe(30 * 60 * 1000);
+		expect(C.DIGEST_HOUR_LOCAL).toBe(21);
+		expect(C.DEFAULT_MAX_IN_FLIGHT_PER_MEMBER).toBe(1);
+		expect(C.NEEDS_OWNER_LABEL).toBe('needs-owner');
+	});
+
+	it('never lets the idle trigger fire more often than the tick cadence allows', async () => {
+		const { TICKET_AUTOPILOT_CONSTANTS: C } = await import('./constants.js');
+		expect(C.IDLE_TRIGGER_MIN_INTERVAL_MS).toBeGreaterThan(0);
+		expect(C.IDLE_TRIGGER_MIN_INTERVAL_MS).toBeLessThanOrEqual(C.TRIAGE_MIN_INTERVAL_MS);
+		expect(C.TRIAGE_RELIST_AFTER_MS).toBeGreaterThan(C.TRIAGE_MIN_INTERVAL_MS);
+	});
+});
+
+describe('ORC_WAKE_CONSTANTS', () => {
+	it('digest at most every 30 min; counter hourly', () => {
+		expect(ORC_WAKE_CONSTANTS.DIGEST_INTERVAL_MS).toBe(30 * 60 * 1000);
+		expect(ORC_WAKE_CONSTANTS.COUNTER_LOG_INTERVAL_MS).toBe(60 * 60 * 1000);
+	});
+
+	it('progress markers (incl. [IDLE]) are record-only; [DONE] and [BLOCKED] are not', () => {
+		for (const m of ['[IN_PROGRESS]', '[ACTIVE]', '[READY]', '[WORKING]', '[IDLE]']) expect(ORC_WAKE_CONSTANTS.RECORD_ONLY_MARKERS.test(`${m} x`)).toBe(true);
+		expect(ORC_WAKE_CONSTANTS.RECORD_ONLY_MARKERS.test('[DONE] x')).toBe(false);
+		expect(ORC_WAKE_CONSTANTS.DONE_MARKERS.test('[COMPLETED] x')).toBe(true);
+		expect(ORC_WAKE_CONSTANTS.ATTENTION_MARKERS.test('[BLOCKED] x')).toBe(true);
+	});
+});
+
+describe('WIKI_QUEUE_CONSTANTS (#914 wiki queue hygiene)', () => {
+	it('alerts well before items expire, and releases claims before either', async () => {
+		const { WIKI_QUEUE_CONSTANTS: C } = await import('./constants.js');
+		expect(C.STALE_ALERT_AGE_MS).toBeLessThan(C.MAX_ITEM_AGE_MS);
+		expect(C.CLAIM_TIMEOUT_MS).toBeLessThan(C.STALE_ALERT_AGE_MS);
+		expect(C.STALE_ALERT_COOLDOWN_MS).toBeGreaterThan(0);
+		expect(C.DEAD_LETTER_DIR).toBe('dead-letter');
+	});
+});
+
+describe('WIKI_GAPS_CONSTANTS (#914 knowledge gaps)', () => {
+	it('keeps the page under llm-curated, the state in a dot-file, and the query bounds sane', async () => {
+		const { WIKI_GAPS_CONSTANTS: C } = await import('./constants.js');
+		expect(C.DIR.startsWith('llm-curated/')).toBe(true);
+		expect(C.STATE_FILE.startsWith('.')).toBe(true);
+		expect(C.QUERY_MIN_CHARS).toBeLessThan(C.QUERY_MAX_CHARS);
+		expect(C.MAX_GAPS_PER_PAGE).toBeGreaterThan(0);
+		expect(C.MAX_AGENTS_PER_GAP).toBeGreaterThan(0);
+		expect(C.WINDOW_DAYS).toBe(7);
+		expect(C.WORKITEM_KIND).toBe('wiki-knowledge-gaps');
+	});
+});
+
+describe('MEMORY_CONSTANTS.DEDUP (#914 evidence merge)', () => {
+	it('keeps the near-duplicate threshold strict and the guards positive', async () => {
+		const { MEMORY_CONSTANTS: C } = await import('./constants.js');
+		expect(C.DEDUP.NEAR_DUPLICATE_JACCARD).toBeGreaterThanOrEqual(0.8);
+		expect(C.DEDUP.NEAR_DUPLICATE_JACCARD).toBeLessThan(1);
+		expect(C.DEDUP.MIN_TOKENS_FOR_NEAR).toBeGreaterThan(1);
+		expect(C.DEDUP.SUBSTRING_MIN_CHARS).toBe(20);
+	});
+});
+
+describe('CREWLY_CHANNEL_CONSTANTS', () => {
+	it('names the registry file and keeps limits in line with Slack and huddles', () => {
+		expect(CREWLY_CHANNEL_CONSTANTS.STORE_FILENAME).toBe('crewly-channels.json');
+		expect(CREWLY_CHANNEL_CONSTANTS.MAX_MEMBERS).toBe(50);
+		expect(CREWLY_CHANNEL_CONSTANTS.MAX_PURPOSE_LENGTH).toBe(250);
+		expect(CREWLY_CHANNEL_CONSTANTS.SLACK_REFRESH_MIN_INTERVAL_MS).toBeGreaterThan(0);
+	});
+});
+
+describe('HANDOVER_CONSTANTS (interrupted work, crewly#1361)', () => {
+  it('lists sub-agent and shell tools, with bounded output', () => {
+    expect(HANDOVER_CONSTANTS.SUBAGENT_TOOLS).toEqual(['Task', 'Agent']);
+    expect(HANDOVER_CONSTANTS.SHELL_TOOLS).toEqual(['Bash']);
+    expect(HANDOVER_CONSTANTS.INTERRUPTED_MAX_ITEMS).toBe(5);
+    expect(HANDOVER_CONSTANTS.INTERRUPTED_TEXT_MAX_CHARS).toBe(200);
+    expect(HANDOVER_CONSTANTS.INTERRUPTED_HEADING).toBe('## Interrupted by the restart');
+  });
+
+  it('recognises long-running commands and ignores short ones', () => {
+    expect(HANDOVER_CONSTANTS.LONG_COMMAND_PATTERN.test('npx remotion render src/index.ts W41 out.mp4')).toBe(true);
+    expect(HANDOVER_CONSTANTS.LONG_COMMAND_PATTERN.test('ffmpeg -i a.mov b.mp4')).toBe(true);
+    expect(HANDOVER_CONSTANTS.LONG_COMMAND_PATTERN.test('node server.js &')).toBe(true);
+    expect(HANDOVER_CONSTANTS.LONG_COMMAND_PATTERN.test('cat README.md')).toBe(false);
+  });
+});
+
+describe('VERIFIED_SPOT_CHECK_CONSTANTS (crewly#1315)', () => {
+  it('samples a day of verified work once a day and lists a bounded number of discrepancies', () => {
+    expect(VERIFIED_SPOT_CHECK_CONSTANTS.WINDOW_MS).toBe(24 * 60 * 60 * 1000);
+    expect(VERIFIED_SPOT_CHECK_CONSTANTS.SAMPLE_SIZE).toBeGreaterThan(0);
+    expect(VERIFIED_SPOT_CHECK_CONSTANTS.CHECK_INTERVAL_MS).toBeLessThan(VERIFIED_SPOT_CHECK_CONSTANTS.WINDOW_MS);
+    expect(VERIFIED_SPOT_CHECK_CONSTANTS.BOOT_DELAY_MS).toBeLessThan(VERIFIED_SPOT_CHECK_CONSTANTS.CHECK_INTERVAL_MS);
+    expect(VERIFIED_SPOT_CHECK_CONSTANTS.STATE_FILE).toMatch(/\.json$/);
+    expect(VERIFIED_SPOT_CHECK_CONSTANTS.MAX_LISTED_DISCREPANCIES).toBeGreaterThan(0);
+    expect(VERIFIED_SPOT_CHECK_CONSTANTS.ENV_SWITCH).toBe('CREWLY_VERIFIED_SPOT_CHECK');
+  });
+});
+
+describe('STALL_WATCHER_CONSTANTS (crewly#1363, crewly#1362)', () => {
+  it('keys the ladder to the agent estimate with a floor, and never spams', () => {
+    expect(STALL_WATCHER_CONSTANTS.INTERVAL_MS).toBe(5 * 60 * 1000);
+    expect(STALL_WATCHER_CONSTANTS.AGENT_STEP_MULTIPLIER).toBe(1.5);
+    expect(STALL_WATCHER_CONSTANTS.LEAD_STEP_MULTIPLIER).toBe(3);
+    expect(STALL_WATCHER_CONSTANTS.MIN_AGENT_STEP_MS).toBe(20 * 60 * 1000);
+    expect(STALL_WATCHER_CONSTANTS.LEAD_GRACE_MS).toBe(30 * 60 * 1000);
+    expect(STALL_WATCHER_CONSTANTS.NUDGE_COOLDOWN_MS).toBe(TL_DELEGATION_CONSTANTS.NUDGE_COOLDOWN_MS);
+    expect(STALL_WATCHER_CONSTANTS.OWNER_LINE_INTERVAL_MS).toBe(24 * 60 * 60 * 1000);
+    expect(STALL_WATCHER_CONSTANTS.CLAIM_STALL_MS).toBe(TRACE_CONSTANTS.STALL_MINUTES * 60 * 1000);
+    expect(STALL_WATCHER_CONSTANTS.CLAIM_CHECK_WINDOW_MS).toBe(10 * 60 * 1000);
+    // crewly#1427 item 5: words that make a hand-off a plan, not a claim
+    expect(STALL_WATCHER_CONSTANTS.CLAIM_PLAN_ZH.test('你看过说可以,我再')).toBe(true);
+    expect(STALL_WATCHER_CONSTANTS.CLAIM_PLAN_ZH.test('会随这次一起')).toBe(true);
+    expect(STALL_WATCHER_CONSTANTS.CLAIM_PLAN_ZH.test('刚才')).toBe(false);
+    expect(STALL_WATCHER_CONSTANTS.CLAIM_PLAN_ZH.test('视频已经是')).toBe(false);
+    expect(STALL_WATCHER_CONSTANTS.CLAIM_PLAN_EN.test("Once you approve, I'll")).toBe(true);
+    expect(STALL_WATCHER_CONSTANTS.CLAIM_PLAN_EN.test('After the review I')).toBe(false);
+    expect(STALL_WATCHER_CONSTANTS.ARM_DELAY_MS).toBe(24 * 60 * 60 * 1000);
+    expect(STALL_WATCHER_CONSTANTS.ENV_KILL_SWITCH).toBe('CREWLY_STALL_WATCHER');
+    expect(STALL_WATCHER_CONSTANTS.ENV_DRY_RUN).toBe('CREWLY_STALL_WATCHER_DRY_RUN');
+    expect(STALL_WATCHER_CONSTANTS.STATE_FILE).toBe('in-flight-runs.json');
+  });
+
+  it('recognises background runs, finished reports and deliverables in both languages', () => {
+    expect(STALL_WATCHER_CONSTANTS.BACKGROUND_RUN_PATTERN.test('已经开跑了')).toBe(true);
+    expect(STALL_WATCHER_CONSTANTS.BACKGROUND_RUN_PATTERN.test('Kicked off the render')).toBe(true);
+    expect(STALL_WATCHER_CONSTANTS.BACKGROUND_RUN_PATTERN.test('I will start tomorrow')).toBe(false);
+    expect(STALL_WATCHER_CONSTANTS.RUN_FINISHED_PATTERN.test('跑完了')).toBe(true);
+    expect(STALL_WATCHER_CONSTANTS.RUN_FINISHED_PATTERN.test('still going')).toBe(false);
+    expect(STALL_WATCHER_CONSTANTS.DELIVERABLE_PATTERN.test('see final.mp4')).toBe(true);
+    expect(STALL_WATCHER_CONSTANTS.DELIVERABLE_PATTERN.test('working on it')).toBe(false);
+  });
+});
+
+describe('OPEN_ITEMS_CONSTANTS due defaults (crewly#1360)', () => {
+  it('a live chat promise is due sooner than the general default, and an estimate counts for 10 minutes', () => {
+    expect(OPEN_ITEMS_CONSTANTS.CHAT_PROMISE_DEFAULT_DUE_MS).toBe(4 * 60 * 60 * 1000);
+    expect(OPEN_ITEMS_CONSTANTS.CHAT_PROMISE_DEFAULT_DUE_MS).toBeLessThan(OPEN_ITEMS_CONSTANTS.DEFAULT_DUE_MS);
+    expect(OPEN_ITEMS_CONSTANTS.ESTIMATE_WINDOW_MS).toBe(10 * 60 * 1000);
+  });
+});
+
+describe('MEETING_CONSTANTS', () => {
+	it('advertises meeting_pack and keeps the pack within the Cloud budget', () => {
+		expect(MEETING_CONSTANTS.CAPABILITY).toBe('meeting_pack');
+		expect(MEETING_CONSTANTS.SOURCE).toBe('cloud-talk');
+		expect(MEETING_CONSTANTS.PACK_MAX_TOKENS).toBeLessThanOrEqual(15_000);
+		expect(MEETING_CONSTANTS.AGENDA_MAX).toBeLessThanOrEqual(15);
+	});
+});

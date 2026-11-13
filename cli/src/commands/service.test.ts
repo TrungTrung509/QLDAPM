@@ -1,0 +1,1503 @@
+/**
+ * Tests for the CLI service command.
+ *
+ * Validates install, uninstall, and status subcommands for both
+ * macOS (Login Item) and Linux (systemd) service management.
+ */
+
+// ---------------------------------------------------------------------------
+// Mocks — declared before imports
+// ---------------------------------------------------------------------------
+
+jest.mock('chalk', () => ({
+	__esModule: true,
+	default: new Proxy(
+		{},
+		{
+			get: () => {
+				const fn = (s: string) => s;
+				return new Proxy(fn, {
+					get: () => fn,
+					apply: (_t: unknown, _this: unknown, args: string[]) => args[0],
+				});
+			},
+		},
+	),
+}));
+
+const mockExecAsync = jest.fn();
+const mockExecSync = jest.fn((_cmd: string): string => '');
+jest.mock('child_process', () => ({
+	exec: jest.fn(
+		(
+			cmd: string,
+			...rest: unknown[]
+		) => {
+			// exec(cmd, cb) or exec(cmd, opts, cb)
+			const cb = typeof rest[0] === 'function'
+				? rest[0] as (err: Error | null, result: { stdout: string; stderr: string }) => void
+				: rest[1] as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+
+			const result = mockExecAsync(cmd);
+			if (result instanceof Error) {
+				cb(result, { stdout: '', stderr: result.message });
+			} else {
+				Promise.resolve(result).then((r) => {
+					if (r instanceof Error) {
+						cb(r, { stdout: '', stderr: r.message });
+					} else {
+						cb(null, {
+							stdout: typeof r === 'string' ? r : '',
+							stderr: '',
+						});
+					}
+				});
+			}
+		},
+	),
+	spawn: jest.fn(),
+	execSync: jest.fn((cmd: string) => mockExecSync(cmd)),
+}));
+
+jest.mock('../../../config/index.js', () => ({
+	CREWLY_CONSTANTS: {
+		PATHS: {
+			CREWLY_HOME: '.crewly',
+		},
+	},
+	SAFE_RESTART_CONSTANTS: {
+		SHUTDOWN_MARKER_DIR: 'run',
+		SHUTDOWN_MARKER_FILE: 'shutdown-requested',
+	},
+}));
+
+// Safe-shutdown helpers: no network, no real waits.
+const mockFetchReadiness = jest.fn().mockResolvedValue(null);
+const mockWaitForPidExit = jest.fn().mockResolvedValue(true);
+jest.mock('../utils/safe-shutdown.js', () => ({
+	SKIP_DRAIN_SIGNAL_GAP_MS: 0,
+	describeReadiness: jest.fn(() => ['1 agent(s) are mid-turn']),
+	fetchRestartReadiness: (...args: unknown[]) => mockFetchReadiness(...args),
+	isPidAlive: jest.fn(() => false),
+	resolveRestartDrainMs: jest.fn(() => 120_000),
+	resolveShutdownBudgetMs: jest.fn(() => 150_000),
+	waitForPidExit: (...args: unknown[]) => mockWaitForPidExit(...args),
+}));
+
+const mockExistsSync = jest.fn();
+const mockWriteFileSync = jest.fn();
+const mockReadFileSync = jest.fn();
+const mockUnlinkSync = jest.fn();
+const mockMkdirSync = jest.fn();
+
+jest.mock('fs', () => ({
+	existsSync: (...args: unknown[]) => mockExistsSync(...args),
+	writeFileSync: (...args: unknown[]) => mockWriteFileSync(...args),
+	readFileSync: (...args: unknown[]) => mockReadFileSync(...args),
+	unlinkSync: (...args: unknown[]) => mockUnlinkSync(...args),
+	mkdirSync: (...args: unknown[]) => mockMkdirSync(...args),
+}));
+
+import {
+	serviceCommand,
+	captureServiceEnvironment,
+	generateCommandFile,
+	generateSystemdUnit,
+	refreshSystemdUnitFile,
+	generateLinuxWrapper,
+	enableLinger,
+	getLingerState,
+	getRunningPid,
+	getSystemdState,
+	isLoginItemRegistered,
+	generateWatchdogPlist,
+} from './service.js';
+import { setCliModuleDir } from '../utils/package-root.js';
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('serviceCommand', () => {
+	let logSpy: jest.SpyInstance;
+	let errorSpy: jest.SpyInstance;
+	let exitSpy: jest.SpyInstance;
+	const originalPlatform = process.platform;
+
+	beforeEach(() => {
+		logSpy = jest.spyOn(console, 'log').mockImplementation();
+		errorSpy = jest.spyOn(console, 'error').mockImplementation();
+		exitSpy = jest
+			.spyOn(process, 'exit')
+			.mockImplementation(() => undefined as never);
+		jest.clearAllMocks();
+		Object.defineProperty(process, 'platform', { value: 'darwin' });
+	});
+
+	afterEach(() => {
+		logSpy.mockRestore();
+		errorSpy.mockRestore();
+		exitSpy.mockRestore();
+		Object.defineProperty(process, 'platform', { value: originalPlatform });
+	});
+
+	// -----------------------------------------------------------------------
+	// Routing & platform guard
+	// -----------------------------------------------------------------------
+
+	describe('action routing', () => {
+		it('rejects unknown actions', async () => {
+			await serviceCommand('bogus', {});
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('Unknown action: bogus');
+			expect(exitSpy).toHaveBeenCalledWith(1);
+		});
+
+		it('rejects unsupported platforms', async () => {
+			Object.defineProperty(process, 'platform', { value: 'win32' });
+
+			await serviceCommand('install', {});
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('not supported on win32');
+			expect(exitSpy).toHaveBeenCalledWith(1);
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// macOS install
+	// -----------------------------------------------------------------------
+
+	describe('install (macOS)', () => {
+		it('skips if already installed without --force', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('.plist')) return false;
+				if (p.includes('crewly-start.command')) return true;
+				if (p.includes('package.json')) return true;
+				return false;
+			});
+
+			mockReadFileSync.mockReturnValue(
+				JSON.stringify({ name: 'crewly' }),
+			);
+
+			await serviceCommand('install', {});
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('already installed');
+			// The .command is not rewritten (only the missing watchdog is added)
+			expect(mockWriteFileSync).not.toHaveBeenCalledWith(
+				expect.stringContaining('crewly-start.command'),
+				expect.anything(),
+				expect.anything(),
+			);
+		});
+
+		it('writes .command file and registers Login Item on fresh install', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('.plist')) return false;
+				if (p.includes('crewly-start.command')) return false;
+				if (p.includes('crewly-service.sh')) return false;
+				if (p.includes('package.json')) return true;
+				return false;
+			});
+
+			mockReadFileSync.mockReturnValue(
+				JSON.stringify({ name: 'crewly' }),
+			);
+
+			mockExecAsync.mockReturnValue('login item Crewly Backend');
+
+			await serviceCommand('install', {});
+
+			expect(mockWriteFileSync).toHaveBeenCalledWith(
+				expect.stringContaining('crewly-start.command'),
+				expect.stringContaining('#!/bin/bash'),
+				expect.objectContaining({ mode: 0o755 }),
+			);
+
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				expect.stringContaining('make login item'),
+			);
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('installed successfully');
+		});
+
+		it('overwrites existing installation with --force', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('.plist')) return false;
+				if (p.includes('crewly-start.command')) return true;
+				if (p.includes('crewly-service.sh')) return false;
+				if (p.includes('package.json')) return true;
+				return false;
+			});
+
+			mockReadFileSync.mockReturnValue(
+				JSON.stringify({ name: 'crewly' }),
+			);
+
+			mockExecAsync.mockReturnValue('login item Crewly Backend');
+
+			await serviceCommand('install', { force: true });
+
+			expect(mockWriteFileSync).toHaveBeenCalled();
+		});
+
+		it('migrates legacy LaunchAgent plist during install', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('.plist')) return true;
+				if (p.includes('crewly-start.command')) return false;
+				if (p.includes('crewly-service.sh')) return true;
+				if (p.includes('package.json')) return true;
+				return false;
+			});
+
+			mockReadFileSync.mockReturnValue(
+				JSON.stringify({ name: 'crewly' }),
+			);
+
+			mockExecAsync.mockReturnValue('');
+
+			await serviceCommand('install', {});
+
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				expect.stringContaining('launchctl bootout'),
+			);
+
+			expect(mockUnlinkSync).toHaveBeenCalledWith(
+				expect.stringContaining('.plist'),
+			);
+
+			expect(mockUnlinkSync).toHaveBeenCalledWith(
+				expect.stringContaining('crewly-service.sh'),
+			);
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// start subcommand
+	// -----------------------------------------------------------------------
+
+	describe('start (macOS)', () => {
+		it('opens .command file when not running', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly.pid')) return false;
+				if (p.includes('crewly-start.command')) return true;
+				return false;
+			});
+
+			mockExecAsync.mockReturnValue('');
+
+			await serviceCommand('start', {});
+
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				expect.stringContaining('open'),
+			);
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('started');
+		});
+
+		it('shows warning if already running', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly.pid')) return true;
+				return false;
+			});
+			mockReadFileSync.mockReturnValue('12345');
+
+			const killSpy = jest.spyOn(process, 'kill').mockImplementation(() => true);
+
+			await serviceCommand('start', {});
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('already running');
+
+			killSpy.mockRestore();
+		});
+
+		it('clears stale PID file before starting', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly.pid')) return true;
+				if (p.includes('crewly-start.command')) return true;
+				return false;
+			});
+			mockReadFileSync.mockReturnValue('99999');
+
+			// PID check fails → stale
+			const killSpy = jest.spyOn(process, 'kill').mockImplementation(() => {
+				throw new Error('ESRCH');
+			});
+			mockExecAsync.mockReturnValue('');
+
+			await serviceCommand('start', {});
+
+			expect(mockUnlinkSync).toHaveBeenCalledWith(
+				expect.stringContaining('crewly.pid'),
+			);
+
+			killSpy.mockRestore();
+		});
+
+		it('exits with error if not installed', async () => {
+			mockExistsSync.mockReturnValue(false);
+
+			await serviceCommand('start', {});
+
+			expect(exitSpy).toHaveBeenCalledWith(1);
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('not installed');
+		});
+	});
+
+	describe('restart / stop — safe restart', () => {
+		beforeEach(() => {
+			mockFetchReadiness.mockReset().mockResolvedValue(null);
+			mockWaitForPidExit.mockReset().mockResolvedValue(true);
+		});
+
+		afterEach(() => {
+			// Do not leak implementations into the tests that follow.
+			mockExecAsync.mockReset();
+			mockExistsSync.mockReset();
+			mockReadFileSync.mockReset();
+			Object.defineProperty(process, 'platform', { value: originalPlatform });
+		});
+
+		it('macOS restart with a wrapper: SIGTERM once, waits for the drain, lets the wrapper restart', async () => {
+			Object.defineProperty(process, 'platform', { value: 'darwin' });
+			mockExistsSync.mockImplementation((p: string) => p.includes('crewly.pid'));
+			mockReadFileSync.mockReturnValue('12345');
+			mockExecAsync.mockImplementation((cmd: string) => (cmd.includes('ps -o ppid=') ? '777' : ''));
+			mockFetchReadiness.mockResolvedValue({ safe: false, busyAgents: [{ session: 'ella', since: 'x', messagePreview: 'y' }], queued: 0 });
+			const killSpy = jest.spyOn(process, 'kill').mockImplementation(() => true);
+			try {
+				await serviceCommand('restart', {});
+				const terms = killSpy.mock.calls.filter((c) => c[0] === 12345 && c[1] === 'SIGTERM');
+				expect(terms).toHaveLength(1);
+				expect(mockWaitForPidExit).toHaveBeenCalledWith(12345, 150_000, expect.any(Object));
+				const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+				expect(output).toContain('mid-turn');
+				expect(output).toContain('auto-restart');
+			} finally {
+				killSpy.mockRestore();
+			}
+		});
+
+		it('macOS restart --now sends a second SIGTERM so the backend skips the drain', async () => {
+			Object.defineProperty(process, 'platform', { value: 'darwin' });
+			mockExistsSync.mockImplementation((p: string) => p.includes('crewly.pid'));
+			mockReadFileSync.mockReturnValue('12345');
+			mockExecAsync.mockImplementation((cmd: string) => (cmd.includes('ps -o ppid=') ? '777' : ''));
+			const killSpy = jest.spyOn(process, 'kill').mockImplementation(() => true);
+			try {
+				await serviceCommand('restart', { now: true });
+				const terms = killSpy.mock.calls.filter((c) => c[0] === 12345 && c[1] === 'SIGTERM');
+				expect(terms).toHaveLength(2);
+			} finally {
+				killSpy.mockRestore();
+			}
+		});
+
+		it('macOS restart without a wrapper does not re-launch while the old process is still draining', async () => {
+			Object.defineProperty(process, 'platform', { value: 'darwin' });
+			mockExistsSync.mockImplementation((p: string) => p.includes('crewly.pid') || p.includes('crewly-start.command'));
+			mockReadFileSync.mockReturnValue('12345');
+			mockExecAsync.mockImplementation((cmd: string) => (cmd.includes('ps -o ppid=') ? '1' : ''));
+			mockWaitForPidExit.mockResolvedValue(false);
+			const killSpy = jest.spyOn(process, 'kill').mockImplementation(() => true);
+			try {
+				await serviceCommand('restart', {});
+				expect(mockExecAsync).not.toHaveBeenCalledWith(expect.stringContaining('open "'));
+				const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+				expect(output).toContain('Not re-launching');
+			} finally {
+				killSpy.mockRestore();
+			}
+		});
+
+		it('macOS stop stops the wrapper and waits for the node process to drain', async () => {
+			Object.defineProperty(process, 'platform', { value: 'darwin' });
+			mockExistsSync.mockImplementation((p: string) => p.includes('crewly.pid'));
+			mockReadFileSync.mockReturnValue('12345');
+			mockExecAsync.mockImplementation((cmd: string) => (cmd.includes('ps -o ppid=') ? '777' : ''));
+			const killSpy = jest.spyOn(process, 'kill').mockImplementation(() => true);
+			try {
+				await serviceCommand('stop', {});
+				expect(killSpy).toHaveBeenCalledWith(777, 'SIGTERM');
+				expect(killSpy).toHaveBeenCalledWith(12345, 'SIGTERM');
+				expect(mockWaitForPidExit).toHaveBeenCalledWith(12345, 150_000, expect.any(Object));
+			} finally {
+				killSpy.mockRestore();
+			}
+		});
+
+		it('Linux restart --now asks the unit to skip its drain before systemctl restart', async () => {
+			Object.defineProperty(process, 'platform', { value: 'linux' });
+			mockExecAsync.mockReturnValue('');
+			await serviceCommand('restart', { now: true });
+			const cmds = mockExecAsync.mock.calls.map((c: unknown[]) => c[0] as string);
+			const kills = cmds.filter((c) => c.includes('systemctl --user kill --kill-whom=main --signal=SIGTERM'));
+			expect(kills).toHaveLength(2);
+			expect(cmds.indexOf(kills[0])).toBeLessThan(cmds.findIndex((c) => c.includes('systemctl --user restart')));
+		});
+
+		it('Linux restart without --now leaves the drain to systemd', async () => {
+			Object.defineProperty(process, 'platform', { value: 'linux' });
+			mockExecAsync.mockReturnValue('');
+			await serviceCommand('restart', {});
+			const cmds = mockExecAsync.mock.calls.map((c: unknown[]) => c[0] as string);
+			expect(cmds.some((c) => c.includes('systemctl --user kill'))).toBe(false);
+			expect(cmds.some((c) => c.includes('systemctl --user restart'))).toBe(true);
+		});
+	});
+
+	describe('start (Linux)', () => {
+		beforeEach(() => {
+			Object.defineProperty(process, 'platform', { value: 'linux' });
+		});
+
+		it('calls systemctl start when installed', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly.pid')) return false;
+				if (p.includes('crewly.service')) return true;
+				return false;
+			});
+			mockExecAsync.mockReturnValue('');
+
+			await serviceCommand('start', {});
+
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				expect.stringContaining('systemctl --user start'),
+			);
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// upgrade subcommand
+	// -----------------------------------------------------------------------
+
+	describe('upgrade (macOS)', () => {
+		it('stops, installs, regenerates, and starts', async () => {
+			// Stop phase: no running process
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly.pid')) return false;
+				if (p.includes('crewly-start.command')) return true;
+				if (p.includes('package.json')) return true;
+				return false;
+			});
+			mockReadFileSync.mockReturnValue(JSON.stringify({ name: 'crewly' }));
+			mockExecAsync.mockReturnValue('');
+
+			await serviceCommand('upgrade', { version: '1.5.0' });
+
+			// Should run npm install
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				'npm install -g crewly@1.5.0',
+			);
+
+			// Should regenerate .command file
+			expect(mockWriteFileSync).toHaveBeenCalledWith(
+				expect.stringContaining('crewly-start.command'),
+				expect.stringContaining('#!/bin/bash'),
+				expect.objectContaining({ mode: 0o755 }),
+			);
+
+			// Should open the .command file to start
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				expect.stringContaining('open'),
+			);
+		});
+
+		it('defaults to latest when no version specified', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly.pid')) return false;
+				if (p.includes('crewly-start.command')) return true;
+				if (p.includes('package.json')) return true;
+				return false;
+			});
+			mockReadFileSync.mockReturnValue(JSON.stringify({ name: 'crewly' }));
+			mockExecAsync.mockReturnValue('');
+
+			await serviceCommand('upgrade', {});
+
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				'npm install -g crewly@latest',
+			);
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// help text
+	// -----------------------------------------------------------------------
+
+	describe('help text', () => {
+		it('shows start and upgrade in usage message', async () => {
+			await serviceCommand('bogus', {});
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('start');
+			expect(output).toContain('upgrade');
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// macOS uninstall
+	// -----------------------------------------------------------------------
+
+	describe('uninstall (macOS)', () => {
+		it('removes Login Item, .command file, and kills process', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly-start.command')) return true;
+				if (p.includes('crewly.pid')) return true;
+				if (p.includes('.plist')) return false;
+				return false;
+			});
+
+			mockReadFileSync.mockReturnValue('12345');
+
+			const killSpy = jest
+				.spyOn(process, 'kill')
+				.mockImplementation(() => true);
+
+			mockExecAsync.mockReturnValue('');
+
+			await serviceCommand('uninstall', {});
+
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				expect.stringContaining('delete login item'),
+			);
+
+			expect(mockUnlinkSync).toHaveBeenCalledWith(
+				expect.stringContaining('crewly-start.command'),
+			);
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('uninstalled');
+
+			killSpy.mockRestore();
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// macOS status
+	// -----------------------------------------------------------------------
+
+	describe('status (macOS)', () => {
+		it('shows fully operational when everything is running', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly-start.command')) return true;
+				if (p.includes('crewly.pid')) return true;
+				if (p.includes('.plist')) return false;
+				return false;
+			});
+
+			mockReadFileSync.mockReturnValue('12345');
+
+			const killSpy = jest
+				.spyOn(process, 'kill')
+				.mockImplementation(() => true);
+
+			mockExecAsync.mockReturnValue('Crewly Backend');
+
+			await serviceCommand('status', {});
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('.command file: Installed');
+			expect(output).toContain('Login Item: Registered');
+			expect(output).toContain('Running (PID 12345)');
+			expect(output).toContain('fully operational');
+
+			killSpy.mockRestore();
+		});
+
+		it('shows not installed when nothing exists', async () => {
+			mockExistsSync.mockReturnValue(false);
+			mockExecAsync.mockReturnValue('');
+
+			await serviceCommand('status', {});
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('.command file: Not found');
+			expect(output).toContain('Login Item: Not registered');
+			expect(output).toContain('Not running');
+			expect(output).toContain('not installed');
+		});
+
+		it('warns about legacy LaunchAgent plist', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('.plist')) return true;
+				return false;
+			});
+
+			mockExecAsync.mockReturnValue('');
+
+			await serviceCommand('status', {});
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('Legacy LaunchAgent');
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// Linux install
+	// -----------------------------------------------------------------------
+
+	describe('install (Linux)', () => {
+		beforeEach(() => {
+			Object.defineProperty(process, 'platform', { value: 'linux' });
+		});
+
+		it('writes wrapper script and systemd unit on fresh install', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly.service')) return false;
+				if (p.includes('package.json')) return true;
+				return false;
+			});
+
+			mockReadFileSync.mockReturnValue(
+				JSON.stringify({ name: 'crewly' }),
+			);
+
+			mockExecAsync.mockReturnValue('');
+
+			await serviceCommand('install', {});
+
+			// Should write wrapper script
+			expect(mockWriteFileSync).toHaveBeenCalledWith(
+				expect.stringContaining('crewly-start.sh'),
+				expect.stringContaining('#!/bin/bash'),
+				expect.objectContaining({ mode: 0o755 }),
+			);
+
+			// Should write systemd unit file
+			expect(mockWriteFileSync).toHaveBeenCalledWith(
+				expect.stringContaining('crewly.service'),
+				expect.stringContaining('[Unit]'),
+			);
+
+			// Should call systemctl daemon-reload and enable
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				'systemctl --user daemon-reload',
+			);
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				'systemctl --user enable crewly.service',
+			);
+
+			// finding 10: linger is enabled so the user manager survives logout
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				expect.stringMatching(/^loginctl enable-linger \S+$/),
+			);
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('installed successfully');
+		});
+
+		it('prints the manual linger command when loginctl is missing, and still installs', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly.service')) return false;
+				if (p.includes('package.json')) return true;
+				return false;
+			});
+			mockReadFileSync.mockReturnValue(JSON.stringify({ name: 'crewly' }));
+			mockExecAsync.mockImplementation((cmd: string) => {
+				if (cmd.startsWith('loginctl')) return new Error('loginctl: command not found');
+				return '';
+			});
+
+			await serviceCommand('install', {});
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('Could not enable linger');
+			expect(output).toMatch(/Run manually: loginctl enable-linger \S+/);
+			expect(output).toContain('installed successfully');
+		});
+
+		it('skips if already installed without --force', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly.service')) return true;
+				if (p.includes('package.json')) return true;
+				return false;
+			});
+
+			mockReadFileSync.mockReturnValue(
+				JSON.stringify({ name: 'crewly' }),
+			);
+
+			await serviceCommand('install', {});
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('already installed');
+			expect(mockWriteFileSync).not.toHaveBeenCalled();
+		});
+
+		it('overwrites with --force', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly.service')) return true;
+				if (p.includes('package.json')) return true;
+				return false;
+			});
+
+			mockReadFileSync.mockReturnValue(
+				JSON.stringify({ name: 'crewly' }),
+			);
+
+			mockExecAsync.mockReturnValue('');
+
+			await serviceCommand('install', { force: true });
+
+			expect(mockWriteFileSync).toHaveBeenCalled();
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// Linux uninstall
+	// -----------------------------------------------------------------------
+
+	describe('uninstall (Linux)', () => {
+		beforeEach(() => {
+			Object.defineProperty(process, 'platform', { value: 'linux' });
+		});
+
+		it('stops service, removes unit and wrapper, reloads systemd', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly.service')) return true;
+				if (p.includes('crewly-start.sh')) return true;
+				if (p.includes('crewly.pid')) return false;
+				return false;
+			});
+
+			mockExecAsync.mockReturnValue('');
+
+			await serviceCommand('uninstall', {});
+
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				expect.stringContaining('systemctl --user stop'),
+			);
+			expect(mockExecAsync).toHaveBeenCalledWith(
+				expect.stringContaining('systemctl --user disable'),
+			);
+			expect(mockUnlinkSync).toHaveBeenCalledWith(
+				expect.stringContaining('crewly.service'),
+			);
+			expect(mockUnlinkSync).toHaveBeenCalledWith(
+				expect.stringContaining('crewly-start.sh'),
+			);
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('uninstalled');
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// Linux status
+	// -----------------------------------------------------------------------
+
+	describe('status (Linux)', () => {
+		beforeEach(() => {
+			Object.defineProperty(process, 'platform', { value: 'linux' });
+		});
+
+		it('shows fully operational when active with PID', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p.includes('crewly.service')) return true;
+				if (p.includes('crewly.pid')) return true;
+				return false;
+			});
+
+			mockReadFileSync.mockReturnValue('54321');
+
+			const killSpy = jest
+				.spyOn(process, 'kill')
+				.mockImplementation(() => true);
+
+			mockExecAsync.mockImplementation((cmd: string) => {
+				if (cmd.includes('is-active')) return 'active';
+				return '';
+			});
+
+			await serviceCommand('status', {});
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('Unit file: Installed');
+			expect(output).toContain('Active (running)');
+			expect(output).toContain('Running (PID 54321)');
+			expect(output).toContain('fully operational');
+
+			killSpy.mockRestore();
+		});
+
+		it('warns when linger is disabled', async () => {
+			mockExistsSync.mockReturnValue(false);
+			mockExecAsync.mockImplementation((cmd: string) => {
+				if (cmd.includes('show-user')) return 'no\n';
+				throw new Error('not found');
+			});
+
+			await serviceCommand('status', {});
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toMatch(/Linger: Disabled — run: loginctl enable-linger \S+/);
+		});
+
+		it('shows not installed when nothing exists', async () => {
+			mockExistsSync.mockReturnValue(false);
+			mockExecAsync.mockImplementation(() => {
+				throw new Error('not found');
+			});
+
+			await serviceCommand('status', {});
+
+			const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+			expect(output).toContain('Unit file: Not found');
+			expect(output).toContain('Not registered');
+			expect(output).toContain('not installed');
+		});
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Unit tests for exported helpers
+// ---------------------------------------------------------------------------
+
+describe('generateCommandFile', () => {
+	it('includes the project root path', () => {
+		const content = generateCommandFile('/path/to/crewly');
+		expect(content).toContain('CREWLY_DIR="/path/to/crewly"');
+	});
+
+	it('sources zshrc for NVM/PATH', () => {
+		const content = generateCommandFile('/any/path');
+		expect(content).toContain('.zshrc');
+	});
+
+	it('also exports the captured PATH/node and sources service.env', () => {
+		const content = generateCommandFile('/any/path', fakeEnv);
+		expect(content).toContain('export PATH="/opt/npm/bin:/opt/node/bin:/usr/local/bin:/usr/bin"');
+		expect(content).toContain('NODE_BIN="/opt/node/bin/node"');
+		expect(content).toContain('SERVICE_ENV="$HOME/.crewly/service.env"');
+		expect(content).toContain('"$NODE_BIN" dist/cli/cli/src/index.js start');
+	});
+
+	it('includes PID-based duplicate prevention', () => {
+		const content = generateCommandFile('/any/path');
+		expect(content).toContain('PIDFILE');
+		expect(content).toContain('kill -0');
+	});
+
+	it('includes crash restart loop', () => {
+		const content = generateCommandFile('/any/path');
+		expect(content).toContain('while true');
+		expect(content).toContain('restarting in 5s');
+	});
+
+	it('includes native module arch check', () => {
+		const content = generateCommandFile('/any/path');
+		expect(content).toContain('pty.node');
+		expect(content).toContain('npm rebuild node-pty');
+		expect(content).toContain('Architecture mismatch');
+	});
+
+	it('prefers the matching node-pty prebuild over rebuilding on arch mismatch (#778)', () => {
+		const content = generateCommandFile('/any/path');
+		expect(content).toContain('$PTY_DIR/prebuilds/$NODE_PLATFORM_ARCH/pty.node');
+		expect(content).toContain('rm -rf "$PTY_DIR/build"');
+	});
+
+	it('#244: has cd INSIDE the while loop (not before it)', () => {
+		const content = generateCommandFile('/any/path');
+		const whilePos = content.indexOf('while true');
+		const cdPos = content.indexOf('cd "$CREWLY_DIR"');
+		// cd must appear AFTER 'while true', not before it
+		expect(whilePos).toBeGreaterThan(-1);
+		expect(cdPos).toBeGreaterThan(whilePos);
+	});
+
+	it('#244: cd has error handling', () => {
+		const content = generateCommandFile('/any/path');
+		expect(content).toContain('cd "$CREWLY_DIR" || {');
+	});
+
+	it.each([0, 1, 143])(
+		'logs the real exit status of the CLI (%i), not the status of `|| true`',
+		(code) => {
+			// Run the wrapper's own wait/record lines, as generated, under bash with
+			// `set -euo pipefail` like the real file, against a child that exits
+			// with `code`. The old `wait || true; EXIT_CODE=$?` always logged 0.
+			const fs = jest.requireActual<typeof import('fs')>('fs');
+			const os = jest.requireActual<typeof import('os')>('os');
+			const path = jest.requireActual<typeof import('path')>('path');
+			const content = generateCommandFile('/any/path');
+			const start = content.indexOf('  NODE_PID=$!');
+			const end = content.indexOf('  sleep 5', start);
+			expect(start).toBeGreaterThan(-1);
+			expect(end).toBeGreaterThan(start);
+			const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crewly-wrapper-'));
+			try {
+				const script = [
+					'set -euo pipefail',
+					`LOG_DIR="${logDir}"`,
+					`PIDFILE="${logDir}/crewly.pid"`,
+					`SHUTDOWN_MARKER="${logDir}/no-such-marker"`,
+					`( exit ${code} ) &`,
+					content.slice(start, end),
+				].join('\n');
+				const { spawnSync } = jest.requireActual<typeof import('child_process')>('child_process');
+				const run = spawnSync('bash', ['-c', script], { encoding: 'utf-8' });
+				expect(run.status).toBe(0);
+				const log = fs.readFileSync(path.join(logDir, 'service.log'), 'utf-8');
+				expect(log).toContain(`Crewly exited with code ${code},`);
+			} finally {
+				fs.rmSync(logDir, { recursive: true, force: true });
+			}
+		},
+	);
+});
+
+describe('generateSystemdUnit', () => {
+	it('includes [Unit], [Service], and [Install] sections', () => {
+		const content = generateSystemdUnit('/path/to/crewly');
+		expect(content).toContain('[Unit]');
+		expect(content).toContain('[Service]');
+		expect(content).toContain('[Install]');
+	});
+
+	it('uses the wrapper script as ExecStart', () => {
+		const content = generateSystemdUnit('/path/to/crewly');
+		expect(content).toContain('ExecStart=');
+		expect(content).toContain('crewly-start.sh');
+	});
+
+	it('sets WorkingDirectory to project root', () => {
+		const content = generateSystemdUnit('/opt/crewly');
+		expect(content).toContain('WorkingDirectory=/opt/crewly');
+	});
+
+	it('configures restart on failure with 5s delay', () => {
+		const content = generateSystemdUnit('/any/path');
+		expect(content).toContain('Restart=on-failure');
+		expect(content).toContain('RestartSec=5');
+	});
+
+	it('loads the optional ~/.crewly/service.env (missing file tolerated)', () => {
+		const content = generateSystemdUnit('/any/path');
+		expect(content).toContain('EnvironmentFile=-%h/.crewly/service.env');
+	});
+
+	it('targets default.target for user services', () => {
+		const content = generateSystemdUnit('/any/path');
+		expect(content).toContain('WantedBy=default.target');
+	});
+
+	it('lets the backend drain: SIGTERM to the main process only, SIGKILL after the drain budget', () => {
+		const content = generateSystemdUnit('/any/path');
+		expect(content).toContain('KillMode=mixed');
+		expect(content).toContain('TimeoutStopSec=150');
+	});
+});
+
+describe('refreshSystemdUnitFile', () => {
+	beforeEach(() => {
+		mockExistsSync.mockReset();
+		mockReadFileSync.mockReset();
+		mockWriteFileSync.mockReset();
+	});
+
+	it('rewrites an installed unit whose content is out of date (old TimeoutStopSec)', () => {
+		mockExistsSync.mockReturnValue(true);
+		mockReadFileSync.mockReturnValue('[Service]\nTimeoutStopSec=150\n');
+		expect(refreshSystemdUnitFile('/opt/crewly')).toBe(true);
+		expect(mockWriteFileSync).toHaveBeenCalledWith(expect.stringContaining('crewly.service'), generateSystemdUnit('/opt/crewly'));
+	});
+
+	it('leaves an up-to-date or missing unit alone', () => {
+		mockExistsSync.mockReturnValue(true);
+		mockReadFileSync.mockReturnValue(generateSystemdUnit('/opt/crewly'));
+		expect(refreshSystemdUnitFile('/opt/crewly')).toBe(false);
+		mockExistsSync.mockReturnValue(false);
+		expect(refreshSystemdUnitFile('/opt/crewly')).toBe(false);
+		expect(mockWriteFileSync).not.toHaveBeenCalled();
+	});
+});
+
+/** Deterministic environment for wrapper-generation assertions. */
+const fakeEnv = {
+	nodeBin: '/opt/node/bin/node',
+	npmGlobalBin: '/opt/npm/bin',
+	path: '/usr/local/bin:/usr/bin',
+};
+
+describe('captureServiceEnvironment', () => {
+	beforeEach(() => {
+		jest.clearAllMocks();
+	});
+
+	it('captures execPath, npm prefix bin and PATH', () => {
+		mockExecSync.mockReturnValue('/usr/local\n');
+		const env = captureServiceEnvironment();
+		expect(env.nodeBin).toBe(process.execPath);
+		expect(env.npmGlobalBin).toBe('/usr/local/bin');
+		expect(env.path).toBe(process.env.PATH);
+		expect(mockExecSync).toHaveBeenCalledWith('npm prefix -g');
+	});
+
+	it('degrades to null npm bin when npm is unavailable', () => {
+		mockExecSync.mockImplementation(() => {
+			throw new Error('npm: not found');
+		});
+		expect(captureServiceEnvironment().npmGlobalBin).toBeNull();
+	});
+});
+
+describe('generateLinuxWrapper', () => {
+	it('includes the project root path', () => {
+		const content = generateLinuxWrapper('/path/to/crewly');
+		expect(content).toContain('CREWLY_DIR="/path/to/crewly"');
+	});
+
+	it('does NOT source .bashrc (finding 9: it returns early under systemd)', () => {
+		const content = generateLinuxWrapper('/any/path', fakeEnv);
+		expect(content).not.toContain('source "$HOME/.bashrc"');
+	});
+
+	it('exports the captured PATH with npm global bin and node dir first', () => {
+		const content = generateLinuxWrapper('/any/path', fakeEnv);
+		expect(content).toContain('export PATH="/opt/npm/bin:/opt/node/bin:/usr/local/bin:/usr/bin"');
+	});
+
+	it('pins NODE_BIN to the absolute node binary and execs it', () => {
+		const content = generateLinuxWrapper('/any/path', fakeEnv);
+		expect(content).toContain('NODE_BIN="/opt/node/bin/node"');
+		expect(content).toContain('exec "$NODE_BIN" dist/cli/cli/src/index.js start');
+	});
+
+	it('sources ~/.crewly/service.env when present (with allexport)', () => {
+		const content = generateLinuxWrapper('/any/path', fakeEnv);
+		expect(content).toContain('SERVICE_ENV="$HOME/.crewly/service.env"');
+		expect(content).toContain('set -a');
+		expect(content).toContain('source "$SERVICE_ENV"');
+	});
+
+	it('lets service.env override NODE_ENV', () => {
+		const content = generateLinuxWrapper('/any/path', fakeEnv);
+		expect(content).toContain('export NODE_ENV="${NODE_ENV:-development}"');
+	});
+
+	it('tolerates an unknown npm global bin dir', () => {
+		const content = generateLinuxWrapper('/any/path', { ...fakeEnv, npmGlobalBin: null });
+		expect(content).toContain('export PATH="/opt/node/bin:/usr/local/bin:/usr/bin"');
+	});
+
+	it('de-duplicates PATH entries already present in the captured PATH', () => {
+		const content = generateLinuxWrapper('/any/path', { ...fakeEnv, path: '/opt/node/bin:/usr/bin' });
+		expect(content).toContain('export PATH="/opt/npm/bin:/opt/node/bin:/usr/bin"');
+	});
+
+	it('writes PID file', () => {
+		const content = generateLinuxWrapper('/any/path');
+		expect(content).toContain('PIDFILE');
+		expect(content).toContain('echo $$');
+	});
+
+	it('uses exec to replace shell with node', () => {
+		const content = generateLinuxWrapper('/any/path', fakeEnv);
+		expect(content).toContain('exec "$NODE_BIN"');
+	});
+
+	it('includes native module arch check', () => {
+		const content = generateLinuxWrapper('/any/path');
+		expect(content).toContain('pty.node');
+		expect(content).toContain('npm rebuild node-pty');
+	});
+});
+
+describe('getRunningPid', () => {
+	beforeEach(() => {
+		jest.clearAllMocks();
+	});
+
+	it('returns null when PID file does not exist', () => {
+		mockExistsSync.mockReturnValue(false);
+		expect(getRunningPid()).toBeNull();
+	});
+
+	it('returns null when PID file has non-numeric content', () => {
+		mockExistsSync.mockReturnValue(true);
+		mockReadFileSync.mockReturnValue('not-a-number');
+		expect(getRunningPid()).toBeNull();
+	});
+
+	it('returns null when process is not alive', () => {
+		mockExistsSync.mockReturnValue(true);
+		mockReadFileSync.mockReturnValue('99999');
+
+		const killSpy = jest.spyOn(process, 'kill').mockImplementation(() => {
+			throw new Error('ESRCH');
+		});
+
+		expect(getRunningPid()).toBeNull();
+
+		killSpy.mockRestore();
+	});
+
+	it('returns the PID when process is alive', () => {
+		mockExistsSync.mockReturnValue(true);
+		mockReadFileSync.mockReturnValue('12345');
+
+		const killSpy = jest
+			.spyOn(process, 'kill')
+			.mockImplementation(() => true);
+
+		expect(getRunningPid()).toBe(12345);
+
+		killSpy.mockRestore();
+	});
+});
+
+describe('enableLinger', () => {
+	let logSpy: jest.SpyInstance;
+
+	beforeEach(() => {
+		jest.clearAllMocks();
+		logSpy = jest.spyOn(console, 'log').mockImplementation();
+	});
+
+	afterEach(() => {
+		logSpy.mockRestore();
+	});
+
+	it('runs loginctl enable-linger for the user and reports success', async () => {
+		mockExecAsync.mockImplementation((cmd: string) => (cmd.includes('show-user') ? 'yes\n' : ''));
+		expect(await enableLinger('alice')).toBe(true);
+		expect(mockExecAsync).toHaveBeenCalledWith('loginctl enable-linger alice');
+		const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+		expect(output).toContain('Enabled linger for alice');
+	});
+
+	it('returns false and prints the manual command when enable-linger fails', async () => {
+		mockExecAsync.mockReturnValue(new Error('Interactive authentication required'));
+		expect(await enableLinger('alice')).toBe(false);
+		const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+		expect(output).toContain('Interactive authentication required');
+		expect(output).toContain('Run manually: loginctl enable-linger alice');
+	});
+
+	it('returns false when enable-linger exits 0 but Linger is still "no"', async () => {
+		mockExecAsync.mockImplementation((cmd: string) => (cmd.includes('show-user') ? 'no\n' : ''));
+		expect(await enableLinger('alice')).toBe(false);
+		const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+		expect(output).toContain('Linger is still off');
+	});
+
+	it('trusts the enable call when show-user is unavailable', async () => {
+		mockExecAsync.mockImplementation((cmd: string) => {
+			if (cmd.includes('show-user')) return new Error('unknown option');
+			return '';
+		});
+		expect(await enableLinger('alice')).toBe(true);
+	});
+});
+
+describe('getLingerState', () => {
+	beforeEach(() => {
+		jest.clearAllMocks();
+	});
+
+	it('returns yes/no from loginctl', async () => {
+		mockExecAsync.mockReturnValue('yes\n');
+		expect(await getLingerState('alice')).toBe('yes');
+		mockExecAsync.mockReturnValue('no\n');
+		expect(await getLingerState('alice')).toBe('no');
+	});
+
+	it('returns null when loginctl is unavailable', async () => {
+		mockExecAsync.mockReturnValue(new Error('not found'));
+		expect(await getLingerState('alice')).toBeNull();
+	});
+});
+
+describe('getSystemdState', () => {
+	beforeEach(() => {
+		jest.clearAllMocks();
+	});
+
+	it('returns "active" when service is active', async () => {
+		mockExecAsync.mockReturnValue('active');
+		expect(await getSystemdState()).toBe('active');
+	});
+
+	it('returns "inactive" when service is loaded but stopped', async () => {
+		mockExecAsync.mockReturnValue('inactive');
+		expect(await getSystemdState()).toBe('inactive');
+	});
+
+	it('returns "enabled" when is-active fails but is-enabled succeeds', async () => {
+		mockExecAsync.mockImplementation((cmd: string) => {
+			if (cmd.includes('is-active')) throw new Error('inactive');
+			if (cmd.includes('is-enabled')) return 'enabled';
+			return '';
+		});
+		expect(await getSystemdState()).toBe('enabled');
+	});
+
+	it('returns null when service is not registered', async () => {
+		mockExecAsync.mockImplementation(() => {
+			throw new Error('not found');
+		});
+		expect(await getSystemdState()).toBeNull();
+	});
+});
+
+describe('isLoginItemRegistered', () => {
+	beforeEach(() => {
+		jest.clearAllMocks();
+	});
+
+	it('returns true when Login Item is in the list', async () => {
+		mockExecAsync.mockReturnValue('Crewly Backend, SomeOther');
+		expect(await isLoginItemRegistered()).toBe(true);
+	});
+
+	it('returns false when Login Item is not in the list', async () => {
+		mockExecAsync.mockReturnValue('SomeOther, AnotherItem');
+		expect(await isLoginItemRegistered()).toBe(false);
+	});
+
+	it('returns false when osascript fails', async () => {
+		mockExecAsync.mockReturnValue(new Error('osascript error'));
+		expect(await isLoginItemRegistered()).toBe(false);
+	});
+});
+
+describe('install from an unrelated cwd (finding 8)', () => {
+	const originalPlatform = process.platform;
+	let logSpy: jest.SpyInstance;
+	let cwdSpy: jest.SpyInstance;
+
+	beforeEach(() => {
+		jest.clearAllMocks();
+		logSpy = jest.spyOn(console, 'log').mockImplementation();
+		cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue('/home/operator');
+		Object.defineProperty(process, 'platform', { value: 'linux' });
+		setCliModuleDir('/opt/crewly-install/dist/cli/cli/src');
+	});
+
+	afterEach(() => {
+		setCliModuleDir(null);
+		cwdSpy.mockRestore();
+		logSpy.mockRestore();
+		Object.defineProperty(process, 'platform', { value: originalPlatform });
+	});
+
+	it('resolves the package root from the CLI module location, not cwd', async () => {
+		mockExistsSync.mockImplementation((p: string) => p === '/opt/crewly-install/package.json');
+		mockReadFileSync.mockReturnValue(JSON.stringify({ name: 'crewly' }));
+		mockExecAsync.mockReturnValue('');
+
+		await serviceCommand('install', {});
+
+		expect(mockWriteFileSync).toHaveBeenCalledWith(
+			expect.stringContaining('crewly-start.sh'),
+			expect.stringContaining('CREWLY_DIR="/opt/crewly-install"'),
+			expect.objectContaining({ mode: 0o755 }),
+		);
+		const output = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+		expect(output).not.toContain('Could not find');
+	});
+});
+
+
+// ---------------------------------------------------------------------------
+// launchd watchdog (macOS)
+// ---------------------------------------------------------------------------
+
+describe('watchdog LaunchAgent (macOS)', () => {
+	let logSpy: jest.SpyInstance;
+	const originalPlatform = process.platform;
+	const WATCHDOG_SCRIPT = '#!/bin/bash\n# watchdog script body\n';
+
+	/** Written files by path fragment */
+	const written = (fragment: string): unknown[][] =>
+		mockWriteFileSync.mock.calls.filter((c: unknown[]) => String(c[0]).includes(fragment));
+	const commandsRun = (): string[] => mockExecAsync.mock.calls.map((c: unknown[]) => String(c[0]));
+
+	beforeEach(() => {
+		logSpy = jest.spyOn(console, 'log').mockImplementation();
+		jest.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+		jest.clearAllMocks();
+		mockExecAsync.mockReset();
+		mockExecAsync.mockReturnValue('');
+		Object.defineProperty(process, 'platform', { value: 'darwin' });
+		mockReadFileSync.mockImplementation((p: string) =>
+			String(p).endsWith('crewly-watchdog.sh') ? WATCHDOG_SCRIPT : JSON.stringify({ name: 'crewly' }),
+		);
+	});
+
+	afterEach(() => {
+		jest.restoreAllMocks();
+		Object.defineProperty(process, 'platform', { value: originalPlatform });
+	});
+
+	const output = (): string => logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+
+	describe('generateWatchdogPlist', () => {
+		it('runs the script at load and every 60 s at background priority', () => {
+			const plist = generateWatchdogPlist('/Users/me/.crewly/crewly-watchdog.sh');
+			expect(plist).toContain('<string>com.crewly.watchdog</string>');
+			expect(plist).toContain('<string>/bin/bash</string>');
+			expect(plist).toContain('<string>/Users/me/.crewly/crewly-watchdog.sh</string>');
+			expect(plist).toMatch(/<key>RunAtLoad<\/key>\s*<true\/>/);
+			expect(plist).toMatch(/<key>StartInterval<\/key>\s*<integer>60<\/integer>/);
+			expect(plist).toContain('<string>Background</string>');
+			expect(plist).toMatch(/<key>LowPriorityIO<\/key>\s*<true\/>/);
+			expect(plist).toContain('/usr/sbin');
+		});
+
+		it('escapes XML in the script path', () => {
+			expect(generateWatchdogPlist('/a&b/<x>.sh')).toContain('/a&amp;b/&lt;x&gt;.sh');
+		});
+	});
+
+	describe('install', () => {
+		it('copies the script, writes the plist and bootstraps it on a fresh install', async () => {
+			mockExistsSync.mockImplementation((p: string) => String(p).includes('package.json'));
+
+			await serviceCommand('install', {});
+
+			expect(written('crewly-watchdog.sh')).toEqual([
+				[expect.stringContaining('.crewly/crewly-watchdog.sh'), WATCHDOG_SCRIPT, expect.objectContaining({ mode: 0o755 })],
+			]);
+			const plist = written('com.crewly.watchdog.plist');
+			expect(plist).toHaveLength(1);
+			expect(String(plist[0][0])).toContain('Library/LaunchAgents');
+			expect(commandsRun().some((c) => c.includes('launchctl bootstrap gui/$(id -u)') && c.includes('com.crewly.watchdog.plist'))).toBe(true);
+			expect(output()).toContain('Loaded watchdog LaunchAgent');
+		});
+
+		it('adds only the watchdog when the service is already installed without --force', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				const f = String(p);
+				return f.includes('crewly-start.command') || f.includes('package.json');
+			});
+
+			await serviceCommand('install', {});
+
+			expect(written('crewly-start.command')).toHaveLength(0);
+			expect(written('com.crewly.watchdog.plist')).toHaveLength(1);
+		});
+
+		it('does not touch an existing watchdog without --force', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				const f = String(p);
+				return f.includes('crewly-start.command') || f.includes('com.crewly.watchdog.plist') || f.includes('package.json');
+			});
+
+			await serviceCommand('install', {});
+
+			expect(written('crewly-watchdog')).toHaveLength(0);
+			expect(written('com.crewly.watchdog.plist')).toHaveLength(0);
+		});
+
+		it('keeps the install going and says how to load it when launchctl fails', async () => {
+			mockExistsSync.mockImplementation((p: string) => String(p).includes('package.json'));
+			mockExecAsync.mockImplementation((cmd: string) =>
+				cmd.includes('launchctl bootstrap') ? new Error('Bootstrap failed: 5') : '',
+			);
+
+			await serviceCommand('install', {});
+
+			expect(output()).toContain('Watchdog written but not loaded');
+			expect(output()).toContain('installed successfully');
+		});
+
+		it('does not fail the install when the packaged script is missing', async () => {
+			mockExistsSync.mockImplementation((p: string) => String(p).includes('package.json'));
+			mockReadFileSync.mockImplementation((p: string) => {
+				if (String(p).endsWith('crewly-watchdog.sh')) throw new Error('ENOENT');
+				return JSON.stringify({ name: 'crewly' });
+			});
+
+			await serviceCommand('install', {});
+
+			expect(output()).toContain('Could not install the watchdog');
+			expect(written('com.crewly.watchdog.plist')).toHaveLength(0);
+			expect(output()).toContain('installed successfully');
+		});
+	});
+
+	describe('uninstall', () => {
+		it('boots the watchdog out and removes its plist and script', async () => {
+			mockExistsSync.mockImplementation((p: string) => {
+				const f = String(p);
+				return f.includes('com.crewly.watchdog.plist') || f.includes('crewly-watchdog.sh');
+			});
+
+			await serviceCommand('uninstall', {});
+
+			expect(commandsRun().some((c) => c.includes('launchctl bootout') && c.includes('com.crewly.watchdog'))).toBe(true);
+			expect(mockUnlinkSync).toHaveBeenCalledWith(expect.stringContaining('com.crewly.watchdog.plist'));
+			expect(mockUnlinkSync).toHaveBeenCalledWith(expect.stringContaining('crewly-watchdog.sh'));
+		});
+	});
+
+	describe('status', () => {
+		const installed = (extra: string[] = []) => (p: string) => {
+			const f = String(p);
+			return (
+				f.includes('crewly-start.command') ||
+				f.includes('com.crewly.watchdog.plist') ||
+				f.includes('crewly-watchdog.sh') ||
+				extra.some((e) => f.includes(e))
+			);
+		};
+
+		it('shows the watchdog as loaded', async () => {
+			mockExistsSync.mockImplementation(installed());
+			await serviceCommand('status', {});
+			expect(output()).toContain('Watchdog: Loaded');
+			expect(commandsRun().some((c) => c.includes('launchctl print gui/$(id -u)/com.crewly.watchdog'))).toBe(true);
+		});
+
+		it('flags a missing watchdog', async () => {
+			mockExistsSync.mockImplementation((p: string) => String(p).includes('crewly-start.command'));
+			await serviceCommand('status', {});
+			expect(output()).toContain('Watchdog: Not installed');
+		});
+
+		it('flags an installed but unloaded watchdog', async () => {
+			mockExistsSync.mockImplementation(installed());
+			mockExecAsync.mockImplementation((cmd: string) => (cmd.includes('launchctl print') ? new Error('not found') : ''));
+			await serviceCommand('status', {});
+			expect(output()).toContain('Watchdog: Installed but not loaded');
+		});
+
+		it('flags a paused watchdog and a deliberate stop', async () => {
+			mockExistsSync.mockImplementation(installed(['watchdog-paused', 'shutdown-requested']));
+			await serviceCommand('status', {});
+			expect(output()).toContain('PAUSED');
+			expect(output()).toContain('Stopped on purpose');
+		});
+	});
+
+	describe('pause / resume / stop marker', () => {
+		it('pause writes the flag the script checks; resume removes it', async () => {
+			await serviceCommand('pause', {});
+			expect(written('run/watchdog-paused')).toHaveLength(1);
+
+			mockExistsSync.mockImplementation((p: string) => String(p).includes('watchdog-paused'));
+			await serviceCommand('resume', {});
+			expect(mockUnlinkSync).toHaveBeenCalledWith(expect.stringContaining('run/watchdog-paused'));
+		});
+
+		it('service stop writes the shutdown marker so the watchdog stays out', async () => {
+			mockExistsSync.mockImplementation((p: string) => String(p).includes('crewly.pid'));
+			mockReadFileSync.mockReturnValue('12345');
+			jest.spyOn(process, 'kill').mockImplementation(() => true);
+			mockExecAsync.mockReturnValue('1');
+
+			await serviceCommand('stop', {});
+
+			expect(written('run/shutdown-requested')).toHaveLength(1);
+		});
+	});
+});

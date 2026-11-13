@@ -1,0 +1,1466 @@
+/**
+ * TicketIntakeService — the single intake point of the ticket loop
+ * (specs/ticket-loop.md, Phase 1 §1).
+ *
+ * Every surface the owner talks on (Slack team channels and shared rooms,
+ * Slack agent DMs, chat-v2 — which covers the dashboard, portal and phone —
+ * and the legacy chat + legacy Slack bridge) hands its inbound owner message
+ * to {@link TicketIntakeService.intake}. The service decides, with one shared
+ * gate, whether the message:
+ *
+ * - opens a new ticket (a `Request` with a TKT number, `kind`, `origin`,
+ *   `assignee`) and posts ONE receipt where it was said;
+ * - is a reply in a thread that already has a ticket — open, waiting for the
+ *   owner, or finished within {@link TICKET_CONSTANTS.FOLLOW_UP.RECENT_TICKET_MS}:
+ *   a follow-up, an answer or a decision is appended to its discussion (and
+ *   on a 待验收 ticket counts as the owner's OK); only a genuinely new ask
+ *   opens its own ticket in the same thread, linked to the parent (#827,
+ *   {@link isGenuinelyNewAsk});
+ * - is a DM reply soon after the conversation's latest ticket
+ *   ({@link TICKET_CONSTANTS.FOLLOW_UP.DM_WINDOW_MS}): the same, for
+ *   conversations where every message is top level;
+ * - is a reply in a thread an agent started (no ticket): an answer to the
+ *   agent, ignored unless it is a genuinely new ask (2026-09-28: 「发了」
+ *   「A 论文那个 开个Issue吧」 had become tickets of their own);
+ * - is "不用记" (don't track) and dismisses the ticket it answers;
+ * - is noise (trivial ack, file only, a status ping, agent-authored) and is
+ *   ignored. Request-phrased questions ("可以去研究一下 X 吗") are asks, and a
+ *   pure information question opens a lightweight `question` ticket (#827).
+ *
+ * Creation goes through {@link RequestService.create}, so `request:created`
+ * still fires and the decompose + SLA subscribers keep working unchanged.
+ *
+ * @module services/v3/ticket-intake.service
+ */
+
+import * as path from 'path';
+import { LoggerService, type ComponentLogger } from '../core/logger.service.js';
+import { modifyJsonFile } from '../../utils/file-io.utils.js';
+import { TICKET_CONSTANTS } from '../../constants.js';
+import { isApproval } from '../open-items/open-items.service.js';
+import { askText, classifyOwnerMessage, weightedTextLength, type AskClassification } from './ticket-ask-classifier.js';
+import { ticketLastActivity, RESEND_OR_WHERE } from './ticket-hygiene.js';
+import type { IntakeLogEvent, IntakeOutcomeRecorder } from './ticket-intake-log.js';
+import { redactSensitive } from '../wiki/wiki-redaction.js';
+import {
+  type Request,
+  type RequestStatus,
+  type TicketAcceptedBy,
+  TERMINAL_REQUEST_STATUSES,
+  isValidRequestTransition,
+} from '../../types/v2/request.types.js';
+import {
+  type TicketOrigin,
+  type TicketReceipt,
+  type TicketKind,
+  type TicketBoardColumn,
+  type TicketPriorityLabel,
+  type BoardWorkItemView,
+  formatTicketNumber,
+  parseTicketNumber,
+  deriveBoardColumn,
+  ticketPriorityLabel,
+  inferTicketKind,
+  uniqueTicketIdFromTexts,
+  parseReviewReply,
+  activeAcceptance,
+  ticketNeedsReview,
+  type ReviewReply,
+  type TicketAcceptance,
+  type TicketReply,
+} from '../../types/v2/ticket.types.js';
+
+// ---------------------------------------------------------------------------
+// Suppression gate (moved here from SlackOrchestratorBridge so every channel
+// uses the same rules)
+// ---------------------------------------------------------------------------
+
+/**
+ * Trimmed-text regex for trivial acknowledgement messages — anchored,
+ * case-insensitive, allows trailing punctuation, spaces and emoji. Matches
+ * "ok", "好的", "thx", "👍", etc.
+ *
+ * The tail used to be `\W*`, and CJK characters are all `\W`: 「是绿卡」
+ * 「对 就按第二种来 不用再问了」 read as a bare 「是」/「对」 and were dropped.
+ */
+const TRIVIAL_ACK_PATTERN = /^(ok|okay|好的|好|收到|thx|thanks|thank you|谢谢|多谢|👍|✅|got it|sure|yes|是|对|对的|嗯|嗯嗯|行)[\s\p{P}\p{S}]*$/iu;
+
+/**
+ * Trimmed-text regex matching the synthetic `[Slack File: …]` lines the
+ * Slack bridge appends for uploaded files.
+ */
+const FILE_REFERENCE_LINE = /\[Slack File:[^\]]*\]\.?/g;
+
+// `weightedTextLength` lives with the ask classifier now; re-exported so the
+// existing importers of this module keep working.
+export { weightedTextLength };
+
+/**
+ * Gate 1 — trivial acknowledgement or too short to be a request.
+ *
+ * @param rawText - Message text
+ * @returns `'trivial_or_short'` when suppressed, else null
+ */
+export function suppressTrivialOrShort(rawText: string): string | null {
+  const trimmed = rawText.trim();
+  if (weightedTextLength(trimmed) < TICKET_CONSTANTS.MIN_WEIGHTED_TEXT_LENGTH || TRIVIAL_ACK_PATTERN.test(trimmed)) {
+    return 'trivial_or_short';
+  }
+  return null;
+}
+
+/**
+ * Gate 3 — only file references (or only attachments), no narrative.
+ *
+ * @param rawText - Message text (may carry `[Slack File: …]` lines)
+ * @param hasAttachments - Whether the message carried files
+ * @returns `'file_only'` when suppressed, else null
+ */
+export function suppressFileOnly(rawText: string, hasAttachments = false): string | null {
+  const trimmed = rawText.trim();
+  const hadReference = FILE_REFERENCE_LINE.test(trimmed);
+  FILE_REFERENCE_LINE.lastIndex = 0;
+  const narrative = trimmed.replace(FILE_REFERENCE_LINE, '').trim();
+  if ((hadReference || hasAttachments) && narrative.length === 0) return 'file_only';
+  return null;
+}
+
+/**
+ * Text a ticket title is made from: Slack's raw `<@U0C2ZK849ND>` mention codes
+ * and `<https://…|label>` links read as noise on the board (2026-09-24:
+ * "[Message] <@U0C2ZK849ND> 看看这个"), so mentions go and links keep their
+ * label (or the bare URL).
+ *
+ * @param text - Message text
+ * @returns Cleaned text (the ticket description keeps the original)
+ */
+export function titleText(text: string): string {
+  const cleaned = text
+    .replace(/<@[A-Z0-9]+(\|[^>]*)?>/g, '')
+    .replace(/<(https?:[^>|]+)\|([^>]+)>/g, '$2')
+    .replace(/<(https?:[^>]+)>/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned || text.trim();
+}
+
+/**
+ * Whether a message is the "don't track" action.
+ *
+ * @param text - Message text
+ * @returns True for "不用记" and its variants
+ */
+export function isDismissText(text: string): boolean {
+  return TICKET_CONSTANTS.DISMISS_PATTERN.test(text);
+}
+
+/**
+ * Whether a reply in an existing conversation (a ticket's thread, an agent's
+ * thread, a DM right after a ticket) is a genuinely new ask that deserves its
+ * own ticket (2026-09-28). Stricter than the classifier's `new_ask` alone:
+ *
+ * - a question stays in the conversation (the agent answers it there);
+ * - a short reply (≤ {@link TICKET_CONSTANTS.FOLLOW_UP.SHORT_REPLY_WEIGHTED_LENGTH}
+ *   weighted) is an answer — 「可以改到10:30吗」 — unless it says 「帮我…」
+ *   outright or opens a new topic.
+ *
+ * @param text - The owner's message
+ * @param ask - Its in-thread classification
+ * @returns True when it opens a ticket of its own
+ *
+ * @example
+ * ```typescript
+ * isGenuinelyNewAsk('A 论文那个 开个Issue吧 放到backlog', classifyOwnerMessage(t, { inThread: true })); // false
+ * ```
+ */
+export function isGenuinelyNewAsk(text: string, ask: AskClassification): boolean {
+  if (ask.verdict !== 'new_ask') return false;
+  if (ask.signals.includes('strong_request') || ask.signals.includes('new_topic')) return true;
+  return weightedTextLength(askText(text)) > TICKET_CONSTANTS.FOLLOW_UP.SHORT_REPLY_WEIGHTED_LENGTH;
+}
+
+// ---------------------------------------------------------------------------
+// Chases ("之前说的X现在什么情况了？")
+// ---------------------------------------------------------------------------
+
+/**
+ * Wording that marks a chase: the owner points at EARLIER work or says it was
+ * forgotten. A bare status question ("what is the status of the deploy?") is
+ * not a chase and stays a ping.
+ */
+const CHASE_PATTERN = /(之前(说|讲|提|聊)过?的?|上次(说|讲|提)的?|忘了|忘记|还没(有)?(做|弄|好|出|看到|发|剪)|\bforgot(ten)?\b|\bearlier\b|\blast time\b)/i;
+/** CJK words that carry no topic once the chase wording is taken out. */
+const CHASE_FILLER_CJK =
+  /(之前|上次|说过?的?|讲过?的?|提过?的?|那个|这个|我们|你们|大家|现在|目前|是不是|是否|有没有|又|给|都|还|已经|什么|情况|怎么样了?|进度|进展|到哪了|忘了|忘记|了|吗|呢|吧|啊|的|是|在|把|被|和|跟|与)/g;
+/** Latin words that carry no topic. */
+const CHASE_FILLER_LATIN = /\b(forgot(ten)?|earlier|last|time|status|update|the|a|an|of|on|about|is|are|what|how|did|you|we|i)\b/gi;
+
+/**
+ * The topic words of a chase message, or null for a bare ping ("进度呢",
+ * "在吗", "status?") that names nothing.
+ *
+ * @param text - The owner's message
+ * @returns Latin tokens (lowercase) and CJK bigrams, or null when no topic
+ */
+export function chaseTopic(text: string): { latin: string[]; cjk: string[] } | null {
+  const body = askText(text).replace(/https?:\/\/\S+/g, ' ');
+  if (!CHASE_PATTERN.test(body)) return null;
+  const rest = body.replace(CHASE_FILLER_LATIN, ' ').replace(CHASE_FILLER_CJK, ' ');
+  const latin = [...new Set((rest.match(/[A-Za-z][A-Za-z0-9]{1,}/g) ?? []).map((w) => w.toLowerCase()))];
+  const cjkRuns = rest.match(/[一-鿿]+/g) ?? [];
+  const cjk: string[] = [];
+  for (const run of cjkRuns) {
+    if (run.length === 1) continue;
+    for (let i = 0; i < run.length - 1; i++) cjk.push(run.slice(i, i + 2));
+  }
+  if (latin.length === 0 && cjk.length === 0) return null;
+  return { latin, cjk: [...new Set(cjk)] };
+}
+
+/**
+ * How well a ticket matches a chase topic: Latin word hits count double
+ * (a name like "AZ" is far more specific than a CJK bigram).
+ *
+ * @param topic - From {@link chaseTopic}
+ * @param ticket - Candidate ticket
+ * @returns Score; a match needs at least 2
+ */
+export function chaseMatchScore(topic: { latin: string[]; cjk: string[] }, ticket: Pick<Request, 'title' | 'description'>): number {
+  const hay = `${ticket.title ?? ''}\n${ticket.description ?? ''}`.toLowerCase();
+  let score = 0;
+  for (const w of topic.latin) if (hay.includes(w)) score += 2;
+  for (const b of topic.cjk) if (hay.includes(b)) score += 1;
+  return score;
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** Where a receipt should be posted. */
+export type ReceiptTarget =
+  | {
+      kind: 'slack';
+      slackChannelId: string;
+      /** Thread to reply in (the message's thread root, or the message itself) */
+      threadTs: string;
+      /** Agent whose bot posts it (DMs, private rooms); absent = workspace bot */
+      postAs?: string;
+      /**
+       * The owner's own message. When set, the receipt is a 🎫 reaction on it
+       * instead of a thread reply: a reply per ticket was one more message
+       * (and notification) in every thread, next to the agent's own "working
+       * on it" (owner, 2026-09-24: 「每次都要问一下会不会很麻烦」).
+       */
+      messageTs?: string;
+    }
+  | {
+      kind: 'chat-v2';
+      chatChannelId: string;
+      /** Thread root the receipt goes under */
+      threadId?: string;
+    };
+
+/** One inbound message handed to intake. */
+export interface IntakeMessage {
+  /** Message text as the owner wrote it (file references allowed) */
+  text: string;
+  /** Where and by whom */
+  origin: TicketOrigin;
+  /** Attached files, when any */
+  attachments?: ReadonlyArray<{ name?: string }>;
+  /** True only for the owner's own words — agent-authored text never opens a ticket */
+  isOwner: boolean;
+  /** The agent the message was addressed to (becomes `assignee`) */
+  targetAgent?: string;
+  /**
+   * Conversation the message belongs to (a Slack channel, a chat-v2 channel).
+   * A top-level "不用记" dismisses the latest open ticket from it. Must be the
+   * prefix of `origin.threadRef` (`<conversationRef>:<thread root>`).
+   */
+  conversationRef?: string;
+  /**
+   * sourceConversationItemId of the thread root as older (pre-ticket) code
+   * stored it, so a reply in a thread opened before the ticket loop still
+   * counts as a continuation.
+   */
+  legacyThreadParentRef?: string;
+  /** Extra tags (e.g. `slack` / `chat-v2` for the SLA subscriber) */
+  tags?: readonly string[];
+  /**
+   * The message is a reply inside a thread (not the thread's root). A reply
+   * in a thread with no ticket answers whoever started it — an agent.
+   */
+  isThreadReply?: boolean;
+  /**
+   * With `isThreadReply`: the thread's root is the OWNER's own message (not an
+   * agent's brief). If that root opened no ticket (intake missed it, or it
+   * read as a pure question), the owner's replies are still asks — they must
+   * not be dropped as answers to an agent.
+   */
+  threadRootIsOwner?: boolean;
+  /** Where to post the receipt; omitted = no receipt */
+  receipt?: ReceiptTarget;
+}
+
+/** What intake did with a message. */
+export type IntakeOutcome =
+  | { action: 'created'; ticket: Request }
+  /** A new ask in another ticket's thread: its own ticket, linked to that one (#827) */
+  | { action: 'created_in_thread'; ticket: Request; parent: Request }
+  | { action: 'appended'; ticket: Request }
+  | { action: 'duplicate'; ticket: Request }
+  | { action: 'dismissed'; ticket: Request }
+  /** 验过了 on a 待验收 ticket (Phase 2) */
+  | { action: 'verified'; ticket: Request }
+  /** 打回 on a 待验收 ticket (Phase 2) */
+  | { action: 'rejected'; ticket: Request }
+  | { action: 'ignored'; reason: string };
+
+/** The review actions intake hands 验过了 / 打回 / follow-ups to (TicketReviewService). */
+export interface IntakeReviewHandler {
+  verify(ref: string): Promise<{ ok: boolean; ticket?: Request }>;
+  reject(ref: string, reason: string, via: 'thread'): Promise<{ ok: boolean; ticket?: Request }>;
+  reopenOnFollowUp(ticketId: string): Promise<Request | null>;
+}
+
+/** Posts and edits receipts on one kind of surface. */
+export interface TicketReceiptSink {
+  /**
+   * Post the receipt for a new ticket.
+   *
+   * @param ticket - The ticket
+   * @param target - Where to post
+   * @returns Where it landed, or null when it could not be posted
+   */
+  post(ticket: Request, target: ReceiptTarget): Promise<TicketReceipt | null>;
+  /**
+   * Change an existing receipt to "no longer tracked".
+   *
+   * @param ticket - The dismissed ticket
+   * @param receipt - The receipt to edit
+   */
+  markDismissed(ticket: Request, receipt: TicketReceipt): Promise<void>;
+  /**
+   * Change an existing receipt to "done" (Phase 2).
+   *
+   * @param ticket - The accepted ticket
+   * @param receipt - The receipt to edit
+   */
+  markDone?(ticket: Request, receipt: TicketReceipt): Promise<void>;
+}
+
+/** RequestService surface the intake needs (narrow for tests). */
+export interface TicketRequestStore {
+  create(input: Parameters<import('./request.service.js').RequestService['create']>[0]): Promise<Request>;
+  getById(id: string): Promise<Request | null>;
+  listAll(): Promise<Request[]>;
+  update(id: string, updates: Parameters<import('./request.service.js').RequestService['update']>[1]): Promise<Request>;
+  getRequestsDir(): string;
+}
+
+/** Board-shaped ticket row returned by the API. */
+export interface TicketListItem {
+  id: string;
+  tkt: string | null;
+  ticketNumber: number | null;
+  title: string;
+  description: string;
+  kind: TicketKind;
+  column: TicketBoardColumn;
+  status: RequestStatus;
+  priority: Request['priority'];
+  priorityLabel: TicketPriorityLabel;
+  origin: TicketOrigin | null;
+  assignee: string | null;
+  workItemIds: string[];
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
+  /** Live acceptance criteria (removed ones left out) */
+  acceptance: TicketAcceptance[];
+  /** Start of the latest agent answer */
+  reply: TicketReply | null;
+  rejectCount: number;
+  submitCount: number;
+  /** When it last went to 待验收 */
+  submittedAt: string | null;
+  completedAt: string | null;
+  /** When silence will accept it (待验收 only) */
+  autoAcceptAt: string | null;
+  /**
+   * How a done ticket was accepted (#813): `owner` reviewed it, `silence` =
+   * nobody objected in time. Null while open. Older tickets fall back to the
+   * `auto_accepted` tag.
+   */
+  acceptedBy: TicketAcceptedBy | null;
+}
+
+/** Filters for {@link TicketIntakeService.list}. */
+export interface TicketListQuery {
+  column?: TicketBoardColumn;
+  kind?: TicketKind;
+  /** Case-insensitive search over TKT, title and description */
+  q?: string;
+  /** Include Requests from before the ticket loop (no TKT number) */
+  includeLegacy?: boolean;
+}
+
+/** Input for {@link TicketIntakeService.split}. */
+export interface SplitTicketInput {
+  /**
+   * `ref` of a discussion entry to move out into the new ticket — the usual
+   * case: a new ask was appended to the wrong ticket. Its text becomes the
+   * new ticket's description.
+   */
+  discussionRef?: string;
+  /** Text of the new ask (required when no `discussionRef`) */
+  text?: string;
+  /** Title override (default: made from the text, as for any ticket) */
+  title?: string;
+  /** Who takes it (default: the source ticket's assignee) */
+  assignee?: string;
+  /** A pure information question: kind `question`, no acceptance step */
+  question?: boolean;
+  /** Who asked for the split (agent session), for the log */
+  by?: string;
+}
+
+/** Result of {@link TicketIntakeService.split}. */
+export type SplitResult =
+  | { ok: true; ticket: Request; source: Request; moved: boolean }
+  | { ok: false; reason: 'not_found' | 'invalid' | 'discussion_not_found' | 'no_origin'; ticket?: Request };
+
+/** Result of {@link TicketIntakeService.dismiss}. */
+export type DismissResult =
+  | { ok: true; ticket: Request; alreadyDismissed: boolean }
+  | { ok: false; reason: 'not_found' | 'already_done' | 'invalid_transition'; ticket?: Request };
+
+/** Constructor dependencies. */
+export interface TicketIntakeServiceDeps {
+  requests: TicketRequestStore;
+  /** WorkItem lookup for the derived board column (optional) */
+  findWorkItem?: (id: string) => Promise<BoardWorkItemView | null | undefined>;
+  now?: () => Date;
+  /** Post receipts (default {@link TICKET_CONSTANTS.RECEIPT.ENABLED}, i.e. off) */
+  receiptsEnabled?: boolean;
+  /**
+   * Where each owner message's fate is recorded (#828 coverage: the receipt
+   * says how many messages became tickets, went into one, or were ignored).
+   */
+  outcomeLog?: IntakeOutcomeRecorder | null;
+}
+
+/** Counter file shape. */
+interface TicketCounterFile {
+  /** Last number handed out; -1 = not yet seeded from existing tickets */
+  last: number;
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+/**
+ * Single intake point for owner messages → tickets. See module docs.
+ */
+export class TicketIntakeService {
+  private readonly logger: ComponentLogger;
+  private readonly sinks: Partial<Record<ReceiptTarget['kind'], TicketReceiptSink>> = {};
+  /** Serialises intake so two messages in one thread cannot both open a ticket. */
+  private chain: Promise<unknown> = Promise.resolve();
+  /** 验过了 / 打回 handler (Phase 2); absent = those words are plain follow-ups */
+  private review: IntakeReviewHandler | null = null;
+  /** Tells a ticket's assignee the owner chased it; absent = the discussion entry only */
+  private chaseNudge: ((agentSession: string, text: string) => Promise<void>) | null = null;
+
+  /**
+   * @param deps - Request store and optional WorkItem lookup
+   */
+  constructor(private readonly deps: TicketIntakeServiceDeps) {
+    this.logger = LoggerService.getInstance().createComponentLogger('TicketIntake');
+  }
+
+  /**
+   * Register the receipt poster for a surface.
+   *
+   * @param kind - `slack` or `chat-v2`
+   * @param sink - The poster, or null to remove
+   */
+  setReceiptSink(kind: ReceiptTarget['kind'], sink: TicketReceiptSink | null): void {
+    if (sink) this.sinks[kind] = sink;
+    else delete this.sinks[kind];
+  }
+
+  /**
+   * Wire the nudge sent to an assignee when the owner chases its ticket.
+   *
+   * @param nudge - Sends text to an agent session, or null to remove
+   */
+  setChaseNudge(nudge: ((agentSession: string, text: string) => Promise<void>) | null): void {
+    this.chaseNudge = nudge;
+  }
+
+  /**
+   * Wire the review handler (Phase 2).
+   *
+   * @param handler - The handler, or null to remove
+   */
+  setReviewHandler(handler: IntakeReviewHandler | null): void {
+    this.review = handler;
+  }
+
+  /**
+   * Mark a ticket's receipt done (🎫 → ✅ on Slack, "is done" in chat-v2).
+   *
+   * @param ticket - The done ticket
+   */
+  async markReceiptDone(ticket: Request): Promise<void> {
+    if (!ticket.receipt) return;
+    const sink = this.sinks[ticket.receipt.kind];
+    if (sink?.markDone) await sink.markDone(ticket, ticket.receipt);
+  }
+
+  /**
+   * Spec entry point: take one inbound message.
+   *
+   * @param message - The message
+   * @returns The ticket the message now belongs to (new, appended-to or
+   *   dedupe hit), or null when it opened nothing
+   */
+  async intake(message: IntakeMessage): Promise<Request | null> {
+    const outcome = await this.intakeWithOutcome(message);
+    return outcome.action === 'created' ||
+      outcome.action === 'created_in_thread' ||
+      outcome.action === 'appended' ||
+      outcome.action === 'duplicate'
+      ? outcome.ticket
+      : null;
+  }
+
+  /**
+   * Take one inbound message and say what happened to it.
+   *
+   * Never throws: a failure is logged and reported as `ignored`, because
+   * intake must never stop a message from being delivered.
+   *
+   * @param message - The message
+   * @returns The outcome
+   */
+  intakeWithOutcome(message: IntakeMessage): Promise<IntakeOutcome> {
+    const run = this.chain.then(() => this.process(message));
+    this.chain = run.catch(() => undefined);
+    return run
+      .catch((err: unknown) => {
+        this.logger.warn('Ticket intake failed (message still delivered)', {
+          ref: message.origin.ref,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return { action: 'ignored', reason: 'error' } as IntakeOutcome;
+      })
+      .then(async (outcome) => {
+        await this.recordOutcome(message, outcome);
+        return outcome;
+      });
+  }
+
+  /**
+   * Log that an owner message never reached {@link intake} because the caller
+   * skipped it (e.g. another machine owns a shared room's message). Without
+   * this, a dropped ask leaves no trace in the intake log. Never throws.
+   *
+   * @param message - The message
+   * @param reason - Why the caller skipped intake
+   */
+  async recordSkipped(message: IntakeMessage, reason: string): Promise<void> {
+    if (!message.isOwner) return;
+    await this.recordOutcome(message, { action: 'ignored', reason });
+  }
+
+  /**
+   * Record what happened to an owner message (#828 coverage). Duplicates are
+   * the same message delivered twice and are not counted again. Never throws.
+   *
+   * @param message - The message
+   * @param outcome - What intake did with it
+   */
+  private async recordOutcome(message: IntakeMessage, outcome: IntakeOutcome): Promise<void> {
+    const log = this.deps.outcomeLog;
+    if (!log || !message.isOwner || outcome.action === 'duplicate') return;
+    const base = { at: this.now().toISOString(), ref: message.origin.ref };
+    let event: IntakeLogEvent;
+    if (outcome.action === 'ignored') {
+      event = { ...base, action: 'ignored', reason: outcome.reason };
+    } else if (outcome.action === 'created' || outcome.action === 'created_in_thread') {
+      event = { ...base, action: 'created', ticketId: outcome.ticket.id, ...(typeof outcome.ticket.ticketNumber === 'number' ? { ticketNumber: outcome.ticket.ticketNumber } : {}) };
+    } else {
+      // appended, or a review reply / 不用记 that went into an existing ticket.
+      const text = (message.text ?? '').trim();
+      const askSignal = outcome.action === 'appended' && classifyOwnerMessage(text, { inThread: true }).ask > 0;
+      event = {
+        ...base,
+        action: 'appended',
+        ...(outcome.action !== 'appended' ? { reason: outcome.action } : {}),
+        ticketId: outcome.ticket.id,
+        ...(typeof outcome.ticket.ticketNumber === 'number' ? { ticketNumber: outcome.ticket.ticketNumber } : {}),
+        ...(askSignal ? { askSignal: true, text: redactSensitive(text).slice(0, 400) } : {}),
+      };
+    }
+    try {
+      await log.record(event);
+    } catch (err) {
+      this.logger.warn('Intake outcome could not be recorded (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /**
+   * The gate, in order. See module docs.
+   *
+   * @param message - The message
+   * @returns The outcome
+   */
+  private async process(message: IntakeMessage): Promise<IntakeOutcome> {
+    if (!message.isOwner) return this.ignored(message, 'not_owner');
+    const text = (message.text ?? '').trim();
+    const all = await this.deps.requests.listAll();
+
+    // "不用记" — the owner undoing the ticket this message answers.
+    if (isDismissText(text)) {
+      const target = this.findDismissTarget(all, message);
+      if (!target) return this.ignored(message, 'dismiss_without_ticket');
+      const result = await this.dismissTicket(target);
+      if (!result.ok) return this.ignored(message, `dismiss_${result.reason}`);
+      return { action: 'dismissed', ticket: result.ticket };
+    }
+
+    // Same message twice (Slack redelivery, two event types) — whether it
+    // opened a ticket or was appended to one.
+    const duplicate = all.find(
+      (r) => r.sourceConversationItemId === message.origin.ref || (r.discussion ?? []).some((d) => d.ref === message.origin.ref),
+    );
+    if (duplicate) return { action: 'duplicate', ticket: duplicate };
+
+    // A follow-up in a thread that already has a ticket.
+    const threadTicket = this.findThreadTicket(all, message);
+    const review = parseReviewReply(text);
+    // The agent asked "is this OK?" in its own words; a plain 「好的」「可以」
+    // back is the OK (2026-09-24).
+    const ack = TICKET_CONSTANTS.REVIEW.ACK_PATTERN.test(text);
+    if (threadTicket) {
+      if (TERMINAL_REQUEST_STATUSES.has(threadTicket.status)) {
+        // A dismissed thread stays quiet.
+        if (threadTicket.tags.includes(TICKET_CONSTANTS.DISMISSED_TAG)) {
+          return this.ignored(message, 'thread_dismissed');
+        }
+        // A recently finished ticket's thread is still its conversation: the
+        // owner answering the agent, choosing, parking it — not a new ticket.
+        if (this.finishedRecently(threadTicket)) {
+          const ask = classifyOwnerMessage(text, { inThread: true });
+          if (isGenuinelyNewAsk(text, ask)) return this.createInThread(all, message, text, threadTicket, ask);
+          return this.appendToTicket(threadTicket, message, text);
+        }
+        // An old thread: a new conversation (it may open a ticket below).
+      } else if (threadTicket.status === 'waiting_confirmation' && this.review) {
+        if (review) return this.applyReview(threadTicket, review);
+        if (ack) return this.applyReview(threadTicket, { action: 'verify' });
+        // A new ask does not reopen the answered one: it gets its own ticket.
+        const ask = classifyOwnerMessage(text, { inThread: true });
+        if (isGenuinelyNewAsk(text, ask)) return this.createInThread(all, message, text, threadTicket, ask);
+        // Anything else from the owner that is not 打回 is his OK (2026-09-28).
+        return this.acceptOnFollowUp(threadTicket, message, text);
+      } else {
+        // #827: a thread is not one ticket — but only a genuinely new ask
+        // opens its own; answers, choices and questions stay in this one.
+        const ask = classifyOwnerMessage(text, { inThread: true });
+        if (isGenuinelyNewAsk(text, ask)) return this.createInThread(all, message, text, threadTicket, ask);
+        return this.appendToTicket(threadTicket, message, text);
+      }
+    }
+
+    // 验过了 / 打回 outside a thread (DMs, where every message is top-level):
+    // the newest 待验收 ticket of this conversation.
+    if ((review || ack) && this.review && message.conversationRef) {
+      const conversation = message.conversationRef;
+      const inReview = all.find(
+        (r) => r.status === 'waiting_confirmation' && typeof r.ticketNumber === 'number' && this.conversationMatches(r, conversation),
+      );
+      // A bare 「好的」 only counts while the agent's question is recent — the
+      // owner says 「好的」 to plenty of other things in a DM.
+      const recent =
+        inReview &&
+        this.now().getTime() - Date.parse(inReview.lastNudgeAt ?? inReview.submittedAt ?? inReview.updatedAt) <
+          TICKET_CONSTANTS.REVIEW.NUDGE_AFTER_MS;
+      if (inReview && (review || recent)) return this.applyReview(inReview, review ?? { action: 'verify' });
+    }
+
+    // A DM reply right after the conversation's latest ticket is its
+    // follow-up — short answers too (「是绿卡」 answers the agent's question).
+    if (!threadTicket && text && !TRIVIAL_ACK_PATTERN.test(text)) {
+      const recent = this.recentConversationTicket(all, message);
+      if (recent && !isGenuinelyNewAsk(text, classifyOwnerMessage(text, { inThread: true }))) {
+        if (recent.status === 'waiting_confirmation' && this.review) return this.acceptOnFollowUp(recent, message, text);
+        return this.appendToTicket(recent, message, text);
+      }
+    }
+
+    // A chase about earlier work ("之前说的X现在什么情况了？") is tracked, not
+    // ignored as a status ping: it goes to the ticket it is about, or opens a
+    // lightweight one so the agent's promises in reply are followed up.
+    if (!threadTicket && !message.isThreadReply && text) {
+      const chase = await this.handleChase(all, message, text);
+      if (chase) return chase;
+    }
+
+    const trivial = suppressTrivialOrShort(text);
+    if (trivial) return this.ignored(message, trivial);
+    const fileOnly = suppressFileOnly(text, (message.attachments?.length ?? 0) > 0);
+    if (fileOnly) return this.ignored(message, fileOnly);
+
+    // A reply in a thread the OWNER started that holds no ticket (intake missed
+    // the root, or read it as a question): the replies are his asks and
+    // corrections, not answers to an agent (2026-10-13, AZ star video).
+    const ownerRooted = !threadTicket && !!message.isThreadReply && !!message.threadRootIsOwner;
+    if (!threadTicket) {
+      const threadAsk = classifyOwnerMessage(text, { inThread: true });
+      if (ownerRooted) {
+        // Only pure acknowledgements, approvals and status pings stay quiet.
+        const quiet = threadAsk.signals.some((s) => s === 'ack_only' || s === 'approval' || s === 'status_ping');
+        if (quiet && !isGenuinelyNewAsk(text, threadAsk)) return this.ignored(message, 'thread_reply');
+      } else if (message.isThreadReply && !isGenuinelyNewAsk(text, threadAsk)) {
+        // A reply in a thread an agent started (a brief, a question): the
+        // owner is answering it. Only a genuinely new ask becomes a ticket.
+        return this.ignored(message, 'thread_reply');
+      }
+    }
+
+    // Lazy: v3-data pulls in the pool and storage singletons, which the Slack
+    // modules that import this service must not load at module time.
+    const { classifyIntent } = await import('./v3-data.service.js');
+    const intent = classifyIntent(text);
+    // #827: the intent classifier calls 「可以去研究一下 X 吗」 L0 and many
+    // requests a `query`; the ask classifier rescues those. Status pings and
+    // chatter stay ignored.
+    const ask = classifyOwnerMessage(text, { inThread: false });
+    const rescued = ask.verdict === 'new_ask' || ask.verdict === 'question';
+    // "Is Nova online yet?" is a ping, not an ask — even when the intent
+    // classifier calls it actionable.
+    if (!ownerRooted) {
+      if (!rescued && ask.signals.includes('status_ping') && ask.ask === 0) return this.ignored(message, 'status_ping');
+      if (intent.intentCategory === 'query' && !rescued) return this.ignored(message, 'query');
+      if (intent.intentLevel === 'L0' && !rescued) return this.ignored(message, 'not_actionable');
+    }
+
+    // A finished ticket's thread: the new ticket still records where it came from.
+    const ticket = await this.createTicket(all, message, text, {
+      question: ask.verdict === 'question',
+      ...(threadTicket ? { parent: threadTicket } : {}),
+    });
+    this.logger.info('Ticket created', {
+      tkt: formatTicketNumber(ticket.ticketNumber as number),
+      id: ticket.id,
+      channel: message.origin.channel,
+      assignee: message.targetAgent,
+      ...(rescued && (intent.intentCategory === 'query' || intent.intentLevel === 'L0') ? { rescuedBy: ask.signals } : {}),
+    });
+    if (message.receipt) void this.postReceipt(ticket, message.receipt);
+    return { action: 'created', ticket };
+  }
+
+  /**
+   * Handle a top-level chase. Bare pings ("进度呢", "在吗") name no topic and
+   * return null (they stay ignored further down).
+   *
+   * @param all - Every Request
+   * @param message - The owner's message
+   * @param text - Trimmed text
+   * @returns The outcome, or null when the message is not a chase with a topic
+   */
+  private async handleChase(all: readonly Request[], message: IntakeMessage, text: string): Promise<IntakeOutcome | null> {
+    const topic = chaseTopic(text);
+    if (!topic) return null;
+    const horizon = this.now().getTime() - TICKET_CONSTANTS.FOLLOW_UP.CHASE_MATCH_WINDOW_MS;
+    let best: { ticket: Request; score: number } | null = null;
+    for (const r of all) {
+      if (typeof r.ticketNumber !== 'number' || TERMINAL_REQUEST_STATUSES.has(r.status)) continue;
+      if (r.tags.includes(TICKET_CONSTANTS.DISMISSED_TAG)) continue;
+      if (ticketLastActivity(r) < horizon) continue;
+      const score = chaseMatchScore(topic, r);
+      if (score >= 2 && (!best || score > best.score)) best = { ticket: r, score };
+    }
+    if (best) {
+      const outcome = await this.appendToTicket(best.ticket, message, text);
+      const target = outcome.action === 'appended' ? outcome.ticket : best.ticket;
+      if (target.assignee && this.chaseNudge) {
+        const tkt = formatTicketNumber(target.ticketNumber as number);
+        void this.chaseNudge(
+          target.assignee,
+          `The owner is asking where ${tkt} stands: "${text.slice(0, 300)}". Answer in the thread; if you owe anything, say what and when.`,
+        ).catch(() => undefined);
+      }
+      this.logger.info('Chase appended to its ticket', { id: target.id, score: best.score });
+      return outcome;
+    }
+    const ticket = await this.createTicket(all, message, text, { question: true, extraTags: ['chase'] });
+    this.logger.info('Chase opened a lightweight ticket', { tkt: formatTicketNumber(ticket.ticketNumber as number), id: ticket.id });
+    if (message.receipt) void this.postReceipt(ticket, message.receipt);
+    return { action: 'created', ticket };
+  }
+
+  /**
+   * A new ask said in another ticket's thread (#827): open its own ticket in
+   * the same thread, linked to the one it was said under.
+   *
+   * @param all - Every Request
+   * @param message - The owner's message
+   * @param text - Trimmed text
+   * @param parent - The ticket whose thread it was said in
+   * @param ask - The classifier's verdict (for the log)
+   * @returns `created_in_thread`
+   */
+  private async createInThread(
+    all: readonly Request[],
+    message: IntakeMessage,
+    text: string,
+    parent: Request,
+    ask: AskClassification,
+  ): Promise<IntakeOutcome> {
+    const ticket = await this.createTicket(all, message, text, {
+      parent,
+      question: ask.verdict === 'question',
+      // Addressed to nobody in particular: whoever holds the thread's ticket.
+      fallbackAssignee: parent.assignee,
+    });
+    this.logger.info('New ask in a ticket thread → its own ticket', {
+      tkt: formatTicketNumber(ticket.ticketNumber as number),
+      parent: parent.id,
+      signals: ask.signals,
+      ask: ask.ask,
+      follow: ask.follow,
+    });
+    if (message.receipt) void this.postReceipt(ticket, message.receipt);
+    return { action: 'created_in_thread', ticket, parent };
+  }
+
+  /**
+   * Create one ticket from an owner message (top level, a new ask in a
+   * thread, or a split).
+   *
+   * @param all - Every Request (for the ticket number)
+   * @param message - The message it comes from
+   * @param text - Its text
+   * @param opts.parent - The ticket it came from, if any
+   * @param opts.question - A pure information question: kind `question`, no acceptance step
+   * @param opts.fallbackAssignee - Assignee when the message names no agent
+   * @param opts.extraTags - More tags (e.g. `split`)
+   * @returns The new ticket
+   */
+  private async createTicket(
+    all: readonly Request[],
+    message: IntakeMessage,
+    text: string,
+    opts: { parent?: Request; question?: boolean; fallbackAssignee?: string; extraTags?: readonly string[] },
+  ): Promise<Request> {
+    const { classifyIntent, generateRequestTitle } = await import('./v3-data.service.js');
+    const { intentLevel, intentCategory } = classifyIntent(text);
+    const ticketNumber = await this.nextTicketNumber(all);
+    const tags = [
+      ...new Set([TICKET_CONSTANTS.TAG, message.origin.channel, ...(message.tags ?? []), ...(opts.extraTags ?? [])]),
+    ];
+    const assignee = message.targetAgent ?? opts.fallbackAssignee;
+    return this.deps.requests.create({
+      sourceConversationItemId: message.origin.ref,
+      title: generateRequestTitle(titleText(text), intentCategory),
+      description: text,
+      priority: 'normal',
+      tags,
+      // A rescued L0 is still an ask: never store it as not-actionable.
+      intentLevel: intentLevel === 'L0' ? 'L1' : intentLevel,
+      intentCategory,
+      ticketNumber,
+      kind: opts.question ? 'question' : inferTicketKind(text),
+      origin: message.origin,
+      // Phase 2: the owner accepts it (or silence does); cron / mission close
+      // alone; a pure question has no acceptance step (#827).
+      requiresConfirmation:
+        !opts.question &&
+        !TICKET_CONSTANTS.REVIEW.NO_REVIEW_ORIGINS.includes(message.origin.channel) &&
+        !TICKET_CONSTANTS.REVIEW.NO_REVIEW_CATEGORIES.includes(intentCategory),
+      ...(assignee ? { assignee } : {}),
+      ...(opts.parent ? { parentTicketId: opts.parent.id } : {}),
+    });
+  }
+
+  /**
+   * Hand a 验过了 / 打回 to the review handler.
+   *
+   * @param ticket - The 待验收 ticket
+   * @param review - What the owner said
+   * @returns The outcome
+   */
+  private async applyReview(ticket: Request, review: NonNullable<ReviewReply>): Promise<IntakeOutcome> {
+    const handler = this.review;
+    if (!handler) return { action: 'appended', ticket };
+    const result =
+      review.action === 'verify' ? await handler.verify(ticket.id) : await handler.reject(ticket.id, review.reason, 'thread');
+    const after = result.ticket ?? ticket;
+    if (!result.ok) return { action: 'appended', ticket: after };
+    return review.action === 'verify' ? { action: 'verified', ticket: after } : { action: 'rejected', ticket: after };
+  }
+
+  /**
+   * Log and build an `ignored` outcome.
+   *
+   * @param message - The message
+   * @param reason - Why
+   * @returns The outcome
+   */
+  private ignored(message: IntakeMessage, reason: string): IntakeOutcome {
+    this.logger.debug('Message did not open a ticket', { ref: message.origin.ref, channel: message.origin.channel, reason });
+    return { action: 'ignored', reason };
+  }
+
+  /**
+   * The ticket a message in this thread should be routed to, if any.
+   *
+   * #827 lets a thread hold more than one open ticket at once (a new ask
+   * said under an existing ticket gets its own, linked, ticket). #831: when
+   * that happens, a `waiting_confirmation` ticket — one the owner still owes
+   * an answer on — must keep priority over a newer sibling ticket, or every
+   * reply in the thread (a review verdict, an ack, or an ordinary follow-up)
+   * lands on whichever ticket is newest instead of the one actually awaiting
+   * approval. Left unfixed, the awaiting ticket never hears back and only
+   * times out as "默认通过 · 未验收" (see `escalation-router.service.ts`) —
+   * exactly the outcome #819's verification gate exists to prevent.
+   *
+   * Deliberate choice: this applies to EVERY message routed through a
+   * thread, including a plain follow-up with no review/ack wording — not
+   * only review replies. A thread with an open ticket the owner still owes
+   * an answer on has one live conversation; a message that isn't itself a
+   * new, distinct ask (see {@link classifyOwnerMessage}) is presumed to be
+   * about that conversation, not about a because-it's-newer sibling ticket.
+   * When nothing in the thread is `waiting_confirmation`, behaviour is
+   * unchanged: prefer any open ticket, newest first (`listAll` is
+   * newest-first), falling back to the newest ticket overall.
+   *
+   * @param all - Every Request
+   * @param message - The message
+   * @returns The ticket to route to, or null when the thread has none
+   */
+  private findThreadTicket(all: readonly Request[], message: IntakeMessage): Request | null {
+    const threadRef = message.origin.threadRef;
+    const legacy = message.legacyThreadParentRef;
+    const matches = all.filter(
+      (r) =>
+        (threadRef && r.origin?.threadRef === threadRef) ||
+        (legacy && r.sourceConversationItemId === legacy),
+    );
+    if (matches.length === 0) return null;
+    return (
+      matches.find((r) => r.status === 'waiting_confirmation') ??
+      matches.find((r) => !TERMINAL_REQUEST_STATUSES.has(r.status)) ??
+      matches[0]
+    );
+  }
+
+  /**
+   * The ticket a "不用记" is aimed at: the open ticket in its thread, else the
+   * newest open ticket opened recently in the same conversation.
+   *
+   * @param all - Every Request
+   * @param message - The dismiss message
+   * @returns The ticket, or null
+   */
+  private findDismissTarget(all: readonly Request[], message: IntakeMessage): Request | null {
+    const inThread = this.findThreadTicket(all, message);
+    if (inThread && !TERMINAL_REQUEST_STATUSES.has(inThread.status)) return inThread;
+    const conversation = message.conversationRef;
+    if (!conversation) return null;
+    const cutoff = this.now().getTime() - TICKET_CONSTANTS.DISMISS_LOOKBACK_MS;
+    return (
+      all.find(
+        (r) =>
+          typeof r.ticketNumber === 'number' &&
+          !TERMINAL_REQUEST_STATUSES.has(r.status) &&
+          this.conversationMatches(r, conversation) &&
+          Date.parse(r.createdAt) >= cutoff,
+      ) ?? null
+    );
+  }
+
+  /**
+   * Whether a ticket was opened in a conversation. Thread refs are built as
+   * `<conversationRef>:<thread root>` (see ticket-channel-hooks), so the
+   * conversation is a prefix of the thread.
+   *
+   * @param r - Ticket
+   * @param conversation - Conversation ref
+   * @returns True when it was
+   */
+  private conversationMatches(r: Request, conversation: string): boolean {
+    return !!r.origin?.threadRef && r.origin.threadRef.startsWith(`${conversation}:`);
+  }
+
+  /**
+   * Whether a finished ticket finished recently enough that its thread is
+   * still its conversation ({@link TICKET_CONSTANTS.FOLLOW_UP.RECENT_TICKET_MS}).
+   *
+   * @param ticket - A done or cancelled ticket
+   * @returns True when follow-ups in its thread still belong to it
+   */
+  private finishedRecently(ticket: Request): boolean {
+    const at = Date.parse(ticket.completedAt ?? ticket.updatedAt);
+    return Number.isFinite(at) && this.now().getTime() - at < TICKET_CONSTANTS.FOLLOW_UP.RECENT_TICKET_MS;
+  }
+
+  /**
+   * In a DM-like conversation (every message top level), the ticket a reply
+   * most likely follows up: the conversation's ticket with the latest
+   * activity, if that was within {@link TICKET_CONSTANTS.FOLLOW_UP.DM_WINDOW_MS}.
+   * Dismissed tickets never take follow-ups.
+   *
+   * @param all - Every Request
+   * @param message - The message
+   * @returns The ticket, or null
+   */
+  private recentConversationTicket(all: readonly Request[], message: IntakeMessage): Request | null {
+    const conversation = message.conversationRef;
+    if (!conversation || !TICKET_CONSTANTS.FOLLOW_UP.DM_ORIGINS.includes(message.origin.channel)) return null;
+    const cutoff = this.now().getTime() - TICKET_CONSTANTS.FOLLOW_UP.DM_WINDOW_MS;
+    let best: Request | null = null;
+    let bestAt = -Infinity;
+    for (const r of all) {
+      if (typeof r.ticketNumber !== 'number' || !this.conversationMatches(r, conversation)) continue;
+      if (r.tags.includes(TICKET_CONSTANTS.DISMISSED_TAG) || r.tags.includes(TICKET_CONSTANTS.STALE.TAG)) continue;
+      const at = ticketLastActivity(r);
+      if (at >= cutoff && at > bestAt) {
+        best = r;
+        bestAt = at;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * An owner follow-up on a 待验收 ticket that is not 打回 — three outcomes
+   * (specs/2026-10-02-harness-owned-routing.md §5):
+   *  - an approval-like answer (好 / 可以 / OK / approve / ship it / 👍 and the
+   *    review aliases) accepts it, as before (2026-09-28);
+   *  - 打回 (handled before this) sends it back, as before;
+   *  - anything else — a question, "where is it / send it again", "can you
+   *    also…", "发了 请持续关注" — neither accepts nor reopens: the ticket stays
+   *    待验收, the message is kept in its discussion and reaches the agent as an
+   *    ordinary owner message it owes an answer to, and the reminder /
+   *    auto-accept clock (`submittedAt`) keeps running. "where did you send
+   *    it? send the link again" accepted TKT-187.
+   * When an approval cannot be taken yet (live work), the agent is back on it.
+   *
+   * @param ticket - The 待验收 ticket
+   * @param message - The follow-up
+   * @param text - Trimmed text
+   * @returns `verified`, or `appended` (kept in review, or reopened for live work)
+   */
+  private async acceptOnFollowUp(ticket: Request, message: IntakeMessage, text: string): Promise<IntakeOutcome> {
+    const review = this.review;
+    if (!review) return this.appendToTicket(ticket, message, text);
+    if (!isAcceptanceReply(text)) {
+      this.logger.info('Owner follow-up on a ticket in review is not an approval — kept in review, delivered to the agent', { ticket: ticket.id });
+      return this.appendToTicket(ticket, message, text);
+    }
+    const result = await review.verify(ticket.id);
+    if (!result.ok) {
+      const reopened = (await review.reopenOnFollowUp(ticket.id)) ?? ticket;
+      return this.appendToTicket(reopened, message, text);
+    }
+    const appended = await this.appendToTicket(result.ticket ?? ticket, message, text);
+    return { action: 'verified', ticket: appended.action === 'appended' ? appended.ticket : ticket };
+  }
+
+  /**
+   * Append a follow-up to a ticket's discussion.
+   *
+   * Pure acknowledgements ("好的", "thanks") are not written, but the message
+   * still belongs to the ticket (so the delivered copy carries its marker).
+   * Short answers are written: 「是绿卡」 is what the agent asked for.
+   *
+   * @param ticket - The open ticket
+   * @param message - The follow-up
+   * @param text - Trimmed text
+   * @returns `appended` outcome
+   */
+  private async appendToTicket(ticket: Request, message: IntakeMessage, text: string): Promise<IntakeOutcome> {
+    if (text.length === 0 || TRIVIAL_ACK_PATTERN.test(text) || suppressFileOnly(text, (message.attachments?.length ?? 0) > 0)) {
+      return { action: 'appended', ticket };
+    }
+    const discussion = [
+      ...(ticket.discussion ?? []),
+      {
+        at: this.now().toISOString(),
+        author: message.origin.authorName ?? message.origin.author,
+        text,
+        ref: message.origin.ref,
+      },
+    ];
+    const updated = await this.deps.requests.update(ticket.id, { discussion });
+    this.logger.debug('Follow-up appended to ticket', { id: ticket.id, ref: message.origin.ref });
+    return { action: 'appended', ticket: updated };
+  }
+
+  /**
+   * Hand out the next ticket number. Monotonic per data dir: an atomic counter
+   * file next to the Request files, updated under a lock. The first call seeds
+   * it from the highest number already on disk.
+   *
+   * @param all - Every Request (for seeding)
+   * @returns The new number
+   */
+  private async nextTicketNumber(all: readonly Request[]): Promise<number> {
+    const counterPath = path.join(this.deps.requests.getRequestsDir(), TICKET_CONSTANTS.COUNTER_FILENAME);
+    const maxExisting = all.reduce((m, r) => (typeof r.ticketNumber === 'number' && r.ticketNumber > m ? r.ticketNumber : m), 0);
+    const data = await modifyJsonFile<TicketCounterFile, TicketCounterFile>(counterPath, { last: -1 }, (current) => {
+      const last = typeof current?.last === 'number' ? current.last : -1;
+      // Never hand out a number that is already on disk, even if the counter
+      // file was lost or restored from an older backup.
+      return { last: Math.max(last, maxExisting) + 1 };
+    });
+    return data.last;
+  }
+
+  /**
+   * Post the receipt and remember where it landed. Runs after intake returns
+   * so delivery is not held up by Slack. If the owner dismissed the ticket
+   * before the receipt landed, the receipt is edited straight away.
+   *
+   * @param ticket - New ticket
+   * @param target - Where to post
+   */
+  private async postReceipt(ticket: Request, target: ReceiptTarget): Promise<void> {
+    // Tickets are Crewly's own record; the owner sees no receipt (2026-09-24).
+    if (!(this.deps.receiptsEnabled ?? TICKET_CONSTANTS.RECEIPT.ENABLED)) return;
+    const sink = this.sinks[target.kind];
+    if (!sink) {
+      this.logger.debug('No receipt sink for surface', { kind: target.kind, id: ticket.id });
+      return;
+    }
+    try {
+      const receipt = await sink.post(ticket, target);
+      if (!receipt) return;
+      const current = await this.deps.requests.getById(ticket.id);
+      if (!current) return;
+      const updated = await this.deps.requests.update(ticket.id, { receipt });
+      if (current.status === 'cancelled') await sink.markDismissed(updated, receipt);
+    } catch (err) {
+      this.logger.warn('Ticket receipt could not be posted', {
+        id: ticket.id,
+        kind: target.kind,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Dismiss / lookup / list
+  // -------------------------------------------------------------------------
+
+  /**
+   * "不用记": cancel a ticket, tag it `dismissed`, and edit its receipt.
+   *
+   * @param ref - `TKT-123`, `123` or the ticket id
+   * @returns What happened
+   */
+  async dismiss(ref: string): Promise<DismissResult> {
+    const run = this.chain.then(async () => {
+      const ticket = await this.resolve(ref);
+      if (!ticket) return { ok: false, reason: 'not_found' } as DismissResult;
+      return this.dismissTicket(ticket);
+    });
+    this.chain = run.catch(() => undefined);
+    return run;
+  }
+
+  /**
+   * Dismiss a loaded ticket (see {@link dismiss}).
+   *
+   * @param ticket - The ticket
+   * @returns What happened
+   */
+  private async dismissTicket(ticket: Request): Promise<DismissResult> {
+    if (ticket.status === 'cancelled') return { ok: true, ticket, alreadyDismissed: true };
+    if (ticket.status === 'done') return { ok: false, reason: 'already_done', ticket };
+    if (!isValidRequestTransition(ticket.status, 'cancelled')) {
+      return { ok: false, reason: 'invalid_transition', ticket };
+    }
+    const tags = [...new Set([...ticket.tags, TICKET_CONSTANTS.DISMISSED_TAG])];
+    const updated = await this.deps.requests.update(ticket.id, { status: 'cancelled', tags });
+    this.logger.info('Ticket dismissed (不用记)', {
+      tkt: typeof ticket.ticketNumber === 'number' ? formatTicketNumber(ticket.ticketNumber) : null,
+      id: ticket.id,
+    });
+    if (updated.receipt) {
+      const sink = this.sinks[updated.receipt.kind];
+      if (sink) {
+        await sink.markDismissed(updated, updated.receipt).catch((err: unknown) => {
+          this.logger.warn('Receipt could not be marked dismissed', {
+            id: ticket.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+    }
+    return { ok: true, ticket: updated, alreadyDismissed: false };
+  }
+
+  /**
+   * Split an ask out of a ticket into its own ticket (#827).
+   *
+   * Intake appends when unsure, so a new ask can land in another ticket's
+   * discussion; the agent that receives it fixes that with one call. The new
+   * ticket keeps the thread link (the source's `origin.threadRef`, so later
+   * follow-ups in that thread still find a ticket), records `parentTicketId`,
+   * and is tagged `split`. With `discussionRef`, the entry is moved: removed
+   * from the source's discussion and used as the new ticket's text.
+   *
+   * @param ref - Source ticket: `TKT-123`, `123` or id
+   * @param input - What to split out
+   * @returns The new ticket and the (updated) source, or why not
+   *
+   * @example
+   * ```typescript
+   * await intake.split('TKT-039', { discussionRef: 'slackch-C0C2QCGE9K9-1790433421.1' });
+   * ```
+   */
+  async split(ref: string, input: SplitTicketInput): Promise<SplitResult> {
+    const run = this.chain.then(async (): Promise<SplitResult> => {
+      const source = await this.resolve(ref);
+      if (!source) return { ok: false, reason: 'not_found' };
+      if (!source.origin) return { ok: false, reason: 'no_origin', ticket: source };
+
+      let text = input.text?.trim() ?? '';
+      let entryRef: string | undefined;
+      let current = source;
+      if (input.discussionRef) {
+        const entry = (source.discussion ?? []).find((d) => d.ref === input.discussionRef);
+        if (!entry) return { ok: false, reason: 'discussion_not_found', ticket: source };
+        text = text || entry.text;
+        entryRef = entry.ref;
+      }
+      if (!text) return { ok: false, reason: 'invalid', ticket: source };
+
+      const all = await this.deps.requests.listAll();
+      const n = all.filter((r) => r.parentTicketId === source.id).length + 1;
+      const message: IntakeMessage = {
+        text,
+        isOwner: true,
+        origin: {
+          ...source.origin,
+          // A moved follow-up keeps its own message ref; a typed split gets a
+          // ref of its own so it can never collide with a real message.
+          ref: entryRef ?? `${source.id}:split:${n}`,
+        },
+      };
+      if (all.some((r) => r.sourceConversationItemId === message.origin.ref)) {
+        return { ok: false, reason: 'invalid', ticket: source };
+      }
+      let ticket = await this.createTicket(all, message, text, {
+        parent: source,
+        question: input.question === true,
+        fallbackAssignee: input.assignee ?? source.assignee,
+        extraTags: [TICKET_CONSTANTS.SPLIT_TAG, ...(source.tags ?? []).filter((t) => t === 'slack' || t === 'chat-v2')],
+      });
+      if (input.title?.trim()) ticket = await this.deps.requests.update(ticket.id, { title: input.title.trim() });
+      if (entryRef) {
+        const discussion = (source.discussion ?? []).filter((d) => d.ref !== entryRef);
+        current = await this.deps.requests.update(source.id, { discussion });
+      }
+      this.logger.info('Ticket split', {
+        from: typeof source.ticketNumber === 'number' ? formatTicketNumber(source.ticketNumber) : source.id,
+        to: formatTicketNumber(ticket.ticketNumber as number),
+        moved: !!entryRef,
+        by: input.by,
+      });
+      return { ok: true, ticket, source: current, moved: !!entryRef };
+    });
+    this.chain = run.catch(() => undefined);
+    return run;
+  }
+
+  /**
+   * Find a ticket by `TKT-123`, `123` or id.
+   *
+   * @param ref - The reference
+   * @returns The ticket, or null
+   */
+  async resolve(ref: string): Promise<Request | null> {
+    const trimmed = (ref ?? '').trim();
+    if (!trimmed) return null;
+    const byId = await this.deps.requests.getById(trimmed);
+    if (byId) return byId;
+    const n = parseTicketNumber(trimmed);
+    if (n === null) return null;
+    const all = await this.deps.requests.listAll();
+    return all.find((r) => r.ticketNumber === n) ?? null;
+  }
+
+  /**
+   * Board-shaped ticket list.
+   *
+   * @param query - Filters
+   * @returns Rows (newest first) and per-column counts over the filtered set
+   */
+  async list(query: TicketListQuery = {}): Promise<{ tickets: TicketListItem[]; columns: Record<TicketBoardColumn, number> }> {
+    const all = await this.deps.requests.listAll();
+    const q = query.q?.trim().toLowerCase();
+    const rows: TicketListItem[] = [];
+    for (const r of all) {
+      if (!query.includeLegacy && typeof r.ticketNumber !== 'number') continue;
+      const item = await this.toListItem(r);
+      if (query.kind && item.kind !== query.kind) continue;
+      if (q && ![item.tkt ?? '', item.title, item.description].some((s) => s.toLowerCase().includes(q))) continue;
+      rows.push(item);
+    }
+    const columns: Record<TicketBoardColumn, number> = {
+      idea: 0,
+      todo: 0,
+      in_progress: 0,
+      blocked: 0,
+      to_review: 0,
+      done: 0,
+      cancelled: 0,
+    };
+    for (const row of rows) columns[row.column] += 1;
+    const tickets = query.column
+      ? rows.filter((row) => row.column === query.column)
+      // Cancelled tickets are hidden unless asked for (searchable via column=cancelled).
+      : rows.filter((row) => row.column !== 'cancelled');
+    return { tickets, columns };
+  }
+
+  /**
+   * Shape one Request as a board row.
+   *
+   * @param r - The Request
+   * @returns The row
+   */
+  async toListItem(r: Request): Promise<TicketListItem> {
+    const workItems: BoardWorkItemView[] = [];
+    if (this.deps.findWorkItem) {
+      for (const id of r.workItemIds) {
+        const wi = await this.deps.findWorkItem(id).catch(() => null);
+        if (wi) workItems.push(wi);
+      }
+    }
+    const kind: TicketKind = r.kind ?? 'feature';
+    return {
+      id: r.id,
+      tkt: typeof r.ticketNumber === 'number' ? formatTicketNumber(r.ticketNumber) : null,
+      ticketNumber: typeof r.ticketNumber === 'number' ? r.ticketNumber : null,
+      title: r.title,
+      description: r.description,
+      kind,
+      column: deriveBoardColumn({ status: r.status, kind, requiresConfirmation: r.requiresConfirmation }, workItems),
+      status: r.status,
+      priority: r.priority,
+      priorityLabel: ticketPriorityLabel(r.priority),
+      origin: r.origin ?? null,
+      assignee: r.assignee ?? null,
+      workItemIds: r.workItemIds,
+      tags: r.tags,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+      acceptance: activeAcceptance(r.acceptance),
+      reply: r.reply ?? null,
+      rejectCount: r.rejectCount ?? 0,
+      submitCount: r.submitCount ?? 0,
+      submittedAt: r.submittedAt ?? null,
+      completedAt: r.completedAt ?? null,
+      acceptedBy:
+        r.status !== 'done'
+          ? null
+          : r.acceptedBy ?? (r.tags.includes(TICKET_CONSTANTS.REVIEW.AUTO_ACCEPTED_TAG) ? 'silence' : null),
+      autoAcceptAt:
+        r.status === 'waiting_confirmation' && r.submittedAt && ticketNeedsReview(r)
+          ? new Date(Date.parse(r.submittedAt) + TICKET_CONSTANTS.REVIEW.AUTO_ACCEPT_MS).toISOString()
+          : null,
+    };
+  }
+
+  /**
+   * Current time (injectable for tests).
+   *
+   * @returns Now
+   */
+  private now(): Date {
+    return this.deps.now ? this.deps.now() : new Date();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WorkItem → ticket linking (spec §3)
+// ---------------------------------------------------------------------------
+
+/** The slice of InFlightTurnTracker the resolver reads. */
+export interface InFlightTurnSource {
+  snapshot(): Array<{ sessionName: string; messages: Array<{ text: string; originalContent?: string }> }>;
+}
+
+/**
+ * The ticket an agent's current turn is about, from the `[TICKET:…]` markers
+ * in the messages delivered into that turn.
+ *
+ * @param tracker - The in-flight turn tracker
+ * @param sessionName - The agent creating a WorkItem
+ * @returns The ticket id, or null when the turn has none or several tickets
+ */
+export function resolveTicketIdForSession(tracker: InFlightTurnSource, sessionName: string): string | null {
+  const turn = tracker.snapshot().find((t) => t.sessionName === sessionName);
+  if (!turn) return null;
+  return uniqueTicketIdFromTexts(turn.messages.map((m) => `${m.text}\n${m.originalContent ?? ''}`));
+}
+
+// ---------------------------------------------------------------------------
+// Singleton
+// ---------------------------------------------------------------------------
+
+let instance: TicketIntakeService | null = null;
+
+/**
+ * Install the process-wide intake (composition root).
+ *
+ * @param service - The service, or null to clear (tests)
+ */
+export function setTicketIntakeService(service: TicketIntakeService | null): void {
+  instance = service;
+}
+
+/**
+ * The process-wide intake, or null before boot wired it. Callers skip ticket
+ * intake when null — a message is always delivered either way.
+ *
+ * @returns The service or null
+ */
+export function getTicketIntakeService(): TicketIntakeService | null {
+  return instance;
+}
+
+/** Extra approval words beyond {@link isApproval} and the review aliases. */
+const SHIP_IT = /^\s*(?:ship it|ship|looks great|perfect|nice|great)[\s。.!！~～👍✅]*$/i;
+
+/**
+ * Whether an owner's follow-up on a ticket in review is an approval
+ * (specs/2026-10-02-harness-owned-routing.md §5): 好 / 可以 / OK / approve /
+ * ship it / 👍 and the review ACK / VERIFY aliases. A question or a request
+ * to resend is not.
+ *
+ * @param text - The owner's message
+ * @returns True when it accepts the work
+ */
+export function isAcceptanceReply(text: string): boolean {
+  const t = (text ?? '').trim();
+  if (!t) return false;
+  if (/[?？]/.test(t) || RESEND_OR_WHERE.test(t)) return false;
+  return (
+    TICKET_CONSTANTS.REVIEW.ACK_PATTERN.test(t) ||
+    TICKET_CONSTANTS.REVIEW.VERIFY_PATTERN.test(t) ||
+    SHIP_IT.test(t) ||
+    isApproval(t)
+  );
+}

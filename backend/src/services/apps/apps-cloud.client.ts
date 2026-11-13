@@ -1,0 +1,199 @@
+/**
+ * AppsCloudClient — this instance's calls to the Crewly Apps agent API
+ * (`<cloudUrl>/api/apps/v1`, crewly-services apps/SPEC.md §3.1).
+ *
+ * Authenticates with the Cloud access token the {@link CloudClientService}
+ * holds and refreshes, bound to this instance (`X-Crewly-Instance`) and
+ * attributed to the calling agent (`X-Crewly-Agent`). Agents never see the
+ * token: they reach this through `/api/apps` (specs/2026-10-04-crewly-apps-p2.md).
+ *
+ * @module services/apps/apps-cloud.client
+ */
+
+import { CREWLY_APPS_CONSTANTS } from '../../constants.js';
+import { CloudClientService } from '../cloud/cloud-client.service.js';
+
+const C = CREWLY_APPS_CONSTANTS;
+
+/** The slice of the Cloud client used here (injectable for tests). */
+export interface AppsCloudSession {
+  isConnected(): boolean;
+  getToken(): string | null;
+  getCloudUrl(): string | null;
+  tryRefreshToken(): Promise<boolean>;
+}
+
+/** Constructor dependencies. */
+export interface AppsCloudClientDeps {
+  cloud?: AppsCloudSession;
+  /** This instance's Cloud device id (the Slack instance registry's id) */
+  instanceId: () => Promise<string | null>;
+  fetchImpl?: typeof fetch;
+}
+
+/** A failed Apps call: HTTP status and a stable code for the controller and skills. */
+export class AppsCloudError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly code: string,
+    message: string,
+    /** Cloud's machine-readable `details` (e.g. a template scan's findings), when it sent any */
+    public readonly details?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = 'AppsCloudError';
+  }
+}
+
+/** Options of one request. */
+export interface AppsRequestOptions {
+  /** JSON body */
+  body?: unknown;
+  /** Raw bytes instead of JSON (the thumbnail upload); wins over `body` */
+  raw?: { data: Buffer; contentType: string };
+  /** Extra request headers (a file upload's `X-File-Name`); never overrides auth, instance, agent or content type */
+  headers?: Record<string, string>;
+  /** Query parameters (undefined values are dropped) */
+  query?: Record<string, string | number | undefined>;
+  /** Agent session to attribute the call to; omitted for the owner */
+  agent?: string;
+  /** Request timeout (default REQUEST_TIMEOUT_MS) */
+  timeoutMs?: number;
+  /**
+   * Call as the account owner: no `X-Crewly-Instance`, no `X-Crewly-Agent`
+   * (Cloud's owner actor). Only for work the owner approved, never for an
+   * agent's own call (the collaborator grant after an owner tap).
+   */
+  asOwner?: boolean;
+}
+
+/**
+ * Typed wrapper over the Apps agent API.
+ */
+export class AppsCloudClient {
+  private readonly cloud: AppsCloudSession;
+  private readonly fetchImpl: typeof fetch;
+
+  constructor(private readonly deps: AppsCloudClientDeps) {
+    this.cloud = deps.cloud ?? CloudClientService.getInstance();
+    this.fetchImpl = deps.fetchImpl ?? fetch;
+  }
+
+  /**
+   * Whether a Cloud login is present (a call can be attempted).
+   *
+   * @returns True when connected with a token and URL
+   */
+  isAvailable(): boolean {
+    return this.cloud.isConnected() && !!this.cloud.getToken() && !!this.cloud.getCloudUrl();
+  }
+
+  /**
+   * Call the Apps API and return its `data`.
+   *
+   * A 401 refreshes the Cloud token once and retries. Cloud's
+   * `{ success:false, error, code }` becomes an {@link AppsCloudError} with
+   * Cloud's status and code. The token is never part of an error.
+   *
+   * @param method - HTTP method
+   * @param path - Path under `/api/apps/v1` (starts with `/`)
+   * @param opts - Body, query, agent attribution
+   * @returns The response `data`
+   * @throws AppsCloudError not_logged_in / instance_unknown / network / Cloud's code
+   */
+  async request<T>(method: string, path: string, opts: AppsRequestOptions = {}): Promise<T> {
+    if (!this.isAvailable()) {
+      throw new AppsCloudError(409, C.ERROR_CODES.NOT_LOGGED_IN, 'This machine is not signed in to Crewly Cloud. Run `crewly cloud login`.');
+    }
+    const instanceId = opts.asOwner ? '' : ((await this.deps.instanceId()) ?? '');
+    if (!opts.asOwner && !instanceId) {
+      throw new AppsCloudError(409, C.ERROR_CODES.NO_INSTANCE, 'This machine has no Crewly Cloud instance id yet. Sign in to Crewly Cloud and try again in a minute.');
+    }
+    let res = await this.send(method, path, opts, instanceId);
+    if (res.status === 401 && (await this.cloud.tryRefreshToken().catch(() => false))) {
+      res = await this.send(method, path, opts, instanceId);
+    }
+    const json = await AppsCloudClient.readJson(res);
+    if (res.ok && json && json.success !== false) return json.data as T;
+    const code = typeof json?.code === 'string' ? json.code : res.status === 401 ? C.ERROR_CODES.NOT_LOGGED_IN : `http_${res.status}`;
+    const message =
+      typeof json?.error === 'string'
+        ? json.error
+        : res.status === 401
+          ? 'Crewly Cloud rejected the session. Run `crewly cloud login` again.'
+          : `Crewly Apps request failed (${res.status}).`;
+    const details = json?.details && typeof json.details === 'object' && !Array.isArray(json.details) ? (json.details as Record<string, unknown>) : undefined;
+    throw new AppsCloudError(res.status === 401 ? 409 : res.status, code, message, details);
+  }
+
+  /**
+   * GET binary content from the Apps API (a voice comment's recording).
+   * Same auth, refresh and error mapping as {@link request}; a body larger
+   * than `maxBytes` is refused.
+   *
+   * @param path - Path under `/api/apps/v1`
+   * @param opts - `maxBytes` cap, timeout
+   * @returns Bytes, Content-Type and the response headers
+   * @throws AppsCloudError as {@link request}, or `too_large`
+   */
+  async download(path: string, opts: { maxBytes: number; timeoutMs?: number; agent?: string }): Promise<{ data: Buffer; contentType: string; headers: Headers }> {
+    if (!this.isAvailable()) {
+      throw new AppsCloudError(409, C.ERROR_CODES.NOT_LOGGED_IN, 'This machine is not signed in to Crewly Cloud. Run `crewly cloud login`.');
+    }
+    const instanceId = await this.deps.instanceId();
+    if (!instanceId) {
+      throw new AppsCloudError(409, C.ERROR_CODES.NO_INSTANCE, 'This machine has no Crewly Cloud instance id yet. Sign in to Crewly Cloud and try again in a minute.');
+    }
+    const reqOpts: AppsRequestOptions = { ...(opts.agent ? { agent: opts.agent } : {}), ...(opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}) };
+    let res = await this.send('GET', path, reqOpts, instanceId);
+    if (res.status === 401 && (await this.cloud.tryRefreshToken().catch(() => false))) {
+      res = await this.send('GET', path, reqOpts, instanceId);
+    }
+    if (!res.ok) {
+      const json = await AppsCloudClient.readJson(res);
+      const code = typeof json?.code === 'string' ? json.code : `http_${res.status}`;
+      throw new AppsCloudError(res.status === 401 ? 409 : res.status, code, typeof json?.error === 'string' ? json.error : `Crewly Apps download failed (${res.status}).`);
+    }
+    const declared = Number(res.headers.get('content-length') ?? '0');
+    if (declared > opts.maxBytes) throw new AppsCloudError(413, 'too_large', 'The file is larger than this machine accepts.');
+    const data = Buffer.from(await res.arrayBuffer());
+    if (data.length > opts.maxBytes) throw new AppsCloudError(413, 'too_large', 'The file is larger than this machine accepts.');
+    return { data, contentType: (res.headers.get('content-type') ?? 'application/octet-stream').split(';')[0]!.trim().toLowerCase(), headers: res.headers };
+  }
+
+  private static async readJson(res: Response): Promise<{ success?: boolean; data?: unknown; error?: unknown; code?: unknown; details?: unknown } | null> {
+    try {
+      const parsed: unknown = await res.json();
+      return parsed && typeof parsed === 'object' ? (parsed as { success?: boolean; data?: unknown; error?: unknown; code?: unknown; details?: unknown }) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async send(method: string, path: string, opts: AppsRequestOptions, instanceId: string): Promise<Response> {
+    const base = `${(this.cloud.getCloudUrl() ?? '').replace(/\/+$/, '')}${C.CLOUD_PATH}`;
+    const url = new URL(`${base}${path}`);
+    for (const [k, v] of Object.entries(opts.query ?? {})) {
+      if (v !== undefined && v !== '') url.searchParams.set(k, String(v));
+    }
+    const headers: Record<string, string> = {
+      ...(opts.headers ?? {}),
+      Authorization: `Bearer ${this.cloud.getToken() ?? ''}`,
+    };
+    if (!opts.asOwner) headers['X-Crewly-Instance'] = instanceId;
+    if (opts.agent && !opts.asOwner) headers['X-Crewly-Agent'] = opts.agent;
+    if (opts.raw) headers['Content-Type'] = opts.raw.contentType;
+    else if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
+    try {
+      return await this.fetchImpl(url.toString(), {
+        method,
+        headers,
+        ...(opts.raw ? { body: new Uint8Array(opts.raw.data) } : opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
+        signal: AbortSignal.timeout(opts.timeoutMs ?? C.REQUEST_TIMEOUT_MS),
+      });
+    } catch (err) {
+      const why = err instanceof Error ? err.name : 'error';
+      throw new AppsCloudError(502, C.ERROR_CODES.NETWORK, `Could not reach Crewly Apps (${why}). Try again shortly.`);
+    }
+  }
+}

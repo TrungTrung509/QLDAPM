@@ -1,0 +1,500 @@
+/**
+ * Session Controller Tests
+ *
+ * Tests for session controller endpoints.
+ *
+ * @module controllers/session/session.controller.test
+ */
+
+import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
+import type { Request, Response } from 'express';
+import { getPreviousSessions, dismissPreviousSessions, writeToSession, createSession } from './session.controller.js';
+import { DEFAULT_SHELL } from '../../services/session/session-backend.interface.js';
+import { setSpendCapGate, type SpendStop } from '../../services/spend/spend-cap.gate.js';
+import { RUNTIME_TYPES } from '../../constants.js';
+
+// Mock dependencies
+const mockSendMessage = jest.fn<any>();
+const mockGetAllItems = jest.fn<any>().mockResolvedValue([]);
+
+jest.mock('../../services/session/index.js', () => ({
+	getSessionBackendSync: jest.fn(),
+	getSessionBackend: jest.fn(),
+	getSessionStatePersistence: jest.fn(),
+	createSessionCommandHelper: jest.fn(() => ({
+		sendMessage: mockSendMessage,
+	})),
+}));
+
+jest.mock('../../services/task-pool/task-pool.service.js', () => ({
+	TaskPoolService: {
+		getInstance: () => ({
+			getAllItems: () => mockGetAllItems(),
+		}),
+	},
+}));
+
+jest.mock('../../services/core/logger.service.js', () => ({
+	LoggerService: {
+		getInstance: jest.fn(() => ({
+			createComponentLogger: jest.fn(() => ({
+				info: jest.fn(),
+				debug: jest.fn(),
+				warn: jest.fn(),
+				error: jest.fn(),
+			})),
+		})),
+	},
+}));
+
+// The persistent queue a capped agent's message waits on (#937).
+const mockEnqueue = jest.fn();
+jest.mock('../../services/messaging/sub-agent-message-queue.service.js', () => ({
+	SubAgentMessageQueue: {
+		getInstance: () => ({ enqueue: mockEnqueue }),
+	},
+}));
+
+// Import mocked modules
+import { getSessionStatePersistence, getSessionBackendSync, getSessionBackend } from '../../services/session/index.js';
+import { lastOutsideInputAt, resetInputLedgerForTesting } from '../../services/session/input-ledger.js';
+
+const mockGetPersistence = getSessionStatePersistence as jest.MockedFunction<typeof getSessionStatePersistence>;
+const mockGetBackend = getSessionBackendSync as jest.MockedFunction<typeof getSessionBackendSync>;
+
+/**
+ * Shape of the JSON response from getPreviousSessions
+ */
+interface PreviousSessionsResponse {
+	success: boolean;
+	data: {
+		sessions: Array<{
+			name: string;
+			role?: string;
+			teamId?: string;
+			runtimeType: string;
+			hasResumeId: boolean;
+		}>;
+	};
+}
+
+/**
+ * Create a mock Express Response object
+ */
+function createMockRes(): Response {
+	const res: Partial<Response> = {
+		json: jest.fn().mockReturnThis() as any,
+		status: jest.fn().mockReturnThis() as any,
+	};
+	return res as Response;
+}
+
+/**
+ * Create a mock Express Request object
+ */
+function createMockReq(overrides?: Partial<Request>): Request {
+	return { params: {}, query: {}, body: {}, ...overrides } as Request;
+}
+
+describe('Session Controller - Previous Sessions', () => {
+	let mockPersistence: any;
+	let mockBackend: any;
+
+	beforeEach(() => {
+		jest.clearAllMocks();
+
+		mockPersistence = {
+			getRegisteredSessionsMap: jest.fn(() => new Map()),
+			getRegisteredSessions: jest.fn(() => [] as string[]),
+			clearStateAndMetadata: jest.fn(() => Promise.resolve()),
+			forgetSessions: jest.fn(() => Promise.resolve()),
+		};
+
+		mockBackend = {
+			sessionExists: jest.fn(() => false),
+		};
+
+		mockGetPersistence.mockReturnValue(mockPersistence);
+		mockGetBackend.mockReturnValue(mockBackend);
+	});
+
+	describe('getPreviousSessions', () => {
+		beforeEach(() => {
+			// Reset pool mock between tests
+			mockGetAllItems.mockReset();
+			mockGetAllItems.mockResolvedValue([]);
+		});
+
+		it('should return sessions with no active PTY (pool-filter retains them when WI targets them)', async () => {
+			// Steve 2026-05-15: pool filter retains sessions that have
+			// at least one non-terminal WI targeting them. Both agents
+			// here have pool work — pass through.
+			mockGetAllItems.mockResolvedValue([
+				{ target: 'agent-1', status: 'queued' },
+				{ target: 'agent-2', status: 'running' },
+			]);
+
+			const sessionsMap = new Map([
+				['agent-1', { name: 'agent-1', role: 'dev', teamId: 'team-1', runtimeType: RUNTIME_TYPES.CLAUDE_CODE, claudeSessionId: 'abc-123' }],
+				['agent-2', { name: 'agent-2', role: 'qa', runtimeType: RUNTIME_TYPES.GEMINI_CLI }],
+			]);
+			mockPersistence.getRegisteredSessionsMap.mockReturnValue(sessionsMap);
+			mockBackend.sessionExists.mockReturnValue(false);
+
+			const req = createMockReq();
+			const res = createMockRes();
+
+			await getPreviousSessions.call(undefined, req, res);
+
+			expect(res.json).toHaveBeenCalledWith({
+				success: true,
+				data: {
+					sessions: [
+						{ name: 'agent-1', role: 'dev', teamId: 'team-1', runtimeType: RUNTIME_TYPES.CLAUDE_CODE, hasResumeId: true },
+						{ name: 'agent-2', role: 'qa', teamId: undefined, runtimeType: RUNTIME_TYPES.GEMINI_CLI, hasResumeId: false },
+					],
+				},
+			});
+		});
+
+		it('should filter out sessions with active PTY', async () => {
+			mockGetAllItems.mockResolvedValue([
+				{ target: 'active-agent', status: 'running' },
+				{ target: 'stopped-agent', status: 'queued' },
+			]);
+
+			const sessionsMap = new Map([
+				['active-agent', { name: 'active-agent', role: 'dev', runtimeType: RUNTIME_TYPES.CLAUDE_CODE }],
+				['stopped-agent', { name: 'stopped-agent', role: 'qa', runtimeType: RUNTIME_TYPES.CLAUDE_CODE }],
+			]);
+			mockPersistence.getRegisteredSessionsMap.mockReturnValue(sessionsMap);
+			mockBackend.sessionExists.mockImplementation((name: string) => name === 'active-agent');
+
+			const req = createMockReq();
+			const res = createMockRes();
+
+			await getPreviousSessions.call(undefined, req, res);
+
+			const jsonCall = (res.json as jest.Mock).mock.calls[0][0] as PreviousSessionsResponse;
+			expect(jsonCall.data.sessions).toHaveLength(1);
+			expect(jsonCall.data.sessions[0].name).toBe('stopped-agent');
+		});
+
+		// Steve 2026-05-15 dogfood: Resume dialog listed 12 marketing/
+		// think-tank agents with zero pool work, then `startTeam` woke
+		// them all, then wake-gate rejected each member with "pool has
+		// no queued/blocked WorkItem with target=...". Filter now
+		// matches the wake-gate's contract.
+
+		it('filters out sessions with no active WI in the pool (Steve 2026-05-15)', async () => {
+			mockGetAllItems.mockResolvedValue([
+				{ target: 'agent-with-work', status: 'queued' },
+				{ target: 'agent-also-idle', status: 'done' }, // terminal — doesn't count
+			]);
+
+			const sessionsMap = new Map([
+				['agent-with-work', { name: 'agent-with-work', role: 'dev', runtimeType: RUNTIME_TYPES.CLAUDE_CODE }],
+				['agent-idle', { name: 'agent-idle', role: 'dev', runtimeType: RUNTIME_TYPES.CLAUDE_CODE }],
+				['agent-also-idle', { name: 'agent-also-idle', role: 'dev', runtimeType: RUNTIME_TYPES.CLAUDE_CODE }],
+			]);
+			mockPersistence.getRegisteredSessionsMap.mockReturnValue(sessionsMap);
+			mockBackend.sessionExists.mockReturnValue(false);
+
+			const req = createMockReq();
+			const res = createMockRes();
+			await getPreviousSessions.call(undefined, req, res);
+
+			const jsonCall = (res.json as jest.Mock).mock.calls[0][0] as PreviousSessionsResponse;
+			expect(jsonCall.data.sessions).toHaveLength(1);
+			expect(jsonCall.data.sessions[0].name).toBe('agent-with-work');
+		});
+
+		it('always includes orchestrator sessions regardless of pool state', async () => {
+			mockGetAllItems.mockResolvedValue([]); // empty pool
+
+			const sessionsMap = new Map([
+				['crewly-orc', { name: 'crewly-orc', role: 'orchestrator', runtimeType: RUNTIME_TYPES.CLAUDE_CODE }],
+				['agent-x', { name: 'agent-x', role: 'dev', runtimeType: RUNTIME_TYPES.CLAUDE_CODE }],
+			]);
+			mockPersistence.getRegisteredSessionsMap.mockReturnValue(sessionsMap);
+			mockBackend.sessionExists.mockReturnValue(false);
+
+			const req = createMockReq();
+			const res = createMockRes();
+			await getPreviousSessions.call(undefined, req, res);
+
+			const jsonCall = (res.json as jest.Mock).mock.calls[0][0] as PreviousSessionsResponse;
+			expect(jsonCall.data.sessions.map((s) => s.name)).toEqual(['crewly-orc']);
+		});
+
+		it('falls back to include-all behavior when pool read fails (graceful degradation)', async () => {
+			mockGetAllItems.mockRejectedValue(new Error('pool unavailable'));
+
+			const sessionsMap = new Map([
+				['agent-x', { name: 'agent-x', role: 'dev', runtimeType: RUNTIME_TYPES.CLAUDE_CODE }],
+			]);
+			mockPersistence.getRegisteredSessionsMap.mockReturnValue(sessionsMap);
+			mockBackend.sessionExists.mockReturnValue(false);
+
+			const req = createMockReq();
+			const res = createMockRes();
+			await getPreviousSessions.call(undefined, req, res);
+
+			const jsonCall = (res.json as jest.Mock).mock.calls[0][0] as PreviousSessionsResponse;
+			// Pool unavailable → fall back to legacy behavior, include all
+			expect(jsonCall.data.sessions.map((s) => s.name)).toEqual(['agent-x']);
+		});
+
+		describe('stale (unbound) session names', () => {
+			const TEAM = 'team-mkt';
+			const BOUND = 'crewly-marketing-dana-45506487';
+			const STALE = 'crewly-marketing-self-watch-scribe-45506487';
+			const teams = [{ id: TEAM, members: [{ id: 'dana-id', sessionName: BOUND }] }];
+
+			beforeEach(() => {
+				mockGetAllItems.mockResolvedValue([
+					{ target: BOUND, status: 'queued' },
+					{ target: STALE, status: 'queued' },
+					{ target: 'crewly-orc', status: 'queued' },
+				]);
+				mockPersistence.getRegisteredSessionsMap.mockReturnValue(new Map([
+					[BOUND, { name: BOUND, role: 'content-strategist', teamId: TEAM, memberId: 'dana-id', runtimeType: RUNTIME_TYPES.CLAUDE_CODE }],
+					[STALE, { name: STALE, role: 'content-strategist', teamId: TEAM, runtimeType: RUNTIME_TYPES.CLAUDE_CODE }],
+					['crewly-orc', { name: 'crewly-orc', role: 'orchestrator', runtimeType: RUNTIME_TYPES.CLAUDE_CODE }],
+				]));
+			});
+
+			it('does not offer a team session whose name no member is bound to', async () => {
+				const res = createMockRes();
+				const ctx = { storageService: { getTeams: jest.fn<any>().mockResolvedValue(teams) } };
+
+				await getPreviousSessions.call(ctx as any, createMockReq(), res);
+
+				const body = (res.json as jest.Mock).mock.calls[0][0] as PreviousSessionsResponse;
+				const names = body.data.sessions.map((s) => s.name);
+				expect(names).not.toContain(STALE);
+				expect(names).toEqual([BOUND, 'crewly-orc']);
+			});
+
+			it('offers only non-team sessions when the team bindings cannot be read', async () => {
+				const res = createMockRes();
+				const ctx = { storageService: { getTeams: jest.fn<any>().mockRejectedValue(new Error('disk')) } };
+
+				await getPreviousSessions.call(ctx as any, createMockReq(), res);
+
+				const body = (res.json as jest.Mock).mock.calls[0][0] as PreviousSessionsResponse;
+				expect(body.data.sessions.map((s) => s.name)).toEqual(['crewly-orc']);
+			});
+		});
+
+		it('should return empty array when no sessions registered', async () => {
+			const req = createMockReq();
+			const res = createMockRes();
+
+			await getPreviousSessions.call(undefined, req, res);
+
+			expect(res.json).toHaveBeenCalledWith({
+				success: true,
+				data: { sessions: [] },
+			});
+		});
+
+		it('should handle errors gracefully', async () => {
+			mockGetPersistence.mockImplementation(() => { throw new Error('Persistence error'); });
+
+			const req = createMockReq();
+			const res = createMockRes();
+
+			await getPreviousSessions.call(undefined, req, res);
+
+			expect(res.status).toHaveBeenCalledWith(500);
+		});
+	});
+
+	describe('dismissPreviousSessions', () => {
+		it('forgets only the sessions that are not running, keeps live ones (their resume id survives)', async () => {
+			mockPersistence.getRegisteredSessions.mockReturnValue(['dead-1', 'alive-1', 'dead-2']);
+			mockBackend.sessionExists.mockImplementation((name: string) => name === 'alive-1');
+			const req = createMockReq();
+			const res = createMockRes();
+
+			await dismissPreviousSessions.call(undefined, req, res);
+
+			expect(mockPersistence.forgetSessions).toHaveBeenCalledWith(['dead-1', 'dead-2']);
+			expect(mockPersistence.clearStateAndMetadata).not.toHaveBeenCalled();
+			expect(res.json).toHaveBeenCalledWith({ success: true });
+		});
+
+		it('should handle errors gracefully', async () => {
+			mockPersistence.forgetSessions.mockRejectedValue(new Error('Clear failed'));
+
+			const req = createMockReq();
+			const res = createMockRes();
+
+			await dismissPreviousSessions.call(undefined, req, res);
+
+			expect(res.status).toHaveBeenCalledWith(500);
+		});
+	});
+});
+
+describe('Session Controller - writeToSession', () => {
+	let mockWrite: jest.Mock<any>;
+
+	beforeEach(() => {
+		jest.clearAllMocks();
+		mockWrite = jest.fn();
+		mockSendMessage.mockResolvedValue(undefined);
+	});
+
+	it('should use raw write by default (no mode)', async () => {
+		const mockSession = { write: mockWrite };
+		mockGetBackend.mockReturnValue({
+			sessionExists: jest.fn(() => true),
+			getSession: jest.fn(() => mockSession),
+		} as any);
+
+		const req = createMockReq({
+			params: { name: 'test-session' },
+			body: { data: 'hello world' },
+		} as any);
+		const res = createMockRes();
+
+		await writeToSession.call(undefined, req, res);
+
+		expect(mockWrite).toHaveBeenCalledWith('hello world');
+		expect(mockSendMessage).not.toHaveBeenCalled();
+		expect(res.json).toHaveBeenCalledWith({ success: true, message: "Data written to session 'test-session'" });
+		// Raw input from outside: the harness's earlier pastes are no longer the only possible source.
+		expect(lastOutsideInputAt('test-session')).toBeDefined();
+		resetInputLedgerForTesting();
+	});
+
+	it('should use sendMessage when mode is "message"', async () => {
+		mockGetBackend.mockReturnValue({
+			sessionExists: jest.fn(() => true),
+			getSession: jest.fn(() => ({ write: mockWrite })),
+		} as any);
+
+		const req = createMockReq({
+			params: { name: 'test-session' },
+			body: { data: 'hello world', mode: 'message' },
+		} as any);
+		const res = createMockRes();
+
+		await writeToSession.call(undefined, req, res);
+
+		expect(mockSendMessage).toHaveBeenCalledWith('test-session', 'hello world');
+		expect(mockWrite).not.toHaveBeenCalled();
+		expect(res.json).toHaveBeenCalledWith({ success: true, message: "Message sent to session 'test-session'" });
+	});
+
+	describe('daily token cap (#937)', () => {
+		const stop: SpendStop = { session: 'test-session', scope: 'agent', capTokens: 5_000_000, usedTokens: 6_000_000 };
+
+		beforeEach(() => {
+			setSpendCapGate({ stopOf: (s) => (s === 'test-session' ? stop : null), displayNameOf: () => 'Ella' });
+			mockGetBackend.mockReturnValue({
+				sessionExists: jest.fn(() => true),
+				getSession: jest.fn(() => ({ write: mockWrite })),
+			} as any);
+		});
+
+		afterEach(() => {
+			setSpendCapGate(null);
+		});
+
+		it('queues a message-mode write for a capped agent instead of sending it', async () => {
+			const req = createMockReq({
+				params: { name: 'test-session' },
+				body: { data: 'hello world', mode: 'message' },
+			} as any);
+			const res = createMockRes();
+
+			await writeToSession.call(undefined, req, res);
+
+			expect(mockSendMessage).not.toHaveBeenCalled();
+			expect(mockEnqueue).toHaveBeenCalledWith('test-session', 'hello world');
+			expect(res.status).toHaveBeenCalledWith(202);
+			expect(res.json).toHaveBeenCalledWith({
+				success: true,
+				queued: true,
+				spendCapped: true,
+				message: '[SPEND_CAP] Ella hit its daily token cap (5M tokens); message queued',
+			});
+		});
+
+		it('keeps raw writes (control keys) ungated', async () => {
+			const req = createMockReq({
+				params: { name: 'test-session' },
+				body: { data: '\x03' },
+			} as any);
+			const res = createMockRes();
+
+			await writeToSession.call(undefined, req, res);
+
+			expect(mockWrite).toHaveBeenCalledWith('\x03');
+			expect(mockEnqueue).not.toHaveBeenCalled();
+		});
+	});
+
+	it('should return 400 when data is missing', async () => {
+		const req = createMockReq({
+			params: { name: 'test-session' },
+			body: {},
+		} as any);
+		const res = createMockRes();
+
+		await writeToSession.call(undefined, req, res);
+
+		expect(res.status).toHaveBeenCalledWith(400);
+		expect(res.json).toHaveBeenCalledWith({ error: 'Data is required' });
+	});
+
+	it('should return 404 when session does not exist', async () => {
+		mockGetBackend.mockReturnValue({
+			sessionExists: jest.fn(() => false),
+		} as any);
+
+		const req = createMockReq({
+			params: { name: 'missing-session' },
+			body: { data: 'hello' },
+		} as any);
+		const res = createMockRes();
+
+		await writeToSession.call(undefined, req, res);
+
+		expect(res.status).toHaveBeenCalledWith(404);
+	});
+});
+
+describe('createSession — command selection (#1012)', () => {
+	/**
+	 * Run createSession against a fake backend and return the options it spawned with.
+	 *
+	 * @param body - Request body
+	 * @returns The options passed to backend.createSession
+	 */
+	async function spawnOptions(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+		const create = jest.fn<any>().mockResolvedValue({ pid: 1, cwd: '/tmp' });
+		(getSessionBackend as jest.MockedFunction<typeof getSessionBackend>).mockResolvedValue({
+			sessionExists: jest.fn(() => false),
+			createSession: create,
+		} as any);
+		const req = createMockReq({ body } as any);
+		const res = createMockRes();
+		await createSession.call(undefined, req, res);
+		expect(res.status).toHaveBeenCalledWith(201);
+		return create.mock.calls[0][1] as Record<string, unknown>;
+	}
+
+	it('uses the command it was given (it used to become powershell.exe)', async () => {
+		const opts = await spawnOptions({ name: 's1', command: '/bin/zsh' });
+		expect(opts.command).toBe('/bin/zsh');
+	});
+
+	it('falls back to the platform shell when no command is given', async () => {
+		const opts = await spawnOptions({ name: 's2' });
+		expect(opts.command).toBe(DEFAULT_SHELL);
+	});
+});

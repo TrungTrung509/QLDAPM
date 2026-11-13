@@ -1,0 +1,93 @@
+/**
+ * Cloud REST Routes
+ *
+ * Router configuration for CrewlyAI Cloud integration endpoints.
+ *
+ * Endpoints:
+ * - POST /connect              - Connect to CrewlyAI Cloud
+ * - POST /disconnect           - Disconnect from CrewlyAI Cloud
+ * - POST /validate             - Validate JWT (local verification + optional proxy)
+ * - GET  /status               - Get connection status and subscription tier
+ * - GET  /device-id            - Get persistent device UUID and hostname
+ * - GET  /devices              - Get device list from CloudSync (or fallback to legacy)
+ * - GET  /templates            - Fetch premium templates (requires connection)
+ * - GET  /license/verify       - Verify license and return tier + features
+ * - POST /send                 - Send a message to another device via Cloud Sync
+ * - GET  /google/start         - Redirect to Google OAuth consent screen
+ * - GET  /google/callback      - Handle Google OAuth callback, issue JWT, redirect to frontend
+ * - POST /google/url           - Return Google OAuth URL as JSON (SPA client flow)
+ * - POST /google/callback      - Exchange code for JWT, return JSON (SPA client flow)
+ * - POST /device/start         - Start device-code pairing (owner-only; link + code for the owner's phone)
+ * - GET  /device/status        - Pairing progress; `connected` once approved (owner-only)
+ * - POST /device/cancel        - Stop waiting for approval (owner-only)
+ *
+ * @module controllers/cloud/cloud.routes
+ */
+
+import { Router } from 'express';
+import {
+  connectToCloud,
+  disconnectFromCloud,
+  getCloudStatus,
+  getCloudTemplates,
+  validateCloudToken,
+  refreshCloudToken,
+  sendCloudMessage,
+  getDeviceId,
+  getDevicesFromSync,
+  verifyLicense,
+  mobilePair,
+  cloudSearch,
+} from './cloud.controller.js';
+import {
+  cloudGoogleStart,
+  cloudGoogleCallback,
+  cloudGoogleUrl,
+  cloudGoogleCallbackPost,
+} from './cloud-google-auth.controller.js';
+import {
+  startCloudDevicePairing,
+  getCloudDevicePairingStatus,
+  cancelCloudDevicePairing,
+} from './cloud-device-pairing.controller.js';
+
+/**
+ * Creates the cloud router with all CrewlyAI Cloud endpoints.
+ *
+ * @returns Express router configured with cloud routes
+ */
+export function createCloudRouter(): Router {
+  const router = Router();
+
+  router.post('/connect', connectToCloud);
+  router.post('/disconnect', disconnectFromCloud);
+  router.post('/validate', validateCloudToken);
+  router.post('/refresh', refreshCloudToken);
+  router.get('/status', getCloudStatus);
+  router.get('/device-id', getDeviceId);
+  router.get('/devices', getDevicesFromSync);
+  router.post('/send', sendCloudMessage);
+  router.get('/templates', getCloudTemplates);
+  router.get('/license/verify', verifyLicense);
+  // Mobile-app LAN pairing — adopt this OSS's cloud session (see mobilePair).
+  router.post('/mobile-pair', mobilePair);
+  // Cloud web search for agents: the backend calls Cloud with its own token
+  // (agents never hold Cloud credentials). Owner or badge-identified agent.
+  router.post('/search', cloudSearch);
+
+  // Device-code pairing — the owner approves on crewlyai.com (usually from a
+  // phone); this backend polls and connects by itself. Owner-only.
+  router.post('/device/start', startCloudDevicePairing);
+  router.get('/device/status', getCloudDevicePairingStatus);
+  router.post('/device/cancel', cancelCloudDevicePairing);
+
+  // Google OAuth login flow — browser-redirect (GET)
+  router.get('/google/start', cloudGoogleStart);
+  router.get('/google/callback', cloudGoogleCallback);
+
+  // Google OAuth login flow — SPA JSON API (POST)
+  router.post('/google/url', cloudGoogleUrl);
+  router.post('/google/callback', cloudGoogleCallbackPost);
+
+  return router;
+}

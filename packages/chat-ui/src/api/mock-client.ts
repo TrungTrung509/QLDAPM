@@ -1,0 +1,319 @@
+/**
+ * In-memory mock client used when `ChatAPIProvider mode="mock"` is set.
+ *
+ * Purpose: lets us iterate on UI / Storybook / demo before Sam's backend
+ * is live. Emits WS frames on a small timer so presence + agent-reply
+ * flows feel real enough to catch UX bugs.
+ *
+ * Mock honors the same Week-2 contract the HTTP client implements:
+ *  - sendMessage emits an optimistic `pending` event before the
+ *    "persistence" delay, then a `sent` event with the same
+ *    clientMessageId so reconciliation paths exercise.
+ *  - Agent replies arrive on the same channel subscription with
+ *    `senderType=agent`.
+ *
+ * @module api/mock-client
+ */
+
+import type {
+  ChatApiClient,
+  ChannelSubscription,
+} from './client';
+import type {
+  Channel,
+  CreateChannelInput,
+  CreateHuddleInput,
+  Message,
+  MessagePage,
+  SendMessageInput,
+  AgentPresence,
+  ChatWebsocketEvent,
+  ChatSearchHit,
+  ChatSearchOptions,
+} from '../types/chat.types';
+
+const MOCK_USER_ID = 'demo-user';
+const MOCK_USER_NAME = 'Steve';
+const DEFAULT_AGENT_REPLY_MS = 800;
+
+/**
+ * Options for `MockChatApiClient`. Exposed so demo/storybook can pre-seed
+ * channels + messages to exercise empty/populated states.
+ */
+export interface MockClientOptions {
+  initialChannels?: Channel[];
+  initialMessages?: Record<string, Message[]>;
+  agentReplyDelayMs?: number;
+}
+
+/** Increment-only id generator scoped to a mock client instance. */
+const makeIdFactory = () => {
+  let n = 1;
+  return (prefix: string) => `${prefix}-${n++}`;
+};
+
+export class MockChatApiClient implements ChatApiClient {
+  private channels: Channel[];
+  private messages: Record<string, Message[]>;
+  private subscribers: Record<string, Array<(e: ChatWebsocketEvent) => void>> = {};
+  private readonly replyDelay: number;
+  private readonly nextId = makeIdFactory();
+
+  constructor(opts: MockClientOptions = {}) {
+    this.channels = opts.initialChannels ?? seedChannels();
+    this.messages = opts.initialMessages ?? seedMessages(this.channels);
+    this.replyDelay = opts.agentReplyDelayMs ?? DEFAULT_AGENT_REPLY_MS;
+  }
+
+  async listChannels(): Promise<Channel[]> {
+    return [...this.channels];
+  }
+
+  async createChannel(input: CreateChannelInput): Promise<Channel> {
+    const type = input.type ?? 'dm';
+    const ch: Channel = {
+      id: this.nextId('ch'),
+      agentSession: type === 'dm' ? input.agentSession ?? '' : '',
+      name: input.name,
+      purpose: input.purpose,
+      createdAt: new Date().toISOString(),
+      presence: 'online',
+      type,
+      teamId: input.teamId,
+      projectId: input.projectId,
+      targetMemberId: input.targetMemberId,
+    };
+    this.channels = [...this.channels, ch];
+    this.messages[ch.id] = [];
+    return ch;
+  }
+
+  async createHuddle(input: CreateHuddleInput): Promise<Channel> {
+    const ch: Channel = {
+      id: this.nextId('ch'),
+      agentSession: '',
+      name: input.name,
+      purpose: input.purpose,
+      createdAt: new Date().toISOString(),
+      presence: 'online',
+      type: 'huddle',
+      members: input.memberSessions.map((sessionName) => ({ sessionName })),
+    };
+    this.channels = [...this.channels, ch];
+    this.messages[ch.id] = [];
+    return ch;
+  }
+
+  async renameChannel(channelId: string, name: string): Promise<Channel> {
+    const ch = this.channels.find((c) => c.id === channelId);
+    if (!ch) throw new Error('channel not found');
+    const next = { ...ch, name };
+    this.channels = this.channels.map((c) => (c.id === channelId ? next : c));
+    return next;
+  }
+
+  async setHuddleMembers(channelId: string, memberSessions: string[]): Promise<Channel> {
+    const ch = this.channels.find((c) => c.id === channelId);
+    if (!ch) throw new Error('channel not found');
+    const next = { ...ch, members: memberSessions.map((sessionName) => ({ sessionName })) };
+    this.channels = this.channels.map((c) => (c.id === channelId ? next : c));
+    return next;
+  }
+
+  /** In-memory keyword search over every seeded channel (all words, case-insensitive), newest first. */
+  async searchMessages(query: string, opts: ChatSearchOptions = {}): Promise<ChatSearchHit[]> {
+    const terms = query.toLowerCase().split(/\s+/).filter((t) => t.length > 0);
+    if (terms.length === 0) return [];
+    const hits: ChatSearchHit[] = [];
+    for (const ch of this.channels) {
+      if (opts.channel && opts.channel !== ch.id && opts.channel.replace(/^#/, '') !== ch.name.replace(/^#/, '')) continue;
+      for (const m of this.messages[ch.id] ?? []) {
+        const text = m.content.toLowerCase();
+        if (!terms.every((t) => text.includes(t))) continue;
+        hits.push({
+          id: m.id,
+          time: m.createdAt,
+          channelId: ch.id,
+          channel: ch.name,
+          channelType: ch.type ?? 'dm',
+          sender: m.author.name ?? m.author.id,
+          senderType: m.author.role,
+          text: m.content,
+          threadId: m.threadId ?? null,
+        });
+      }
+    }
+    hits.sort((a, b) => b.time.localeCompare(a.time));
+    return hits.slice(0, opts.limit ?? hits.length);
+  }
+
+  async listMessages(
+    channelId: string,
+    opts: { cursor?: string; limit?: number } = {},
+  ): Promise<MessagePage> {
+    const all = this.messages[channelId] ?? [];
+    const limit = opts.limit ?? 50;
+    // Simplified pagination — returns the most recent `limit` messages.
+    const messages = all.slice(-limit);
+    return { messages, nextCursor: all.length > limit ? 'mock-older' : null };
+  }
+
+  async sendMessage(channelId: string, input: SendMessageInput): Promise<Message> {
+    const channel = this.channels.find((c) => c.id === channelId);
+    if (!channel) throw new Error(`Unknown channel: ${channelId}`);
+
+    const clientMessageId = input.clientMessageId ?? this.nextId('cmid');
+
+    // Phase B — preserve mentions + threadId on the round-trip so mock
+    // and HTTP clients have identical lifecycle semantics. `mentions` is
+    // always `string[]` on domain Messages (never null) per SEALED §3.2.
+    const mentions = input.mentions ?? [];
+    const threadId = input.threadId;
+
+    // 1. Optimistic pending — fire before "persistence" so subscribers see
+    //    the same lifecycle the HTTP client produces.
+    const pending: Message = {
+      id: clientMessageId,
+      channelId,
+      seq: -1,
+      author: { role: 'user', id: MOCK_USER_ID, name: MOCK_USER_NAME },
+      content: input.content,
+      attachments: input.attachments,
+      createdAt: new Date().toISOString(),
+      clientMessageId,
+      deliveryStatus: 'pending',
+      mentions,
+      threadId,
+    };
+    this.emit(channelId, { type: 'message', channelId, message: pending });
+
+    // 2. Persistence + confirmation event.
+    const confirmed: Message = {
+      id: this.nextId('m'),
+      channelId,
+      seq: (this.messages[channelId]?.length ?? 0) + 1,
+      author: { role: 'user', id: MOCK_USER_ID, name: MOCK_USER_NAME },
+      content: input.content,
+      attachments: input.attachments,
+      createdAt: pending.createdAt,
+      clientMessageId,
+      deliveryStatus: 'sent',
+      mentions,
+      threadId,
+    };
+    (this.messages[channelId] ||= []).push(confirmed);
+    this.emit(channelId, { type: 'message', channelId, message: confirmed });
+
+    // 3. Fake agent reply — tightens the feedback loop while no backend is up.
+    window.setTimeout(() => {
+      const reply: Message = {
+        id: this.nextId('m'),
+        channelId,
+        seq: (this.messages[channelId]?.length ?? 0) + 1,
+        author: { role: 'agent', id: channel.agentSession, name: channel.name },
+        content: `(mock reply) you said: "${input.content}"`,
+        createdAt: new Date().toISOString(),
+        deliveryStatus: 'sent',
+        mentions: [],
+        // Echo the same thread root so the mock thread pane stays consistent.
+        threadId,
+      };
+      (this.messages[channelId] ||= []).push(reply);
+      this.emit(channelId, { type: 'message', channelId, message: reply });
+    }, this.replyDelay);
+
+    return confirmed;
+  }
+
+  async getAgentPresence(agentId: string): Promise<AgentPresence> {
+    const ch = this.channels.find((c) => c.agentSession === agentId);
+    return {
+      agentId,
+      status: ch?.presence ?? 'offline',
+      lastSeen: new Date().toISOString(),
+    };
+  }
+
+  subscribeToChannel(
+    channelId: string,
+    onEvent: (event: ChatWebsocketEvent) => void,
+  ): ChannelSubscription {
+    (this.subscribers[channelId] ||= []).push(onEvent);
+    return {
+      unsubscribe: () => {
+        const list = this.subscribers[channelId];
+        if (!list) return;
+        this.subscribers[channelId] = list.filter((cb) => cb !== onEvent);
+      },
+    };
+  }
+
+  private emit(channelId: string, event: ChatWebsocketEvent): void {
+    const list = this.subscribers[channelId];
+    if (!list) return;
+    for (const cb of list) {
+      try {
+        cb(event);
+      } catch {
+        // A subscriber crashing must not stop the others.
+      }
+    }
+  }
+}
+
+// ---- seeds ---------------------------------------------------------------
+
+function seedChannels(): Channel[] {
+  const now = new Date().toISOString();
+  return [
+    {
+      id: 'ch-ella',
+      agentSession: 'crewly-marketing-ella',
+      name: 'Ella · Marketing',
+      purpose: 'Marketing strategy + content planning',
+      createdAt: now,
+      lastMessageAt: now,
+      presence: 'online',
+      type: 'dm',
+    },
+    {
+      id: 'ch-sam',
+      agentSession: 'crewly-product-sam',
+      name: 'Sam · Engineering',
+      purpose: 'Platform architecture + delivery',
+      createdAt: now,
+      lastMessageAt: now,
+      presence: 'busy',
+      type: 'dm',
+    },
+    {
+      id: 'ch-offline',
+      agentSession: 'crewly-offline-demo',
+      name: 'Dormant Agent',
+      purpose: 'Shows the offline state',
+      createdAt: now,
+      presence: 'offline',
+      type: 'dm',
+    },
+  ];
+}
+
+function seedMessages(channels: Channel[]): Record<string, Message[]> {
+  const out: Record<string, Message[]> = {};
+  for (const ch of channels) {
+    out[ch.id] = [
+      {
+        id: `${ch.id}-welcome`,
+        channelId: ch.id,
+        seq: 1,
+        author: { role: 'agent', id: ch.agentSession, name: ch.name },
+        content: `Welcome — I'm **${ch.name.split('·')[0]?.trim() ?? ch.name}**. Ask me anything.`,
+        createdAt: ch.createdAt,
+        // Phase B — `mentions: string[]` is required on domain Message;
+        // seeded with empty array since the welcome message has none.
+        mentions: [],
+      },
+    ];
+  }
+  return out;
+}

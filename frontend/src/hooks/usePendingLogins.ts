@@ -1,0 +1,87 @@
+/**
+ * Use Pending Logins Hook
+ *
+ * Polls `GET /api/oauth/pending` — every agent session currently parked on
+ * a runtime sign-in screen — so the app can show a global "Sign-in needed"
+ * banner. Polls once a minute and again whenever the tab regains focus or
+ * becomes visible (the owner typically signs in in another tab, then comes
+ * back); the list is small and only changes when a runtime's OAuth token
+ * expires, so a WebSocket subscription is not worth the extra plumbing.
+ *
+ * @module hooks/usePendingLogins
+ */
+
+import { useState, useEffect, useRef, useCallback } from 'react';
+import axios from 'axios';
+import type { PendingLogin } from '../types';
+import { SIGN_IN_CONSTANTS } from '../constants/sign-in.constants';
+import { setVisibleInterval } from '../utils/visible-interval';
+
+/**
+ * Return type for the usePendingLogins hook
+ */
+export interface UsePendingLoginsResult {
+  /** Sessions waiting on a human sign-in (empty when none) */
+  pending: PendingLogin[];
+  /** Whether the first fetch is still in flight */
+  isLoading: boolean;
+  /** Re-fetch immediately */
+  refresh: () => Promise<void>;
+}
+
+/**
+ * Hook that keeps the pending-logins list fresh.
+ *
+ * @param intervalMs - Poll interval (defaults to SIGN_IN_CONSTANTS.PENDING_POLL_INTERVAL_MS)
+ * @returns Pending logins, loading flag and a manual refresh
+ */
+export function usePendingLogins(
+  intervalMs: number = SIGN_IN_CONSTANTS.PENDING_POLL_INTERVAL_MS,
+): UsePendingLoginsResult {
+  const [pending, setPending] = useState<PendingLogin[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const isMountedRef = useRef(true);
+
+  const refresh = useCallback(async () => {
+    try {
+      const response = await axios.get<{ success: boolean; data?: PendingLogin[] }>(
+        SIGN_IN_CONSTANTS.PENDING_ENDPOINT,
+        { timeout: SIGN_IN_CONSTANTS.PENDING_REQUEST_TIMEOUT_MS },
+      );
+      if (!isMountedRef.current) return;
+      if (response.data.success && Array.isArray(response.data.data)) {
+        setPending(response.data.data);
+      }
+    } catch {
+      // Non-critical: keep the last known list rather than flashing the banner off.
+    } finally {
+      if (isMountedRef.current) setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    void refresh();
+    const timer = setVisibleInterval(() => {
+      void refresh();
+    }, intervalMs);
+    const onFocus = (): void => {
+      void refresh();
+    };
+    const onVisibility = (): void => {
+      if (document.visibilityState === 'visible') void refresh();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      isMountedRef.current = false;
+      clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [refresh, intervalMs]);
+
+  return { pending, isLoading, refresh };
+}
+
+export default usePendingLogins;

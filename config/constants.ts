@@ -1,0 +1,1781 @@
+/**
+ * Crewly Cross-Domain Constants
+ *
+ * This file contains constants shared across all Crewly domains:
+ * - Backend (Express.js server)
+ * - Frontend (React application)
+ * - CLI (Command-line interface)
+ * - MCP Server (Model Context Protocol server)
+ *
+ * Domain-specific constants should remain in their respective constants.ts files.
+ */
+
+// ========================= CORE SYSTEM CONSTANTS =========================
+
+/**
+ * Crewly core system identifiers and names
+ */
+export const CREWLY_CONSTANTS = {
+	/**
+	 * Session and orchestrator configuration
+	 */
+	SESSIONS: {
+		/** Default orchestrator session name used across all domains */
+		ORCHESTRATOR_NAME: 'crewly-orc',
+		/** Default timeout for agent initialization (2 minutes) */
+		DEFAULT_TIMEOUT: 120000,
+		/** Interval for checking agent registration status (5 seconds) */
+		REGISTRATION_CHECK_INTERVAL: 5000,
+		/** Cache timeout for Claude detection (30 seconds) */
+		CLAUDE_DETECTION_CACHE_TIMEOUT: 30000,
+		/** Default shell for terminal sessions, /bin/bash, /bin/zsh */
+		DEFAULT_SHELL: '/bin/bash',
+	},
+
+	/**
+	 * File system paths and directory structure
+	 */
+	PATHS: {
+		/** Crewly home directory name */
+		CREWLY_HOME: '.crewly',
+		/** Teams configuration file */
+		TEAMS_FILE: 'teams.json',
+		/** Projects configuration file */
+		PROJECTS_FILE: 'projects.json',
+		/** Runtime state file */
+		RUNTIME_FILE: 'runtime.json',
+		/** Scheduled messages file */
+		SCHEDULED_MESSAGES_FILE: 'scheduled-messages.json',
+		/** Message delivery logs file */
+		MESSAGE_DELIVERY_LOGS_FILE: 'message-delivery-logs.json',
+		/** Configuration directory */
+		CONFIG_DIR: 'config',
+		/** System prompts directory */
+		PROMPTS_DIR: 'prompts',
+		/** Tasks directory */
+		TASKS_DIR: 'tasks',
+		/** Specifications directory */
+		SPECS_DIR: 'specs',
+		/** Agent memory directory */
+		MEMORY_DIR: 'memory',
+		/** Knowledge documents directory */
+		DOCS_DIR: 'docs',
+		/** Knowledge documents index file */
+		DOCS_INDEX_FILE: 'docs-index.json',
+		/** Server logs directory */
+		LOGS_DIR: 'logs',
+		/** Session PTY logs subdirectory (under LOGS_DIR) */
+		SESSION_LOGS_DIR: 'sessions',
+		/** Bug reports directory */
+		BUG_REPORTS_DIR: 'bug-reports',
+		/** Skills directory (under CREWLY_HOME) */
+		SKILLS_DIR: 'skills',
+		/** Agent skills catalog file (under SKILLS_DIR) */
+		SKILLS_CATALOG_FILE: 'AGENT_SKILLS_CATALOG.md',
+	},
+
+	/**
+	 * Agent status enumeration - represents agent lifecycle states
+	 * Lifecycle: inactive -> starting -> started -> active
+	 */
+	AGENT_STATUSES: {
+		/** Agent is not running or has been stopped */
+		INACTIVE: 'inactive',
+		/** Terminal/PTY session is being created */
+		STARTING: 'starting',
+		/** Runtime (Claude Code, etc.) is running but agent hasn't registered yet */
+		STARTED: 'started',
+		/** Agent has registered and is fully operational */
+		ACTIVE: 'active',
+		/** Agent was active but has been suspended to free resources (idle timeout) */
+		SUSPENDED: 'suspended',
+		/** @deprecated Use STARTING instead - kept for backward compatibility */
+		ACTIVATING: 'activating',
+	},
+
+	/**
+	 * Working status enumeration - represents current agent activity
+	 */
+	WORKING_STATUSES: {
+		/** Agent is idle and available for tasks */
+		IDLE: 'idle',
+		/** Agent is currently processing a task */
+		IN_PROGRESS: 'in_progress',
+	},
+
+	/**
+	 * Agent roles available in the system
+	 */
+	ROLES: {
+		/** System orchestrator - coordinates all activities */
+		ORCHESTRATOR: 'orchestrator',
+		/** Project manager - handles project-level coordination */
+		PROJECT_MANAGER: 'pm',
+		/** Technical project manager - technical leadership */
+		TECH_LEAD: 'tpm',
+		/** Software developer - implements features */
+		DEVELOPER: 'developer',
+		/** Quality assurance engineer - testing and validation */
+		QA: 'qa',
+		/** DevOps engineer - deployment and infrastructure */
+		DEVOPS: 'devops',
+	},
+
+	/**
+	 * Special agent identifiers for system-level agents
+	 */
+	AGENT_IDS: {
+		/** Orchestrator agent identifier - used in teamAgentStatus.json */
+		ORCHESTRATOR_ID: 'orchestrator',
+	},
+
+	/**
+	 * Human-readable role display names
+	 */
+	ROLE_DISPLAY_NAMES: {
+		orchestrator: 'Orchestrator',
+		pm: 'Project Manager',
+		tpm: 'Technical Project Manager',
+		developer: 'Developer',
+		qa: 'Quality Assurance',
+		devops: 'DevOps Engineer',
+	},
+
+	/**
+	 * Orchestrator-specific configuration
+	 */
+	ORCHESTRATOR: {
+		/** Display name for the orchestrator role */
+		DISPLAY_NAME: 'Orchestrator',
+		/** Default orchestrator window name */
+		WINDOW_NAME: 'Crewly Orchestrator',
+		/** Crewly session name prefix pattern */
+		SESSION_PREFIX: 'crewly_',
+	},
+} as const;
+
+// ========================= AGENT IDENTITY CONSTANTS =========================
+
+/**
+ * Convenient agent identity references combining multiple constants
+ */
+export const AGENT_IDENTITY_CONSTANTS = {
+	/**
+	 * Orchestrator agent identity - combines ID, session name, and role
+	 */
+	ORCHESTRATOR: {
+		/** Agent identifier used in teamAgentStatus.json */
+		ID: CREWLY_CONSTANTS.AGENT_IDS.ORCHESTRATOR_ID, // 'orchestrator'
+		/** PTY session name */
+		SESSION_NAME: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME, // 'crewly-orc'
+		/** Agent role */
+		ROLE: CREWLY_CONSTANTS.ROLES.ORCHESTRATOR // 'orchestrator'
+	}
+} as const;
+
+// ========================= PROCESS EXIT CODES =========================
+
+/**
+ * Process exit codes used for inter-process communication between the CLI
+ * parent process and the backend child process.
+ */
+export const PROCESS_EXIT_CODES = {
+	/** Normal shutdown — do not respawn */
+	SUCCESS: 0,
+	/** Error — do not respawn */
+	ERROR: 1,
+	/** Graceful restart requested — CLI should respawn the backend */
+	RESTART_REQUESTED: 120,
+} as const;
+
+// ========================= SAFE RESTART CONSTANTS =========================
+
+/**
+ * Safe-restart budget shared by the backend (which drains in-flight agent
+ * turns on SIGTERM/SIGINT) and every supervisor that stops it (CLI `start`
+ * parent, `crewly stop`, `crewly service`, the systemd unit). A supervisor
+ * that escalates to SIGKILL sooner than the drain plus a margin would cut
+ * off the very turns the drain is waiting for.
+ */
+export const SAFE_RESTART_CONSTANTS = {
+	/** Default time the backend waits for agents to finish their current turn (ms) */
+	DRAIN_TIMEOUT_MS: 120_000,
+	/** Env var overriding DRAIN_TIMEOUT_MS; `0` disables the wait */
+	DRAIN_ENV_VAR: 'CREWLY_RESTART_DRAIN_MS',
+	/**
+	 * Hard cap on the drain while an agent it waits on has a tool call or a
+	 * subagent / background task still running (ms). Such work routinely
+	 * outlasts DRAIN_TIMEOUT_MS (2026-10-02, Eve).
+	 */
+	BACKGROUND_DRAIN_TIMEOUT_MS: 600_000,
+	/** Env var overriding BACKGROUND_DRAIN_TIMEOUT_MS */
+	BACKGROUND_DRAIN_ENV_VAR: 'CREWLY_RESTART_DRAIN_BACKGROUND_MS',
+	/**
+	 * Time allowed after the drain for the rest of the shutdown (session state
+	 * save, PTY teardown, queue flush) before a supervisor may SIGKILL (ms).
+	 * Must exceed the backend's own post-drain force-exit timer (10s).
+	 */
+	SHUTDOWN_MARGIN_MS: 30_000,
+	/** Two signals closer together than this count as one (tty process-group delivery) */
+	SIGNAL_DEDUP_WINDOW_MS: 1_000,
+	/** REST path an operator (or the CLI) polls before restarting */
+	READINESS_ENDPOINT: '/api/system/restart-readiness',
+	/**
+	 * Shutdown marker: `<crewlyHome>/run/shutdown-requested`. Written when the
+	 * owner shuts Crewly down (not restarts it). A supervisor that relaunches
+	 * Crewly on exit (the macOS `crewly-start.command` loop) checks it first
+	 * and stays down; `crewly start` and a fresh supervisor launch clear it.
+	 */
+	SHUTDOWN_MARKER_DIR: 'run',
+	/** File name of the shutdown marker inside SHUTDOWN_MARKER_DIR */
+	SHUTDOWN_MARKER_FILE: 'shutdown-requested',
+	/** Wind-down grace before a restart, when the request names none (seconds) */
+	WIND_DOWN_RESTART_GRACE_SECONDS: 180,
+	/** Wind-down grace before a shutdown, when the request names none (seconds) */
+	WIND_DOWN_SHUTDOWN_GRACE_SECONDS: 300,
+	/** Longest wind-down grace a request may ask for (seconds) */
+	WIND_DOWN_MAX_GRACE_SECONDS: 900,
+	/** How often the wind-down re-checks which agents are still busy (ms) */
+	WIND_DOWN_POLL_MS: 2_000,
+	/** Tag at the start of the harness note agents receive */
+	WIND_DOWN_TAG: '[Crewly wind-down]',
+} as const;
+
+// ========================= WEB SERVER CONSTANTS =========================
+
+/**
+ * Web server and API configuration
+ */
+export const WEB_CONSTANTS = {
+	/**
+	 * Default server ports
+	 */
+	PORTS: {
+		/** Backend API server default port */
+		BACKEND: 8787,
+		/** Frontend development server default port */
+		FRONTEND: 8788,
+	},
+
+	/**
+	 * API endpoint paths
+	 */
+	ENDPOINTS: {
+		/** Health check endpoint */
+		HEALTH: '/health',
+		/** Base API path */
+		API_BASE: '/api',
+		/** Teams management endpoints */
+		TEAMS: '/api/teams',
+		/** Projects management endpoints */
+		PROJECTS: '/api/projects',
+		/** Orchestrator control endpoints */
+		ORCHESTRATOR: '/api/orchestrator',
+		/** Terminal operations endpoints */
+		TERMINAL: '/api/terminal',
+		/** Live agent sessions (PTY): name, pid, cwd */
+		SESSIONS: '/api/sessions',
+		/** Live terminal sessions including in-process (no PTY) agents */
+		TERMINAL_SESSIONS: '/api/terminal/sessions',
+		/** Task management endpoints */
+		TASKS: '/api/tasks',
+		/** Factory SSE endpoint */
+		FACTORY_SSE: '/api/factory/sse',
+	},
+
+	/**
+	 * SSE (Server-Sent Events) configuration
+	 */
+	SSE: {
+		/** Backend polling interval in milliseconds (3 seconds) */
+		POLL_INTERVAL: 3000,
+		/** Heartbeat interval in milliseconds (30 seconds) */
+		HEARTBEAT_INTERVAL: 30000,
+		/** Maximum reconnection attempts before fallback to polling */
+		MAX_RECONNECT_ATTEMPTS: 5,
+		/** Base delay between reconnection attempts (1 second) */
+		BASE_RECONNECT_DELAY: 1000,
+		/** Maximum reconnection delay (30 seconds) */
+		MAX_RECONNECT_DELAY: 30000,
+		/** Fallback polling interval when SSE fails (5 seconds) */
+		FALLBACK_POLL_INTERVAL: 5000,
+	},
+} as const;
+
+// ========================= API SECURITY CONSTANTS =========================
+
+/**
+ * Network exposure + API token authentication for the OSS server.
+ *
+ * The REST API and WebSocket endpoints are open to loopback callers (local
+ * skills, the local dashboard) and require a shared API token from every
+ * other address. See README "Securing a server install".
+ */
+export const API_SECURITY_CONSTANTS = {
+	/** Environment variable names */
+	ENV: {
+		/** Host/interface the HTTP server binds to (default: all interfaces) */
+		BIND_HOST: 'CREWLY_BIND_HOST',
+		/** Pinned API token; when unset one is generated on first boot */
+		API_TOKEN: 'CREWLY_API_TOKEN',
+		/** Set to `1` to honour `X-Forwarded-For` when classifying loopback callers */
+		TRUST_PROXY: 'CREWLY_TRUST_PROXY',
+		/** Set to `1`/`true` to force headless (no display) detection */
+		HEADLESS: 'CREWLY_HEADLESS',
+		/**
+		 * Set to `1`/`true` to keep `GET /health` open to non-loopback callers
+		 * without the API token (#825). For deployments that monitor /health
+		 * from another machine or through a public reverse proxy.
+		 */
+		PUBLIC_HEALTH: 'CREWLY_PUBLIC_HEALTH',
+	},
+	/**
+	 * Backend-only secrets that agent PTYs must not inherit from the backend's
+	 * process.env. No agent, skill or runtime reads them (the Slack bridge runs
+	 * in the backend), and an agent that runs `env` would print them into
+	 * scrollback and its session log.
+	 */
+	AGENT_ENV_DENYLIST: ['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'SLACK_SIGNING_SECRET'] as readonly string[],
+	/** Default bind host — every interface, for backward compatibility */
+	DEFAULT_BIND_HOST: '0.0.0.0',
+	/** Loopback-only bind host suggested in the startup warning */
+	LOOPBACK_BIND_HOST: '127.0.0.1',
+	/** File (relative to CREWLY_HOME) holding the generated API token */
+	TOKEN_FILE_NAME: 'api-token',
+	/** Random bytes in a generated token (hex-encoded → 64 chars) */
+	TOKEN_BYTES: 32,
+	/** POSIX mode for the token file (owner read/write only) */
+	TOKEN_FILE_MODE: 0o600,
+	/** Hex characters of sha256(token) recorded for audit purposes */
+	FINGERPRINT_HEX_LENGTH: 8,
+	/** Request header carrying the token */
+	TOKEN_HEADER: 'x-crewly-token',
+	/** Cookie name carrying the token (lets `<img>`/asset/WS requests pass) */
+	TOKEN_COOKIE: 'crewly_token',
+	/** Query-string parameter carrying the token (WebSocket + dashboard deep link) */
+	TOKEN_QUERY_PARAM: 'token',
+	/** localStorage key the dashboard stores the token under */
+	TOKEN_STORAGE_KEY: 'crewly_api_token',
+	/** `WWW-Authenticate` scheme advertised on 401 so clients can detect the challenge */
+	AUTH_SCHEME: 'Crewly-Token',
+	/** Error codes returned in `{ success: false, error }` */
+	ERRORS: {
+		UNAUTHORIZED: 'unauthorized',
+		OWNER_APPROVAL_REQUIRED: 'owner_approval_required',
+	},
+	/** Actor recorded on approvals performed with the owner token */
+	OWNER_ACTOR: 'owner',
+	/**
+	 * Header the dashboard sets on owner-initiated actions (e.g. the per-member
+	 * Start button). Paired with the ABSENCE of `X-Agent-Session`, it marks a
+	 * request as a human action rather than an agent skill or an internal
+	 * server-to-server call, which send neither (issue #775).
+	 */
+	CALLER_HEADER: 'x-crewly-caller',
+	/** Value of {@link CALLER_HEADER} sent by the dashboard. */
+	DASHBOARD_CALLER: 'dashboard',
+	/** Header skills send to identify the calling agent session. */
+	AGENT_SESSION_HEADER: 'x-agent-session',
+	/** Legacy alias of {@link AGENT_SESSION_HEADER} still accepted by the backend. */
+	AGENT_SESSION_HEADER_LEGACY: 'x-crewly-agent-session',
+	/** Hint appended to 401 responses */
+	UNAUTHORIZED_HINT:
+		'Non-loopback callers must send the API token: `Authorization: Bearer <token>`, `X-Crewly-Token: <token>` or a `crewly_token` cookie. Run `crewly token` on the server to print it.',
+	/** Loopback addresses that bypass token auth */
+	LOOPBACK_ADDRESSES: ['127.0.0.1', '::1', '::ffff:127.0.0.1'],
+} as const;
+
+/**
+ * Owner authentication (#999, specs/2026-10-03-owner-auth.md).
+ *
+ * Who a caller is comes from credentials, never from a missing header:
+ * - agents carry a per-session **agent badge** minted by the harness at launch;
+ * - the dashboard holds an owner session cookie plus a CSRF token;
+ * - the phone / portal relay and Cloud-forwarded Slack envelopes carry an
+ *   in-memory internal credential;
+ * - remote dashboards, the phone on the LAN and the CLI present the owner API token.
+ */
+export const OWNER_AUTH_CONSTANTS = {
+	/**
+	 * Environment variable holding the agent badge in every agent process.
+	 * Deliberately free of TOKEN / KEY / SECRET: Codex's default
+	 * `shell_environment_policy` strips variables whose names contain those
+	 * words from the shells it runs, so the skills would never see it.
+	 */
+	AGENT_BADGE_ENV: 'CREWLY_AGENT_BADGE',
+	/** Request header carrying the agent badge */
+	AGENT_BADGE_HEADER: 'x-agent-badge',
+	/** Version prefix of a badge (`cab1.<base64url session>.<hmac>`) */
+	AGENT_BADGE_PREFIX: 'cab1',
+	/** Owner session cookie name prefix; the backend port is appended (cookies ignore ports) */
+	OWNER_SESSION_COOKIE_PREFIX: 'crewly_owner_',
+	/** Version prefix of an owner session value */
+	OWNER_SESSION_PREFIX: 'cos1',
+	/** Lifetime of an owner session cookie (seconds). The signing secret is in memory, so a restart ends it sooner. */
+	OWNER_SESSION_MAX_AGE_S: 30 * 24 * 60 * 60,
+	/** Header the dashboard sends the CSRF token in on every write */
+	CSRF_HEADER: 'x-crewly-csrf',
+	/** Header carrying the in-memory internal credential (relay / cloud) */
+	INTERNAL_HEADER: 'x-crewly-internal',
+	/** Header naming the scheduled command that sends (validated; shown as `scheduler:<name>`) */
+	SCHEDULER_NAME_HEADER: 'x-crewly-scheduler',
+	/** Env var that carries the scheduler credential into a scheduled command's process */
+	SCHEDULER_CREDENTIAL_ENV: 'CREWLY_SCHEDULER_CREDENTIAL',
+	/** Env var that carries the scheduled command's entry name */
+	SCHEDULER_NAME_ENV: 'CREWLY_SCHEDULER_NAME',
+	/** Sender label prefix on a message a scheduled command delivers */
+	SCHEDULER_SENDER_PREFIX: 'scheduler:',
+	/** Path (under `/api`) that issues the owner session and returns the CSRF token */
+	SESSION_ROUTE: '/auth/session',
+	/** HTTP methods that change state and therefore need CSRF / a header-borne token */
+	MUTATING_METHODS: ['POST', 'PUT', 'PATCH', 'DELETE'] as readonly string[],
+	/**
+	 * What a browser without a session (a dashboard tab opened before the
+	 * upgrade) is told in the 401's `error`, which that old tab shows as is.
+	 */
+	RELOAD_MESSAGE: 'Reload this page — Crewly was updated.',
+	/** Response header naming the dashboard build the backend serves (its hashed entry script) */
+	BUILD_HEADER: 'x-crewly-dashboard-build',
+	/** socket.io event announcing the served dashboard build on each connection */
+	BUILD_EVENT: 'dashboard_build',
+	/** Error codes in `{ success: false, error }` */
+	ERRORS: {
+		/** No owner credential (401). The dashboard refreshes its session and retries once. */
+		OWNER_AUTH_REQUIRED: 'owner_auth_required',
+		/** An agent called an owner-only route (403) */
+		OWNER_ONLY: 'owner_only',
+		/** An agent without a valid badge (legacy header only) asked for something only a badge unlocks (403) */
+		AGENT_BADGE_REQUIRED: 'agent_badge_required',
+		/** A scheduled command asked for anything but a plain message to an agent (403) */
+		SCHEDULER_MESSAGE_ONLY: 'scheduler_message_only',
+	},
+	/** Give up looking up a local client's process after this long (fail open) */
+	PEER_LOOKUP_TIMEOUT_MS: 3000,
+	/** Longest parent chain walked from a client process */
+	PEER_MAX_ANCESTRY_DEPTH: 64,
+	/** `X-Agent-Session` without a badge (migration window) is logged at most this often per session */
+	LEGACY_WARN_THROTTLE_MS: 10 * 60 * 1000,
+} as const;
+
+// ========================= TIMING CONSTANTS =========================
+
+/**
+ * Timing and interval configurations used across domains
+ */
+export const TIMING_CONSTANTS = {
+	/**
+	 * Retry and timeout configurations
+	 */
+	RETRIES: {
+		/** Maximum retry attempts for failed operations */
+		MAX_ATTEMPTS: 3,
+		/** Base delay between retries (1 second) */
+		BASE_DELAY: 1000,
+		/** Maximum delay between retries (10 seconds) */
+		MAX_DELAY: 10000,
+	},
+
+	/**
+	 * Polling and monitoring intervals
+	 */
+	INTERVALS: {
+		/** Health check interval (30 seconds) */
+		HEALTH_CHECK: 30000,
+		/** Memory cleanup interval (5 minutes) */
+		MEMORY_CLEANUP: 5 * 60 * 1000,
+		/** Status update interval (10 seconds) */
+		STATUS_UPDATE: 10000,
+		/** Activity monitoring interval (15 seconds) */
+		ACTIVITY_MONITOR: 15000,
+		/** General cleanup interval (1 minute) */
+		CLEANUP: 60000,
+		/** Batch operation delay (500ms) */
+		BATCH_DELAY: 500,
+		/** Rate limit window for short bursts (1 second) */
+		RATE_LIMIT_WINDOW: 1000,
+		/** Task cleanup interval (5 minutes) */
+		TASK_CLEANUP: 300000,
+	},
+
+	/**
+	 * Timeout values for various operations
+	 */
+	TIMEOUTS: {
+		/** Claude initialization timeout (45 seconds) */
+		CLAUDE_INIT: 45000,
+		/** Agent setup timeout (90 seconds) */
+		AGENT_SETUP: 90000,
+		/** Task completion timeout (5 minutes) */
+		TASK_COMPLETION: 5 * 60 * 1000,
+		/** WebSocket connection timeout (30 seconds) */
+		WEBSOCKET: 30000,
+		/** Orchestrator setup timeout (30 seconds) */
+		ORCHESTRATOR_SETUP: 30000,
+		/** Task monitoring and polling intervals (2 seconds) */
+		TASK_MONITOR_POLL: 2000,
+		/** Health check timeout for individual checks (1 second) */
+		HEALTH_CHECK_TIMEOUT: 1000,
+		/** HTTP health check timeout for CLI commands (3 seconds) */
+		HTTP_HEALTH_CHECK: 3000,
+		/** API request timeout for quick calls (2 seconds) */
+		API_REQUEST_QUICK: 2000,
+		/** Shutdown wait timeout (2 seconds) */
+		SHUTDOWN: 2000,
+		/** Connection timeout for network requests (10 seconds) */
+		CONNECTION: 10000,
+		/** Agent default timeout for operations (5 minutes) */
+		AGENT_DEFAULT: 300000,
+		/** Context refresh interval (30 minutes) */
+		CONTEXT_REFRESH: 1800000,
+		/** WebSocket ping timeout (60 seconds) */
+		WS_PING: 60000,
+		/** WebSocket ping interval (25 seconds) */
+		WS_PING_INTERVAL: 25000,
+		/** Backup interval (1 hour) */
+		BACKUP: 3600000,
+		/** Rate limit window (15 minutes) */
+		RATE_LIMIT_WINDOW: 900000,
+		/** Command timestamp offset (5 minutes) */
+		COMMAND_TIMESTAMP_OFFSET: 300000,
+		/** Command timestamp offset long (10 minutes) */
+		COMMAND_TIMESTAMP_OFFSET_LONG: 600000,
+	},
+} as const;
+
+// ========================= MESSAGE CONSTANTS =========================
+
+/**
+ * Message handling and communication constants
+ */
+export const MESSAGE_CONSTANTS = {
+	/**
+	 * Message size and chunking limits
+	 */
+	LIMITS: {
+		/** Maximum message size before chunking (1500 characters) */
+		CHUNK_SIZE: 1500,
+		/** Small chunk size to avoid paste detection (200 characters) */
+		SMALL_CHUNK_SIZE: 200,
+		/** Maximum output buffer size for streaming */
+		MAX_BUFFER_SIZE: 100,
+	},
+
+	/**
+	 * Message types and categories
+	 */
+	TYPES: {
+		/** System-generated status messages */
+		SYSTEM: 'system',
+		/** User-initiated messages */
+		USER: 'user',
+		/** Agent-to-agent communications */
+		AGENT: 'agent',
+		/** Error and warning messages */
+		ERROR: 'error',
+		/** Broadcast messages to all agents */
+		BROADCAST: 'broadcast',
+	},
+} as const;
+
+// ========================= ENVIRONMENT CONSTANTS =========================
+
+/**
+ * Environment variable names used across domains
+ */
+export const ENV_CONSTANTS = {
+	/** PTY session name used for agent identity and heartbeat tracking */
+	CREWLY_SESSION_NAME: 'CREWLY_SESSION_NAME',
+	/** Crewly role identifier */
+	CREWLY_ROLE: 'CREWLY_ROLE',
+	/** API server port */
+	API_PORT: 'API_PORT',
+	/** MCP server port */
+	MCP_PORT: 'CREWLY_MCP_PORT',
+	/** Project path */
+	PROJECT_PATH: 'PROJECT_PATH',
+	/** Agent role */
+	AGENT_ROLE: 'AGENT_ROLE',
+	/** Node environment */
+	NODE_ENV: 'NODE_ENV',
+	/** Development mode flag */
+	DEV_MODE: 'DEV_MODE',
+} as const;
+
+// ========================= BACKEND-SPECIFIC CONSTANTS =========================
+
+/**
+ * Backend-specific configuration constants
+ * These constants are primarily used by the Express.js backend server
+ */
+export const BACKEND_CONSTANTS = {
+	/**
+	 * File names and configurations
+	 */
+	FILES: {
+		/** Active projects tracking file name */
+		ACTIVE_PROJECTS_FILE: 'active_projects.json',
+		/** Task tracking file name */
+		TASK_TRACKING_FILE: 'in_progress_tasks.json',
+		/** Communication log file name */
+		COMMUNICATION_LOG_FILE: 'communication.log',
+		/** Configuration file names */
+		CONFIG_FILE_NAMES: {
+			CONFIG_JSON: 'config.json',
+			APP_JSON: 'app.json',
+		},
+		/** Log file naming patterns */
+		LOG_FILE_PREFIX: 'crewly-',
+		LOG_FILE_EXTENSION: '.log',
+	},
+
+	/**
+	 * Additional directory names not covered in CREWLY_CONSTANTS.PATHS
+	 */
+	ADDITIONAL_DIRS: {
+		LOGS: 'logs',
+		DATA: 'data',
+	},
+
+	/**
+	 * HTTP and network configuration
+	 */
+	NETWORK: {
+		/** Default CORS origin */
+		DEFAULT_CORS_ORIGIN: 'http://localhost:8788',
+		/** Allowed HTTP methods */
+		ALLOWED_HTTP_METHODS: ['GET', 'POST'],
+		/** HTTP status codes used in the application */
+		HTTP_STATUS_CODES: {
+			OK: 200,
+			CREATED: 201,
+			BAD_REQUEST: 400,
+			NOT_FOUND: 404,
+			INTERNAL_SERVER_ERROR: 500,
+			SERVICE_UNAVAILABLE: 503,
+		},
+		/** Maximum request body size (10MB) */
+		MAX_REQUEST_BODY_SIZE: '10mb',
+	},
+
+	/**
+	 * API endpoint paths
+	 */
+	API_ENDPOINTS: {
+		ORCHESTRATOR_SETUP: '/api/orchestrator/setup',
+		TEAMS: '/api/teams',
+		TEAM_START: '/api/teams/:id/start',
+		HEALTH: '/health',
+		API_BASE: '/api',
+		PROJECTS: '/projects',
+		MONITORING: '/monitoring',
+		SYSTEM: '/system',
+	},
+
+	/**
+	 * Orchestrator command identifiers
+	 */
+	ORCHESTRATOR_COMMANDS: {
+		GET_TEAM_STATUS: 'get_team_status',
+		LIST_PROJECTS: 'list_projects',
+		LIST_SESSIONS: 'list_sessions',
+		BROADCAST: 'broadcast',
+		HELP: 'help',
+	},
+
+	/**
+	 * Session command templates (legacy - PTY backend now used)
+	 */
+	SESSION_COMMANDS: {
+		/** @deprecated PTY backend now manages sessions internally */
+		LIST_SESSIONS: '',
+	},
+
+	/**
+	 * Special key names
+	 */
+	SPECIAL_KEYS: {
+		ENTER: 'Enter',
+		CTRL_C: 'C-c',
+	},
+
+	/**
+	 * Initialization script file names
+	 */
+	INIT_SCRIPTS: {
+		CLAUDE: 'initialize_claude.sh',
+	},
+
+	/**
+	 * Size and limit constants
+	 */
+	LIMITS: {
+		/** Maximum file size for context loading (1MB) */
+		MAX_CONTEXT_FILE_SIZE_BYTES: 1048576,
+		/** Default log entry limit */
+		DEFAULT_LOG_LIMIT: 100,
+		/** Maximum concurrent monitoring jobs */
+		MAX_CONCURRENT_MONITORING_JOBS: 10,
+		/** Default log file size limit */
+		DEFAULT_LOG_FILE_SIZE: '10m',
+	},
+
+	/**
+	 * Frontend build directory path (relative to backend)
+	 */
+	FRONTEND_DIST_PATH: '../../frontend/dist',
+
+	/**
+	 * Additional environment variable names
+	 */
+	ADDITIONAL_ENV_VARS: {
+		WEB_PORT: 'WEB_PORT',
+		DEFAULT_CHECK_INTERVAL: 'DEFAULT_CHECK_INTERVAL',
+		AUTO_COMMIT_INTERVAL: 'AUTO_COMMIT_INTERVAL',
+		CREWLY_HOME: 'CREWLY_HOME',
+	},
+
+	/**
+	 * Orchestrator help text
+	 */
+	ORCHESTRATOR_HELP_TEXT: `
+Available commands:
+- get_team_status: Get current status of all team members
+- list_projects: List all available projects
+- list_sessions: List all active sessions
+- broadcast [message]: Send message to all active agents
+- help: Show this help message
+`.trim(),
+} as const;
+
+// ========================= MEMORY SYSTEM CONSTANTS =========================
+
+/**
+ * Memory system configuration for the two-level memory architecture
+ * Agent-level: ~/.crewly/agents/{agentId}/
+ * Project-level: project/.crewly/knowledge/
+ */
+export const MEMORY_CONSTANTS = {
+  /**
+   * Storage paths for memory files
+   */
+  PATHS: {
+    /** Agent memory directory (relative to CREWLY_HOME) */
+    AGENTS_DIR: 'agents',
+    /** Project knowledge directory (relative to project .crewly) */
+    KNOWLEDGE_DIR: 'knowledge',
+    /** Agent session archives directory name (under agent dir) */
+    SESSIONS_DIR: 'sessions',
+    /** Latest session summary file name */
+    LATEST_SUMMARY: 'latest-summary.md',
+    /** Daily log directory (under project .crewly) */
+    DAILY_LOG_DIR: 'logs/daily',
+    /** Goals directory (under project .crewly) */
+    GOALS_DIR: 'goals',
+    /** Goals file */
+    GOALS_FILE: 'goals.md',
+    /** Current focus file */
+    FOCUS_FILE: 'current_focus.md',
+    /** Decisions log file (with retrospective outcomes) */
+    DECISIONS_LOG: 'decisions_log.md',
+    /** Learning accumulation directory (under project .crewly) */
+    LEARNING_DIR: 'learning',
+    /** What worked file */
+    WHAT_WORKED_FILE: 'what_worked.md',
+    /** What failed file */
+    WHAT_FAILED_FILE: 'what_failed.md',
+    /** Global learning directory (under CREWLY_HOME) */
+    GLOBAL_LEARNING_DIR: 'learning',
+    /** Cross-project insights file */
+    CROSS_PROJECT_INSIGHTS: 'cross_project_insights.md',
+    /** Agents index file (under project .crewly) */
+    AGENTS_INDEX: 'agents-index.json',
+  },
+
+  /**
+   * Status word a goals-log entry heading may carry right after its
+   * timestamp: `### [<iso>] REACHED — Set by <who>`. A closed status
+   * (reached, superseded, cancelled) takes the entry out of the project's
+   * active goal; `reached` also makes it a milestone the daily retro
+   * reviews (#985). Entries without a status word are active.
+   */
+  GOAL_STATUSES: {
+    ACTIVE: 'active',
+    REACHED: 'reached',
+    SUPERSEDED: 'superseded',
+    CANCELLED: 'cancelled',
+  },
+
+  /**
+   * File names for agent-level memory
+   */
+  AGENT_FILES: {
+    /** Main memory file */
+    MEMORY: 'memory.json',
+    /** Detailed role knowledge entries */
+    ROLE_KNOWLEDGE: 'role-knowledge.json',
+    /** Agent preferences */
+    PREFERENCES: 'preferences.json',
+    /** Performance metrics */
+    PERFORMANCE: 'performance.json',
+    /** Custom SOPs directory */
+    SOP_CUSTOM_DIR: 'sop-custom',
+  },
+
+  /**
+   * File names for project-level memory
+   */
+  PROJECT_FILES: {
+    /** Main index file */
+    INDEX: 'index.json',
+    /** Pattern entries */
+    PATTERNS: 'patterns.json',
+    /** Decision entries */
+    DECISIONS: 'decisions.json',
+    /** Gotcha entries */
+    GOTCHAS: 'gotchas.json',
+    /** Relationship entries */
+    RELATIONSHIPS: 'relationships.json',
+    /** Completed-task ledger (TaskHistoryEntry[]) */
+    TASK_HISTORY: 'task-history.json',
+    /** Human-readable learnings log */
+    LEARNINGS: 'learnings.md',
+    /** Archive directory (under knowledge/) for entries moved out of long-term memory */
+    ARCHIVE_DIR: 'archive',
+    /** Archived task-completion decisions (JSON array, #833) */
+    ARCHIVED_TASK_DECISIONS: 'task-completion-decisions.json',
+    /** Archived task-completion learnings (markdown, #833) */
+    ARCHIVED_TASK_LEARNINGS: 'task-completion-learnings.md',
+  },
+
+  /**
+   * Task-completion summaries are episodic task logs, not durable knowledge
+   * (#833). They live on the WorkItem and in task-history.json; these
+   * patterns identify them so they are never written to — and are migrated
+   * out of — decisions, learnings and role knowledge.
+   */
+  TASK_LOG: {
+    /** Entry id returned by remember() when a task log is dropped instead of stored */
+    SKIPPED_ENTRY_ID: 'skipped-task-log',
+    /**
+     * Wrappers that other writers put around the summary before it is
+     * stored (decision → learning mirror, agent-scope coercion).
+     */
+    WRAPPER_PREFIXES: [
+      /^\[coerced from category=[^\]]*\]\s*/,
+      /^Decision made:\s*/,
+    ] as const,
+    /**
+     * The summary itself, as written by the complete-task and report-status
+     * skills (current and older versions).
+     */
+    CONTENT_PATTERNS: [
+      /^\[COMPLETED\]\s*Task completed by\b/,
+      /^Task completed(?: by [^:\n]+)?:/,
+    ] as const,
+  },
+
+  /**
+   * Storage limits to keep memory files performant
+   */
+  LIMITS: {
+    /** Maximum entries per category in agent memory */
+    MAX_ROLE_KNOWLEDGE_ENTRIES: 500,
+    /** Maximum entries per category in project memory */
+    MAX_PATTERN_ENTRIES: 200,
+    MAX_DECISION_ENTRIES: 100,
+    MAX_GOTCHA_ENTRIES: 200,
+    MAX_RELATIONSHIP_ENTRIES: 500,
+    /** Maximum file size in bytes (1MB) */
+    MAX_FILE_SIZE_BYTES: 1048576,
+    /** Maximum entries returned in a single query */
+    MAX_QUERY_RESULTS: 50,
+    /** Minimum confidence to retain during pruning (0-1) */
+    MIN_CONFIDENCE_THRESHOLD: 0.2,
+    /** Days before low-confidence entries are pruned */
+    PRUNE_AFTER_DAYS: 90,
+  },
+
+  /**
+   * Default values for memory entries
+   */
+  DEFAULTS: {
+    /** Default confidence for new knowledge entries */
+    INITIAL_CONFIDENCE: 0.5,
+    /** Confidence increase when knowledge is reinforced */
+    CONFIDENCE_REINFORCEMENT: 0.1,
+    /** Maximum confidence value */
+    MAX_CONFIDENCE: 1.0,
+    /** Minimum confidence value */
+    MIN_CONFIDENCE: 0.0,
+  },
+
+  /**
+   * Near-duplicate detection on write (#914 P1): a new role-knowledge entry
+   * close enough to an existing one in the same scope merges its evidence
+   * into it instead of being added.
+   */
+  DEDUP: {
+    /**
+     * Token-set Jaccard at or above which two entries are one fact restated
+     * (numbers must agree, see knowledge-similarity). Set by replaying 3.7k
+     * real entries (2026-10-25): at 0.8 the matches are the same claim with
+     * another id, a re-check of the same item, or a correction of the same
+     * assertion (166 entries, 4.5%); from 0.7 down, different items that
+     * share a sentence frame ("Schedule X stops after 3 more runs" / "Schedule
+     * Y stops …") start to collide.
+     */
+    NEAR_DUPLICATE_JACCARD: 0.8,
+    /** Fewer tokens than this and only an exact match counts (short texts overlap by chance) */
+    MIN_TOKENS_FOR_NEAR: 4,
+    /** The legacy containment rule applies only to incoming texts longer than this */
+    SUBSTRING_MIN_CHARS: 20,
+  },
+
+  /**
+   * Schema versioning for migrations
+   */
+  SCHEMA: {
+    /** Current schema version */
+    CURRENT_VERSION: 1,
+    /** Minimum supported schema version */
+    MIN_SUPPORTED_VERSION: 1,
+  },
+
+  /**
+   * Memory categories
+   */
+  CATEGORIES: {
+    /** Role knowledge categories */
+    ROLE_KNOWLEDGE: ['best-practice', 'anti-pattern', 'tool-usage', 'workflow'] as const,
+    /** Pattern categories */
+    PATTERN: ['api', 'component', 'service', 'testing', 'styling', 'database', 'config', 'other'] as const,
+    /** Gotcha severity levels */
+    GOTCHA_SEVERITY: ['low', 'medium', 'high', 'critical'] as const,
+    /** Learning categories */
+    LEARNING: ['pattern', 'decision', 'gotcha', 'insight', 'improvement'] as const,
+    /** Relationship types */
+    RELATIONSHIP: ['depends-on', 'uses', 'extends', 'implements', 'calls', 'imported-by'] as const,
+  },
+} as const;
+
+// ========================= CONTINUATION SYSTEM =========================
+
+/**
+ * Continuation system configuration for automatic agent continuation
+ */
+export const CONTINUATION_CONSTANTS = {
+  /**
+   * Detection thresholds
+   */
+  DETECTION: {
+    /** Number of idle poll cycles before triggering continuation check */
+    IDLE_CYCLES_BEFORE_CHECK: 2,
+    /** Minutes without MCP calls before heartbeat is considered stale */
+    STALE_THRESHOLD_MINUTES: 20,
+    /** Milliseconds between activity poll checks */
+    ACTIVITY_POLL_INTERVAL_MS: 120000, // 2 minutes
+  },
+
+  /**
+   * Event handling configuration
+   */
+  EVENTS: {
+    /** Debounce time for events (ms) */
+    DEBOUNCE_MS: 5000,
+    /** Deduplication window (ms) */
+    DEDUP_WINDOW_MS: 10000,
+    /** Cleanup interval for recent events (ms) */
+    CLEANUP_INTERVAL_MS: 60000,
+  },
+
+  /**
+   * Iteration limits
+   */
+  ITERATIONS: {
+    /** Default maximum iterations per task */
+    DEFAULT_MAX: 10,
+    /** Absolute maximum iterations (hard limit) */
+    ABSOLUTE_MAX: 50,
+    /** Warning threshold (percentage of max) */
+    WARNING_THRESHOLD: 0.8,
+  },
+
+  /**
+   * Timeouts
+   */
+  TIMEOUTS: {
+    /** Timeout for output analysis (ms) */
+    ANALYSIS_MS: 10000,
+    /** Timeout for action execution (ms) */
+    ACTION_MS: 30000,
+    /** Timeout for prompt injection (ms) */
+    PROMPT_INJECTION_MS: 15000,
+  },
+
+  /**
+   * Output analysis patterns
+   */
+  PATTERNS: {
+    /** Patterns indicating task completion */
+    COMPLETION: [
+      'task completed',
+      'task done',
+      'successfully completed',
+      'implementation complete',
+      'all tests pass',
+      'ready for review',
+    ],
+    /** Patterns indicating agent is waiting */
+    WAITING: [
+      'waiting for',
+      'awaiting',
+      'blocked by',
+      'need input',
+      'please provide',
+      'let me know',
+    ],
+    /** Patterns indicating errors */
+    ERROR: [
+      'error:',
+      'failed:',
+      'exception:',
+      'cannot',
+      'unable to',
+      'permission denied',
+    ],
+  },
+
+  /**
+   * Confidence thresholds for analysis
+   */
+  CONFIDENCE: {
+    /** Minimum confidence to take action */
+    ACTION_THRESHOLD: 0.6,
+    /** High confidence threshold */
+    HIGH: 0.8,
+    /** Medium confidence threshold */
+    MEDIUM: 0.5,
+    /** Low confidence threshold */
+    LOW: 0.3,
+  },
+} as const;
+
+// ========================= ORCHESTRATOR RESTART SYSTEM =========================
+
+/**
+ * Orchestrator auto-restart configuration.
+ * Used by OrchestratorRestartService to automatically restart the orchestrator
+ * when it becomes unresponsive (child process dies inside PTY shell).
+ */
+export const ORCHESTRATOR_RESTART_CONSTANTS = {
+  /** Maximum number of restarts allowed within the cooldown window */
+  MAX_RESTARTS_PER_WINDOW: 3,
+  /** Cooldown window in milliseconds (1 hour) */
+  COOLDOWN_WINDOW_MS: 3600000,
+  /** Delay before attempting restart (ms) - allows cleanup */
+  RESTART_DELAY_MS: 5000,
+  /**
+   * Consecutive failed restarts after which auto-restart stops until the
+   * orchestrator runs again (B8 D1: a missing runtime CLI looped every ~2.5 min
+   * forever, because failed attempts never counted toward the cooldown).
+   */
+  MAX_CONSECUTIVE_FAILURES: 3,
+  /**
+   * After stopping, one quiet retry this often. The owner is usually away
+   * from the machine: a network blip or a sign-in they later fix from their
+   * phone must not leave the orchestrator down until someone walks up to it.
+   * Equal to the cooldown window so the old attempts have aged out of it.
+   */
+  GAVE_UP_RETRY_MS: 3600000,
+} as const;
+
+// ========================= ORCHESTRATOR HEARTBEAT MONITOR =========================
+
+/**
+ * Orchestrator heartbeat monitoring configuration.
+ * Used by OrchestratorHeartbeatMonitorService to detect unresponsive orchestrators,
+ * send proactive heartbeat requests, and trigger auto-restart with resume.
+ */
+export const ORCHESTRATOR_HEARTBEAT_CONSTANTS = {
+	/** Interval between heartbeat checks in milliseconds (30 seconds) */
+	CHECK_INTERVAL_MS: 30_000,
+	/** Time without API activity before sending a heartbeat request when PTY is idle (5 minutes) */
+	HEARTBEAT_REQUEST_THRESHOLD_MS: 300_000,
+	/** Time without API activity before sending a heartbeat request when PTY is active (15 minutes).
+	 *  A longer threshold is used when the orchestrator's terminal is producing output
+	 *  (e.g. running a build, tests, or other long commands) since that proves the
+	 *  orchestrator is alive and working — just not making API calls. */
+	HEARTBEAT_REQUEST_THRESHOLD_PTY_ACTIVE_MS: 900_000,
+	/** PTY idle time below which the orchestrator is considered "PTY active" (2 minutes).
+	 *  If the orchestrator produced terminal output within this window, the longer
+	 *  HEARTBEAT_REQUEST_THRESHOLD_PTY_ACTIVE_MS threshold is used instead. */
+	PTY_ACTIVE_WINDOW_MS: 120_000,
+	/** Time after heartbeat request before triggering auto-restart (1 minute) */
+	RESTART_THRESHOLD_MS: 60_000,
+	/** Message sent to orchestrator PTY to request a heartbeat */
+	HEARTBEAT_REQUEST_MESSAGE: 'Please run your heartbeat skill now: bash config/skills/orchestrator/heartbeat/execute.sh',
+	/** Grace period after server start before monitoring begins (120 seconds).
+	 *  Increased from 30s to account for orchestrator boot time + first API call delay,
+	 *  preventing false-positive heartbeat timeouts on slow starts or restarts. */
+	STARTUP_GRACE_PERIOD_MS: 120_000,
+	/** Maximum time the orchestrator can stay in_progress before triggering
+	 *  a heartbeat/restart (30 minutes). Spinner animation counts as "activity"
+	 *  in the idle tracker, so a stuck orchestrator may appear active forever.
+	 *  This timeout provides a hard upper bound. */
+	IN_PROGRESS_TIMEOUT_MS: 1_800_000,
+} as const;
+
+/**
+ * Agent heartbeat monitor configuration.
+ * Used by AgentHeartbeatMonitorService to detect crashed/unresponsive agents
+ * and auto-restart them with task re-delivery.
+ */
+export const AGENT_HEARTBEAT_MONITOR_CONSTANTS = {
+	/** Interval between heartbeat checks in milliseconds (30 seconds) */
+	CHECK_INTERVAL_MS: 30_000,
+	/** Time without activity (both PTY and API) before checking process liveness (5 minutes) */
+	HEARTBEAT_REQUEST_THRESHOLD_MS: 300_000,
+	/** Grace period after server start before monitoring begins (1 minute) */
+	STARTUP_GRACE_PERIOD_MS: 60_000,
+	/** Maximum restarts per cooldown window per agent */
+	MAX_RESTARTS_PER_WINDOW: 3,
+	/** Cooldown window for restart tracking (1 hour) */
+	COOLDOWN_WINDOW_MS: 3_600_000,
+} as const;
+
+// ========================= AGENT SUSPEND SYSTEM =========================
+
+/**
+ * Agent suspend/rehydrate configuration.
+ * Used by AgentSuspendService, IdleDetectionService, and DiskCleanupService
+ * to automatically suspend idle agents and transparently rehydrate them.
+ */
+export const AGENT_SUSPEND_CONSTANTS = {
+	/** Default idle timeout in minutes before an agent is suspended (0 = disabled) */
+	DEFAULT_IDLE_TIMEOUT_MINUTES: 30,
+	/** Interval between idle checks in milliseconds (2 minutes) */
+	IDLE_CHECK_INTERVAL_MS: 120_000,
+	/** Maximum age of debug log files eligible for cleanup on suspend (hours) */
+	DEBUG_LOG_MAX_AGE_HOURS: 24,
+	/** Timeout for rehydration to complete in milliseconds (45 seconds) */
+	REHYDRATION_TIMEOUT_MS: 45_000,
+	/** Roles that are exempt from suspension */
+	EXEMPT_ROLES: ['orchestrator'] as const,
+	/** Idle timeout for agents stuck in 'started' status (minutes) */
+	STARTED_AGENT_IDLE_TIMEOUT_MINUTES: 15,
+	/**
+	 * An idle agent is stopped only when memory is tight — at or above this
+	 * share of RAM in use, or below {@link IDLE_STOP_MIN_FREE_MB} free. An
+	 * idle agent costs no tokens; stopping it costs a full cold start (init
+	 * prompt plus rebuilding a context that is often 200k+ tokens) the next
+	 * time anyone speaks to it (owner, 2026-09-22).
+	 */
+	IDLE_STOP_MEMORY_USED_PERCENT: 85,
+	/** See {@link IDLE_STOP_MEMORY_USED_PERCENT}. */
+	IDLE_STOP_MIN_FREE_MB: 1024,
+	/**
+	 * Also tight when the OS reports memory pressure, or when this share of
+	 * swap is in use while free memory is under IDLE_STOP_MIN_FREE_MB ×
+	 * {@link IDLE_STOP_SWAP_FREE_FACTOR}. Swap was first added alone because
+	 * "free" counts reclaimable pages and stayed high while the machine
+	 * swapped itself to a crawl (2026-09-23, load 117); that case still trips
+	 * the OS pressure flag and the CPU-load rule. Swap alone does not count:
+	 * macOS keeps its swap file full for hours on a healthy machine, which put
+	 * a 16 GB Mac with 5–6 GB free into pressure mode 11 times on 2026-10-26.
+	 */
+	IDLE_STOP_SWAP_USED_PERCENT: 75,
+	/** Swap counts only while free memory is under this many times IDLE_STOP_MIN_FREE_MB (2 GB). */
+	IDLE_STOP_SWAP_FREE_FACTOR: 2,
+	/** Roles that should never be auto-stopped (always-on) */
+	ALWAYS_ON_ROLES: ['orchestrator', 'auditor'] as const,
+	/** Idle timeout in ms before a worker agent is stopped (default 30 min) */
+	AGENT_IDLE_STOP_TIMEOUT_MS: 1_800_000,
+	/**
+	 * Do not idle-stop an agent whose next cron run is due within this many
+	 * minutes. Killing it only to respawn it for the cron costs a cold start
+	 * (init prompt + registration + recall, ~0.5-1M input tokens on Codex)
+	 * every single run — a 15-minute cron under a 10-minute idle timeout
+	 * paid that 50 times a day on steamfun-ops (2026-09-16).
+	 */
+	CRON_KEEPALIVE_WINDOW_MINUTES: 30,
+	/**
+	 * An idle member that is in a conversation with the owner (an owner thread
+	 * the sentinel watches: the owner wrote to it, or it promised the owner
+	 * something, in the last two hours) is kept at least this long before an
+	 * idle stop, whatever the configured or pressure timeout says. Under the
+	 * 10-minute pressure timeout the audit of 2026-10-16 counted 50 idle stops
+	 * in 9 h, many of them agents the owner was still talking to; every stop
+	 * costs a cold start and, past the fresh-start threshold, the conversation
+	 * (crewly#1344). Memory-pressure and critical stops still apply.
+	 */
+	OWNER_THREAD_IDLE_TIMEOUT_MINUTES: 30,
+} as const;
+
+// ========================= SERVER PROCESS CONSTANTS =========================
+
+/**
+ * Server process configuration for Node.js heap sizing and resource management.
+ * Used by CLI start command to dynamically allocate memory based on system RAM.
+ */
+export const SERVER_CONSTANTS = {
+	/** Minimum heap size in MB (floor for very low-RAM machines) */
+	MIN_HEAP_SIZE_MB: 256,
+	/** Maximum heap size in MB (cap for high-RAM machines) */
+	MAX_HEAP_SIZE_MB: 2048,
+	/** Fraction of total system RAM to allocate to Node.js heap */
+	HEAP_MEMORY_RATIO: 0.4,
+} as const;
+
+// ========================= AUDITOR SYSTEM =========================
+
+/**
+ * Auditor feature-flag configuration.
+ * Controls whether the autonomous auditor agent (Claude Code PTY session)
+ * is started at boot. Disabled by default to save memory on small machines.
+ */
+export const AUDITOR_CONSTANTS = {
+	/** Whether the auditor is enabled by default (can be overridden by CREWLY_ENABLE_AUDITOR env) */
+	ENABLED_BY_DEFAULT: false,
+	/** Environment variable name to enable/disable the auditor */
+	ENV_VAR: 'CREWLY_ENABLE_AUDITOR',
+} as const;
+
+// ========================= VERSION CHECK SYSTEM =========================
+
+/**
+ * Version check configuration for CLI and web update notifications.
+ * Used by VersionCheckService (backend) and version-check utilities (CLI)
+ * to query the npm registry and cache the result.
+ */
+export const VERSION_CHECK_CONSTANTS = {
+	/** npm registry URL for fetching the latest published version */
+	NPM_REGISTRY_URL: 'https://registry.npmjs.org/crewly/latest',
+	/** Cache file name stored under CREWLY_HOME */
+	CHECK_CACHE_FILE: '.update-check',
+	/** Time-to-live for cached check result (24 hours) */
+	CACHE_TTL_MS: 24 * 60 * 60 * 1000,
+	/** HTTP request timeout for npm registry calls (5 seconds) */
+	REQUEST_TIMEOUT_MS: 5000,
+} as const;
+
+// ========================= AUTO-UPDATE CONSTANTS =========================
+
+/**
+ * Automatic self-update (specs/auto-update.md).
+ *
+ * The backend's AutoUpdateService checks npm for a newer `crewly`, waits for
+ * a quiet window, installs into the prefix the running copy lives in,
+ * verifies the installed version and restarts gracefully. Shared with the
+ * CLI (`crewly update-status`) and `crewly start` (which marks itself as the
+ * restart supervisor for the backend it spawns).
+ */
+export const AUTO_UPDATE_CONSTANTS = {
+	/** Interval between registry checks (ms) — 30 minutes (the update itself still waits for idle agents) */
+	CHECK_INTERVAL_MS: 30 * 60 * 1000,
+	/** First check after boot (ms) — 10 minutes */
+	FIRST_CHECK_DELAY_MS: 10 * 60 * 1000,
+	/** A registry answer older than this is re-fetched for the auto-update decision (ms) */
+	REGISTRY_MAX_AGE_MS: 30 * 60 * 1000,
+	/** Gap between the two quiet-window probes (ms) */
+	QUIET_CONFIRM_MS: 60 * 1000,
+	/** Retry interval while agents are busy (ms) — 5 minutes */
+	BUSY_RETRY_MS: 5 * 60 * 1000,
+	/**
+	 * After deferring this long, an agent whose workingStatus is stuck at
+	 * in_progress no longer blocks the update; only turns actually in flight
+	 * do (the restart drain handles those anyway) (ms) — 24 hours
+	 */
+	MAX_BUSY_DEFER_MS: 24 * 60 * 60 * 1000,
+	/** Back-off after a failed install or verify (ms) — 6 hours */
+	FAILURE_BACKOFF_MS: 6 * 60 * 60 * 1000,
+	/** Consecutive failures before the owner is told (once per target version) */
+	FAILURE_NOTIFY_THRESHOLD: 2,
+	/** Upper bound for one `npm install -g` (ms) — 10 minutes */
+	INSTALL_TIMEOUT_MS: 10 * 60 * 1000,
+	/** Sanitised npm output lines written to the backend log when an install fails */
+	FAILURE_LOG_TAIL_LINES: 40,
+	/** Longest error / trailer line quoted in the one-line failure reason (chars) */
+	FAILURE_REASON_MAX_CHARS: 240,
+	/** How long the post-restart notice waits for Slack to connect (ms) */
+	NOTIFY_WAIT_MS: 10 * 60 * 1000,
+	/** Poll interval while waiting for Slack (ms) */
+	NOTIFY_POLL_MS: 15 * 1000,
+	/** A pending-upgrade marker older than this is ignored at boot (ms) — 1 day */
+	MARKER_MAX_AGE_MS: 24 * 60 * 60 * 1000,
+	/** Env var: `0`/`false`/`off` forces auto-update off, `1`/`true`/`on` forces it on */
+	ENV_VAR: 'CREWLY_AUTO_UPDATE',
+	/**
+	 * Env var `crewly start` sets on the backend it spawns: the parent respawns
+	 * the backend when it exits with RESTART_REQUESTED, so an upgrade can come back.
+	 */
+	SUPERVISOR_ENV_VAR: 'CREWLY_RESTART_SUPERVISOR',
+	/** Value of SUPERVISOR_ENV_VAR set by `crewly start` */
+	SUPERVISOR_CLI_START: 'cli-start',
+	/** Log file under `<crewlyHome>/logs/` */
+	LOG_FILE: 'auto-update.log',
+	/** Status file under CREWLY_HOME (read by `crewly update-status`) */
+	STATE_FILE: 'auto-update-state.json',
+	/** Marker written before an upgrade restart, read (and removed) on the next boot */
+	MARKER_FILE: 'auto-update-pending.json',
+	/** npm package name */
+	PACKAGE_NAME: 'crewly',
+} as const;
+
+// ========================= MARKETPLACE CONSTANTS =========================
+
+/**
+ * Constants for marketplace registry, installation, and submission management.
+ * Used by marketplace services (backend + CLI) to resolve API endpoints,
+ * cache settings, schema versions, and local file paths.
+ */
+export const MARKETPLACE_CONSTANTS = {
+	/** GitHub raw content URL for the public skills registry index */
+	PUBLIC_REGISTRY_URL: 'https://raw.githubusercontent.com/stevehuang0115/crewly/main/config/skills/registry.json',
+	/** GitHub raw content base URL for downloading public skill files */
+	PUBLIC_CDN_BASE: 'https://raw.githubusercontent.com/stevehuang0115/crewly/main',
+	/** Base URL for the Crewly marketplace webapp (premium/private registry) */
+	PREMIUM_BASE_URL: 'https://crewlyai.com',
+	/** API endpoint for premium skills registry */
+	PREMIUM_REGISTRY_ENDPOINT: '/api/registry/skills',
+	/** API endpoint for downloading marketplace assets */
+	ASSETS_ENDPOINT: '/api/assets',
+	/** In-memory registry cache time-to-live (1 hour in ms) */
+	CACHE_TTL: 3600000,
+	/** Directory name under ~/.crewly/ for marketplace data */
+	DIR_NAME: 'marketplace',
+	/** File name for the installed-items manifest */
+	MANIFEST_FILE: 'manifest.json',
+	/** File name for the local registry of published skills */
+	LOCAL_REGISTRY_FILE: 'local-registry.json',
+	/** Subdirectory for skill submission archives */
+	SUBMISSIONS_DIR: 'submissions',
+	/** GitHub repository (owner/repo) for PR-based skill submissions */
+	GITHUB_REPO: 'stevehuang0115/crewly',
+	/** Registry schema version -- bump when the registry format changes */
+	SCHEMA_VERSION: 2,
+	/** Timeout for downloading archive assets from the CDN (30 seconds) */
+	DOWNLOAD_TIMEOUT: 30000,
+	/** Timeout for downloading individual skill files from GitHub (15 seconds) */
+	GITHUB_FILE_TIMEOUT: 15000,
+	/** Timeout for fetching the registry index from public or premium sources (10 seconds) */
+	REGISTRY_FETCH_TIMEOUT: 10000,
+	/** Category mapping from skill.json categories to marketplace display categories */
+	CATEGORY_MAP: {
+		'task-management': 'automation',
+		'communication': 'communication',
+		'monitoring': 'analysis',
+		'development': 'development',
+		'knowledge': 'research',
+		'quality': 'quality',
+		'integration': 'integration',
+		'content-creation': 'content-creation',
+		'automation': 'automation',
+		'memory': 'research',
+		'security': 'security',
+		'design': 'design',
+		'research': 'research',
+		'analysis': 'analysis',
+	} as Record<string, string>,
+} as const;
+
+/**
+ * Template Marketplace constants for creating, versioning, and publishing
+ * team configuration templates. Templates are stored as JSON files under
+ * ~/.crewly/marketplace/templates/.
+ */
+export const TEMPLATE_MARKETPLACE_CONSTANTS = {
+	/** Subdirectory under marketplace dir for template data */
+	TEMPLATES_DIR: 'templates',
+	/** File name for the template store index */
+	STORE_FILE: 'templates.json',
+	/** Subdirectory under each template for version files */
+	VERSIONS_DIR: 'versions',
+	/** File name for the version store within each template dir */
+	VERSIONS_FILE: 'versions.json',
+	/** Schema version for template store files */
+	SCHEMA_VERSION: 1,
+	/** Maximum template name length */
+	MAX_NAME_LENGTH: 100,
+	/** Maximum template description length */
+	MAX_DESCRIPTION_LENGTH: 2000,
+	/** Maximum changelog length per version */
+	MAX_CHANGELOG_LENGTH: 5000,
+	/** Maximum number of tags per template */
+	MAX_TAGS: 20,
+	/** Maximum tag length */
+	MAX_TAG_LENGTH: 50,
+} as const;
+
+// ========================= ADDON SYSTEM CONSTANTS =========================
+
+/**
+ * Addon system configuration for loading and managing Crewly addons.
+ * Addons are installed to ~/.crewly/addons/ and loaded on server startup.
+ * Each addon has a manifest.json and a dist/ directory with compiled code.
+ */
+export const ADDON_CONSTANTS = {
+	/**
+	 * File system paths for addon management
+	 */
+	PATHS: {
+		/** Directory name under ~/.crewly/ for installed addons */
+		ADDONS_DIR: 'addons',
+		/** Directory name for addon downloads/tarballs */
+		DOWNLOADS_DIR: 'downloads',
+	},
+
+	/**
+	 * Addon manifest configuration
+	 */
+	MANIFEST_FILE: 'manifest.json',
+
+	/**
+	 * Default entrypoint file within an addon's directory
+	 */
+	DEFAULT_ENTRYPOINT: 'dist/index.js',
+
+	/**
+	 * Cloud API configuration for downloading Pro addons
+	 */
+	CLOUD_API: {
+		/** Base URL for the Crewly Cloud API */
+		BASE_URL: 'https://api.crewlyai.com/v1',
+		/** Endpoint path for addon downloads */
+		DOWNLOAD_ENDPOINT: '/addons',
+	},
+
+	/**
+	 * Crewly Pro addon identifiers
+	 */
+	PRO_ADDON: {
+		/** Pro addon package name */
+		NAME: 'crewly-pro',
+		/** Default tarball filename */
+		DEFAULT_TARBALL: 'crewly-pro.tar.gz',
+	},
+
+	/**
+	 * Addon loading timeouts
+	 */
+	TIMEOUTS: {
+		/** Maximum time to load a single addon (10 seconds) */
+		LOAD_TIMEOUT_MS: 10_000,
+	},
+} as const;
+
+/** Shorthand for debounce value */
+export const EVENT_DEBOUNCE_MS = CONTINUATION_CONSTANTS.EVENTS.DEBOUNCE_MS;
+
+// ========================= TYPE HELPERS =========================
+
+// ========================= REDIS CACHE CONSTANTS =========================
+
+/**
+ * Redis connection and caching configuration
+ */
+export const REDIS_CONSTANTS = {
+	/** Redis connection settings */
+	CONNECTION: {
+		/** Default Redis host */
+		HOST: '127.0.0.1',
+		/** Default Redis port */
+		PORT: 6379,
+		/** Connection timeout in milliseconds (5 seconds) */
+		CONNECT_TIMEOUT: 5000,
+		/** Maximum number of reconnect retries before giving up */
+		MAX_RETRIES: 3,
+		/** Delay between reconnect attempts in milliseconds */
+		RETRY_DELAY: 1000,
+		/** Base key prefix; RedisCacheService appends the per-instance home id (`crewly:<homeId>:`) */
+		KEY_PREFIX: 'crewly:',
+	},
+	/** Cache TTL (time-to-live) settings in seconds */
+	TTL: {
+		/** TTL for GET /api/teams list (60 seconds) */
+		TEAMS_LIST: 60,
+		/** TTL for GET /api/projects list (60 seconds) */
+		PROJECTS_LIST: 60,
+		/** Default TTL for unspecified cache entries (60 seconds) */
+		DEFAULT: 60,
+	},
+	/** Cache key patterns */
+	KEYS: {
+		/** Cache key for the teams list endpoint */
+		TEAMS_LIST: 'api:teams',
+		/** Cache key for the projects list endpoint */
+		PROJECTS_LIST: 'api:projects',
+	},
+	/** Environment variable names for Redis configuration */
+	ENV: {
+		/** Redis host override */
+		REDIS_HOST: 'CREWLY_REDIS_HOST',
+		/** Redis port override */
+		REDIS_PORT: 'CREWLY_REDIS_PORT',
+		/** Redis password */
+		REDIS_PASSWORD: 'CREWLY_REDIS_PASSWORD',
+		/** Redis URL (takes precedence over host/port) */
+		REDIS_URL: 'CREWLY_REDIS_URL',
+	},
+} as const;
+
+/**
+ * Device-code pairing with Crewly Cloud (crewly-auth `/api/cloud/device/*`).
+ *
+ * A machine signs in to the owner's Cloud account without anyone at it: it
+ * shows a short code + link (`crewlyai.com/cloud/pair?code=ABCD-2345`), the
+ * owner approves on their phone, and the machine polls until it receives its
+ * token pair. Shared by `crewly cloud login` (CLI) and the backend's
+ * background pairing used by `/setup` and Settings → Cloud.
+ */
+export const CLOUD_DEVICE_PAIRING_CONSTANTS = {
+	/** crewly-auth endpoints (relative to the Cloud API URL) */
+	CLOUD_ENDPOINTS: {
+		START: '/api/cloud/device/start',
+		POLL: '/api/cloud/device/poll',
+		REDEEM: '/api/cloud/device/redeem',
+	},
+	/** Local backend endpoints (owner-only; mounted under /api/cloud) */
+	LOCAL_ENDPOINTS: {
+		START: '/api/cloud/device/start',
+		STATUS: '/api/cloud/device/status',
+		CANCEL: '/api/cloud/device/cancel',
+	},
+	/** Poll outcomes reported by crewly-auth (RFC 8628 names where one exists) */
+	POLL_STATUS: {
+		PENDING: 'authorization_pending',
+		SLOW_DOWN: 'slow_down',
+		EXPIRED: 'expired',
+		DENIED: 'denied',
+		APPROVED: 'approved',
+	},
+	/** Poll interval when the Cloud does not say (seconds) */
+	DEFAULT_INTERVAL_S: 5,
+	/** Added to the interval on slow_down / rate limiting (seconds) */
+	SLOW_DOWN_INCREMENT_S: 5,
+	/** Longest interval the client will back off to (seconds) */
+	MAX_INTERVAL_S: 60,
+	/** Pairing lifetime when the Cloud does not say (seconds) */
+	DEFAULT_EXPIRES_IN_S: 900,
+	/** Timeout for one start / poll request (ms) */
+	REQUEST_TIMEOUT_MS: 15_000,
+	/** Consecutive network / server errors tolerated while polling */
+	MAX_CONSECUTIVE_POLL_ERRORS: 10,
+	/** `purpose` sent with a pairing (shown to the owner on the approve page) */
+	PURPOSES: {
+		CLI: 'cli',
+		SETUP: 'setup',
+	},
+} as const;
+
+/**
+ * Cloud disconnect notice: when a signed-in machine cannot talk to Crewly
+ * Cloud for a sustained period (sign-in expired, Cloud unreachable), inbound
+ * Slack messages for its agents queue in Cloud unseen. The notice DMs the
+ * owner on Slack (outbound still works with the local bot tokens) with a
+ * phone-friendly re-login link from `crewly cloud login`, run by Crewly.
+ */
+export const CLOUD_DISCONNECT_NOTICE_CONSTANTS = {
+	/** Kill switch: `CREWLY_CLOUD_DISCONNECT_NOTICE=0` turns the notice off */
+	ENV_SWITCH: 'CREWLY_CLOUD_DISCONNECT_NOTICE',
+	/** No successful Cloud request for this long = disconnected (ms) — 15 min */
+	DISCONNECT_THRESHOLD_MS: 15 * 60 * 1000,
+	/** How often the monitor checks (ms) */
+	CHECK_INTERVAL_MS: 60 * 1000,
+	/** Repeat the notice at most this often while still disconnected (ms) — 6 h */
+	REPEAT_INTERVAL_MS: 6 * 60 * 60 * 1000,
+	/**
+	 * Relay queue registration failing (and no queue held) for this long =
+	 * disconnected (ms) — 2 min. Heartbeats can keep succeeding meanwhile, so
+	 * the 15-min "no contact" rule never sees it (2026-10-02).
+	 */
+	QUEUE_FAILURE_THRESHOLD_MS: 2 * 60 * 1000,
+	/**
+	 * When the owner was last told about a relay-queue failure (survives the
+	 * episode, so a flapping registration is reported at most every 6 h).
+	 */
+	RELAY_QUEUE_NOTICE_FILE: 'cloud/relay-queue-notice.json',
+	/** State file under the Crewly home (last notice, DM message, episode start) */
+	STATE_FILE: 'cloud/disconnect-notice.json',
+	/** Arguments for the CLI login run in a PTY (device pairing, no local browser) */
+	CLI_LOGIN_ARGS: ['cloud', 'login', '--no-browser'],
+	/** CLI entry point relative to the package root */
+	CLI_ENTRY: 'dist/cli/cli/src/index.js',
+	/** How long to wait for the CLI to print its login link before sending the notice without one (ms) */
+	LINK_WAIT_MS: 30 * 1000,
+	/** Hard stop for one CLI login run (ms) — the pairing itself lasts 15 min */
+	LOGIN_TIMEOUT_MS: 16 * 60 * 1000,
+	/** Wait before starting another login run after one could not start (ms) */
+	LOGIN_RETRY_MS: 5 * 60 * 1000,
+	/** How often to read the owner's Slack DM for a reply the CLI asked for (ms) */
+	REPLY_POLL_INTERVAL_MS: 5 * 1000,
+	/** Stop reading replies after this long (ms) */
+	REPLY_MAX_WAIT_MS: 15 * 60 * 1000,
+	/** PTY size for the CLI login (wide so the link is never wrapped) */
+	PTY_COLS: 500,
+	PTY_ROWS: 50,
+	/** Largest PTY output kept for parsing (chars) */
+	RAW_BUFFER_MAX_CHARS: 64 * 1024,
+	/** Slack Web API base */
+	SLACK_API_BASE: 'https://slack.com/api',
+	/** Timeout for one Slack Web API call (ms) */
+	SLACK_REQUEST_TIMEOUT_MS: 15 * 1000,
+} as const;
+
+/**
+ * Project tickets (specs/2026-09-28-project-tickets.md): a project's own
+ * backlog, one markdown file per ticket under `<project>/.crewly/tickets/`,
+ * tracked in git. Shared by the backend service, the CLI migration command
+ * and (mirrored) the frontend board.
+ */
+export const PROJECT_TICKET_CONSTANTS = {
+	/** Folder inside the project's `.crewly` data dir */
+	DIR_NAME: 'tickets',
+	/** Repo-relative folder, used for git tracking checks */
+	REPO_RELATIVE_DIR: '.crewly/tickets',
+	/** Counter file (tracked): `{ "prefix": "CRW", "next": 13 }` */
+	COUNTER_FILENAME: '.counter.json',
+	/** Cross-process lockfile (ignored by the folder's own .gitignore) */
+	LOCK_FILENAME: '.lock',
+	/** The folder's own .gitignore (keeps the lock and temp files out of version control) */
+	FOLDER_GITIGNORE_CONTENT: '# Crewly: transient files, never commit\n.lock\n*.tmp.*\n',
+	/** A lockfile older than this is considered left behind by a crashed writer (ms) */
+	LOCK_STALE_MS: 30 * 1000,
+	/** Wait between lock attempts (ms) */
+	LOCK_RETRY_MS: 25,
+	/** Give up acquiring the lock after this long (ms) */
+	LOCK_TIMEOUT_MS: 10 * 1000,
+	/** Ticket statuses, in board order */
+	STATUSES: ['backlog', 'ready', 'in_progress', 'review', 'done', 'cancelled'] as const,
+	/** Priorities, highest first */
+	PRIORITIES: ['P0', 'P1', 'P2', 'P3'] as const,
+	/** Priority of a ticket created without one */
+	DEFAULT_PRIORITY: 'P2',
+	/** Status of a ticket created without one (and of every worker-created ticket) */
+	DEFAULT_STATUS: 'backlog',
+	/** Fallback id prefix when the project name has no letters/digits */
+	FALLBACK_PREFIX: 'T',
+	/** Max characters of the id prefix derived from the project name */
+	MAX_PREFIX_LENGTH: 4,
+	/** Max characters of the slug in the file name */
+	MAX_SLUG_LENGTH: 48,
+	/** Section headings the service reads / writes */
+	SECTIONS: {
+		DESCRIPTION: 'Description',
+		ACCEPTANCE: 'Acceptance criteria',
+		LOG: 'Log',
+	},
+	/** `source` value stamped by the v1 migration */
+	MIGRATION_SOURCE: 'v1-migration',
+	/** v1 status folders whose files are imported (done/ and blocked/ are not) */
+	MIGRATION_STATUS_FOLDERS: ['open', 'in_progress'] as const,
+	/** v1 task root inside the project's `.crewly` data dir */
+	MIGRATION_V1_DIR: 'tasks',
+	/** Lines appended to the project's .gitignore when the tickets folder is ignored */
+	GITIGNORE_BLOCK: [
+		'# Crewly project tickets are tracked (specs/2026-09-28-project-tickets.md)',
+		'!.crewly/',
+		'.crewly/*',
+		'!.crewly/tickets/',
+		'!.crewly/tickets/**',
+	] as const,
+	/** WorkItem metadata key linking a WorkItem to its project ticket */
+	WORK_ITEM_METADATA_KEY: 'projectTicket',
+	/** How often the sweep reconciles tickets with their WorkItems (ms) */
+	SYNC_SWEEP_INTERVAL_MS: 60 * 1000,
+	/** Successor hops followed from a ticket's WorkItem before giving up */
+	MAX_SUCCESSOR_HOPS: 8,
+	/**
+	 * Delegation through tickets (spec §11): the task-pool body field naming the
+	 * project ticket a delegated WorkItem works (`delegate-task --ticket`).
+	 */
+	DELEGATION_TICKET_BODY_KEY: 'projectTicketId',
+	/** WorkItem metadata key a delegating skill uses to name the delegator when no X-Agent-Session header is sent */
+	DELEGATION_CALLER_METADATA_KEY: 'delegatedBy',
+	/** WorkItem types that are delegations of work to someone (the only ones routed through tickets) */
+	DELEGATION_WORK_ITEM_TYPES: ['delegate'] as const,
+	/** Max characters of a ticket title derived from a delegation's title */
+	DELEGATION_TITLE_MAX_CHARS: 120,
+	/** Error `code` of a task-pool add refused by the ticket rules (skills stop instead of delivering) */
+	DELEGATION_REFUSED_CODE: 'project_ticket_refused',
+} as const;
+
+// ========================= OSS / PRO BOUNDARY CONSTANTS =========================
+
+/**
+ * Inputs to the OSS/Pro boundary check (issue #809).
+ *
+ * The rule "no premium/paid content in the OSS repo" (CLAUDE.md, Critical
+ * Rule 10) is enforced by `backend/src/scripts/check-oss-boundary.ts`, which
+ * runs in CI (`.github/workflows/oss-boundary.yml`) and inside the jest suite.
+ * Every path here is relative to the repository root.
+ */
+/**
+ * Rule metadata (issue #877): every SOP records the failure it prevents, the
+ * model where that was seen, and a review date — so rules can be re-tested
+ * and deleted when they stop making a difference.
+ */
+export const RULE_METADATA_CONSTANTS = {
+	/** Directory of SOP files whose frontmatter is audited */
+	SOPS_DIR: 'config/sops',
+	/** The three frontmatter fields (plus the optional `source` link) */
+	FIELDS: { PREVENTS: 'prevents', SEEN_ON: 'seenOn', REVIEW_BY: 'reviewBy', SOURCE: 'source' } as const,
+	/** Share of SOPs that must carry all three fields for the check to pass */
+	MIN_COVERAGE: 0.8,
+	/** `prevents` starts with this when no failure was ever recorded for the rule */
+	NO_RECORDED_FAILURE: 'none recorded',
+} as const;
+
+export const OSS_BOUNDARY_CONSTANTS = {
+	/** Allowlist of explicit exceptions; every entry carries a one-line reason */
+	ALLOWLIST_FILE: 'config/oss-boundary-allowlist.json',
+	/** Directory whose JSON templates must stay free-tier (rules 1 and 2) */
+	TEMPLATES_DIR: 'config/templates',
+	/** Directory whose file paths must not look premium (rule 3) */
+	CONFIG_DIR: 'config',
+	/** Field that gates a template or skill behind a paid tier */
+	TIER_FIELD: 'requiredTier',
+	/** Tier values that mark content as paid — only allowed in crewly-pro */
+	PAID_TIERS: ['pro', 'enterprise'] as const,
+	/** Top-level template fields that are Pro-only features */
+	PRO_ONLY_TEMPLATE_FIELDS: ['workflows', 'verificationPipeline', 'qualityGates'] as const,
+	/** A path segment starting with this prefix looks like Pro content */
+	PRO_SEGMENT_PREFIX: 'pro-',
+	/** A path segment containing this word looks like premium content */
+	PREMIUM_SEGMENT_MARKER: 'premium',
+	/** Package names OSS source must never import (also matches their subpaths) */
+	FORBIDDEN_IMPORT_PACKAGES: ['crewly-pro', '@crewly/pro'] as const,
+	/** Source roots scanned for forbidden imports (rule 4); missing roots are skipped */
+	SOURCE_ROOTS: ['backend/src', 'frontend/src', 'cli/src', 'mcp-server/src'] as const,
+	/** Workspace packages directory; each `<pkg>/src` is also scanned */
+	PACKAGES_DIR: 'packages',
+	/** Source directory name inside each workspace package */
+	PACKAGE_SOURCE_SUBDIR: 'src',
+	/** Directory names never descended into */
+	SKIPPED_DIRS: ['node_modules', 'dist', '.git'] as const,
+	/** File extensions treated as importable source */
+	SOURCE_EXTENSIONS: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts'] as const,
+	/** File extension of template definitions */
+	JSON_EXTENSION: '.json',
+	/** Rule identifiers used in reports and allowlist entries */
+	RULES: {
+		PAID_TIER: 'paid-tier',
+		PRO_TEMPLATE_FIELD: 'pro-template-field',
+		PREMIUM_PATH: 'premium-path',
+		PRO_IMPORT: 'pro-import',
+	},
+} as const;
+
+/**
+ * Type helpers for extracting literal types from constants
+ */
+export type AgentStatus =
+	(typeof CREWLY_CONSTANTS.AGENT_STATUSES)[keyof typeof CREWLY_CONSTANTS.AGENT_STATUSES];
+export type WorkingStatus =
+	(typeof CREWLY_CONSTANTS.WORKING_STATUSES)[keyof typeof CREWLY_CONSTANTS.WORKING_STATUSES];
+export type AgentRole = (typeof CREWLY_CONSTANTS.ROLES)[keyof typeof CREWLY_CONSTANTS.ROLES];
+export type MessageType = (typeof MESSAGE_CONSTANTS.TYPES)[keyof typeof MESSAGE_CONSTANTS.TYPES];
+export type OrchestratorCommand =
+	(typeof BACKEND_CONSTANTS.ORCHESTRATOR_COMMANDS)[keyof typeof BACKEND_CONSTANTS.ORCHESTRATOR_COMMANDS];
+export type HTTPStatusCode =
+	(typeof BACKEND_CONSTANTS.NETWORK.HTTP_STATUS_CODES)[keyof typeof BACKEND_CONSTANTS.NETWORK.HTTP_STATUS_CODES];
+export type AgentId = (typeof CREWLY_CONSTANTS.AGENT_IDS)[keyof typeof CREWLY_CONSTANTS.AGENT_IDS];

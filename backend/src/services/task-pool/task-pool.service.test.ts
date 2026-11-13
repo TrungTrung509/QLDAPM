@@ -1,0 +1,4889 @@
+/**
+ * Task Pool Service Tests
+ *
+ * @module services/task-pool/task-pool.service.test
+ */
+
+import { ThreadAnswerLog, setThreadAnswerLog } from '../messaging/thread-answer-log.js';
+import { TaskPoolService, WorkItemClaimedError } from './task-pool.service.js';
+import { originOfWorkItem } from '../orc/work-item-destination.js';
+import { setOwnerThreadSentinel, type OwnerThreadSentinelService } from '../messaging/owner-thread-sentinel.service.js';
+import { TeamBudgetExceededError } from '../budget/team-budget-gate.service.js';
+import { PoolStorage } from './pool-storage.js';
+import {
+  createWorkItem,
+  LAST_REQUEUED_AT_METADATA_KEY,
+  getWorkItemDisposition,
+  WORK_ITEM_BLOCK_SOURCES,
+  TERMINAL_WORK_ITEM_STATUSES,
+} from '../../types/v2/work-item.types.js';
+import { ReconcilerService } from '../reconciler/reconciler.service.js';
+import type { ReconcilerDataProvider } from '../reconciler/reconciler.service.js';
+import type { AgentHealth } from '../reconciler/reconcile-rules.js';
+import { detectWaitingOnHumanWorkItems, detectRecoverableWorkItems } from '../reconciler/reconcile-rules.js';
+import type { WakeAction, WorkItemStatus } from '../../types/v2/index.js';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import * as os from 'os';
+
+// Mock LoggerService
+/** The worker completing its own item (what the controller resolves for a skill call). */
+const AGENT_ACTOR = { role: 'agent' as const, session: 'agent-1', via: 'test' };
+/** The reviewer of record on fixture items (see makeWorkItem). */
+const REVIEWER_ACTOR = { role: 'team_lead' as const, session: 'tl-sam', via: 'test' };
+
+const mockEscalateFailedWorkItem = jest.fn<Promise<string | null>, [unknown, string]>();
+jest.mock('../v3/escalation-router.service.js', () => ({
+  EscalationRouterService: {
+    getInstance: () => ({ escalateFailedWorkItem: mockEscalateFailedWorkItem }),
+  },
+}));
+
+jest.mock('../core/logger.service.js', () => ({
+  LoggerService: {
+    getInstance: () => ({
+      createComponentLogger: () => ({
+        info: jest.fn(),
+        warn: jest.fn(),
+        debug: jest.fn(),
+        error: jest.fn(),
+      }),
+    }),
+  },
+}));
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+async function makeTempDir(): Promise<string> {
+  return fs.mkdtemp(path.join(os.tmpdir(), 'task-pool-test-'));
+}
+
+function makeWorkItem(overrides?: Record<string, unknown>) {
+  return createWorkItem({
+    type: 'delegate',
+    owner: 'agent',
+    title: 'Test task',
+    // #813: verdicts are identity-checked, so fixtures carry a reviewer of
+    // record. Tests that override `metadata` drop it on purpose.
+    metadata: { reviewer: REVIEWER_ACTOR.session },
+    // Hygiene #3: default target=undefined so existing tests that claim
+    // with arbitrary agent ids continue to pass after the target-respect
+    // gate landed in claimFromPool / claimSpecificItem. Tests that need
+    // an explicit target pass it via overrides — see e.g. the
+    // "target-respect" describe block below for #3 regression coverage.
+    ...overrides,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('TaskPoolService', () => {
+  let service: TaskPoolService;
+  let storage: PoolStorage;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await makeTempDir();
+    storage = new PoolStorage({ dataDir: tempDir });
+    service = new TaskPoolService(storage);
+  });
+
+  afterEach(async () => {
+    TaskPoolService.resetInstance();
+    await service.destroy();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  // -----------------------------------------------------------------------
+  // addToPool
+  // -----------------------------------------------------------------------
+
+  describe('addToPool', () => {
+    it('adds a queued WorkItem to the pool', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+
+      const items = await service.getAllItems();
+      expect(items).toHaveLength(1);
+      expect(items[0].id).toBe(wi.id);
+    });
+
+    describe('ticket loop — requestId from the creator’s in-flight turn', () => {
+      it('fills requestId from the resolver and records where it came from', async () => {
+        service.setTicketResolver((session) => (session === 'crewly-orc' ? 'ticket-1' : null));
+        const wi = makeWorkItem();
+        await service.addToPool(wi, { creatorSession: 'crewly-orc' });
+        const [stored] = await service.getAllItems();
+        expect(stored.requestId).toBe('ticket-1');
+        expect(stored.metadata).toMatchObject({ requestIdSource: 'in-flight-turn' });
+      });
+
+      it('never overrides an explicit requestId', async () => {
+        const resolver = jest.fn(() => 'ticket-1');
+        service.setTicketResolver(resolver);
+        await service.addToPool(makeWorkItem({ requestId: 'explicit' }), { creatorSession: 'crewly-orc' });
+        expect((await service.getAllItems())[0].requestId).toBe('explicit');
+        expect(resolver).not.toHaveBeenCalled();
+      });
+
+      it('does nothing without a creator, a resolver, or a unique ticket', async () => {
+        await service.addToPool(makeWorkItem(), { creatorSession: 'crewly-orc' });
+        service.setTicketResolver(() => null);
+        await service.addToPool(makeWorkItem(), { creatorSession: 'crewly-orc' });
+        service.setTicketResolver(() => 'ticket-1');
+        await service.addToPool(makeWorkItem());
+        expect((await service.getAllItems()).every((w) => w.requestId === undefined)).toBe(true);
+      });
+
+      it('a throwing resolver leaves the item unlinked but still adds it', async () => {
+        service.setTicketResolver(() => {
+          throw new Error('boom');
+        });
+        await service.addToPool(makeWorkItem(), { creatorSession: 'crewly-orc' });
+        const items = await service.getAllItems();
+        expect(items).toHaveLength(1);
+        expect(items[0].requestId).toBeUndefined();
+      });
+
+      it('links the inferred ticket through the Request linker', async () => {
+        const linker = { linkWorkItem: jest.fn().mockResolvedValue(null) };
+        service.setRequestService(linker);
+        service.setTicketResolver(() => 'ticket-9');
+        const wi = makeWorkItem();
+        await service.addToPool(wi, { creatorSession: 'dev-1' });
+        expect(linker.linkWorkItem).toHaveBeenCalledWith('ticket-9', wi.id);
+      });
+    });
+
+    describe('origin chain (specs/2026-10-01-orc-status-wakes.md §2)', () => {
+      const ownerTurn = { conversationId: 'room-brief', slackChannelId: 'C0BRIEF', slackThreadKey: 'C0BRIEF:1790856242.596149', receivedAt: Date.now() };
+
+      beforeEach(() => service.setOwnerAskedAtLookup(null));
+
+      it('a delegate that names the owner thread gets the owner origin; its verify item inherits it', async () => {
+        service.setTurnOriginLookup((s) => (s === 'atlas' ? ownerTurn : undefined));
+        const delegate = makeWorkItem({ target: 'sage', metadata: { delegatedBy: 'atlas', ownerThread: 'C0BRIEF:1790856242.596149' } });
+        await service.addToPool(delegate, { creatorSession: 'atlas' });
+        const stored = (await service.getAllItems()).find((w) => w.id === delegate.id)!;
+        expect(stored.metadata?.origin).toEqual({ kind: 'owner', conversationId: 'room-brief', slackChannelId: 'C0BRIEF', threadTs: '1790856242.596149', receivedBy: 'atlas' });
+
+        // The verify item is created by the system (no creator) — it inherits from its source.
+        service.setTurnOriginLookup(() => undefined);
+        const verify = makeWorkItem({ id: `${delegate.id}:verify:${delegate.id}`, type: 'review', target: 'atlas', parentWorkItemId: delegate.id, metadata: { verifyOf: delegate.id } });
+        await service.addToPool(verify);
+        const storedVerify = (await service.getAllItems()).find((w) => w.id === verify.id)!;
+        expect(storedVerify.metadata?.origin).toEqual(stored.metadata?.origin);
+      });
+
+      describe('team lead report stamp (crewly#1371)', () => {
+        const stamp = { lead: 'ella', worker: 'luna', teamId: 'mkt', teamName: 'Marketing', slackChannelId: 'C0MKT', channelName: 'marketing' };
+        afterEach(() => service.setLeadReportResolver(null));
+
+        it('owner work the orc delegates is stamped; its verify item copies the stamp without asking again', async () => {
+          const resolver = jest.fn(async () => stamp);
+          service.setLeadReportResolver(resolver);
+          service.setTurnOriginLookup((s) => (s === 'crewly-orc' ? ownerTurn : undefined));
+          const delegate = makeWorkItem({ target: 'luna', metadata: { delegatedBy: 'crewly-orc', ownerThread: 'C0BRIEF:1790856242.596149' } });
+          await service.addToPool(delegate, { creatorSession: 'crewly-orc' });
+          const stored = (await service.getAllItems()).find((w) => w.id === delegate.id)!;
+          expect(stored.metadata?.leadReport).toEqual(stamp);
+          expect(resolver).toHaveBeenCalledWith(expect.objectContaining({ creator: 'crewly-orc' }));
+
+          service.setTurnOriginLookup(() => undefined);
+          const verify = makeWorkItem({ id: `${delegate.id}:verify:${delegate.id}`, type: 'review', target: 'ella', parentWorkItemId: delegate.id, metadata: { verifyOf: delegate.id } });
+          await service.addToPool(verify);
+          expect((await service.getAllItems()).find((w) => w.id === verify.id)!.metadata?.leadReport).toEqual(stamp);
+          expect(resolver).toHaveBeenCalledTimes(1);
+        });
+
+        it('non-owner work is never offered to the resolver; a failing resolver adds nothing', async () => {
+          const resolver = jest.fn(async () => stamp);
+          service.setLeadReportResolver(resolver);
+          service.setTurnOriginLookup(() => undefined);
+          const own = makeWorkItem({ target: 'luna', metadata: { delegatedBy: 'ella' } });
+          await service.addToPool(own, { creatorSession: 'ella' });
+          expect(resolver).not.toHaveBeenCalled();
+          expect((await service.getAllItems())[0].metadata?.leadReport).toBeUndefined();
+
+          service.setLeadReportResolver(async () => Promise.reject(new Error('teams')));
+          service.setTurnOriginLookup(() => ownerTurn);
+          const owner = makeWorkItem({ target: 'luna', metadata: { delegatedBy: 'crewly-orc', ownerThread: 'C0BRIEF:1790856242.596149' } });
+          await service.addToPool(owner, { creatorSession: 'crewly-orc' });
+          const stored = (await service.getAllItems()).find((w) => w.id === owner.id)!;
+          expect(stored.metadata?.origin).toMatchObject({ kind: 'owner' });
+          expect(stored.metadata?.leadReport).toBeUndefined();
+        });
+      });
+
+      it('a retry / give-up review linked by sourceWorkItemId inherits too', async () => {
+        service.setTurnOriginLookup(() => ownerTurn);
+        const source = makeWorkItem({ target: 'atlas' });
+        await service.addToPool(source, { creatorSession: 'atlas' });
+        service.setTurnOriginLookup(() => undefined);
+        const review = makeWorkItem({ type: 'review', target: 'atlas', metadata: { sourceWorkItemId: source.id } });
+        await service.addToPool(review);
+        expect((await service.getAllItems()).find((w) => w.id === review.id)!.metadata?.origin).toMatchObject({ kind: 'owner', conversationId: 'room-brief' });
+      });
+
+      /**
+       * Message-routing audit 2026-10-18: an agent's own create-task used to
+       * inherit its last owner turn, so the work later answered in whatever
+       * thread the owner last wrote in. It inherits nothing unless it names
+       * the place (--thread / --conversation).
+       */
+      it("a self-assigned item from create-task (inheritCreatorTurn:false) does not take the creator's owner turn; a named thread is still used", async () => {
+        service.setTurnOriginLookup((s) => (s === 'atlas' ? ownerTurn : undefined));
+        const own = makeWorkItem({ target: 'atlas' });
+        await service.addToPool(own, { creatorSession: 'atlas', inheritCreatorTurn: false });
+        expect((await service.getAllItems()).find((w) => w.id === own.id)!.metadata?.origin).toBeUndefined();
+
+        const named = makeWorkItem({ target: 'atlas', metadata: { ownerThread: 'C0BRIEF:1790856242.596149' } });
+        await service.addToPool(named, { creatorSession: 'atlas', inheritCreatorTurn: false });
+        expect((await service.getAllItems()).find((w) => w.id === named.id)!.metadata?.origin).toMatchObject({ kind: 'owner', conversationId: 'room-brief', threadTs: '1790856242.596149' });
+      });
+
+      it('no owner turn and no current work → self work gets no origin; an explicit origin is never replaced', async () => {
+        service.setTurnOriginLookup(() => undefined);
+        const plain = makeWorkItem({ target: 'atlas' });
+        await service.addToPool(plain, { creatorSession: 'atlas' });
+        expect((await service.getAllItems())[0].metadata?.origin).toBeUndefined();
+
+        service.setTurnOriginLookup(() => ownerTurn);
+        const explicit = makeWorkItem({ target: 'sage', metadata: { origin: { kind: 'trigger', topic: 'Daily brief' } } });
+        await service.addToPool(explicit, { creatorSession: 'atlas' });
+        expect((await service.getAllItems()).find((w) => w.id === explicit.id)!.metadata?.origin).toEqual({ kind: 'trigger', topic: 'Daily brief' });
+      });
+
+      // crewly#1083: delegate-task --thread names the owner thread explicitly.
+      it('an explicit owner thread wins over the delegator\'s newer, different owner turn', async () => {
+        service.setTurnOriginLookup(() => ownerTurn); // the lead last answered C0BRIEF
+        service.setSlackThreadConversationLookup(async (ch) => (ch === 'C0THINK' ? 'room-think' : null));
+        const delegate = makeWorkItem({ target: 'sage', metadata: { delegatedBy: 'atlas', ownerThread: 'C0THINK:1790000000.000100' } });
+        await service.addToPool(delegate, { creatorSession: 'atlas' });
+        const stored = (await service.getAllItems()).find((w) => w.id === delegate.id)!;
+        expect(stored.metadata?.origin).toEqual({ kind: 'owner', conversationId: 'room-think', slackChannelId: 'C0THINK', threadTs: '1790000000.000100', receivedBy: 'atlas' });
+      });
+
+      it('an explicit owner thread that IS the delegator\'s turn takes that turn\'s conversation', async () => {
+        service.setTurnOriginLookup(() => ownerTurn);
+        const lookup = jest.fn(async () => 'should-not-be-used');
+        service.setSlackThreadConversationLookup(lookup);
+        const delegate = makeWorkItem({ target: 'sage', metadata: { ownerThread: '[SLACK-THREAD:C0BRIEF:1790856242.596149]' } });
+        await service.addToPool(delegate, { creatorSession: 'atlas' });
+        expect((await service.getAllItems())[0].metadata?.origin).toEqual({ kind: 'owner', conversationId: 'room-brief', slackChannelId: 'C0BRIEF', threadTs: '1790856242.596149', receivedBy: 'atlas' });
+        expect(lookup).not.toHaveBeenCalled();
+      });
+
+      it('an owner thread named by its chat message id resolves to that message\'s Slack thread (CE-199)', async () => {
+        service.setTurnOriginLookup(() => undefined);
+        service.setChatMessageThreadLookup(async (id) =>
+          id === 'fbecfa4b-3474-4c61-8a72-79cccb0d1941' ? { slackChannelId: 'C0PROCE', threadTs: '1791379103.320929', conversationId: 'room-ce' } : null,
+        );
+        const delegate = makeWorkItem({ target: 'vera', metadata: { delegatedBy: 'owen', ownerThread: 'fbecfa4b-3474-4c61-8a72-79cccb0d1941' } });
+        await service.addToPool(delegate, { creatorSession: 'owen' });
+        expect((await service.getAllItems())[0].metadata?.origin).toEqual({ kind: 'owner', conversationId: 'room-ce', slackChannelId: 'C0PROCE', threadTs: '1791379103.320929', receivedBy: 'owen' });
+      });
+
+      describe('an owner thread named as <conversation>:<chat thread> (Atlas → Kai, 2026-10-18)', () => {
+        const conv = '4c090d56-0e5c-4efe-a60f-102179761f67';
+        const thread = '2abe83ec-1643-4a0f-b8a2-be5350e726c4';
+
+        it('resolves to that thread\'s Slack place in that conversation', async () => {
+          service.setTurnOriginLookup(() => undefined);
+          service.setChatMessageThreadLookup(async (id) => (id === thread ? { slackChannelId: 'C0DAILY', threadTs: '1792300000.000100', conversationId: conv } : null));
+          const delegate = makeWorkItem({ target: 'kai', metadata: { delegatedBy: 'atlas', ownerThread: `${conv}:${thread}`, projectTicket: 'CREW-786' } });
+          await service.addToPool(delegate, { creatorSession: 'atlas' });
+          expect((await service.getAllItems())[0].metadata?.origin).toEqual(
+            expect.objectContaining({ kind: 'owner', conversationId: conv, slackChannelId: 'C0DAILY', threadTs: '1792300000.000100', chatThreadId: thread }),
+          );
+        });
+
+        it('a chat-only thread keeps the conversation and its thread', async () => {
+          service.setTurnOriginLookup(() => undefined);
+          service.setChatMessageThreadLookup(async () => null);
+          const delegate = makeWorkItem({ target: 'kai', metadata: { delegatedBy: 'atlas', ownerThread: `${conv}:${thread}` } });
+          await service.addToPool(delegate, { creatorSession: 'atlas' });
+          expect((await service.getAllItems())[0].metadata?.origin).toEqual(expect.objectContaining({ kind: 'owner', conversationId: conv, chatThreadId: thread }));
+        });
+
+        it('a thread of another conversation is not used', async () => {
+          service.setTurnOriginLookup(() => undefined);
+          service.setChatMessageThreadLookup(async () => ({ slackChannelId: 'C0OTHER', threadTs: '1.2', conversationId: 'room-other' }));
+          const delegate = makeWorkItem({ target: 'kai', metadata: { delegatedBy: 'atlas', ownerThread: `${conv}:${thread}` } });
+          await service.addToPool(delegate, { creatorSession: 'atlas' });
+          expect((await service.getAllItems())[0].metadata?.origin).not.toEqual(expect.objectContaining({ kind: 'owner' }));
+        });
+      });
+
+      it('isOwnerThreadUnreadable: true only for a named thread Crewly cannot read', async () => {
+        service.setChatMessageThreadLookup(async () => null);
+        expect(await service.isOwnerThreadUnreadable(undefined)).toBe(false);
+        expect(await service.isOwnerThreadUnreadable('  ')).toBe(false);
+        expect(await service.isOwnerThreadUnreadable('C0BRIEF:1790856242.596149')).toBe(false);
+        expect(await service.isOwnerThreadUnreadable('4c090d56-0e5c-4efe-a60f-102179761f67:2abe83ec-1643-4a0f-b8a2-be5350e726c4')).toBe(false);
+        expect(await service.isOwnerThreadUnreadable('garbage')).toBe(true);
+        expect(await service.isOwnerThreadUnreadable('fbecfa4b-3474-4c61-8a72-79cccb0d1941')).toBe(true);
+      });
+
+      // CREW-878: another agent already answered the owner in the named thread.
+      describe('agentAnswersInOwnerThread (CREW-878)', () => {
+        const KEY = 'C0MKT:1792400000.000100';
+        const ownerTurn878 = { conversationId: 'room-mkt', slackChannelId: 'C0MKT', slackThreadKey: KEY, receivedAt: 1_000_000 };
+        let log: ThreadAnswerLog;
+        let clock = 1_000_000;
+        beforeEach(() => {
+          clock = 1_000_000;
+          log = new ThreadAnswerLog(() => clock);
+          setThreadAnswerLog(log);
+          service.setTurnOriginLookup((s) => (s === 'ella' ? ownerTurn878 : undefined));
+          jest.spyOn(Date, 'now').mockImplementation(() => clock);
+        });
+        afterEach(() => {
+          setThreadAnswerLog(null);
+          jest.restoreAllMocks();
+        });
+
+        it('lists a post another agent made (reply --work-item included) after the owner message', async () => {
+          clock += 60_000;
+          log.record({ agent: 'luna', slackChannelId: 'C0MKT', threadTs: '1792400000.000100', text: 'Answered via work item' });
+          const answers = await service.agentAnswersInOwnerThread(KEY, 'ella');
+          expect(answers.map((a) => a.agent)).toEqual(['luna']);
+          expect(answers[0].preview).toBe('Answered via work item');
+        });
+
+        it('no answer, no warning', async () => {
+          expect(await service.agentAnswersInOwnerThread(KEY, 'ella')).toEqual([]);
+        });
+
+        it('the delegator\'s own post is not "someone else answered"', async () => {
+          clock += 1000;
+          log.record({ agent: 'ella', slackChannelId: 'C0MKT', threadTs: '1792400000.000100', text: 'On it' });
+          expect(await service.agentAnswersInOwnerThread(KEY, 'ella')).toEqual([]);
+        });
+
+        it('the target\'s own post is not "someone else answered"', async () => {
+          clock += 1000;
+          log.record({ agent: 'luna', slackChannelId: 'C0MKT', threadTs: '1792400000.000100', text: 'First part' });
+          expect(await service.agentAnswersInOwnerThread(KEY, 'ella', 'luna')).toEqual([]);
+          expect((await service.agentAnswersInOwnerThread(KEY, 'ella', 'sam')).map((p) => p.agent)).toEqual(['luna']);
+        });
+
+        it('a post older than the owner\'s last message does not count', async () => {
+          log.record({ agent: 'luna', slackChannelId: 'C0MKT', threadTs: '1792400000.000100', text: 'earlier answer' });
+          clock += 5000;
+          service.setTurnOriginLookup(() => ({ ...ownerTurn878, receivedAt: clock }));
+          expect(await service.agentAnswersInOwnerThread(KEY, 'ella')).toEqual([]);
+        });
+
+        it('unknown owner time or no log never blocks', async () => {
+          clock += 1000;
+          log.record({ agent: 'luna', slackChannelId: 'C0MKT', threadTs: '1792400000.000100', text: 'x' });
+          service.setTurnOriginLookup(() => undefined);
+          service.setOwnerAskedAtLookup(async () => null);
+          expect(await service.agentAnswersInOwnerThread(KEY, 'ella')).toEqual([]);
+          setThreadAnswerLog(null);
+          expect(await service.agentAnswersInOwnerThread(KEY, 'ella')).toEqual([]);
+          expect(await service.agentAnswersInOwnerThread('garbage', 'ella')).toEqual([]);
+        });
+      });
+
+      it('an unreadable explicit thread falls back to normal inheritance (a delegation: the delegator)', async () => {
+        service.setTurnOriginLookup(() => ownerTurn);
+        service.setSlackThreadConversationLookup(null);
+        const delegate = makeWorkItem({ target: 'sage', metadata: { ownerThread: 'garbage' } });
+        await service.addToPool(delegate, { creatorSession: 'atlas' });
+        expect((await service.getAllItems())[0].metadata?.origin).toEqual({ kind: 'agent', sessionName: 'atlas' });
+      });
+
+      // crewly#1357: Ella delegated on her own initiative while an owner thread was fresh.
+      describe('agent-initiated delegations (crewly#1357)', () => {
+        const videoTurn = { conversationId: 'room-video', slackChannelId: 'C0VIDEO', slackThreadKey: 'C0VIDEO:1792000000.000100', receivedAt: Date.now() - 60_000 };
+
+        it('a delegation without --thread / --conversation gets the delegator as origin, even while the delegator answers the owner', async () => {
+          service.setTurnOriginLookup((s) => (s === 'ella' ? videoTurn : undefined));
+          service.setOwnerContextLookup(async () => ({ origin: { kind: 'owner', receivedBy: 'lyra', appComment: { appId: 'a', commentId: 'c' } }, at: Date.now(), via: 'hand-over' }));
+          const delegate = makeWorkItem({ target: 'lyra', metadata: { delegatedBy: 'ella' } });
+          await service.addToPool(delegate, { creatorSession: 'ella' });
+          expect((await service.getAllItems())[0].metadata?.origin).toEqual({ kind: 'agent', sessionName: 'ella' });
+          service.setOwnerContextLookup(null);
+        });
+
+        it('metadata.delegatedBy alone (no header) identifies the delegator', async () => {
+          service.setTurnOriginLookup(() => videoTurn);
+          const delegate = makeWorkItem({ target: 'lyra', metadata: { delegatedBy: 'ella' } });
+          await service.addToPool(delegate);
+          expect((await service.getAllItems())[0].metadata?.origin).toEqual({ kind: 'agent', sessionName: 'ella' });
+        });
+
+        it('a delegation never inherits the delegator\'s running work\'s owner origin (the 2026-10-08 DM)', async () => {
+          service.setTurnOriginLookup(() => undefined);
+          const standing = makeWorkItem({ target: 'ella', metadata: { origin: { kind: 'owner', conversationId: 'slack-D0AC7NF5N7L-1791472064', slackChannelId: 'D0AC7NF5N7L', receivedBy: 'ella' } } });
+          await service.addToPool(standing);
+          await storage.updateWorkItem(standing.id, (w) => { w.status = 'running'; w.startedAt = new Date().toISOString(); });
+          const delegate = makeWorkItem({ target: 'lyra', title: 'Refresh today\'s X reply prep', metadata: { delegatedBy: 'ella' } });
+          await service.addToPool(delegate, { creatorSession: 'ella' });
+          expect((await service.getAllItems()).find((w) => w.id === delegate.id)!.metadata?.origin).toEqual({ kind: 'agent', sessionName: 'ella' });
+        });
+
+        it('--conversation names the owner chat conversation; the delegator\'s turn there supplies the thread', async () => {
+          service.setTurnOriginLookup((s) => (s === 'ella' ? { ...videoTurn, chatThreadId: 'root-9' } : undefined));
+          const delegate = makeWorkItem({ target: 'lyra', metadata: { delegatedBy: 'ella', ownerConversation: 'room-video' } });
+          await service.addToPool(delegate, { creatorSession: 'ella' });
+          expect((await service.getAllItems())[0].metadata?.origin).toEqual({
+            kind: 'owner',
+            conversationId: 'room-video',
+            slackChannelId: 'C0VIDEO',
+            threadTs: '1792000000.000100',
+            chatThreadId: 'root-9',
+            receivedBy: 'ella',
+          });
+          const other = makeWorkItem({ target: 'kai', metadata: { delegatedBy: 'ella', ownerConversation: 'room-other' } });
+          await service.addToPool(other, { creatorSession: 'ella' });
+          expect((await service.getAllItems()).find((w) => w.id === other.id)!.metadata?.origin).toEqual({ kind: 'owner', conversationId: 'room-other', receivedBy: 'ella' });
+        });
+
+        it('an explicit owner place where the owner last asked more than ORIGIN_INHERIT_MAX_AGE_MS ago is not taken', async () => {
+          service.setTurnOriginLookup(() => undefined);
+          service.setSlackThreadConversationLookup(async () => 'slack-D0AC7NF5N7L-1791472064');
+          service.setOwnerAskedAtLookup(async () => Date.now() - 9 * 24 * 60 * 60_000);
+          const delegate = makeWorkItem({ target: 'lyra', metadata: { delegatedBy: 'ella', ownerThread: 'D0AC7NF5N7L:1791472064.000100' } });
+          await service.addToPool(delegate, { creatorSession: 'ella' });
+          expect((await service.getAllItems())[0].metadata?.origin).toEqual({ kind: 'agent', sessionName: 'ella' });
+
+          // Fresh: taken. Unknown age: taken as given.
+          service.setOwnerAskedAtLookup(async () => Date.now() - 60_000);
+          const fresh = makeWorkItem({ target: 'lyra', metadata: { delegatedBy: 'ella', ownerThread: 'D0AC7NF5N7L:1791472064.000100' } });
+          await service.addToPool(fresh, { creatorSession: 'ella' });
+          expect((await service.getAllItems()).find((w) => w.id === fresh.id)!.metadata?.origin).toMatchObject({ kind: 'owner', slackChannelId: 'D0AC7NF5N7L' });
+          service.setOwnerAskedAtLookup(async () => null);
+          const unknown = makeWorkItem({ target: 'lyra', metadata: { delegatedBy: 'ella', ownerConversation: 'room-x' } });
+          await service.addToPool(unknown, { creatorSession: 'ella' });
+          expect((await service.getAllItems()).find((w) => w.id === unknown.id)!.metadata?.origin).toMatchObject({ kind: 'owner', conversationId: 'room-x' });
+        });
+
+        it('the delegator\'s own fresh turn in the named place is its age (no store read)', async () => {
+          service.setTurnOriginLookup(() => videoTurn);
+          const lookup = jest.fn(async () => Date.now() - 9 * 24 * 60 * 60_000);
+          service.setOwnerAskedAtLookup(lookup);
+          const delegate = makeWorkItem({ target: 'lyra', metadata: { delegatedBy: 'ella', ownerThread: 'C0VIDEO:1792000000.000100' } });
+          await service.addToPool(delegate, { creatorSession: 'ella' });
+          expect((await service.getAllItems())[0].metadata?.origin).toMatchObject({ kind: 'owner', conversationId: 'room-video' });
+          expect(lookup).not.toHaveBeenCalled();
+        });
+
+        it('a verbatim metadata.origin in the body is kept as given, however old', async () => {
+          service.setTurnOriginLookup(() => videoTurn);
+          const origin = { kind: 'owner', conversationId: 'dm-old', slackChannelId: 'D0OLD', threadTs: '1791000000.000100', receivedBy: 'ella' };
+          const delegate = makeWorkItem({ target: 'lyra', metadata: { delegatedBy: 'ella', origin } });
+          await service.addToPool(delegate, { creatorSession: 'ella' });
+          expect((await service.getAllItems())[0].metadata?.origin).toEqual(origin);
+        });
+
+        it('ticket-linked delegations keep the ticket as origin (the delegator is not stamped over it)', async () => {
+          service.setTurnOriginLookup(() => undefined);
+          const delegate = makeWorkItem({ target: 'sage', metadata: { delegatedBy: 'ella', projectTicket: { projectPath: '/p', id: 'CREW-401' } } });
+          await service.addToPool(delegate, { creatorSession: 'ella' });
+          const stored = (await service.getAllItems())[0];
+          expect(stored.metadata?.origin).toBeUndefined();
+          expect(originOfWorkItem(stored)).toMatchObject({ kind: 'ticket', ticketId: 'CREW-401' });
+        });
+      });
+
+      // 2026-10-07: the schedule-app comment reached Lyra (no chat turn).
+      describe('owner request contexts (app comment, hand-over)', () => {
+        const appComment = { appId: 'upb7se5pfj', commentId: 'QMSjXIhFanDw' };
+        const appCtx = (at: number) => ({
+          origin: { kind: 'owner' as const, receivedBy: 'lyra', appComment, slackChannelId: 'C0C2WMFB9EF', threadTs: '1791380650.784969' },
+          at,
+          via: 'app-comment' as const,
+        });
+        afterEach(() => service.setOwnerContextLookup(null));
+
+        it('own work created while handling an app comment carries an owner origin pointing at the comment and its Slack thread', async () => {
+          service.setTurnOriginLookup(() => undefined);
+          service.setOwnerContextLookup(async (s) => (s === 'lyra' ? appCtx(Date.now()) : null));
+          const own = makeWorkItem({ target: 'lyra' });
+          await service.addToPool(own, { creatorSession: 'lyra' });
+          expect((await service.getAllItems())[0].metadata?.origin).toEqual({
+            kind: 'owner',
+            receivedBy: 'lyra',
+            appComment,
+            slackChannelId: 'C0C2WMFB9EF',
+            threadTs: '1791380650.784969',
+          });
+        });
+
+        it('a delegation made from a hand-over does not inherit it (crewly#1357); the receiver answers the comment itself', async () => {
+          service.setTurnOriginLookup(() => undefined);
+          service.setOwnerContextLookup(async (s) => (s === 'ella' ? { ...appCtx(Date.now()), via: 'hand-over' as const } : null));
+          const delegate = makeWorkItem({ target: 'sage', metadata: { delegatedBy: 'ella' } });
+          await service.addToPool(delegate, { creatorSession: 'ella' });
+          expect((await service.getAllItems())[0].metadata?.origin).toEqual({ kind: 'agent', sessionName: 'ella' });
+          // Naming the comment's Slack thread hands it over explicitly.
+          service.setSlackThreadConversationLookup(async () => 'room-app');
+          const named = makeWorkItem({ target: 'sage', metadata: { delegatedBy: 'ella', ownerThread: 'C0C2WMFB9EF:1791380650.784969' } });
+          await service.addToPool(named, { creatorSession: 'ella' });
+          expect((await service.getAllItems()).find((w) => w.id === named.id)!.metadata?.origin).toMatchObject({ kind: 'owner', slackChannelId: 'C0C2WMFB9EF', receivedBy: 'ella' });
+        });
+
+        it('a context older than the creator\'s current work item is not used for its own work', async () => {
+          service.setTurnOriginLookup(() => undefined);
+          const running = makeWorkItem({ target: 'ella', status: 'queued' });
+          await service.addToPool(running);
+          await storage.updateWorkItem(running.id, (w) => { w.status = 'running'; w.startedAt = new Date().toISOString(); });
+          service.setOwnerContextLookup(async () => appCtx(Date.now() - 60_000));
+          const own = makeWorkItem({ target: 'ella' });
+          await service.addToPool(own, { creatorSession: 'ella' });
+          expect((await service.getAllItems()).find((w) => w.id === own.id)!.metadata?.origin).toBeUndefined();
+        });
+
+        it('ownerOriginOnly (a ticket assignment) takes the owner origin, never the creator\'s ticket origin', async () => {
+          service.setTurnOriginLookup(() => undefined);
+          service.setOwnerContextLookup(async () => null);
+          const current = makeWorkItem({ target: 'ella', metadata: { projectTicket: { projectPath: '/p/m', id: 'CREW-300' } } });
+          await service.addToPool(current);
+          await storage.updateWorkItem(current.id, (w) => { w.status = 'running'; w.startedAt = new Date().toISOString(); });
+          const assigned = makeWorkItem({ target: 'kai', metadata: { projectTicket: { projectPath: '/p/m', id: 'CREW-310' } } });
+          await service.addToPool(assigned, { creatorSession: 'ella', ownerOriginOnly: true });
+          expect((await service.getAllItems()).find((w) => w.id === assigned.id)!.metadata?.origin).toBeUndefined();
+
+          // The lead's own app-comment context is not handed over by itself (crewly#1357)…
+          service.setOwnerContextLookup(async () => appCtx(Date.now() + 1000));
+          const assigned2 = makeWorkItem({ target: 'kai', metadata: { projectTicket: { projectPath: '/p/m', id: 'CREW-311' } } });
+          await service.addToPool(assigned2, { creatorSession: 'ella', ownerOriginOnly: true });
+          expect((await service.getAllItems()).find((w) => w.id === assigned2.id)!.metadata?.origin).toBeUndefined();
+          // …the named owner thread is.
+          service.setSlackThreadConversationLookup(async () => 'room-app');
+          const assigned3 = makeWorkItem({ target: 'kai', metadata: { ownerThread: 'C0C2WMFB9EF:1791380650.784969', projectTicket: { projectPath: '/p/m', id: 'CREW-312' } } });
+          await service.addToPool(assigned3, { creatorSession: 'ella', ownerOriginOnly: true });
+          expect((await service.getAllItems()).find((w) => w.id === assigned3.id)!.metadata?.origin).toMatchObject({ kind: 'owner', slackChannelId: 'C0C2WMFB9EF', receivedBy: 'ella' });
+        });
+      });
+    });
+
+    it('rejects non-queued items', async () => {
+      const wi = makeWorkItem();
+      wi.status = 'running';
+
+      await expect(service.addToPool(wi)).rejects.toThrow(
+        "status must be 'queued'",
+      );
+    });
+
+    it('rejects invalid WorkItem objects', async () => {
+      const invalid = { id: 'x' } as any;
+      await expect(service.addToPool(invalid)).rejects.toThrow('Invalid WorkItem');
+    });
+
+    it('skips duplicate items silently', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.addToPool(wi); // duplicate
+
+      const items = await service.getAllItems();
+      expect(items).toHaveLength(1);
+    });
+
+    it('accepts a blocked WorkItem (waiting on deps)', async () => {
+      const wi = makeWorkItem({ dependsOn: ['upstream-1'] });
+      // makeWorkItem builds via createWorkItem, so dependsOn → blocked
+      expect(wi.status).toBe('blocked');
+
+      await service.addToPool(wi);
+      const items = await service.getAllItems();
+      expect(items).toHaveLength(1);
+      expect(items[0].status).toBe('blocked');
+    });
+
+    // ---------------------------------------------------------------------
+    // INBOUND-1.f1: workitem:queued publish hook
+    // ---------------------------------------------------------------------
+
+    describe('workitem:queued publish (INBOUND-1.f1)', () => {
+      it('publishes workitem:queued with workItemId + requestId + missionId when EventBus is wired', async () => {
+        const publishCalls: any[] = [];
+        const fakeBus = {
+          publish: jest.fn((event: any) => publishCalls.push(event)),
+        } as any;
+        service.setEventBusService(fakeBus);
+
+        const wi = makeWorkItem({ requestId: 'req-99', missionId: 'm-7' });
+        await service.addToPool(wi);
+
+        expect(publishCalls).toHaveLength(1);
+        expect(publishCalls[0].type).toBe('workitem:queued');
+        expect(publishCalls[0].workItemId).toBe(wi.id);
+        expect(publishCalls[0].requestId).toBe('req-99');
+        expect(publishCalls[0].missionId).toBe('m-7');
+        // Deterministic event id keyed on the WI id (dedup contract).
+        expect(publishCalls[0].id).toBe(`workitem:queued:${wi.id}`);
+        expect(publishCalls[0].newValue).toBe(wi.status);
+      });
+
+      it('carries the WorkItem target so the dispatcher can push it on queue', async () => {
+        const publishCalls: any[] = [];
+        service.setEventBusService({ publish: jest.fn((event: any) => publishCalls.push(event)) } as any);
+        const wi = makeWorkItem({ target: 'team-ella-1' });
+        await service.addToPool(wi);
+        expect(publishCalls[0].target).toBe('team-ella-1');
+        expect(publishCalls[0].workItemId).toBe(wi.id);
+      });
+
+      it('does NOT publish workitem:queued when no EventBus is wired (legacy/test path)', async () => {
+        // No setEventBusService — eventBus stays null, addToPool must not throw.
+        const wi = makeWorkItem();
+        await expect(service.addToPool(wi)).resolves.toBeUndefined();
+      });
+
+      it('does NOT publish workitem:queued when addToPool short-circuits on a duplicate id', async () => {
+        const publishCalls: any[] = [];
+        const fakeBus = {
+          publish: jest.fn((event: any) => publishCalls.push(event)),
+        } as any;
+        service.setEventBusService(fakeBus);
+
+        const wi = makeWorkItem({ requestId: 'req-dup' });
+        await service.addToPool(wi);
+        await service.addToPool(wi); // duplicate id — short-circuits
+
+        expect(publishCalls).toHaveLength(1);
+      });
+
+      it('omits requestId/missionId when the WI does not carry them', async () => {
+        const publishCalls: any[] = [];
+        const fakeBus = {
+          publish: jest.fn((event: any) => publishCalls.push(event)),
+        } as any;
+        service.setEventBusService(fakeBus);
+
+        const wi = makeWorkItem(); // no requestId, no missionId
+        await service.addToPool(wi);
+
+        expect(publishCalls).toHaveLength(1);
+        expect(publishCalls[0].requestId).toBeUndefined();
+        expect(publishCalls[0].missionId).toBeUndefined();
+        expect(publishCalls[0].workItemId).toBe(wi.id);
+      });
+
+      it('isolates EventBus.publish errors from the pool mutation (storage commit wins)', async () => {
+        const fakeBus = {
+          publish: jest.fn(() => {
+            throw new Error('bus blew up');
+          }),
+        } as any;
+        service.setEventBusService(fakeBus);
+
+        const wi = makeWorkItem();
+        await expect(service.addToPool(wi)).resolves.toBeUndefined();
+
+        // Pool mutation committed even though publish threw.
+        const items = await service.getAllItems();
+        expect(items).toHaveLength(1);
+        expect(items[0].id).toBe(wi.id);
+      });
+    });
+
+    // ---------------------------------------------------------------------
+    // P1 Bug B: intrinsic Request.workItemIds[] backfill
+    //
+    // Pool umbrella WorkItem 72ca743a-3a66-4d0e-a6cf-1a861f849dbd.
+    //
+    // Pre-fix, addToPool stored requestId on the WI but did NOT push the
+    // WI id into Request.workItemIds[] — that link only happened via
+    // downstream subscribers (request-sla.subscriber on workitem:queued,
+    // V3DataService on task:delegated), both of which require the caller
+    // to have gone through the standard event chain. Manual / programmatic
+    // / cron / orchestrator-script callers bypassed those subscribers and
+    // left Requests with empty workItemIds[].
+    //
+    // The fix: addToPool now invokes a wired `linkWorkItem` on every
+    // successful enqueue. linkWorkItem is idempotent (short-circuits on
+    // duplicate id) so subscriber-driven linking remains as
+    // belt-and-suspenders. These tests pin the contract.
+    // ---------------------------------------------------------------------
+    describe('intrinsic Request link (P1 Bug B)', () => {
+      function makeFakeLinker() {
+        const calls: Array<{ requestId: string; workItemId: string }> = [];
+        const linker = {
+          linkWorkItem: jest.fn(async (requestId: string, workItemId: string) => {
+            calls.push({ requestId, workItemId });
+            return null;
+          }),
+        };
+        return { linker, calls };
+      }
+
+      it('calls linkWorkItem(requestId, workItemId) once when wi.requestId is set', async () => {
+        const { linker, calls } = makeFakeLinker();
+        service.setRequestService(linker as any);
+
+        const wi = makeWorkItem({ requestId: 'req-bug-b-1' });
+        await service.addToPool(wi);
+
+        expect(linker.linkWorkItem).toHaveBeenCalledTimes(1);
+        expect(calls[0]).toEqual({ requestId: 'req-bug-b-1', workItemId: wi.id });
+      });
+
+      it('does NOT call linkWorkItem when wi.requestId is NOT set', async () => {
+        const { linker } = makeFakeLinker();
+        service.setRequestService(linker as any);
+
+        const wi = makeWorkItem(); // no requestId
+        await service.addToPool(wi);
+
+        expect(linker.linkWorkItem).not.toHaveBeenCalled();
+      });
+
+      it('isolates linkWorkItem failures (addToPool still succeeds, warn-logged)', async () => {
+        const linker = {
+          linkWorkItem: jest.fn(async () => {
+            throw new Error('linker blew up — db down');
+          }),
+        };
+        service.setRequestService(linker as any);
+
+        const wi = makeWorkItem({ requestId: 'req-fail' });
+
+        // CRITICAL: addToPool must NOT re-throw — pool mutation is the
+        // source of truth, link is best-effort.
+        await expect(service.addToPool(wi)).resolves.toBeUndefined();
+
+        // Pool mutation committed even though link threw.
+        const items = await service.getAllItems();
+        expect(items).toHaveLength(1);
+        expect(items[0].id).toBe(wi.id);
+        expect(linker.linkWorkItem).toHaveBeenCalledTimes(1);
+      });
+
+      it('does not double-link on duplicate addToPool calls (storage dedup short-circuits)', async () => {
+        const { linker } = makeFakeLinker();
+        service.setRequestService(linker as any);
+
+        const wi = makeWorkItem({ requestId: 'req-dup-link' });
+        await service.addToPool(wi);
+        await service.addToPool(wi); // duplicate id — storage short-circuits at line 206
+
+        // The duplicate addToPool returns early BEFORE the link call,
+        // so linkWorkItem is invoked exactly once. Even if it were called
+        // twice, the production linkWorkItem itself short-circuits on
+        // duplicate workItemId (request.service.ts:328) — pinned in a
+        // belt-and-suspenders test below.
+        expect(linker.linkWorkItem).toHaveBeenCalledTimes(1);
+      });
+
+      it('does NOT call linkWorkItem when no RequestService is wired (legacy/test path)', async () => {
+        // No setRequestService — requestService stays null, addToPool
+        // must not throw and the linker call must be skipped silently.
+        const wi = makeWorkItem({ requestId: 'req-no-linker' });
+        await expect(service.addToPool(wi)).resolves.toBeUndefined();
+
+        const items = await service.getAllItems();
+        expect(items).toHaveLength(1);
+      });
+
+      it('coexists with EventBus publish (both linker and bus invoked, in order)', async () => {
+        // Pin the belt-and-suspenders contract: a caller that goes
+        // through the request:created event chain still triggers BOTH
+        // the intrinsic link (this fix) AND the subscriber-driven link
+        // (downstream of workitem:queued). The downstream link is
+        // exercised in production via request-sla.subscriber.ts:1153,
+        // not invoked here, but we pin the publish ordering.
+        const publishCalls: any[] = [];
+        const fakeBus = {
+          publish: jest.fn((event: any) => publishCalls.push(event)),
+        } as any;
+        const { linker } = makeFakeLinker();
+
+        service.setEventBusService(fakeBus);
+        service.setRequestService(linker as any);
+
+        const wi = makeWorkItem({ requestId: 'req-coexist' });
+        await service.addToPool(wi);
+
+        // Both fired
+        expect(linker.linkWorkItem).toHaveBeenCalledTimes(1);
+        expect(publishCalls).toHaveLength(1);
+        expect(publishCalls[0].requestId).toBe('req-coexist');
+
+        // Ordering: linker BEFORE publish, so a subscriber that loads the
+        // Request synchronously after seeing workitem:queued will already
+        // observe the intrinsic link. (Subscribers re-link idempotently
+        // anyway, but ordering is documented.)
+        const linkOrder = (linker.linkWorkItem as jest.Mock).mock.invocationCallOrder[0];
+        const publishOrder = fakeBus.publish.mock.invocationCallOrder[0];
+        expect(linkOrder).toBeLessThan(publishOrder);
+      });
+
+      it('integration repro: ORC 322e7fd3 case — direct addToPool populates Request.workItemIds[]', async () => {
+        // Mimic the exact failure mode from ORC's bug report: a Request
+        // exists, then a caller directly invokes taskPool.addToPool
+        // outside the request:created event chain (no SLA subscriber, no
+        // V3DataService). PRE-FIX: workItemIds stays empty. POST-FIX:
+        // the intrinsic link populates it.
+        //
+        // We use a FAKE Request store keyed on requestId — simpler than
+        // standing up the full RequestService / persistence stack and
+        // pins the wire contract that matters: linkWorkItem produces the
+        // observed mutation on the Request side.
+        const fakeRequestStore = new Map<string, { id: string; workItemIds: string[] }>();
+        fakeRequestStore.set('req-322e7fd3', {
+          id: 'req-322e7fd3',
+          workItemIds: [], // empty — the bug condition
+        });
+
+        const linker = {
+          linkWorkItem: jest.fn(async (requestId: string, workItemId: string) => {
+            const req = fakeRequestStore.get(requestId);
+            if (!req) return null;
+            // Idempotency: short-circuit on duplicate id (mirrors
+            // request.service.ts:328).
+            if (!req.workItemIds.includes(workItemId)) {
+              req.workItemIds.push(workItemId);
+            }
+            return req;
+          }),
+        };
+        service.setRequestService(linker as any);
+
+        // PRE-FIX assertion baseline
+        expect(fakeRequestStore.get('req-322e7fd3')!.workItemIds).toEqual([]);
+
+        // Direct addToPool — bypasses any event subscribers
+        const wi = makeWorkItem({ requestId: 'req-322e7fd3' });
+        await service.addToPool(wi);
+
+        // POST-FIX: intrinsic link populated workItemIds
+        const after = fakeRequestStore.get('req-322e7fd3')!;
+        expect(after.workItemIds).toHaveLength(1);
+        expect(after.workItemIds).toContain(wi.id);
+
+        // Subscriber-driven re-link (simulated): calling linkWorkItem
+        // again with the same ids is a no-op due to the includes() guard.
+        // This pins the belt-and-suspenders idempotency contract.
+        await linker.linkWorkItem('req-322e7fd3', wi.id);
+        const afterSecondLink = fakeRequestStore.get('req-322e7fd3')!;
+        expect(afterSecondLink.workItemIds).toHaveLength(1); // still 1
+      });
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Dependency resolution (auto-unblock)
+  // -----------------------------------------------------------------------
+
+  describe('dependency resolution', () => {
+    it('promotes a blocked dependent to queued when its single dep completes', async () => {
+      const upstream = makeWorkItem({ type: 'cron_run', title: 'upstream' });
+      await service.addToPool(upstream);
+
+      const downstream = makeWorkItem({
+        type: 'cron_run',
+        title: 'downstream',
+        dependsOn: [upstream.id],
+      });
+      await service.addToPool(downstream);
+
+      // Claim + complete upstream — should auto-unblock downstream
+      const claim = await service.claimFromPool('agent-a');
+      expect(claim!.workItem.id).toBe(upstream.id);
+      await service.completeItem(upstream.id, undefined, AGENT_ACTOR);
+
+      const items = await service.getAllItems();
+      const after = items.find((wi) => wi.id === downstream.id)!;
+      expect(after.status).toBe('queued');
+    });
+
+    it('does not dispatch a blocked task (by claim or by id) until its blocker is done (decompose-goal blockedBy)', async () => {
+      const blocker = makeWorkItem({ type: 'cron_run', title: 'blocker' });
+      await service.addToPool(blocker);
+      const dependent = makeWorkItem({ type: 'cron_run', title: 'dependent', dependsOn: [blocker.id] });
+      await service.addToPool(dependent);
+
+      // Only the blocker is offered; the dependent cannot be taken by id either.
+      expect(await service.claimSpecificItem('agent-b', dependent.id)).toBeNull();
+      const first = await service.claimFromPool('agent-a');
+      expect(first!.workItem.id).toBe(blocker.id);
+      expect(await service.claimFromPool('agent-b')).toBeNull();
+
+      await service.completeItem(blocker.id, undefined, AGENT_ACTOR);
+      const second = await service.claimFromPool('agent-b');
+      expect(second!.workItem.id).toBe(dependent.id);
+    });
+
+    it('keeps the dependent blocked until ALL deps complete', async () => {
+      const depA = makeWorkItem({ type: 'cron_run', title: 'dep-a' });
+      const depB = makeWorkItem({ type: 'cron_run', title: 'dep-b' });
+      await service.addToPool(depA);
+      await service.addToPool(depB);
+
+      const downstream = makeWorkItem({
+        type: 'cron_run',
+        title: 'downstream',
+        dependsOn: [depA.id, depB.id],
+      });
+      await service.addToPool(downstream);
+
+      // Complete only depA first
+      await service.claimFromPool('agent-a');
+      await service.completeItem(depA.id, undefined, AGENT_ACTOR);
+
+      let items = await service.getAllItems();
+      expect(items.find((wi) => wi.id === downstream.id)!.status).toBe('blocked');
+
+      // Now complete depB — downstream should unblock
+      await service.claimFromPool('agent-b');
+      await service.completeItem(depB.id, undefined, AGENT_ACTOR);
+
+      items = await service.getAllItems();
+      expect(items.find((wi) => wi.id === downstream.id)!.status).toBe('queued');
+    });
+
+    it('does not touch dependents that list a different upstream', async () => {
+      const otherUpstream = makeWorkItem({ type: 'cron_run', title: 'other' });
+      const unrelatedDownstream = makeWorkItem({
+        type: 'cron_run',
+        title: 'unrelated',
+        dependsOn: ['some-other-id'],
+      });
+      await service.addToPool(otherUpstream);
+      await service.addToPool(unrelatedDownstream);
+
+      await service.claimFromPool('agent-a');
+      await service.completeItem(otherUpstream.id, undefined, AGENT_ACTOR);
+
+      const items = await service.getAllItems();
+      expect(items.find((wi) => wi.id === unrelatedDownstream.id)!.status).toBe(
+        'blocked',
+      );
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // claimFromPool
+  // -----------------------------------------------------------------------
+
+  describe('claimFromPool — team budget gate', () => {
+    afterEach(() => {
+      service.setTeamBudgetGate(null);
+    });
+
+    it('throws TeamBudgetExceededError (reason team_budget_exceeded) and leaves the WI queued', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      service.setTeamBudgetGate({
+        checkForSession: async () => ({
+          allowed: false,
+          reason: 'team_budget_exceeded',
+          detail: 'Team "T" (t1) is over budget',
+          level: 'blocked',
+          teamId: 't1',
+          teamName: 'T',
+          usage: { tokensToday: 1, usdThisMonth: 0, sessions: ['agent-leo'] },
+        }),
+      });
+
+      await expect(service.claimFromPool('agent-leo')).rejects.toBeInstanceOf(TeamBudgetExceededError);
+      await expect(service.claimFromPool('agent-leo')).rejects.toMatchObject({
+        reason: 'team_budget_exceeded',
+      });
+      const after = (await service.getAllItems()).find((w) => w.id === wi.id);
+      expect(after?.status).toBe('queued');
+    });
+
+    it('claims normally when the gate allows, and fails open when the gate throws', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      service.setTeamBudgetGate({
+        checkForSession: async () => {
+          throw new Error('gate exploded');
+        },
+      });
+      const result = await service.claimFromPool('agent-leo');
+      expect(result?.workItem.id).toBe(wi.id);
+    });
+
+    it('is bypassed entirely when no gate is wired (default)', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      const result = await service.claimFromPool('agent-leo');
+      expect(result?.workItem.id).toBe(wi.id);
+    });
+  });
+
+  describe('ticket claim policy (ticket-loop Phase 3)', () => {
+    afterEach(() => service.setTicketClaimPolicy(null));
+
+    it('claims by priority instead of FIFO and stamps the self-claimer as assignee', async () => {
+      const claimed: Array<[string, string]> = [];
+      service.setTicketClaimPolicy({
+        snapshot: async () =>
+          new Map([
+            ['r-low', { id: 'r-low', priority: 'low' as const }],
+            ['r-urgent', { id: 'r-urgent', priority: 'urgent' as const }],
+          ]),
+        onSelfClaimed: async (requestId, agentId) => void claimed.push([requestId, agentId]),
+      });
+      const low = makeWorkItem({ title: 'low', requestId: 'r-low' });
+      low.createdAt = new Date(Date.now() - 60_000).toISOString();
+      const urgent = makeWorkItem({ title: 'urgent', requestId: 'r-urgent' });
+      await service.addToPool(low);
+      await service.addToPool(urgent);
+      const res = await service.claimFromPool('ann');
+      expect(res?.workItem.title).toBe('urgent');
+      expect(claimed).toEqual([['r-urgent', 'ann']]);
+    });
+
+    it('holds back another ticket while the agent has open work, in both claim paths', async () => {
+      service.setTicketClaimPolicy({
+        snapshot: async () =>
+          new Map([
+            ['rA', { id: 'rA', priority: 'normal' as const }],
+            ['rB', { id: 'rB', priority: 'urgent' as const }],
+          ]),
+      });
+      // Blocked on a dependency: open work on ticket A.
+      const blockedA = makeWorkItem({ title: 'A part 2', requestId: 'rA', target: 'ann', dependsOn: ['elsewhere'] });
+      await service.addToPool(blockedA);
+      const b = makeWorkItem({ title: 'B', requestId: 'rB' });
+      await service.addToPool(b);
+      expect(await service.claimFromPool('ann')).toBeNull();
+      expect(await service.claimSpecificItem('ann', b.id)).toBeNull();
+      // Someone free takes it.
+      expect((await service.claimFromPool('bob'))?.workItem.title).toBe('B');
+    });
+
+    it('marks items that come back from blocked so their owner resumes them first', async () => {
+      const item = makeWorkItem({ title: 'resume me', target: 'ann', dependsOn: ['elsewhere'] });
+      await service.addToPool(item);
+      await service.transitionStatus(item.id, 'queued', 'system');
+      const after = (await service.getAllItems()).find((w) => w.id === item.id);
+      expect(after?.metadata?.unblockedAt).toEqual(expect.any(String));
+    });
+
+    it('falls back to FIFO when the snapshot fails', async () => {
+      service.setTicketClaimPolicy({ snapshot: async () => { throw new Error('disk'); } });
+      const first = makeWorkItem({ title: 'first' });
+      first.createdAt = new Date(Date.now() - 60_000).toISOString();
+      await service.addToPool(makeWorkItem({ title: 'second' }));
+      await service.addToPool(first);
+      expect((await service.claimFromPool('ann'))?.workItem.title).toBe('first');
+    });
+  });
+
+  describe('review verdict (ticket-loop Phase 3)', () => {
+    /**
+     * A source item in done_by_worker plus its review item.
+     *
+     * @returns Ids
+     */
+    async function reviewPair(): Promise<{ sourceId: string; reviewId: string }> {
+      // No explicit reviewer: the review item's assignee (sam) is the reviewer of record.
+      const source = makeWorkItem({ title: 'work', target: 'ann', metadata: {} });
+      await service.addToPool(source);
+      await service.claimFromPool('ann');
+      await service.transitionStatus(source.id, 'done_by_worker', 'agent');
+      await service.releaseClaim(source.id, 'completed');
+      const review = makeWorkItem({ type: 'review', title: 'Verify: work', target: 'sam', metadata: { verifyOf: source.id } });
+      await service.addToPool(review);
+      await service.claimFromPool('sam');
+      return { sourceId: source.id, reviewId: review.id };
+    }
+
+    it('completing a review normally verifies the source', async () => {
+      const { sourceId, reviewId } = await reviewPair();
+      await service.completeSimpleItem(reviewId, { role: 'agent', session: 'sam' }, { summary: 'looks right' });
+      expect((await service.getAllItems()).find((w) => w.id === sourceId)?.status).toBe('verified');
+    });
+
+    it('verdict rejected sends the source back with the feedback', async () => {
+      const { sourceId, reviewId } = await reviewPair();
+      await service.completeSimpleItem(reviewId, { role: 'agent', session: 'sam' }, { summary: 'no', verdict: 'rejected', feedback: 'header row missing' });
+      const src = (await service.getAllItems()).find((w) => w.id === sourceId);
+      expect(src?.status).toBe('rejected');
+      expect(src?.error).toBe('header row missing');
+    });
+  });
+
+  describe('#813 — work is verified only by its reviewer', () => {
+    /**
+     * A delegate item done by `dev-ann`, awaiting review, with a review item
+     * `<id>:verify:<id>` assigned to `tl-sam` (the bridge's shape).
+     *
+     * @param opts.stampReviewer - Also record the reviewer on the source
+     * @returns The source and review ids
+     */
+    async function awaitingReview(opts: { stampReviewer?: boolean } = {}) {
+      const source = makeWorkItem({
+        title: 'deliverable',
+        target: 'dev-ann',
+        metadata: opts.stampReviewer ? { reviewer: 'tl-sam' } : {},
+      });
+      await service.addToPool(source);
+      await service.claimFromPool('dev-ann');
+      await service.submitForVerification(source.id, { role: 'agent', session: 'dev-ann' });
+      const review = makeWorkItem({
+        id: `${source.id}:verify:${source.id}`,
+        type: 'review',
+        title: 'Verify: deliverable',
+        target: 'tl-sam',
+        metadata: { verifyOf: source.id },
+      });
+      await service.addToPool(review);
+      await service.claimFromPool('tl-sam');
+      return { sourceId: source.id, reviewId: review.id };
+    }
+
+    const statusOf = async (id: string) => (await service.findWorkItem(id))?.status;
+
+    describe('verifyItem refuses callers that are not the reviewer', () => {
+      it.each([
+        ['a different team lead', { role: 'team_lead' as const, session: 'tl-other' }, 'not_reviewer'],
+        ['the worker itself, as agent', { role: 'agent' as const, session: 'dev-ann' }, 'role_not_permitted'],
+        ['the worker itself, claiming team_lead', { role: 'team_lead' as const, session: 'dev-ann' }, 'self_review'],
+        ['a bare team_lead role with no identity', 'team_lead' as const, 'not_reviewer'],
+        ['the orchestrator before escalation', { role: 'orchestrator' as const, session: 'crewly-orc' }, 'not_reviewer'],
+        ['system (no timer may certify work)', 'system' as const, 'role_not_permitted'],
+      ])('refuses %s', async (_label, actor, reason) => {
+        const { sourceId } = await awaitingReview();
+        await expect(service.verifyItem(sourceId, actor, 'verified')).rejects.toMatchObject({
+          name: 'ForbiddenTransitionError',
+          reason,
+        });
+        expect(await statusOf(sourceId)).toBe('done_by_worker');
+      });
+
+      it('refuses a missing actor (no default role)', async () => {
+        const { sourceId } = await awaitingReview();
+        await expect(
+          service.verifyItem(sourceId, undefined as unknown as 'team_lead', 'verified'),
+        ).rejects.toMatchObject({ reason: 'missing_actor' });
+        expect(await statusOf(sourceId)).toBe('done_by_worker');
+      });
+
+      it('accepts the reviewer of record (from the review item) and records who reviewed', async () => {
+        const { sourceId } = await awaitingReview();
+        const updated = await service.verifyItem(sourceId, { role: 'team_lead', session: 'tl-sam' }, 'verified');
+        expect(updated?.status).toBe('verified');
+        expect(updated?.metadata).toMatchObject({ reviewedBy: 'tl-sam', reviewedByRole: 'team_lead' });
+      });
+
+      it('accepts the orchestrator once the review is escalated to it', async () => {
+        const { sourceId } = await awaitingReview({ stampReviewer: true });
+        expect(await service.stampReviewEscalation(sourceId, 'verifyEscalatedAt')).toBe(true);
+        const updated = await service.verifyItem(sourceId, { role: 'orchestrator', session: 'crewly-orc' }, 'verified');
+        expect(updated?.status).toBe('verified');
+      });
+
+      it('accepts the owner', async () => {
+        const { sourceId } = await awaitingReview({ stampReviewer: true });
+        expect((await service.verifyItem(sourceId, { role: 'owner' }, 'rejected', 'not yet'))?.status).toBe('rejected');
+      });
+    });
+
+    describe('completing a review item renders the verdict as the caller', () => {
+      it('the assigned reviewer completing it verifies the source', async () => {
+        const { sourceId, reviewId } = await awaitingReview();
+        await service.completeItem(reviewId, { summary: 'checked' }, { role: 'agent', session: 'tl-sam' });
+        expect(await statusOf(sourceId)).toBe('verified');
+        expect((await service.findWorkItem(sourceId))?.metadata).toMatchObject({ reviewer: 'tl-sam', reviewedBy: 'tl-sam' });
+      });
+
+      it.each([
+        ['someone else', { role: 'agent' as const, session: 'dev-bob' }],
+        ['the worker', { role: 'agent' as const, session: 'dev-ann' }],
+        ['a caller with no session', { role: 'agent' as const }],
+      ])('%s completing it is refused, and the review item stays open', async (_label, actor) => {
+        const { sourceId, reviewId } = await awaitingReview();
+        await expect(service.completeItem(reviewId, { summary: 'lgtm' }, actor)).rejects.toMatchObject({
+          name: 'ForbiddenTransitionError',
+        });
+        expect(await statusOf(sourceId)).toBe('done_by_worker');
+        expect(await statusOf(reviewId)).toBe('running');
+      });
+    });
+
+    // #819: a verdict rendered directly on the source (POST /verdict, or the
+    // owner resolving an escalation) used to leave `<id>:verify:<id>` open
+    // in the reviewer's queue forever — only completing the review item
+    // ITSELF closed it. verifyItem must close it too.
+    describe('closing the review item after a direct verdict (#819)', () => {
+      it('a verdict rendered directly (not via completing the review item) closes the open review item', async () => {
+        const { sourceId, reviewId } = await awaitingReview();
+        expect(await statusOf(reviewId)).toBe('running');
+
+        await service.verifyItem(sourceId, { role: 'owner' }, 'verified');
+
+        expect(await statusOf(reviewId)).toBe('done');
+      });
+
+      it('closes the review item on a direct REJECTED verdict too', async () => {
+        const { sourceId, reviewId } = await awaitingReview();
+
+        await service.verifyItem(sourceId, { role: 'owner' }, 'rejected', 'not yet');
+
+        expect(await statusOf(reviewId)).toBe('done');
+      });
+
+      it('cancels a review item that was never claimed (queued), rather than erroring', async () => {
+        const source = makeWorkItem({ title: 'deliverable', target: 'dev-ann', metadata: {} });
+        await service.addToPool(source);
+        await service.claimFromPool('dev-ann');
+        await service.submitForVerification(source.id, { role: 'agent', session: 'dev-ann' });
+        const review = makeWorkItem({
+          id: `${source.id}:verify:${source.id}`,
+          type: 'review',
+          title: 'Verify: deliverable',
+          target: 'tl-sam',
+          metadata: { verifyOf: source.id },
+        });
+        await service.addToPool(review); // never claimed — stays queued
+        expect(await statusOf(review.id)).toBe('queued');
+
+        await service.verifyItem(source.id, { role: 'owner' }, 'verified');
+
+        expect(await statusOf(review.id)).toBe('cancelled');
+      });
+
+      it('a verdict with no review item at all still succeeds (no-op close)', async () => {
+        const wi = makeWorkItem({ type: 'delegate', target: 'dev-ann' });
+        await service.addToPool(wi);
+        await service.claimFromPool('dev-ann');
+        await service.submitForVerification(wi.id, { role: 'agent', session: 'dev-ann' });
+
+        await expect(service.verifyItem(wi.id, { role: 'owner' }, 'verified')).resolves.toMatchObject({
+          status: 'verified',
+        });
+      });
+    });
+
+    describe('no default actor on the status setters', () => {
+      it('updateItemStatus refuses a missing actor', async () => {
+        const wi = makeWorkItem();
+        await service.addToPool(wi);
+        await expect(
+          (service.updateItemStatus as (id: string, s: WorkItemStatus) => Promise<void>)(wi.id, 'cancelled'),
+        ).rejects.toMatchObject({ reason: 'missing_actor' });
+        expect(await statusOf(wi.id)).toBe('queued');
+      });
+
+      it('transitionStatus refuses a missing actor', async () => {
+        const wi = makeWorkItem();
+        await service.addToPool(wi);
+        await expect(
+          service.transitionStatus(wi.id, 'cancelled', undefined as unknown as 'system'),
+        ).rejects.toMatchObject({ reason: 'missing_actor' });
+      });
+    });
+
+    describe('what needs review', () => {
+      it.each([
+        ['a trigger-fired check-in', { triggerId: 'trig-1' }],
+        ['a bridge-auto maintenance item', { metadata: { autoCreated: true } }],
+      ])('%s completes as done, not done_by_worker', async (_label, extra) => {
+        const wi = makeWorkItem({ type: 'delegate', target: 'dev-ann', ...extra });
+        await service.addToPool(wi);
+        await service.claimFromPool('dev-ann');
+        await service.completeItem(wi.id, { summary: 'checked in' }, { role: 'agent', session: 'dev-ann' });
+        expect(await statusOf(wi.id)).toBe('done');
+      });
+
+      it('an explicit requiresVerification still wins for a trigger-fired item', async () => {
+        const wi = makeWorkItem({ type: 'delegate', target: 'dev-ann', triggerId: 'trig-2', metadata: { requiresVerification: true } });
+        await service.addToPool(wi);
+        await service.claimFromPool('dev-ann');
+        await service.completeItem(wi.id, { summary: 'done' }, { role: 'agent', session: 'dev-ann' });
+        expect(await statusOf(wi.id)).toBe('done_by_worker');
+      });
+    });
+
+    it('stampReviewEscalation only stamps items still awaiting review', async () => {
+      const { sourceId } = await awaitingReview();
+      expect(await service.stampReviewEscalation(sourceId, 'reviewOwnerEscalatedAt', '2026-09-26T00:00:00Z')).toBe(true);
+      expect((await service.findWorkItem(sourceId))?.metadata?.reviewOwnerEscalatedAt).toBe('2026-09-26T00:00:00Z');
+      await service.verifyItem(sourceId, { role: 'owner' }, 'verified');
+      expect(await service.stampReviewEscalation(sourceId, 'verifyEscalatedAt')).toBe(false);
+      expect(await service.stampReviewEscalation('ghost', 'verifyEscalatedAt')).toBe(false);
+    });
+  });
+
+  describe('onClaimed + patchMetadata (#814 worktree hooks)', () => {
+    it('tells claim listeners about a NEW claim (both claim paths), never delaying or failing it', async () => {
+      const seen: Array<[string, string]> = [];
+      service.onClaimed((wi, agent) => { seen.push([wi.id, agent]); });
+      service.onClaimed(() => { throw new Error('listener boom'); });
+      const a = makeWorkItem({ type: 'cron_run', title: 'a' });
+      const b = makeWorkItem({ type: 'cron_run', title: 'b' });
+      await service.addToPool(a);
+      await service.addToPool(b);
+
+      const first = await service.claimFromPool('agent-a');
+      expect(first?.workItem.id).toBe(a.id);
+      const second = await service.claimSpecificItem('agent-b', b.id);
+      expect(second?.workItem.id).toBe(b.id);
+      await new Promise((r) => setImmediate(r));
+      expect(seen).toEqual([[a.id, 'agent-a'], [b.id, 'agent-b']]);
+
+      // Re-claiming an already-held item is not a new claim.
+      await service.claimFromPool('agent-a');
+      await new Promise((r) => setImmediate(r));
+      expect(seen).toHaveLength(2);
+    });
+
+    it('unsubscribe stops notifications', async () => {
+      const listener = jest.fn();
+      const off = service.onClaimed(listener);
+      off();
+      await service.addToPool(makeWorkItem({ type: 'cron_run', title: 'a' }));
+      await service.claimFromPool('agent-a');
+      await new Promise((r) => setImmediate(r));
+      expect(listener).not.toHaveBeenCalled();
+    });
+
+    it('patchMetadata sets one key, keeps the others, and never changes status', async () => {
+      const wi = makeWorkItem({ type: 'cron_run', title: 'a', metadata: { keep: 1 } });
+      await service.addToPool(wi);
+      const updated = await service.patchMetadata(wi.id, 'worktree', { path: '/x', state: 'ready' });
+      expect(updated?.metadata).toMatchObject({ keep: 1, worktree: { path: '/x', state: 'ready' } });
+      expect(updated?.status).toBe('queued');
+      expect(await service.patchMetadata('no-such-id', 'k', 1)).toBeNull();
+    });
+  });
+
+  describe('team move (crewly#1189)', () => {
+    it('imports work items exactly as they were and skips ones already in the pool', async () => {
+      const blocked = { ...makeWorkItem({ title: 'blocked one', target: 'a-1' }), status: 'blocked' as const };
+      const queued = makeWorkItem({ title: 'queued one', target: 'a-1' });
+      expect(await service.importWorkItems([blocked, queued, { nonsense: true } as never])).toBe(2);
+      expect(await service.importWorkItems([blocked, queued])).toBe(0);
+      const all = await service.getAllItems();
+      expect(all.map((w) => w.id).sort()).toEqual([blocked.id, queued.id].sort());
+      expect(all.find((w) => w.id === blocked.id)!.status).toBe('blocked');
+    });
+
+    it('removes the items of a moved team together with their claims', async () => {
+      const a = makeWorkItem({ title: 'a', target: 'x-1' });
+      const b = makeWorkItem({ title: 'b', target: 'y-1' });
+      await service.addToPool(a);
+      await service.addToPool(b);
+      await service.claimFromPool('x-1');
+      expect(await service.getActiveClaims()).toHaveLength(1);
+      expect(await service.removeWorkItemsForMove([a.id])).toBe(1);
+      expect((await service.getAllItems()).map((w) => w.id)).toEqual([b.id]);
+      expect(await service.getActiveClaims()).toHaveLength(0);
+      expect(await service.removeWorkItemsForMove([])).toBe(0);
+    });
+  });
+
+  describe('retargetQueuedItem', () => {
+    it('moves a queued item and records where it came from; leaves running work alone', async () => {
+      const wi = makeWorkItem({ title: 'metrics', target: 'old-scribe-45506487' });
+      await service.addToPool(wi);
+      const moved = await service.retargetQueuedItem(wi.id, 'crewly-marketing-dana-45506487', 'renamed_member');
+      expect(moved).toMatchObject({ target: 'crewly-marketing-dana-45506487', metadata: { retargetedFrom: 'old-scribe-45506487', retargetReason: 'renamed_member' } });
+      await service.claimFromPool('crewly-marketing-dana-45506487');
+      expect(await service.retargetQueuedItem(wi.id, 'someone-else', 'x')).toBeNull();
+    });
+  });
+
+  describe('team pause (specs/2026-10-04-team-pause.md)', () => {
+    it('unassignQueuedForSessions unassigns queued, unclaimed items of the paused sessions only', async () => {
+      const queued = makeWorkItem({ title: 'queued', target: 'crewly-leo' });
+      const claimed = makeWorkItem({ title: 'claimed', target: 'crewly-mia' });
+      const other = makeWorkItem({ title: 'other team', target: 'mkt-ann' });
+      for (const wi of [queued, claimed, other]) await service.addToPool(wi);
+      await service.claimFromPool('crewly-mia');
+
+      const ids = await service.unassignQueuedForSessions(new Set(['crewly-leo', 'crewly-mia']), 'team Crewly paused by the owner');
+      expect(ids).toEqual([queued.id]);
+      const all = await service.getAllItems();
+      const q = all.find((w) => w.id === queued.id)!;
+      expect(q.target).toBeUndefined();
+      expect(q.targetSource).toBeUndefined();
+      expect(q.metadata?.pausedTeamUnassigned).toMatchObject({ from: 'crewly-leo', reason: 'team Crewly paused by the owner' });
+      expect(all.find((w) => w.id === claimed.id)!.target).toBe('crewly-mia');
+      expect(all.find((w) => w.id === other.id)!.target).toBe('mkt-ann');
+    });
+  });
+
+  describe('unassigned work routing (owner, 2026-09-24)', () => {
+    afterEach(() => service.setUntargetedRouter(null));
+
+    it('an item added with no target goes to the decider, with a note', async () => {
+      service.setUntargetedRouter({ decide: async (_wi, creator) => (creator === 'leo' ? 'sam' : 'crewly-orc'), next: async () => 'crewly-orc' });
+      const wi = makeWorkItem({ title: 'unowned', description: 'do x' });
+      await service.addToPool(wi, { creatorSession: 'leo' });
+      const stored = (await service.getAllItems()).find((w) => w.id === wi.id)!;
+      expect(stored).toMatchObject({ target: 'sam', targetSource: 'escalated', metadata: expect.objectContaining({ routeLevel: 0, createdBy: 'leo' }) });
+      expect(stored.description).toContain('yours to decide');
+      // A targeted item is left alone.
+      const own = makeWorkItem({ title: 'mine', target: 'max' });
+      await service.addToPool(own);
+      expect((await service.getAllItems()).find((w) => w.id === own.id)?.targetSource).toBeUndefined();
+    });
+
+    it('moves an item nobody took one level up, and routes leftovers', async () => {
+      const legacy = makeWorkItem({ title: 'left over from before' });
+      await service.addToPool(legacy);
+      service.setUntargetedRouter({ decide: async () => 'sam', next: async (cur) => (cur === 'sam' ? 'crewly-orc' : null) });
+      expect(await service.escalateUnassigned(30 * 60_000)).toEqual([{ id: legacy.id, to: 'sam' }]);
+      // Not old enough yet.
+      expect(await service.escalateUnassigned(30 * 60_000)).toEqual([]);
+      // Old enough → orchestrator; then nowhere further.
+      expect(await service.escalateUnassigned(-1)).toEqual([{ id: legacy.id, to: 'crewly-orc' }]);
+      expect(await service.escalateUnassigned(-1)).toEqual([]);
+      expect((await service.getAllItems()).find((w) => w.id === legacy.id)?.metadata?.routeLevel).toBe(1);
+    });
+  });
+
+  describe('claimFromPool', () => {
+    it('claims the oldest available item (FIFO)', async () => {
+      const wi1 = makeWorkItem({ title: 'First' });
+      const wi2 = makeWorkItem({ title: 'Second' });
+      // Ensure wi1 is older
+      wi1.createdAt = new Date(Date.now() - 10000).toISOString();
+      wi2.createdAt = new Date().toISOString();
+
+      await service.addToPool(wi1);
+      await service.addToPool(wi2);
+
+      const result = await service.claimFromPool('agent-leo');
+      expect(result).not.toBeNull();
+      expect(result!.workItem.title).toBe('First');
+      expect(result!.workItem.status).toBe('running');
+      expect(result!.claim.agentId).toBe('agent-leo');
+    });
+
+    it('returns null when pool is empty', async () => {
+      const result = await service.claimFromPool('agent-leo');
+      expect(result).toBeNull();
+    });
+
+    it('returns null when all items are claimed', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      const result = await service.claimFromPool('agent-max');
+      expect(result).toBeNull();
+    });
+
+    it('returns the existing claim with alreadyHeld=true when agent already has one (issue #513)', async () => {
+      // Steve 2026-05-08 incident: an agent that already held an
+      // active claim called accept-task and got a 404 "No available
+      // WorkItem". Misleading — there WAS a WI for them (the one
+      // they already claimed). Now we return the held claim+WI with
+      // alreadyHeld=true so the skill output is honest.
+      const wi1 = makeWorkItem({ title: 'First' });
+      const wi2 = makeWorkItem({ title: 'Second' });
+      await service.addToPool(wi1);
+      await service.addToPool(wi2);
+
+      const first = await service.claimFromPool('agent-leo');
+      expect(first).not.toBeNull();
+      expect(first!.alreadyHeld).toBeFalsy();
+      expect(first!.workItem.id).toBe(wi1.id);
+
+      const second = await service.claimFromPool('agent-leo');
+      // Now returns the existing claim, not null.
+      expect(second).not.toBeNull();
+      expect(second!.alreadyHeld).toBe(true);
+      expect(second!.workItem.id).toBe(wi1.id);   // same WI as first
+      expect(second!.claim.id).toBe(first!.claim.id); // same claim
+    });
+
+    it('filters by type', async () => {
+      const wi1 = makeWorkItem({ type: 'delegate', title: 'Delegate' });
+      const wi2 = makeWorkItem({ type: 'check', title: 'Check' });
+      await service.addToPool(wi1);
+      await service.addToPool(wi2);
+
+      const result = await service.claimFromPool('agent-leo', {
+        types: ['check'],
+      });
+      expect(result).not.toBeNull();
+      expect(result!.workItem.title).toBe('Check');
+    });
+
+    it('filters by owner', async () => {
+      const wi1 = makeWorkItem({ owner: 'agent', title: 'Agent task' });
+      const wi2 = makeWorkItem({ owner: 'system', title: 'System task' });
+      await service.addToPool(wi1);
+      await service.addToPool(wi2);
+
+      const result = await service.claimFromPool('agent-leo', {
+        owner: 'system',
+      });
+      expect(result).not.toBeNull();
+      expect(result!.workItem.title).toBe('System task');
+    });
+
+    it('filters by missionId', async () => {
+      const wi1 = makeWorkItem({ title: 'No mission' });
+      const wi2 = makeWorkItem({ title: 'With mission' });
+      wi2.missionId = 'mission-123';
+      await service.addToPool(wi1);
+      await service.addToPool(wi2);
+
+      const result = await service.claimFromPool('agent-leo', {
+        missionId: 'mission-123',
+      });
+      expect(result).not.toBeNull();
+      expect(result!.workItem.title).toBe('With mission');
+    });
+
+    it('throws on empty agentId', async () => {
+      await expect(service.claimFromPool('')).rejects.toThrow('agentId is required');
+    });
+
+    it('serializes concurrent claims so only one agent wins a given WorkItem', async () => {
+      // Single queued item — two agents race to claim it concurrently.
+      const wi = makeWorkItem({ title: 'Contested' });
+      await service.addToPool(wi);
+
+      const [a, b] = await Promise.all([
+        service.claimFromPool('agent-a'),
+        service.claimFromPool('agent-b'),
+      ]);
+
+      // Exactly one of the two must have won.
+      const winners = [a, b].filter((r) => r !== null);
+      expect(winners).toHaveLength(1);
+      expect(winners[0]!.workItem.id).toBe(wi.id);
+
+      // Storage must reflect a single active claim, not two.
+      const snapshot = await service.getPoolStatus();
+      expect(snapshot.claimed).toBe(1);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Agent-liveness gate — prevents `running` WIs owned by dead agents
+  //
+  // Background: the orchestrator's `delegate-task` skill pre-claims a
+  // fresh WI for its target before the target session is actually
+  // spawned. Previously this flipped the WI to `running` while the
+  // target was still inactive; ~5 s later the reconciler's
+  // detectStuckWorkItems rule marked it `blocked` (and the wake-rule
+  // only handles `queued`, so the agent never got spawned). Atlas was
+  // observed stuck on 3 successive RESEARCH BRIEF delegations on
+  // 2026-05-23 with no progress because of this.
+  //
+  // Fix: setIsAgentActive wires a liveness probe; the claim path
+  // rejects when the requesting agent isn't alive. The WI stays in
+  // `queued`, the reconciler's wake-rule fires, the agent starts, and
+  // claims the WI normally on registration.
+  // -----------------------------------------------------------------------
+
+  describe('claimFromPool — agent-liveness gate', () => {
+    it('refuses claim when isAgentActive probe returns false (target dead at delegate time)', async () => {
+      const wi = makeWorkItem({ title: "Atlas's brief", target: 'think-tank-atlas' });
+      await service.addToPool(wi);
+
+      service.setIsAgentActive(async () => false);
+
+      const result = await service.claimFromPool('think-tank-atlas');
+      expect(result).toBeNull();
+
+      // WI must still be queued — the wake-rule needs to see it.
+      const snapshot = await service.getPoolStatus();
+      expect(snapshot.byStatus.queued ?? 0).toBe(1);
+      expect(snapshot.byStatus.running ?? 0).toBe(0);
+      expect(snapshot.claimed).toBe(0);
+    });
+
+    it('allows claim when isAgentActive probe returns true', async () => {
+      const wi = makeWorkItem({ title: 'Live agent task', target: 'agent-leo' });
+      await service.addToPool(wi);
+
+      service.setIsAgentActive(async () => true);
+
+      const result = await service.claimFromPool('agent-leo');
+      expect(result).not.toBeNull();
+      expect(result!.workItem.status).toBe('running');
+    });
+
+    it('refuses when probe throws (defensive — treat as not active)', async () => {
+      const wi = makeWorkItem({ title: 'task', target: 'agent-leo' });
+      await service.addToPool(wi);
+
+      service.setIsAgentActive(async () => {
+        throw new Error('probe boom');
+      });
+
+      const result = await service.claimFromPool('agent-leo');
+      expect(result).toBeNull();
+    });
+
+    it('passes through when no probe is wired (backwards-compat for tests/CLI)', async () => {
+      const wi = makeWorkItem({ title: 'task' });
+      await service.addToPool(wi);
+
+      // No setIsAgentActive call — current default behavior.
+      const result = await service.claimFromPool('agent-leo');
+      expect(result).not.toBeNull();
+    });
+
+    it('claimSpecificItem also honors the liveness gate', async () => {
+      const wi = makeWorkItem({ title: "Atlas brief", target: 'think-tank-atlas' });
+      await service.addToPool(wi);
+
+      service.setIsAgentActive(async () => false);
+
+      const result = await service.claimSpecificItem('think-tank-atlas', wi.id);
+      expect(result).toBeNull();
+
+      const snapshot = await service.getPoolStatus();
+      expect(snapshot.byStatus.queued ?? 0).toBe(1);
+      expect(snapshot.byStatus.running ?? 0).toBe(0);
+    });
+
+    it('claimSpecificItem refuses when probe throws (defensive — fail closed)', async () => {
+      // Mirrors the claimFromPool probe-throws test. Without this, the
+      // identical defensive .catch(() => false) on claimSpecificItem's
+      // gate path is uncovered and could regress.
+      const wi = makeWorkItem({ title: 'task', target: 'agent-leo' });
+      await service.addToPool(wi);
+
+      service.setIsAgentActive(async () => {
+        throw new Error('probe boom');
+      });
+
+      const result = await service.claimSpecificItem('agent-leo', wi.id);
+      expect(result).toBeNull();
+
+      const snapshot = await service.getPoolStatus();
+      expect(snapshot.byStatus.queued ?? 0).toBe(1);
+      expect(snapshot.byStatus.running ?? 0).toBe(0);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Hygiene #3 — target-respect (target rotation regression)
+  //
+  // Before fix: claimFromPool/claimSpecificItem unconditionally rewrote
+  // wi.target = agentId at claim time. When v3-data.service.ts:279 fired
+  // claimFromPool(newAgent, { types: ['delegate'] }) without a target
+  // filter, the FIFO-oldest queued+unclaimed delegate WI got its target
+  // rotated from its original target to newAgent. Steve, Sam, Quinn each
+  // hit this in the 5/9 wave (WI 6e532a8b: Quinn → flopost-dex → null →
+  // flopost-dex; WI 598c91da: Quinn → Sam).
+  //
+  // After fix: a WI with target=A is claimable ONLY by A (or by anyone
+  // when target=undefined, the no-target broadcast pool). Other agents
+  // are silently skipped during candidate selection so they never even
+  // enter the transitionStatus mutator that would have rewritten target.
+  // -----------------------------------------------------------------------
+
+  describe('claimFromPool — target-respect (Hygiene #3)', () => {
+    it('does NOT rotate target when a non-matching agent claims (regression)', async () => {
+      // Insert a WI explicitly targeted at agent-quinn.
+      const wi = makeWorkItem({ title: "Quinn's task", target: 'agent-quinn' });
+      await service.addToPool(wi);
+
+      // Sam tries to claim with no target filter — the SAME shape that
+      // v3-data.service.ts onTaskDelegated used to fire (and rotated
+      // Quinn's WI to Sam in production).
+      const result = await service.claimFromPool('agent-sam', {
+        types: ['delegate'],
+      });
+
+      // After fix: Sam cannot claim Quinn's WI. result is null.
+      expect(result).toBeNull();
+
+      // The WI's target field is preserved as 'agent-quinn'.
+      const items = await service.getAllItems();
+      const stored = items.find((i) => i.id === wi.id)!;
+      expect(stored.target).toBe('agent-quinn');
+      expect(stored.status).toBe('queued'); // status also untouched
+    });
+
+    it('allows the matching target to claim their own WI', async () => {
+      const wi = makeWorkItem({ title: "Quinn's task", target: 'agent-quinn' });
+      await service.addToPool(wi);
+
+      const result = await service.claimFromPool('agent-quinn', {
+        types: ['delegate'],
+      });
+
+      expect(result).not.toBeNull();
+      expect(result!.workItem.target).toBe('agent-quinn');
+      expect(result!.workItem.status).toBe('running');
+    });
+
+    it('still allows any agent to claim a no-target broadcast WI', async () => {
+      // No target — broadcast pool item.
+      const wi = makeWorkItem({ title: 'Broadcast', target: undefined });
+      await service.addToPool(wi);
+
+      const result = await service.claimFromPool('agent-sam');
+      expect(result).not.toBeNull();
+      expect(result!.workItem.target).toBe('agent-sam');
+      expect(result!.workItem.status).toBe('running');
+    });
+
+    it('skips mismatched targets to find the next eligible WI', async () => {
+      // Two queued WIs: Quinn's first (oldest, FIFO), then Sam's broadcast.
+      const wi1 = makeWorkItem({ title: "Quinn's", target: 'agent-quinn' });
+      wi1.createdAt = new Date(Date.now() - 10000).toISOString();
+      const wi2 = makeWorkItem({ title: 'Broadcast', target: undefined });
+      wi2.createdAt = new Date().toISOString();
+
+      await service.addToPool(wi1);
+      await service.addToPool(wi2);
+
+      // Sam claims with no filter — pre-fix would FIFO-pick Quinn's and
+      // rotate target. After fix: Sam skips Quinn's (target mismatch) and
+      // picks the broadcast WI.
+      const result = await service.claimFromPool('agent-sam');
+      expect(result).not.toBeNull();
+      expect(result!.workItem.id).toBe(wi2.id);
+      expect(result!.workItem.title).toBe('Broadcast');
+
+      // Quinn's WI is still queued with original target preserved.
+      const items = await service.getAllItems();
+      const quinnsItem = items.find((i) => i.id === wi1.id)!;
+      expect(quinnsItem.target).toBe('agent-quinn');
+      expect(quinnsItem.status).toBe('queued');
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Path-B regression — atomic-claim (claim preserved) target rotation
+  //
+  // Sam captured a 4th wave-instance: WI da8c02b8 was created with
+  // target=Quinn AND a pre-existing active TaskClaim for Quinn (Sam's
+  // manual mitigation). 7 minutes later the target rotated to Sam while
+  // the claim record stayed with Quinn — a rotation path that does NOT
+  // go through claimFromPool/claimSpecificItem (those would have created
+  // a new claim record for Sam).
+  //
+  // Hypothesis verified by these tests: my fix does cover path-B
+  // incidentally because:
+  //   - The pre-existing `!claimedIds.has(wi.id)` filter (line 597)
+  //     already excludes any WI with an active claim from candidate
+  //     selection.
+  //   - The new target-respect filter additionally excludes any WI
+  //     whose target ≠ requesting agent.
+  // Both gates fire BEFORE the transitionStatus mutator that previously
+  // rewrote target. So even if some hypothetical path-B caller triggered
+  // claimFromPool/claimSpecificItem on a claim-preserved WI, the rotation
+  // would short-circuit at filter time.
+  //
+  // If a future path-B is identified that bypasses both gates (e.g. a
+  // direct storage.updateWorkItem(wi.target=...) write outside this
+  // service), these tests document the contract that must hold.
+  // ---------------------------------------------------------------------
+
+  describe('claimFromPool — atomic-claim path-B regression (Hygiene #3)', () => {
+    it('refuses to rotate target on a queued WI that has an active claim record', async () => {
+      // Sam's mitigation pattern: create a WI with target=Quinn AND
+      // pre-attach an active TaskClaim for Quinn (atomic-claim).
+      const wi = makeWorkItem({ title: "Quinn's atomic", target: 'agent-quinn' });
+      await service.addToPool(wi);
+      // Pre-attach an active claim record for Quinn directly on storage.
+      // This simulates the atomic-claim creation pattern Sam used.
+      const existingClaim = {
+        id: 'claim-pre-existing',
+        workItemId: wi.id,
+        agentId: 'agent-quinn',
+        status: 'active' as const,
+        claimedAt: new Date().toISOString(),
+        leaseExpiresAt: new Date(Date.now() + 600000).toISOString(),
+        lastHeartbeatAt: new Date().toISOString(),
+        extensionCount: 0,
+        maxExtensions: 3,
+        leaseDurationMs: 600000,
+      };
+      await storage.addClaim(existingClaim);
+
+      // Sam tries to claim with no target filter — pre-fix this rotated
+      // target. Path-B claim: even if this path were invoked, both the
+      // claimedIds gate AND the target-respect gate must refuse.
+      const result = await service.claimFromPool('agent-sam', {
+        types: ['delegate'],
+      });
+
+      expect(result).toBeNull();
+
+      // Target preserved — no rotation. Claim record preserved.
+      const items = await service.getAllItems();
+      const stored = items.find((i) => i.id === wi.id)!;
+      expect(stored.target).toBe('agent-quinn');
+      expect(stored.status).toBe('queued');
+
+      const claims = await service.getActiveClaims();
+      const ourClaim = claims.find((c) => c.workItemId === wi.id);
+      expect(ourClaim).toBeDefined();
+      expect(ourClaim!.agentId).toBe('agent-quinn');
+    });
+  });
+
+  describe('claimSpecificItem — target-respect (Hygiene #3)', () => {
+    it('refuses to rotate target when a non-matching agent specific-claims (regression)', async () => {
+      const wi = makeWorkItem({ title: "Quinn's task", target: 'agent-quinn' });
+      await service.addToPool(wi);
+
+      // Sam tries to specifically claim Quinn's WI (auto-claim path).
+      const result = await service.claimSpecificItem('agent-sam', wi.id);
+
+      // After fix: refused — null.
+      expect(result).toBeNull();
+
+      // Target preserved.
+      const items = await service.getAllItems();
+      const stored = items.find((i) => i.id === wi.id)!;
+      expect(stored.target).toBe('agent-quinn');
+      expect(stored.status).toBe('queued');
+    });
+
+    it('allows specific claim when target matches', async () => {
+      const wi = makeWorkItem({ title: 'Mine', target: 'agent-leo' });
+      await service.addToPool(wi);
+
+      const result = await service.claimSpecificItem('agent-leo', wi.id);
+      expect(result).not.toBeNull();
+      expect(result!.workItem.target).toBe('agent-leo');
+      expect(result!.workItem.status).toBe('running');
+    });
+
+    it('allows specific claim on a no-target broadcast WI', async () => {
+      const wi = makeWorkItem({ target: undefined });
+      await service.addToPool(wi);
+
+      const result = await service.claimSpecificItem('agent-sam', wi.id);
+      expect(result).not.toBeNull();
+      expect(result!.workItem.target).toBe('agent-sam');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // releaseBack
+  // -----------------------------------------------------------------------
+
+  describe('releaseBack', () => {
+    it('releases a claimed item back to queued', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      await service.releaseBack(wi.id, 'agent busy');
+
+      const items = await service.getAvailableItems();
+      expect(items).toHaveLength(1);
+      expect(items[0].status).toBe('queued');
+      // A release is not a failure: retryCount stays put, and the churn is
+      // recorded separately. (This assertion previously expected 1 — it
+      // encoded the bug fixed in WI 25aadd30.)
+      expect(items[0].retryCount).toBe(0);
+      expect(items[0].releaseCount).toBe(1);
+    });
+
+    // -----------------------------------------------------------------
+    // WI 1bebd7ae — a terminal WorkItem must not keep an active claim.
+    //
+    // The SLA orphan-close path drives its own terminal transition because
+    // it can target cancelled/failed/rejected, which `failItem` cannot. It
+    // therefore has to release the claim itself. These tests pin the
+    // contract it depends on, against the real service.
+    // -----------------------------------------------------------------
+    describe('releaseClaim (WI 1bebd7ae)', () => {
+      it('leaves no active claim after the SLA orphan-close sequence', async () => {
+        // The exact sequence failOrphanRespondWi performs on a running WI:
+        // transition → releaseClaim → dispose.
+        const wi = makeWorkItem({ target: 'agent-leo' });
+        await service.addToPool(wi);
+        const claimed = await service.claimFromPool('agent-leo');
+        expect(claimed).not.toBeNull();
+        expect(
+          await service.getClaimService().getActiveClaimByWorkItem(wi.id),
+        ).toBeDefined();
+
+        await service.transitionStatus(wi.id, 'failed', 'system');
+        await service.releaseClaim(wi.id, 'sla escalation timeout (from running)');
+
+        const after = (await service.getAllItems()).find((i) => i.id === wi.id)!;
+        expect(after.status).toBe('failed');
+        expect(
+          await service.getClaimService().getActiveClaimByWorkItem(wi.id),
+        ).toBeUndefined();
+      });
+
+      it('stamps the end reason on the released claim for auditability', async () => {
+        const wi = makeWorkItem({ target: 'agent-leo' });
+        await service.addToPool(wi);
+        const claimed = await service.claimFromPool('agent-leo');
+        const claimId = claimed!.claim.id;
+
+        await service.releaseClaim(wi.id, 'sla escalation timeout (from running)');
+
+        const claim = (await service.getClaimService().getClaimById(claimId))!;
+        expect(claim.status).toBe('released');
+        expect(claim.endReason).toBe('sla escalation timeout (from running)');
+        expect(claim.endedAt).toBeDefined();
+      });
+
+      it('unwedges the agent — a leaked claim hides all further work from them', async () => {
+        // This is what the leak actually costs, and the mechanism is worth
+        // stating exactly because it is quieter than a thrown error:
+        // `claimFromPool` checks `findActiveClaimByAgent` BEFORE it scans
+        // the pool, and short-circuits by returning the held claim with
+        // `alreadyHeld: true` (issue #513). So an agent holding a leaked
+        // claim is handed back the same TERMINAL WorkItem every time they
+        // poll, and never sees the queued work waiting for them. Nothing
+        // throws; it just silently looks like there is nothing new.
+        const stranded = makeWorkItem({ target: 'agent-leo' });
+        await service.addToPool(stranded);
+        await service.claimFromPool('agent-leo');
+        await service.transitionStatus(stranded.id, 'failed', 'system');
+
+        const next = makeWorkItem({ target: 'agent-leo' });
+        await service.addToPool(next);
+
+        const wedged = await service.claimFromPool('agent-leo');
+        expect(wedged).not.toBeNull();
+        expect(wedged!.alreadyHeld).toBe(true);
+        expect(wedged!.workItem.id).toBe(stranded.id);
+        expect(wedged!.workItem.status).toBe('failed');
+
+        // Releasing the terminal item's claim frees the agent to see it.
+        await service.releaseClaim(stranded.id, 'sla escalation timeout (from running)');
+        const recovered = await service.claimFromPool('agent-leo');
+        expect(recovered).not.toBeNull();
+        expect(recovered!.alreadyHeld).toBeFalsy();
+        expect(recovered!.workItem.id).toBe(next.id);
+      });
+
+      it('is a no-op when the item has no active claim', async () => {
+        const wi = makeWorkItem();
+        await service.addToPool(wi);
+        await expect(
+          service.releaseClaim(wi.id, 'nothing to release'),
+        ).resolves.toBeUndefined();
+      });
+    });
+
+    // -----------------------------------------------------------------
+    // WI 25aadd30 — a release is an administrative event, not a failure.
+    //
+    // Before this fix `releaseBack` cleared `target` and incremented
+    // `retryCount` on every release of a running item. A lease timeout —
+    // an agent heads-down for longer than the lease — was therefore
+    // treated as both "this work no longer belongs to you" and "you
+    // failed once". Four live WorkItems reached retryCount 3/3 with zero
+    // actual failures, and their assigned workers could no longer be
+    // woken for their own work.
+    // -----------------------------------------------------------------
+    describe('release is not a failure (WI 25aadd30)', () => {
+      it('preserves target when a lease lapses and the claim is revoked', async () => {
+        const wi = makeWorkItem({ target: 'agent-leo' });
+        await service.addToPool(wi);
+        const claimed = await service.claimFromPool('agent-leo');
+        expect(claimed).not.toBeNull();
+
+        // Lease lapses -> reconciler revokes the claim. This is the exact
+        // production path that orphaned the four WorkItems.
+        await service.revokeAndRelease(claimed!.claim.id, 'grace period exceeded');
+
+        const released = (await service.getAllItems()).find((i) => i.id === wi.id)!;
+        expect(released.status).toBe('queued');
+        expect(released.target).toBe('agent-leo');
+        expect(released.retryCount).toBe(0);
+      });
+
+      it('does not charge a retry for repeated lease churn', async () => {
+        const wi = makeWorkItem({ target: 'agent-leo', maxRetries: 3 });
+        await service.addToPool(wi);
+
+        // Three consecutive claim/lapse cycles — the shape that drove live
+        // items to 3/3. retryCount must not move; releaseCount must.
+        for (let i = 0; i < 3; i++) {
+          const claimed = await service.claimFromPool('agent-leo');
+          expect(claimed).not.toBeNull();
+          await service.releaseBack(wi.id, `lease expired (cycle ${i})`);
+        }
+
+        const churned = (await service.getAllItems()).find((i) => i.id === wi.id)!;
+        expect(churned.retryCount).toBe(0);
+        expect(churned.retryCount).toBeLessThan(churned.maxRetries);
+        expect(churned.releaseCount).toBe(3);
+        expect(churned.target).toBe('agent-leo');
+      });
+
+      it('keeps the assigned worker wakeable after a release (wake-gate predicate)', async () => {
+        // The wake gate (team.controller checkWakeGate, rule 2) admits a
+        // worker only when the pool holds a queued/blocked WI whose
+        // `target` equals their session. Clearing target on release made
+        // the assigned worker unwakeable for their own work, surfacing as
+        // `wake_gate_no_pool_work`. This asserts the exact predicate the
+        // gate evaluates.
+        const sessionName = 'crewly-product-leo-21a5477e';
+        const wi = makeWorkItem({ target: sessionName });
+        await service.addToPool(wi);
+        const claimed = await service.claimFromPool(sessionName);
+        await service.revokeAndRelease(claimed!.claim.id, 'lease expired');
+
+        const items = await service.getAllItems();
+        const wakeable = items.filter(
+          (w) =>
+            (w.status === 'queued' || w.status === 'blocked') &&
+            w.target === sessionName,
+        );
+        expect(wakeable).toHaveLength(1);
+        expect(wakeable[0].id).toBe(wi.id);
+      });
+
+      it('clears target ONLY when un-assignment is explicitly requested', async () => {
+        const wi = makeWorkItem({ target: 'agent-leo' });
+        await service.addToPool(wi);
+        await service.claimFromPool('agent-leo');
+
+        await service.releaseBack(wi.id, 'agent declined', { unassign: true });
+
+        const released = (await service.getAllItems()).find((i) => i.id === wi.id)!;
+        expect(released.target).toBeUndefined();
+        // Still not a failure, even when deliberately handed back.
+        expect(released.retryCount).toBe(0);
+        expect(released.releaseCount).toBe(1);
+      });
+
+      it('leaves the blocked -> queued unblock path intact', async () => {
+        const wi = makeWorkItem({ target: 'agent-leo' });
+        await service.addToPool(wi);
+        await service.claimFromPool('agent-leo');
+        await service.updateItemStatus(wi.id, 'blocked', 'system');
+
+        await service.releaseBack(wi.id, 'agent back online');
+
+        const unblocked = (await service.getAllItems()).find((i) => i.id === wi.id)!;
+        expect(unblocked.status).toBe('queued');
+        expect(unblocked.target).toBe('agent-leo');
+        expect(unblocked.startedAt).toBeUndefined();
+        expect(unblocked.retryCount).toBe(0);
+      });
+
+      it('drops an incidental claim stamp so broadcast work returns to the pool', async () => {
+        // A broadcast item (no target) gets `target` stamped by whoever
+        // claims it. That stamp is bookkeeping, not an assignment, so a
+        // release must return the item to the broadcast pool — otherwise
+        // one claim would bind unassigned work to a single agent forever,
+        // and a dead agent's stamp would make the item unclaimable.
+        const wi = makeWorkItem();
+        await service.addToPool(wi);
+        await service.claimFromPool('agent-leo');
+
+        const stamped = (await service.getAllItems()).find((i) => i.id === wi.id)!;
+        expect(stamped.target).toBe('agent-leo');
+        expect(stamped.targetSource).toBe('claim');
+
+        await service.releaseBack(wi.id, 'lease expired');
+
+        const released = (await service.getAllItems()).find((i) => i.id === wi.id)!;
+        expect(released.target).toBeUndefined();
+        expect(released.targetSource).toBeUndefined();
+        expect(released.retryCount).toBe(0);
+      });
+
+      it('keeps a deliberate assignment across a release, unlike a claim stamp', async () => {
+        // The contrast that the whole fix turns on: same release, two
+        // different provenances, two different outcomes.
+        const assigned = makeWorkItem({ target: 'agent-leo' });
+        await service.addToPool(assigned);
+        await service.claimFromPool('agent-leo');
+        await service.releaseBack(assigned.id, 'lease expired');
+
+        const kept = (await service.getAllItems()).find((i) => i.id === assigned.id)!;
+        expect(kept.target).toBe('agent-leo');
+      });
+
+      it('still charges a retry on the genuine failure path', async () => {
+        // The counter must keep working where it MEANS something —
+        // otherwise this fix would just disable retry accounting.
+        const wi = makeWorkItem({ target: 'agent-leo' });
+        await service.addToPool(wi);
+        await service.claimFromPool('agent-leo');
+        await service.failItem(wi.id, 'boom');
+        await service.requeueAfterFailure(wi.id, 'transient error');
+
+        const requeued = (await service.getAllItems()).find((i) => i.id === wi.id)!;
+        expect(requeued.retryCount).toBe(1);
+        expect(requeued.target).toBe('agent-leo');
+      });
+    });
+
+    it('throws when item not found', async () => {
+      await expect(service.releaseBack('ghost', 'test')).rejects.toThrow(
+        'WorkItem not found',
+      );
+    });
+
+    it('throws when item is not running', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+
+      await expect(service.releaseBack(wi.id, 'test')).rejects.toThrow(
+        "status must be 'running'",
+      );
+    });
+
+    it('allows another agent to claim after release', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      await service.releaseBack(wi.id, 'busy');
+
+      const result = await service.claimFromPool('agent-max');
+      expect(result).not.toBeNull();
+      expect(result!.claim.agentId).toBe('agent-max');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // completeItem
+  // -----------------------------------------------------------------------
+
+  describe('completeItem (facade — VERIF-1 routing)', () => {
+    it('routes a non-delegate item through completeSimpleItem (status → done)', async () => {
+      const wi = makeWorkItem({ type: 'cron_run' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      await service.completeItem(wi.id, { output: 'success' }, AGENT_ACTOR);
+
+      const items = await service.getAllItems();
+      expect(items[0].status).toBe('done');
+      expect(items[0].completedAt).toBeDefined();
+      expect(items[0].result).toEqual({ output: 'success' });
+    });
+
+    it('routes a delegate item through submitForVerification (status → done_by_worker)', async () => {
+      // delegate items default to "requires verification" so the worker's
+      // implicit completeItem call should park the item in done_by_worker
+      // and wake the TL — never auto-advance to done.
+      const wi = makeWorkItem({ type: 'delegate' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      await service.completeItem(wi.id, { output: 'draft' }, AGENT_ACTOR);
+
+      const items = await service.getAllItems();
+      expect(items[0].status).toBe('done_by_worker');
+      expect(items[0].result).toEqual({ output: 'draft' });
+    });
+
+    it('respects metadata.requiresVerification=false on a delegate item (F-H — review WIs do not self-verify)', async () => {
+      // F-H: REVIEW-1's review WorkItems are themselves the verification
+      // step, so they MUST opt out of the delegate-default to avoid a
+      // TL-self-verification loop. This is the explicit override path.
+      const wi = makeWorkItem({
+        type: 'delegate',
+        metadata: { requiresVerification: false },
+      });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      await service.completeItem(wi.id, undefined, AGENT_ACTOR);
+
+      const items = await service.getAllItems();
+      expect(items[0].status).toBe('done');
+    });
+
+    it('respects metadata.requiresVerification=true on a non-delegate item (explicit opt-in)', async () => {
+      const wi = makeWorkItem({
+        type: 'cron_run',
+        metadata: { requiresVerification: true },
+      });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      await service.completeItem(wi.id, undefined, AGENT_ACTOR);
+
+      const items = await service.getAllItems();
+      expect(items[0].status).toBe('done_by_worker');
+    });
+
+    it('throws when item not found', async () => {
+      await expect(service.completeItem('ghost', undefined, AGENT_ACTOR)).rejects.toThrow(
+        'WorkItem not found',
+      );
+    });
+
+    it('throws when item is not running (delegate path surfaces TRANS-1 invalid-transition error)', async () => {
+      const wi = makeWorkItem({ type: 'delegate' });
+      await service.addToPool(wi);
+
+      // queued → done_by_worker is rejected by the state machine
+      await expect(service.completeItem(wi.id, undefined, AGENT_ACTOR)).rejects.toThrow(
+        /Invalid status transition/,
+      );
+    });
+
+    it('throws when item is not running (simple path surfaces TRANS-1 invalid-transition error)', async () => {
+      const wi = makeWorkItem({ type: 'cron_run' });
+      await service.addToPool(wi);
+
+      await expect(service.completeItem(wi.id, undefined, AGENT_ACTOR)).rejects.toThrow(
+        /Invalid status transition/,
+      );
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // submitForVerification (VERIF-1)
+  // -----------------------------------------------------------------------
+
+  describe('submitForVerification', () => {
+    it('transitions running → done_by_worker for an agent actor', async () => {
+      const wi = makeWorkItem({ type: 'delegate' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      const updated = await service.submitForVerification(wi.id, 'agent', { output: 'draft' });
+
+      expect(updated).not.toBeNull();
+      expect(updated!.status).toBe('done_by_worker');
+      expect(updated!.completedAt).toBeDefined();
+      expect(updated!.result).toEqual({ output: 'draft' });
+    });
+
+    it('releases the active claim with endReason="submitted_for_verification"', async () => {
+      const wi = makeWorkItem({ type: 'delegate' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      await service.submitForVerification(wi.id, 'agent');
+
+      const active = await service.getActiveClaims();
+      // The submitted item's claim is released — no longer active
+      expect(active).toHaveLength(0);
+    });
+
+    it('rejects a non-agent actor (e.g. team_lead self-submission) via TRANS-1 actor gate', async () => {
+      // TRANSITION_PERMISSIONS limits running→done_by_worker to 'agent'.
+      // A TL trying to submit on a worker's behalf must throw.
+      const wi = makeWorkItem({ type: 'delegate' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      await expect(service.submitForVerification(wi.id, 'team_lead'))
+        .rejects.toThrow(/Forbidden transition.*actor='team_lead'/);
+    });
+
+    it('rejects when the item is not in running status (state-machine gate)', async () => {
+      const wi = makeWorkItem({ type: 'delegate' });
+      await service.addToPool(wi);
+
+      await expect(service.submitForVerification(wi.id, 'agent'))
+        .rejects.toThrow(/Invalid status transition/);
+    });
+
+    // ---------------------------------------------------------------------
+    // F1-BRIDGE-1: task:done_by_worker publish hook
+    // ---------------------------------------------------------------------
+
+    describe('task:done_by_worker publish (F1-BRIDGE-1)', () => {
+      it('publishes task:done_by_worker exactly once per successful submit, with workItemId + correlation fields', async () => {
+        const publishCalls: any[] = [];
+        const fakeBus = {
+          publish: jest.fn((event: any) => publishCalls.push(event)),
+        } as any;
+        service.setEventBusService(fakeBus);
+
+        const wi = makeWorkItem({ type: 'delegate', requestId: 'req-42', missionId: 'm-9' });
+        await service.addToPool(wi);
+        await service.claimFromPool('agent-leo');
+
+        await service.submitForVerification(wi.id, 'agent', { output: 'draft' });
+
+        // 1 workitem:queued (from addToPool) + 1 task:done_by_worker
+        const doneEvents = publishCalls.filter((e) => e.type === 'task:done_by_worker');
+        expect(doneEvents).toHaveLength(1);
+        expect(doneEvents[0].workItemId).toBe(wi.id);
+        expect(doneEvents[0].requestId).toBe('req-42');
+        expect(doneEvents[0].missionId).toBe('m-9');
+        expect(doneEvents[0].previousValue).toBe('running');
+        expect(doneEvents[0].newValue).toBe('done_by_worker');
+        // Deterministic event id keyed on the WI id (dedup contract — mirrors workitem:queued)
+        expect(doneEvents[0].id).toBe(`task:done_by_worker:${wi.id}`);
+      });
+
+      it('does NOT publish task:done_by_worker when the transition throws (state-machine gate)', async () => {
+        const publishCalls: any[] = [];
+        const fakeBus = {
+          publish: jest.fn((event: any) => publishCalls.push(event)),
+        } as any;
+        service.setEventBusService(fakeBus);
+
+        const wi = makeWorkItem({ type: 'delegate' });
+        await service.addToPool(wi);
+        // Skip claimFromPool so the WI stays in `queued`, not `running` —
+        // submitForVerification must throw on the invalid transition, and
+        // the publisher must NEVER fire on a rolled-back transition.
+        await expect(service.submitForVerification(wi.id, 'agent'))
+          .rejects.toThrow(/Invalid status transition/);
+
+        const doneEvents = publishCalls.filter((e) => e.type === 'task:done_by_worker');
+        expect(doneEvents).toHaveLength(0);
+      });
+
+      it('does NOT publish task:done_by_worker when no EventBus is wired (legacy/test path)', async () => {
+        const wi = makeWorkItem({ type: 'delegate' });
+        await service.addToPool(wi);
+        await service.claimFromPool('agent-leo');
+
+        // No setEventBusService — eventBus stays null, submitForVerification must not throw.
+        await expect(
+          service.submitForVerification(wi.id, 'agent', { output: 'draft' }),
+        ).resolves.not.toBeNull();
+      });
+
+      it('isolates EventBus.publish errors from the verification transition (state commit wins)', async () => {
+        const fakeBus = {
+          publish: jest.fn((event: any) => {
+            // Only blow up on task:done_by_worker so the addToPool publish
+            // (workitem:queued) does not throw and dirty the setup phase.
+            if (event.type === 'task:done_by_worker') {
+              throw new Error('bus blew up');
+            }
+          }),
+        } as any;
+        service.setEventBusService(fakeBus);
+
+        const wi = makeWorkItem({ type: 'delegate' });
+        await service.addToPool(wi);
+        await service.claimFromPool('agent-leo');
+
+        const updated = await service.submitForVerification(wi.id, 'agent', { output: 'draft' });
+
+        // Transition committed even though the bus threw.
+        expect(updated).not.toBeNull();
+        expect(updated!.status).toBe('done_by_worker');
+      });
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // completeSimpleItem (VERIF-1)
+  // -----------------------------------------------------------------------
+
+  describe('completeSimpleItem', () => {
+    it('publishes task:done exactly once with WI correlation fields (KR auto-measure feed)', async () => {
+      const publishCalls: any[] = [];
+      const fakeBus = { publish: jest.fn((event: any) => publishCalls.push(event)) } as any;
+      service.setEventBusService(fakeBus);
+
+      const wi = makeWorkItem({ type: 'cron_run', missionId: 'm-9', requestId: 'req-1' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      await service.completeSimpleItem(wi.id, 'agent');
+
+      const doneEvents = publishCalls.filter((e) => e.type === 'task:done');
+      expect(doneEvents).toHaveLength(1);
+      expect(doneEvents[0]).toMatchObject({
+        id: `task:done:${wi.id}`,
+        workItemId: wi.id,
+        missionId: 'm-9',
+        requestId: 'req-1',
+        previousValue: 'running',
+        newValue: 'done',
+        sessionName: '',
+      });
+    });
+
+    it('does NOT throw when the task:done publisher throws', async () => {
+      const fakeBus = {
+        publish: jest.fn((event: any) => {
+          if (event.type === 'task:done') throw new Error('bus down');
+        }),
+      } as any;
+      service.setEventBusService(fakeBus);
+      const wi = makeWorkItem({ type: 'cron_run' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      const updated = await service.completeSimpleItem(wi.id, 'agent');
+      expect(updated!.status).toBe('done');
+    });
+
+    it('transitions running → done for an agent actor', async () => {
+      const wi = makeWorkItem({ type: 'cron_run' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      const updated = await service.completeSimpleItem(wi.id, 'agent', { output: 'tick' });
+
+      expect(updated).not.toBeNull();
+      expect(updated!.status).toBe('done');
+      expect(updated!.completedAt).toBeDefined();
+      expect(updated!.result).toEqual({ output: 'tick' });
+    });
+
+    it('promotes blocked dependents whose deps are now satisfied', async () => {
+      const upstream = makeWorkItem({ type: 'cron_run' });
+      const downstream = makeWorkItem({ type: 'cron_run', dependsOn: [upstream.id] });
+      await service.addToPool(upstream);
+      await service.addToPool(downstream);
+      // downstream starts blocked because upstream is not yet terminal
+      const downstreamBefore = (await service.getAllItems()).find((wi) => wi.id === downstream.id);
+      expect(downstreamBefore?.status).toBe('blocked');
+
+      await service.claimFromPool('agent-leo');
+      await service.completeSimpleItem(upstream.id, 'agent');
+
+      const downstreamAfter = (await service.getAllItems()).find((wi) => wi.id === downstream.id);
+      expect(downstreamAfter?.status).toBe('queued');
+    });
+
+    it('accepts the "system" actor (Reconciler path bypasses actor check)', async () => {
+      const wi = makeWorkItem({ type: 'reconcile' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      const updated = await service.completeSimpleItem(wi.id, 'system');
+
+      expect(updated!.status).toBe('done');
+    });
+
+    it('propagates verify-WI completion to the source WI and unblocks dependents (Steve 2026-05-15)', async () => {
+      // Repro of the Adsense Plan/Execute chain stall: Plan completes
+      // worker-side (done_by_worker), system creates Verify WI for TL,
+      // TL completes the Verify WI (done) — but the source Plan stayed
+      // done_by_worker because nothing propagated, so Execute (which
+      // depended on Plan) stayed blocked forever.
+      //
+      // The fix: when a verify WI completes with metadata.verifyOf set,
+      // automatically run verifyItem('verified') on the source so it
+      // transitions done_by_worker → verified and resolveBlockedDependents
+      // unblocks downstream WIs.
+
+      // Source Plan WI — delegate type, will go through verification path
+      // No explicit reviewer: the verify WI's assignee is the reviewer of record.
+      const plan = makeWorkItem({ type: 'delegate', target: 'agent-leo', metadata: {} });
+      await service.addToPool(plan);
+      await service.claimFromPool('agent-leo');
+      // Worker reports done — Plan lands in done_by_worker
+      await service.submitForVerification(plan.id, 'agent');
+      const planAfterSubmit = (await service.getAllItems()).find((w) => w.id === plan.id);
+      expect(planAfterSubmit?.status).toBe('done_by_worker');
+
+      // Execute WI depends on the Plan — starts blocked
+      const execute = makeWorkItem({ type: 'cron_run', dependsOn: [plan.id] });
+      await service.addToPool(execute);
+      const executeBefore = (await service.getAllItems()).find((w) => w.id === execute.id);
+      expect(executeBefore?.status).toBe('blocked');
+
+      // System creates a Verify WI for the TL (simulating EventToWorkItemBridge)
+      const verifyWI = makeWorkItem({
+        id: `${plan.id}:verify:${plan.id}`,
+        type: 'review',
+        target: 'agent-tl',
+        metadata: { verifyOf: plan.id },
+      });
+      await service.addToPool(verifyWI);
+      await service.claimFromPool('agent-tl');
+
+      // TL completes the Verify WI
+      await service.completeSimpleItem(verifyWI.id, { role: 'agent', session: 'agent-tl' });
+
+      // Source Plan should now be verified
+      const planAfterVerify = (await service.getAllItems()).find((w) => w.id === plan.id);
+      expect(planAfterVerify?.status).toBe('verified');
+
+      // Execute (which depended on Plan) should now be queued
+      const executeAfter = (await service.getAllItems()).find((w) => w.id === execute.id);
+      expect(executeAfter?.status).toBe('queued');
+    });
+
+    it('does NOT propagate when the source is no longer in done_by_worker (defensive)', async () => {
+      // If the source has already been verified or cancelled out-of-band,
+      // the propagation must be a no-op (not throw, not double-verify).
+      const plan = makeWorkItem({ type: 'delegate', target: 'agent-leo' });
+      await service.addToPool(plan);
+      await service.claimFromPool('agent-leo');
+      await service.submitForVerification(plan.id, 'agent');
+      // Manually finalize the source as verified BEFORE the verify WI completes
+      await service.verifyItem(plan.id, REVIEWER_ACTOR, 'verified');
+
+      // Now the verify WI completes — propagation should bail because
+      // the source is already 'verified', not 'done_by_worker'.
+      const verifyWI = makeWorkItem({
+        id: `${plan.id}:verify:${plan.id}`,
+        type: 'review',
+        target: 'agent-tl',
+        metadata: { verifyOf: plan.id },
+      });
+      await service.addToPool(verifyWI);
+      await service.claimFromPool('agent-tl');
+
+      await expect(
+        service.completeSimpleItem(verifyWI.id, { role: 'agent', session: 'agent-tl' }),
+      ).resolves.not.toThrow();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // verifyItem (VERIF-1)
+  // -----------------------------------------------------------------------
+
+  describe('verifyItem', () => {
+    /**
+     * Drives a WorkItem through `running → done_by_worker` so the verify
+     * tests can exercise the verdict transitions in isolation.
+     */
+    async function makeAwaitingVerification(opts?: { type?: 'delegate' | 'cron_run' }) {
+      const wi = makeWorkItem({ type: opts?.type ?? 'delegate' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      await service.submitForVerification(wi.id, 'agent', { output: 'draft' });
+      return wi;
+    }
+
+    it('transitions done_by_worker → verified for a team_lead actor', async () => {
+      const wi = await makeAwaitingVerification();
+
+      const updated = await service.verifyItem(wi.id, REVIEWER_ACTOR, 'verified');
+
+      expect(updated).not.toBeNull();
+      expect(updated!.status).toBe('verified');
+    });
+
+    it('verifying a retry stamps its rejected parent succeeded_by the retry (CREW-403)', async () => {
+      const parent = await makeAwaitingVerification();
+      await service.verifyItem(parent.id, REVIEWER_ACTOR, 'rejected', 'redo');
+      const retry = makeWorkItem({
+        id: `${parent.id}:retry:1`,
+        type: 'delegate',
+        metadata: { sourceWorkItemId: parent.id, requiresVerification: true, reviewer: REVIEWER_ACTOR.session },
+      });
+      await service.addToPool(retry);
+      await service.claimFromPool('agent-leo');
+      await service.submitForVerification(retry.id, 'agent', { output: 'v2' });
+
+      await service.verifyItem(retry.id, REVIEWER_ACTOR, 'verified');
+
+      const after = (await service.getAllItems()).find((i) => i.id === parent.id)!;
+      expect(after.status).toBe('rejected');
+      expect((after.metadata as any).disposition).toMatchObject({
+        kind: 'succeeded_by',
+        successorWorkItemId: retry.id,
+      });
+    });
+
+    it('publishes task:verified (not task:rejected) on the verified verdict', async () => {
+      const publishCalls: any[] = [];
+      const fakeBus = { publish: jest.fn((event: any) => publishCalls.push(event)) } as any;
+      service.setEventBusService(fakeBus);
+      const wi = await makeAwaitingVerification();
+
+      await service.verifyItem(wi.id, REVIEWER_ACTOR, 'verified');
+
+      const verified = publishCalls.filter((e) => e.type === 'task:verified');
+      expect(verified).toHaveLength(1);
+      expect(verified[0]).toMatchObject({
+        id: `task:verified:${wi.id}`,
+        workItemId: wi.id,
+        previousValue: 'done_by_worker',
+        newValue: 'verified',
+        sessionName: '',
+        // #926: the notification names the item and who did it
+        workItemTitle: wi.title,
+      });
+      expect(publishCalls.filter((e) => e.type === 'task:rejected')).toHaveLength(0);
+    });
+
+    it('task:verified names the worker session that did the item (#926)', async () => {
+      const publishCalls: any[] = [];
+      service.setEventBusService({ publish: jest.fn((event: any) => publishCalls.push(event)) } as any);
+      const wi = makeWorkItem({ type: 'delegate', target: 'agent-leo' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      await service.submitForVerification(wi.id, 'agent', { output: 'draft' });
+
+      await service.verifyItem(wi.id, REVIEWER_ACTOR, 'verified');
+
+      const verified = publishCalls.filter((e) => e.type === 'task:verified');
+      expect(verified).toHaveLength(1);
+      expect(verified[0]).toMatchObject({ workItemId: wi.id, target: 'agent-leo', workItemTitle: wi.title });
+    });
+
+    it('transitions done_by_worker → rejected for a team_lead actor with a reviewer comment', async () => {
+      const wi = await makeAwaitingVerification();
+
+      const updated = await service.verifyItem(wi.id, REVIEWER_ACTOR, 'rejected', 'Output incomplete');
+
+      expect(updated).not.toBeNull();
+      expect(updated!.status).toBe('rejected');
+      // Reviewer comment surfaced via the existing `error` field — see JSDoc
+      expect(updated!.error).toBe('Output incomplete');
+    });
+
+    it('rejects an agent actor calling verifyItem (workers cannot self-verify)', async () => {
+      const wi = await makeAwaitingVerification();
+
+      await expect(service.verifyItem(wi.id, 'agent', 'verified'))
+        .rejects.toThrow(/Forbidden transition.*actor='agent'/);
+    });
+
+    it('rejects an invalid verdict before touching the state machine', async () => {
+      const wi = await makeAwaitingVerification();
+
+      await expect(
+        service.verifyItem(wi.id, REVIEWER_ACTOR, 'cancelled' as 'verified'),
+      ).rejects.toThrow(/Invalid verdict/);
+    });
+
+    it('promotes blocked dependents on verified (terminal-success unblocks waiters)', async () => {
+      const upstream = makeWorkItem({ type: 'delegate' });
+      const downstream = makeWorkItem({ type: 'cron_run', dependsOn: [upstream.id] });
+      await service.addToPool(upstream);
+      await service.addToPool(downstream);
+      await service.claimFromPool('agent-leo');
+      await service.submitForVerification(upstream.id, 'agent');
+
+      await service.verifyItem(upstream.id, REVIEWER_ACTOR, 'verified');
+
+      const downstreamAfter = (await service.getAllItems()).find((wi) => wi.id === downstream.id);
+      expect(downstreamAfter?.status).toBe('queued');
+    });
+
+    it('rejects a verdict on an item that is not in done_by_worker (state-machine gate)', async () => {
+      const wi = makeWorkItem({ type: 'delegate' });
+      await service.addToPool(wi);
+      // never claimed / submitted — still queued
+
+      await expect(service.verifyItem(wi.id, REVIEWER_ACTOR, 'verified'))
+        .rejects.toThrow(/Invalid status transition/);
+    });
+
+    // ---------------------------------------------------------------------
+    // F1-BRIDGE-1: task:rejected publish hook
+    // ---------------------------------------------------------------------
+
+    describe('task:rejected publish (F1-BRIDGE-1)', () => {
+      it('publishes task:rejected exactly once on a rejected verdict, with workItemId + correlation fields', async () => {
+        const publishCalls: any[] = [];
+        const fakeBus = {
+          publish: jest.fn((event: any) => publishCalls.push(event)),
+        } as any;
+        // Wire the bus AFTER the setup helper so we don't capture the
+        // workitem:queued + task:done_by_worker events from the seeding
+        // submitForVerification call. We're isolating the verifyItem
+        // publish here.
+        const wi = await makeAwaitingVerification();
+        service.setEventBusService(fakeBus);
+
+        await service.verifyItem(wi.id, REVIEWER_ACTOR, 'rejected', 'Output incomplete');
+
+        const rejectEvents = publishCalls.filter((e) => e.type === 'task:rejected');
+        expect(rejectEvents).toHaveLength(1);
+        expect(rejectEvents[0].workItemId).toBe(wi.id);
+        expect(rejectEvents[0].previousValue).toBe('done_by_worker');
+        expect(rejectEvents[0].newValue).toBe('rejected');
+        // Deterministic event id (dedup contract).
+        expect(rejectEvents[0].id).toBe(`task:rejected:${wi.id}`);
+      });
+
+      it('does NOT publish task:rejected on the verified branch (success path is bridge-silent)', async () => {
+        const publishCalls: any[] = [];
+        const fakeBus = {
+          publish: jest.fn((event: any) => publishCalls.push(event)),
+        } as any;
+        const wi = await makeAwaitingVerification();
+        service.setEventBusService(fakeBus);
+
+        await service.verifyItem(wi.id, REVIEWER_ACTOR, 'verified');
+
+        const rejectEvents = publishCalls.filter((e) => e.type === 'task:rejected');
+        expect(rejectEvents).toHaveLength(0);
+      });
+
+      it('does NOT publish task:rejected when the transition throws (state-machine gate)', async () => {
+        const publishCalls: any[] = [];
+        const fakeBus = {
+          publish: jest.fn((event: any) => publishCalls.push(event)),
+        } as any;
+        service.setEventBusService(fakeBus);
+
+        const wi = makeWorkItem({ type: 'delegate' });
+        await service.addToPool(wi);
+        // Never claimed / submitted — verifyItem on a queued item must throw.
+        await expect(service.verifyItem(wi.id, REVIEWER_ACTOR, 'rejected'))
+          .rejects.toThrow(/Invalid status transition/);
+
+        const rejectEvents = publishCalls.filter((e) => e.type === 'task:rejected');
+        expect(rejectEvents).toHaveLength(0);
+      });
+
+      it('does NOT publish task:rejected when no EventBus is wired (legacy/test path)', async () => {
+        const wi = await makeAwaitingVerification();
+        // No setEventBusService — eventBus stays null, verifyItem must not throw.
+        await expect(
+          service.verifyItem(wi.id, REVIEWER_ACTOR, 'rejected', 'no-bus-test'),
+        ).resolves.not.toBeNull();
+      });
+
+      it('isolates EventBus.publish errors from the rejection transition (state commit wins)', async () => {
+        const fakeBus = {
+          publish: jest.fn((event: any) => {
+            if (event.type === 'task:rejected') {
+              throw new Error('bus blew up');
+            }
+          }),
+        } as any;
+        const wi = await makeAwaitingVerification();
+        service.setEventBusService(fakeBus);
+
+        const updated = await service.verifyItem(
+          wi.id,
+          REVIEWER_ACTOR,
+          'rejected',
+          'reviewer comment',
+        );
+
+        // Transition committed even though the bus threw.
+        expect(updated).not.toBeNull();
+        expect(updated!.status).toBe('rejected');
+      });
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // failItem
+  // -----------------------------------------------------------------------
+
+  describe('failItem', () => {
+    it('marks item as failed with error', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      await service.failItem(wi.id, 'agent crashed');
+
+      const items = await service.getAllItems();
+      expect(items[0].status).toBe('failed');
+      expect(items[0].error).toBe('agent crashed');
+    });
+
+    it('throws when item not found', async () => {
+      await expect(service.failItem('ghost', 'error')).rejects.toThrow(
+        'WorkItem not found',
+      );
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // #842: task:blocked / task:failed reach the worker's team lead
+  // -----------------------------------------------------------------------
+
+  describe('task:blocked / task:failed events (#842)', () => {
+    let published: any[];
+
+    beforeEach(() => {
+      published = [];
+      service.setEventBusService({ publish: jest.fn((event: any) => published.push(event)) } as any);
+      service.setSessionTeamResolver(async (session) =>
+        session === 'think-tank-sage'
+          ? { teamId: 'team-think-tank', teamName: 'Think Tank', memberId: 'm-sage', memberName: 'Sage' }
+          : null,
+      );
+    });
+
+    /** Queue an item for the worker and let it claim it. */
+    async function runningItem(): Promise<string> {
+      const wi = makeWorkItem({ target: 'think-tank-sage' });
+      await service.addToPool(wi);
+      await service.claimSpecificItem('think-tank-sage', wi.id);
+      return wi.id;
+    }
+
+    it('blockItem publishes task:blocked with the worker team and the reason', async () => {
+      const id = await runningItem();
+      await service.blockItem(id, { agentId: 'think-tank-sage', reason: 'needs_alignment: copyrighted transcripts' });
+
+      const events = published.filter((e) => e.type === 'task:blocked');
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        workItemId: id,
+        teamId: 'team-think-tank',
+        memberName: 'Sage',
+        previousValue: 'running',
+        newValue: 'blocked: needs_alignment: copyrighted transcripts',
+      });
+      // The reason is stored on the WorkItem too.
+      expect((await service.findWorkItem(id))?.blockedReason).toBe('needs_alignment: copyrighted transcripts');
+    });
+
+    it('failItem publishes task:failed with the worker team', async () => {
+      const id = await runningItem();
+      await service.failItem(id, 'upstream API removed');
+
+      const events = published.filter((e) => e.type === 'task:failed');
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ workItemId: id, teamId: 'team-think-tank', newValue: 'failed: upstream API removed' });
+    });
+
+    it('publishes with an empty teamId when the target is no member, and never throws', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      service.setSessionTeamResolver(async () => { throw new Error('storage down'); });
+
+      await service.failItem(wi.id, 'boom');
+
+      expect(published.filter((e) => e.type === 'task:failed')).toEqual([
+        expect.objectContaining({ workItemId: wi.id, teamId: '' }),
+      ]);
+    });
+
+    it('task:verified on lead-reported team work carries the orchestrator note (crewly#1371)', async () => {
+      const leadReport = { lead: 'ella', leadName: 'Ella', worker: 'think-tank-sage', teamId: 'team-think-tank', teamName: 'Think Tank', slackChannelId: 'C0TT', channelName: 'think-tank' };
+      const wi = makeWorkItem({ target: 'think-tank-sage', metadata: { reviewer: 'tl-sam', leadReport } });
+      await service.addToPool(wi);
+      await service.claimSpecificItem('think-tank-sage', wi.id);
+      await service.submitForVerification(wi.id, { role: 'agent', session: 'think-tank-sage' });
+      await service.verifyItem(wi.id, { role: 'owner' }, 'verified');
+
+      const verified = published.filter((e) => e.type === 'task:verified');
+      expect(verified).toHaveLength(1);
+      expect(verified[0].orchestratorNote).toBe('No owner post needed — Ella reports it in #think-tank; do not post it in your thread with the owner.');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // cancelQueued (#609 — clean queued/blocked → cancelled transition)
+  // -----------------------------------------------------------------------
+
+  describe('cancelQueued', () => {
+    it('transitions queued → cancelled with the supplied reason on cancelReason', async () => {
+      const wi = makeWorkItem({ target: 'crewly-orc' });
+      await service.addToPool(wi);
+
+      await service.cancelQueued(wi.id, 'stuck delegate fallback');
+
+      const items = await service.getAllItems();
+      const after = items.find((w) => w.id === wi.id)!;
+      expect(after.status).toBe('cancelled');
+      expect(after.cancelReason).toBe('stuck delegate fallback');
+    });
+
+    it('stamps metadata.supersededBy when the caller names the replacement', async () => {
+      const wi = makeWorkItem({ target: 'crewly-orc' });
+      await service.addToPool(wi);
+
+      await service.cancelQueued(wi.id, 'duplicate — re-routed', { supersededBy: ['806dc528', wi.id] });
+
+      const after = (await service.getAllItems()).find((w) => w.id === wi.id)!;
+      expect(after.status).toBe('cancelled');
+      // The item never names itself as its own successor.
+      expect(after.metadata?.supersededBy).toEqual(['806dc528']);
+    });
+
+    it('stamps metadata.cancelledBy with the cancelling session (crewly#1015 §10)', async () => {
+      const wi = makeWorkItem({ target: 'crewly-orc' });
+      await service.addToPool(wi);
+      await service.cancelQueued(wi.id, 'cleanup', { cancelledBy: 'sam-1' });
+      const after = (await service.getAllItems()).find((w) => w.id === wi.id)!;
+      expect(after.metadata?.cancelledBy).toBe('sam-1');
+      expect(after.metadata?.supersededBy).toBeUndefined();
+    });
+
+    it('leaves metadata untouched when no successor is given', async () => {
+      const wi = makeWorkItem({ target: 'crewly-orc' });
+      await service.addToPool(wi);
+      await service.cancelQueued(wi.id, 'no longer needed');
+      const after = (await service.getAllItems()).find((w) => w.id === wi.id)!;
+      expect(after.metadata?.supersededBy).toBeUndefined();
+    });
+
+    it('also accepts a blocked WI (queued/blocked/scheduled all valid)', async () => {
+      // Blocked is the dep-resolver landing state; we want it cleanable
+      // too, otherwise dep-cycles spam dispatches forever.
+      const wi = makeWorkItem({ dependsOn: ['dep-1'] });
+      await service.addToPool(wi);
+      // makeWorkItem with dependsOn lands in 'blocked' per createWorkItem.
+
+      await service.cancelQueued(wi.id, 'parent abandoned');
+
+      const after = (await service.getAllItems()).find((w) => w.id === wi.id)!;
+      expect(after.status).toBe('cancelled');
+      expect(after.cancelReason).toBe('parent abandoned');
+    });
+
+    it('refuses to cancel a running WI (caller should use failItem)', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      await expect(service.cancelQueued(wi.id, 'oops')).rejects.toThrow(
+        /status must be 'queued', 'blocked', or 'scheduled'/,
+      );
+      // And the WI is NOT mutated — still running.
+      const after = (await service.getAllItems()).find((w) => w.id === wi.id)!;
+      expect(after.status).toBe('running');
+    });
+
+    it('refuses to cancel a terminal WI (cancelled/done/failed/verified)', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.cancelQueued(wi.id, 'first cancel'); // queued → cancelled
+
+      await expect(service.cancelQueued(wi.id, 'second cancel')).rejects.toThrow(
+        /status must be 'queued', 'blocked', or 'scheduled'/,
+      );
+    });
+
+    it('throws when the WI does not exist', async () => {
+      await expect(service.cancelQueued('ghost-id', 'reason')).rejects.toThrow(
+        'WorkItem not found',
+      );
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // requeueAfterFailure (auto-retry path — 2026-05-22)
+  // -----------------------------------------------------------------------
+
+  describe('requeueAfterFailure', () => {
+    /** Walk a fresh WI through queued → running → failed so the next step
+     *  has a `failed` record to retry. Returns the WI id. */
+    async function failOne(target?: string): Promise<string> {
+      const wi = makeWorkItem({ target });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      await service.failItem(wi.id, 'agent crashed mid-task');
+      return wi.id;
+    }
+
+    it('flips failed → queued, bumps retryCount, clears startedAt/completedAt', async () => {
+      const id = await failOne('agent-leo');
+      await service.requeueAfterFailure(id, 'agent crashed mid-task');
+
+      const items = await service.getAllItems();
+      const wi = items.find((x) => x.id === id)!;
+      expect(wi.status).toBe('queued');
+      expect(wi.retryCount).toBe(1);
+      expect(wi.startedAt).toBeUndefined();
+      expect(wi.completedAt).toBeUndefined();
+    });
+
+    it('preserves target so the same agent gets the retry', async () => {
+      const id = await failOne('agent-leo');
+      await service.requeueAfterFailure(id, 'transient timeout');
+
+      const items = await service.getAllItems();
+      const wi = items.find((x) => x.id === id)!;
+      expect(wi.target).toBe('agent-leo');
+    });
+
+    it('stashes the failure reason + attempt number on metadata for postmortem', async () => {
+      const id = await failOne('agent-leo');
+      await service.requeueAfterFailure(id, 'fetch returned 503');
+
+      const items = await service.getAllItems();
+      const wi = items.find((x) => x.id === id)!;
+      expect(wi.metadata?.lastFailureReason).toBe('fetch returned 503');
+      expect(wi.metadata?.retryAttempt).toBe(1);
+      expect(typeof wi.metadata?.lastFailureAt).toBe('string');
+    });
+
+    it('APPENDS to failureHistory across multiple retries (not overwrite)', async () => {
+      // Postmortem needs ALL failure reasons, not just the latest —
+      // each retry could fail for a different reason and that signal
+      // matters when ORC decides surface-vs-replan.
+      const id = await failOne('agent-leo');
+      await service.requeueAfterFailure(id, 'fetch 503');
+      // Cycle through running → failed → queued twice more.
+      await service.claimFromPool('agent-leo');
+      await service.failItem(id, 'parse error');
+      await service.requeueAfterFailure(id, 'parse error');
+      await service.claimFromPool('agent-leo');
+      await service.failItem(id, 'rate limit');
+      await service.requeueAfterFailure(id, 'rate limit');
+
+      const wi = (await service.getAllItems()).find((x) => x.id === id)!;
+      const history = wi.metadata?.failureHistory as Array<{ reason: string; retryAttempt: number }>;
+      expect(history).toHaveLength(3);
+      expect(history.map((h) => h.reason)).toEqual(['fetch 503', 'parse error', 'rate limit']);
+      expect(history.map((h) => h.retryAttempt)).toEqual([1, 2, 3]);
+    });
+
+    it('caps failureHistory at 10 entries (FIFO) to bound metadata growth', async () => {
+      // A pathological retry loop should not bloat metadata
+      // indefinitely. After 12 retries we keep only the most recent
+      // 10 — the oldest two drop off.
+      const id = await failOne('agent-leo');
+      for (let i = 1; i <= 12; i += 1) {
+        await service.requeueAfterFailure(id, `attempt ${i}`);
+        if (i < 12) {
+          await service.claimFromPool('agent-leo');
+          await service.failItem(id, `attempt ${i}`);
+        }
+      }
+      const wi = (await service.getAllItems()).find((x) => x.id === id)!;
+      const history = wi.metadata?.failureHistory as Array<{ reason: string }>;
+      expect(history).toHaveLength(10);
+      // Oldest entries dropped — first kept is attempt 3.
+      expect(history[0].reason).toBe('attempt 3');
+      expect(history[9].reason).toBe('attempt 12');
+    });
+
+    it('stamps a TTL anchor so the granted retry gets a fresh expiry window', async () => {
+      // Without this, the reconciler's TTL rule keeps measuring from the
+      // original `createdAt` — so a WI whose work outlived the 24h TTL is
+      // cancelled on the next pass and the retry is destroyed on arrival.
+      // See getTtlAnchorAt in work-item.types.ts.
+      const before = Date.now();
+      const id = await failOne('agent-leo');
+      await service.requeueAfterFailure(id, 'agent crashed mid-task');
+
+      const wi = (await service.getAllItems()).find((x) => x.id === id)!;
+      const anchor = wi.metadata?.[LAST_REQUEUED_AT_METADATA_KEY];
+      expect(typeof anchor).toBe('string');
+      const anchorMs = new Date(anchor as string).getTime();
+      expect(Number.isNaN(anchorMs)).toBe(false);
+      expect(anchorMs).toBeGreaterThanOrEqual(before);
+      expect(anchorMs).toBeLessThanOrEqual(Date.now());
+    });
+
+    it('leaves createdAt untouched — the anchor postpones TTL without rewriting history', async () => {
+      // `createdAt` feeds age metrics, ordering and postmortems. Overloading
+      // it to mean "time in current attempt" is how it silently breaks
+      // something nobody is looking at.
+      const wi = makeWorkItem({ target: 'agent-leo' });
+      await service.addToPool(wi);
+      const createdAtBefore = (await service.getAllItems()).find((x) => x.id === wi.id)!.createdAt;
+
+      await service.claimFromPool('agent-leo');
+      await service.failItem(wi.id, 'boom');
+      await service.requeueAfterFailure(wi.id, 'boom');
+
+      const after = (await service.getAllItems()).find((x) => x.id === wi.id)!;
+      expect(after.createdAt).toBe(createdAtBefore);
+    });
+
+    it('moves the anchor forward on each successive retry', async () => {
+      const id = await failOne('agent-leo');
+      await service.requeueAfterFailure(id, 'attempt 1');
+      const first = (await service.getAllItems()).find((x) => x.id === id)!
+        .metadata?.[LAST_REQUEUED_AT_METADATA_KEY] as string;
+
+      await service.claimFromPool('agent-leo');
+      await service.failItem(id, 'again');
+      await service.requeueAfterFailure(id, 'attempt 2');
+      const second = (await service.getAllItems()).find((x) => x.id === id)!
+        .metadata?.[LAST_REQUEUED_AT_METADATA_KEY] as string;
+
+      expect(new Date(second).getTime()).toBeGreaterThanOrEqual(new Date(first).getTime());
+    });
+
+    it('clears `error` field so a successful retry does not surface stale text', async () => {
+      const id = await failOne();
+      await service.requeueAfterFailure(id, 'will retry');
+
+      const items = await service.getAllItems();
+      const wi = items.find((x) => x.id === id)!;
+      expect(wi.error).toBeUndefined();
+    });
+
+    it('throws when WI is not in failed status (caller must call failItem first)', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      // queued, not failed
+      await expect(service.requeueAfterFailure(wi.id, 'noop')).rejects.toThrow(
+        /must be 'failed'/,
+      );
+    });
+
+    it('throws when WI is missing', async () => {
+      await expect(service.requeueAfterFailure('ghost', 'noop')).rejects.toThrow(
+        'WorkItem not found',
+      );
+    });
+
+    it('does NOT enforce maxRetries — caller (v3-data.onTaskFailed) is responsible', async () => {
+      // Defensive: requeueAfterFailure is a low-level state-machine
+      // primitive. If the caller calls it past maxRetries, the WI gets
+      // a retryCount > maxRetries record. That's the caller's bug, not
+      // this method's contract.
+      const id = await failOne();
+      await service.requeueAfterFailure(id, 'attempt 1');
+      // Fail again to simulate a retry that also broke.
+      await service.claimFromPool('agent-leo');
+      await service.failItem(id, 'still broken');
+      await service.requeueAfterFailure(id, 'attempt 2');
+      await service.claimFromPool('agent-leo');
+      await service.failItem(id, 'still broken');
+      await service.requeueAfterFailure(id, 'attempt 3');
+
+      const wi = (await service.getAllItems()).find((x) => x.id === id)!;
+      expect(wi.retryCount).toBe(3);
+      expect(wi.status).toBe('queued');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // disposeFailedWorkItem — the successor model funnel
+  // ---------------------------------------------------------------------------
+  describe('disposeFailedWorkItem', () => {
+    beforeEach(() => {
+      mockEscalateFailedWorkItem.mockClear();
+      mockEscalateFailedWorkItem.mockResolvedValue('esc-1');
+    });
+
+    /** Drive a WI to `failed` with a chosen amount of retry budget consumed. */
+    async function strandFailed(retriesUsed: number, maxRetries = 3): Promise<string> {
+      const wi = makeWorkItem({ target: 'agent-leo' });
+      wi.maxRetries = maxRetries;
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      await service.failItem(wi.id, 'boom');
+      if (retriesUsed > 0) {
+        const found = (await service.getAllItems()).find((x) => x.id === wi.id)!;
+        found.retryCount = retriesUsed;
+      }
+      return wi.id;
+    }
+
+    it('retries in place while the budget lasts, and does NOT stamp', async () => {
+      const id = await strandFailed(0);
+
+      const disposition = await service.disposeFailedWorkItem(id, { reason: 'stranded' });
+
+      expect(disposition?.kind).toBe('retried_in_place');
+      const wi = (await service.getAllItems()).find((x) => x.id === id)!;
+      expect(wi.status).toBe('queued');
+      expect(wi.retryCount).toBe(1);
+      // Not stamped on purpose: the item left the stranding statuses under its
+      // own power, and a stamp would describe a failure that is no longer the
+      // current one — which would make the safety net skip the NEXT strand.
+      expect(getWorkItemDisposition(wi)).toBeNull();
+      expect(mockEscalateFailedWorkItem).not.toHaveBeenCalled();
+    });
+
+    it('goes terminal once the budget is spent, escalating and stamping', async () => {
+      const id = await strandFailed(3, 3);
+
+      const disposition = await service.disposeFailedWorkItem(id, { reason: 'stranded' });
+
+      expect(disposition?.kind).toBe('terminal');
+      expect(disposition?.escalationId).toBe('esc-1');
+      expect(mockEscalateFailedWorkItem).toHaveBeenCalledTimes(1);
+
+      const wi = (await service.getAllItems()).find((x) => x.id === id)!;
+      // Deliberately still `failed`. Adding a `→ cancelled` edge so it could
+      // reach a strictly terminal status would re-open the illegal-correction
+      // surface PR #733 closed, and would turn a deliberate decision into a
+      // 24h auto-acceptance default. `failed` + an audit record IS the
+      // deliberate terminal state.
+      expect(wi.status).toBe('failed');
+      expect(getWorkItemDisposition(wi)?.kind).toBe('terminal');
+    });
+
+    it('records a real successor when the caller owns one', async () => {
+      const id = await strandFailed(0);
+
+      const disposition = await service.disposeFailedWorkItem(id, {
+        reason: 'bridge retry',
+        successorWorkItemId: `${id}:retry:1`,
+      });
+
+      expect(disposition?.kind).toBe('succeeded_by');
+      expect(disposition?.successorWorkItemId).toBe(`${id}:retry:1`);
+      const wi = (await service.getAllItems()).find((x) => x.id === id)!;
+      // Source untouched — the successor carries the work now.
+      expect(wi.status).toBe('failed');
+      expect(wi.retryCount).toBe(0);
+      expect(mockEscalateFailedWorkItem).not.toHaveBeenCalled();
+    });
+
+    it('is idempotent — a second call returns the first disposition, no re-escalation', async () => {
+      const id = await strandFailed(3, 3);
+
+      const first = await service.disposeFailedWorkItem(id, { reason: 'stranded' });
+      const second = await service.disposeFailedWorkItem(id, { reason: 'stranded again' });
+
+      expect(second).toEqual(first);
+      // Re-entrancy is the termination argument: concurrent reconciler passes
+      // must converge rather than escalate twice.
+      expect(mockEscalateFailedWorkItem).toHaveBeenCalledTimes(1);
+    });
+
+    it('terminates: repeated disposal walks the budget down, then stops retrying', async () => {
+      const id = await strandFailed(0, 2);
+
+      for (let i = 0; i < 2; i++) {
+        const d = await service.disposeFailedWorkItem(id, { reason: `pass ${i}` });
+        expect(d?.kind).toBe('retried_in_place');
+        await service.claimFromPool('agent-leo');
+        await service.failItem(id, 'boom again');
+      }
+
+      const final = await service.disposeFailedWorkItem(id, { reason: 'final' });
+      expect(final?.kind).toBe('terminal');
+
+      const wi = (await service.getAllItems()).find((x) => x.id === id)!;
+      expect(wi.retryCount).toBe(2);
+      expect(wi.maxRetries).toBe(2);
+    });
+
+    it('no-ops for a status that is not stranded', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi); // queued
+
+      expect(await service.disposeFailedWorkItem(wi.id, { reason: 'n/a' })).toBeNull();
+      expect(mockEscalateFailedWorkItem).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Composition guard for #739 + the successor model.
+     *
+     * Neither PR proves this on its own: #739 proves a release moves
+     * `releaseCount`, and the funnel proves it branches on `retryCount`. What
+     * matters in production is the two together, because the funnel's
+     * `terminal` branch is destructive — it stops the work and escalates.
+     *
+     * Before #739 this was a live bug with a real incident behind it: four WIs
+     * were found at retryCount 3/3 having failed zero times, purely from lease
+     * lapses while their agents were heads-down. Run through this funnel, every
+     * one of them would have been read as "out of retries" and taken straight
+     * to terminal — live, healthy work stopped on the strength of churn.
+     */
+    it('churn does NOT consume the failure budget — a released-but-never-failed WI still retries', async () => {
+      const wi = makeWorkItem({ target: 'agent-leo' });
+      wi.maxRetries = 3;
+      await service.addToPool(wi);
+
+      // Three lease lapses, zero failures — the exact shape of the incident.
+      for (let i = 0; i < 3; i++) {
+        await service.claimFromPool('agent-leo');
+        await service.releaseBack(wi.id, 'lease lapsed');
+      }
+
+      const churned = (await service.getAllItems()).find((x) => x.id === wi.id)!;
+      expect(churned.retryCount).toBe(0);
+      expect(churned.releaseCount).toBe(3);
+
+      // Now it genuinely fails, once.
+      await service.claimFromPool('agent-leo');
+      await service.failItem(wi.id, 'first real failure');
+
+      const disposition = await service.disposeFailedWorkItem(wi.id, { reason: 'stranded' });
+
+      // Must retry. If churn were still charged to retryCount this would read
+      // 3/3 and come back `terminal`, stopping work that never failed.
+      expect(disposition?.kind).toBe('retried_in_place');
+      const after = (await service.getAllItems()).find((x) => x.id === wi.id)!;
+      expect(after.status).toBe('queued');
+      expect(after.retryCount).toBe(1);
+      expect(mockEscalateFailedWorkItem).not.toHaveBeenCalled();
+    });
+
+    it('no-ops for a missing WorkItem rather than throwing', async () => {
+      expect(await service.disposeFailedWorkItem('ghost', { reason: 'n/a' })).toBeNull();
+    });
+
+    it('still stamps when the escalation throws, recording the gap instead of hiding it', async () => {
+      mockEscalateFailedWorkItem.mockRejectedValueOnce(new Error('messaging down'));
+      const id = await strandFailed(3, 3);
+
+      const disposition = await service.disposeFailedWorkItem(id, { reason: 'stranded' });
+
+      // A messaging blip must not leave the item stranded a SECOND time.
+      expect(disposition?.kind).toBe('terminal');
+      expect(disposition?.escalationId).toBeUndefined();
+      const wi = (await service.getAllItems()).find((x) => x.id === id)!;
+      expect(getWorkItemDisposition(wi)?.escalationId).toBeUndefined();
+    });
+
+    it('clears a stale disposition when the item goes back on the queue', async () => {
+      // A stamp describes how a PAST failure was dealt with. If it outlived the
+      // failure, the safety net would read it on the item's NEXT strand and skip
+      // an item that genuinely needs disposing.
+      const id = await strandFailed(3, 3);
+      await service.disposeFailedWorkItem(id, { reason: 'stranded' });
+      expect(
+        getWorkItemDisposition((await service.getAllItems()).find((x) => x.id === id)!),
+      ).not.toBeNull();
+
+      await service.requeueAfterFailure(id, 'operator retry');
+
+      const wi = (await service.getAllItems()).find((x) => x.id === id)!;
+      expect(getWorkItemDisposition(wi)).toBeNull();
+    });
+  });
+
+
+  // -----------------------------------------------------------------------
+  // getPoolStatus
+  // -----------------------------------------------------------------------
+
+  describe('scoreItem (POST /api/tasks/score)', () => {
+    it('stores qualityScore/qualityScoredBy/qualityScoredAt under metadata and keeps existing keys', async () => {
+      const wi = makeWorkItem({ metadata: { notes: ['x'] } });
+      await service.addToPool(wi);
+
+      const updated = await service.scoreItem(wi.id, 92, 'auditor-1');
+      expect(updated).not.toBeNull();
+      expect(updated!.metadata).toMatchObject({
+        notes: ['x'],
+        qualityScore: 92,
+        qualityScoredBy: 'auditor-1',
+      });
+      expect(typeof updated!.metadata!.qualityScoredAt).toBe('string');
+      expect(Number.isNaN(Date.parse(updated!.metadata!.qualityScoredAt as string))).toBe(false);
+
+      const persisted = await service.findWorkItem(wi.id);
+      expect(persisted!.metadata!.qualityScore).toBe(92);
+    });
+
+    it('returns null for an unknown item', async () => {
+      expect(await service.scoreItem('missing', 50, 'auditor-1')).toBeNull();
+    });
+  });
+
+  describe('getPoolStatus', () => {
+    it('returns correct snapshot for empty pool', async () => {
+      const status = await service.getPoolStatus();
+      expect(status.total).toBe(0);
+      expect(status.available).toBe(0);
+      expect(status.claimed).toBe(0);
+      expect(status.avgWaitTimeMs).toBe(0);
+    });
+
+    it('counts available and claimed correctly', async () => {
+      const wi1 = makeWorkItem({ title: 'One' });
+      const wi2 = makeWorkItem({ title: 'Two' });
+      const wi3 = makeWorkItem({ title: 'Three' });
+      await service.addToPool(wi1);
+      await service.addToPool(wi2);
+      await service.addToPool(wi3);
+
+      await service.claimFromPool('agent-leo');
+
+      const status = await service.getPoolStatus();
+      expect(status.total).toBe(3);
+      expect(status.available).toBe(2);
+      expect(status.claimed).toBe(1);
+    });
+
+    it('computes average wait time', async () => {
+      const wi = makeWorkItem();
+      wi.createdAt = new Date(Date.now() - 5000).toISOString();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      const status = await service.getPoolStatus();
+      expect(status.avgWaitTimeMs).toBeGreaterThan(0);
+    });
+
+    it('breaks down by type and status', async () => {
+      const wi1 = makeWorkItem({ type: 'delegate' });
+      const wi2 = makeWorkItem({ type: 'check' });
+      await service.addToPool(wi1);
+      await service.addToPool(wi2);
+
+      const status = await service.getPoolStatus();
+      expect(status.byType['delegate']).toBe(1);
+      expect(status.byType['check']).toBe(1);
+      expect(status.byStatus['queued']).toBe(2);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // getAvailableItems
+  // -----------------------------------------------------------------------
+
+  describe('getAvailableItems', () => {
+    it('returns only unclaimed queued items', async () => {
+      const wi1 = makeWorkItem({ title: 'Available' });
+      const wi2 = makeWorkItem({ title: 'Claimed' });
+      await service.addToPool(wi1);
+      await service.addToPool(wi2);
+      await service.claimFromPool('agent-leo');
+
+      const available = await service.getAvailableItems();
+      expect(available).toHaveLength(1);
+    });
+
+    it('respects filters', async () => {
+      const wi1 = makeWorkItem({ type: 'delegate' });
+      const wi2 = makeWorkItem({ type: 'check' });
+      await service.addToPool(wi1);
+      await service.addToPool(wi2);
+
+      const available = await service.getAvailableItems({ types: ['check'] });
+      expect(available).toHaveLength(1);
+      expect(available[0].type).toBe('check');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Singleton
+  // -----------------------------------------------------------------------
+
+  describe('singleton', () => {
+    it('returns same instance', () => {
+      const a = TaskPoolService.getInstance();
+      const b = TaskPoolService.getInstance();
+      expect(a).toBe(b);
+      TaskPoolService.resetInstance();
+    });
+
+    it('resets instance', () => {
+      const a = TaskPoolService.getInstance();
+      TaskPoolService.resetInstance();
+      const b = TaskPoolService.getInstance();
+      expect(a).not.toBe(b);
+      TaskPoolService.resetInstance();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // P1 1ffffb84(a) — removeFromPool (bulk-DELETE entry)
+  // -----------------------------------------------------------------------
+
+  describe('removeFromPool (P1 1ffffb84 component a)', () => {
+    it('removes an unclaimed WorkItem from the pool', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+
+      const result = await service.removeFromPool(wi.id);
+      expect(result.removed).toBe(true);
+      expect(result.workItem?.id).toBe(wi.id);
+      expect(result.hadActiveClaim).toBe(false);
+
+      // Item is gone from disk + memory.
+      const after = await service.findWorkItem(wi.id);
+      expect(after).toBeNull();
+    });
+
+    it('is idempotent on a missing id (returns reason=not_found)', async () => {
+      const result = await service.removeFromPool('does-not-exist');
+      expect(result.removed).toBe(false);
+      expect(result.reason).toBe('not_found');
+      expect(result.workItem).toBeUndefined();
+    });
+
+    it('is idempotent on second call after a successful delete', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+
+      const first = await service.removeFromPool(wi.id);
+      expect(first.removed).toBe(true);
+
+      const second = await service.removeFromPool(wi.id);
+      expect(second.removed).toBe(false);
+      expect(second.reason).toBe('not_found');
+    });
+
+    it('refuses to delete a claimed WorkItem without force (throws WorkItemClaimedError)', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      const claim = await service.claimFromPool('agent-leo');
+      expect(claim).not.toBeNull();
+
+      let caught: unknown;
+      try {
+        await service.removeFromPool(wi.id);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(WorkItemClaimedError);
+      const e = caught as WorkItemClaimedError;
+      expect(e.workItemId).toBe(wi.id);
+      expect(e.claimedBy).toBe('agent-leo');
+      expect(e.claimId).toBe(claim!.claim.id);
+
+      // No mutation: WI still exists with active claim.
+      const stillThere = await service.findWorkItem(wi.id);
+      expect(stillThere).not.toBeNull();
+      const claims = await service.getActiveClaims();
+      expect(claims).toHaveLength(1);
+    });
+
+    it('deletes a claimed WorkItem when force=true (revokes claim)', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      const claim = await service.claimFromPool('agent-leo');
+      expect(claim).not.toBeNull();
+
+      const result = await service.removeFromPool(wi.id, { force: true });
+      expect(result.removed).toBe(true);
+      expect(result.hadActiveClaim).toBe(true);
+
+      // WI gone, active claims drained.
+      expect(await service.findWorkItem(wi.id)).toBeNull();
+      const activeClaims = await service.getActiveClaims();
+      expect(activeClaims).toHaveLength(0);
+    });
+
+    it('exposes structured fields on WorkItemClaimedError', () => {
+      const err = new WorkItemClaimedError({
+        workItemId: 'wi-1',
+        claimId: 'claim-1',
+        claimedBy: 'agent-x',
+      });
+      expect(err.workItemId).toBe('wi-1');
+      expect(err.claimId).toBe('claim-1');
+      expect(err.claimedBy).toBe('agent-x');
+      expect(err.name).toBe('WorkItemClaimedError');
+      expect(err).toBeInstanceOf(Error);
+      expect(err).toBeInstanceOf(WorkItemClaimedError);
+      expect(err.message).toContain('wi-1');
+      expect(err.message).toContain('claim-1');
+      expect(err.message).toContain('agent-x');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // getActiveClaims (V3 integration)
+  // -----------------------------------------------------------------------
+
+  describe('getActiveClaims', () => {
+    it('returns active claims after claiming', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      const claims = await service.getActiveClaims();
+      expect(claims).toHaveLength(1);
+      expect(claims[0].agentId).toBe('agent-leo');
+      expect(claims[0].status).toBe('active');
+    });
+
+    it('returns empty when no claims', async () => {
+      const claims = await service.getActiveClaims();
+      expect(claims).toHaveLength(0);
+    });
+
+    it('excludes released claims', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      await service.completeItem(wi.id, undefined, AGENT_ACTOR);
+
+      const claims = await service.getActiveClaims();
+      expect(claims).toHaveLength(0);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // updateItemStatus (V3 integration — used by Reconciler)
+  // -----------------------------------------------------------------------
+
+  describe('mergeItemMetadata (#841)', () => {
+    it('merges keys into metadata without touching status or other keys', async () => {
+      const wi = makeWorkItem({ metadata: { keep: 1 } });
+      await service.addToPool(wi);
+      const updated = await service.mergeItemMetadata(wi.id, { stop: { decision: 'retry' } });
+      expect(updated?.status).toBe('queued');
+      expect(updated?.metadata).toEqual({ keep: 1, stop: { decision: 'retry' } });
+    });
+
+    it('returns null for an unknown item', async () => {
+      expect(await service.mergeItemMetadata('ghost', { a: 1 })).toBeNull();
+    });
+  });
+
+  describe('setBlockedReason (crewly#1360)', () => {
+    it('replaces the reason of a blocked item and leaves its status alone', async () => {
+      const wi = makeWorkItem();
+      wi.status = 'blocked';
+      wi.blockedReason = 'Waiting for the promised work (due 2026-10-17T23:14:58.000Z)';
+      await service.addToPool(wi);
+      const updated = await service.setBlockedReason(wi.id, 'Waiting for the promised work (due 2026-10-17T00:15:00.000Z)');
+      expect(updated?.status).toBe('blocked');
+      expect(updated?.blockedReason).toBe('Waiting for the promised work (due 2026-10-17T00:15:00.000Z)');
+    });
+
+    it('does nothing for a queued item or an unknown one', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      expect(await service.setBlockedReason(wi.id, 'x')).toBeNull();
+      expect(await service.setBlockedReason('ghost', 'x')).toBeNull();
+    });
+  });
+
+  describe('updateItemStatus', () => {
+    it('updates running item to blocked', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      await service.updateItemStatus(wi.id, 'blocked', 'system');
+
+      const items = await service.getAllItems();
+      const updated = items.find(i => i.id === wi.id);
+      expect(updated!.status).toBe('blocked');
+    });
+
+    it('waiting_on_human full cycle: running -> blocked -> running through the real state machine (#815)', async () => {
+      const wi = makeWorkItem({ target: 'agent-leo' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      const now = Date.now();
+      const apply = async (corrections: ReturnType<typeof detectWaitingOnHumanWorkItems>['corrections']) => {
+        for (const c of corrections) {
+          await service.updateItemStatus(c.entityId, c.newState as WorkItemStatus, { role: 'system', via: 'reconciler' }, c.reason, c.blockSource);
+        }
+      };
+      const current = async () => (await service.getAllItems()).find((i) => i.id === wi.id)!;
+
+      // Waiting 6 min on a prompt -> parked as blocked, with the waiting_on_human source.
+      const waitingMap = new Map([['agent-leo', {
+        sessionName: 'agent-leo', status: 'active' as const,
+        waitingOnHumanSince: new Date(now - 6 * 60_000).toISOString(),
+      }]]);
+      const park = detectWaitingOnHumanWorkItems([await current()], waitingMap, now);
+      expect(park.blockedIds).toEqual([wi.id]);
+      await apply(park.corrections);
+      const parked = await current();
+      expect(parked.status).toBe('blocked');
+      expect(parked.blockSource).toBe(WORK_ITEM_BLOCK_SOURCES.WAITING_ON_HUMAN);
+      expect(parked.blockedReason).toMatch(/^waiting_on_human/);
+      expect(parked.retryCount).toBe(0);
+
+      // The agent-back-online rule must leave it alone (else the two rules fight).
+      const activeMap = new Map([['agent-leo', { sessionName: 'agent-leo', status: 'active' as const }]]);
+      expect(detectRecoverableWorkItems([parked], activeMap).corrections).toHaveLength(0);
+
+      // Prompt answered -> resumed to running, source cleared, still no retry counted.
+      const resume = detectWaitingOnHumanWorkItems([parked], activeMap, now);
+      expect(resume.resumedIds).toEqual([wi.id]);
+      await apply(resume.corrections);
+      const resumed = await current();
+      expect(resumed.status).toBe('running');
+      expect(resumed.blockSource).toBeUndefined();
+      expect(resumed.retryCount).toBe(0);
+    });
+
+    it('throws for nonexistent item', async () => {
+      await expect(service.updateItemStatus('ghost-id', 'blocked', 'system'))
+        .rejects.toThrow('WorkItem not found');
+    });
+
+    it('throws for invalid transition', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+
+      // queued → done is not a valid direct transition
+      await expect(service.updateItemStatus(wi.id, 'done', 'system'))
+        .rejects.toThrow('Invalid status transition');
+    });
+
+    it('silently no-ops on same-state update (idempotent, Steve 2026-05-15)', async () => {
+      // Reproduces the dogfood race where reconciler stale-pickup and
+      // SLA close both attempt `→ cancelled` on the same WI within ms.
+      // Before this guard, the second call threw "Invalid status
+      // transition: cancelled → cancelled" because WORK_ITEM_TRANSITIONS
+      // for `cancelled` is the empty set; with the guard it should be a
+      // silent no-op so callers can be resilient.
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.updateItemStatus(wi.id, 'cancelled', 'system', 'first cancel');
+
+      // Second call same-state — must NOT throw
+      await expect(
+        service.updateItemStatus(wi.id, 'cancelled', 'system', 'second cancel'),
+      ).resolves.toBeUndefined();
+
+      // cancelReason should be preserved from the first call (mutator
+      // doesn't re-run on the no-op path)
+      const items = await service.getAllItems();
+      const after = items.find((i) => i.id === wi.id);
+      expect(after!.status).toBe('cancelled');
+      expect(after!.cancelReason).toBe('first cancel');
+    });
+
+    it('logs the pre-write status as `from` even when storage mutates in place (Steve 2026-05-15)', async () => {
+      // pool-storage returns the in-memory object by reference, so the
+      // mutator's `wi.status = newStatus` also mutates the local `item`
+      // captured at the top of updateItemStatus. Without `const fromStatus
+      // = item.status` before the write, the post-write log reads
+      // `from: <newStatus>` (i.e. `cancelled → cancelled` for an actual
+      // `queued → cancelled` transition). Verified against the
+      // 17:48:29.328 log entry for request:4917f0c9:respond_to_user.
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+
+      const infoSpy = jest
+        .spyOn((service as any).logger, 'info')
+        .mockImplementation(() => {});
+      try {
+        await service.updateItemStatus(wi.id, 'cancelled', 'system', 'reason');
+
+        const updateCalls = infoSpy.mock.calls.filter(
+          (c) => c[0] === 'Work item status updated',
+        );
+        expect(updateCalls).toHaveLength(1);
+        expect(updateCalls[0][1]).toMatchObject({
+          workItemId: wi.id,
+          from: 'queued',   // NOT 'cancelled'
+          to: 'cancelled',
+        });
+      } finally {
+        infoSpy.mockRestore();
+      }
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // markClaimExpiring (V3 integration — used by Reconciler)
+  // -----------------------------------------------------------------------
+
+  describe('markClaimExpiring', () => {
+    it('marks an active claim as expiring', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      const result = await service.claimFromPool('agent-leo');
+      expect(result).not.toBeNull();
+
+      await service.markClaimExpiring(result!.claim.id);
+
+      // Claim should now be 'expiring' — verify via getActiveClaims
+      // (expiring claims are still considered active for reconciliation)
+      const claims = await service.getActiveClaims();
+      expect(claims).toHaveLength(1);
+      expect(claims[0].status).toBe('expiring');
+    });
+  });
+
+  // =========================================================================
+  // TRANS-1: transitionStatus + role-based permission enforcement (V3)
+  // =========================================================================
+
+  describe('transitionStatus — TRANS-1 V3 enforcement', () => {
+    /**
+     * Helper: add a WorkItem to the pool and claim it so it reaches 'running'
+     * status, mirroring the steady-state of an in-flight task. Used by the
+     * verification gate tests.
+     */
+    async function makeRunning(): Promise<{ id: string; agent: string }> {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      const result = await service.claimFromPool('agent-test');
+      expect(result).not.toBeNull();
+      return { id: result!.workItem.id, agent: 'agent-test' };
+    }
+
+    it('throws when WorkItem does not exist', async () => {
+      await expect(
+        service.transitionStatus('does-not-exist', 'done', 'system'),
+      ).rejects.toThrow(/WorkItem not found/);
+    });
+
+    it('throws on illegal state-machine transition (e.g. done → running)', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-test');
+      // Drive to terminal 'done' first via the legitimate path.
+      await service.transitionStatus(wi.id, 'done', 'system');
+      // Now attempt to revert — disallowed by WORK_ITEM_TRANSITIONS.
+      await expect(
+        service.transitionStatus(wi.id, 'running', 'system'),
+      ).rejects.toThrow(/Invalid status transition/);
+    });
+
+    it('agent CANNOT verify their own work (running → verified blocked for agent)', async () => {
+      const { id } = await makeRunning();
+      // Move to done_by_worker via agent — this is allowed.
+      await service.transitionStatus(id, 'done_by_worker', 'agent');
+      // Attempt agent self-verification — must throw.
+      await expect(
+        service.transitionStatus(id, 'verified', 'agent'),
+      ).rejects.toThrow(/Forbidden transition.*actor='agent'/);
+    });
+
+    it('team_lead CAN verify worker output (done_by_worker → verified)', async () => {
+      const { id } = await makeRunning();
+      await service.transitionStatus(id, 'done_by_worker', 'agent');
+      const verified = await service.transitionStatus(id, 'verified', REVIEWER_ACTOR);
+      expect(verified).not.toBeNull();
+      expect(verified!.status).toBe('verified');
+    });
+
+    it('team_lead CAN reject worker output with custom mutator carrying the error', async () => {
+      const { id } = await makeRunning();
+      await service.transitionStatus(id, 'done_by_worker', 'agent');
+      const rejected = await service.transitionStatus(id, 'rejected', REVIEWER_ACTOR, (wi) => {
+        wi.error = 'Did not meet acceptance criteria';
+      });
+      expect(rejected!.status).toBe('rejected');
+      expect(rejected!.error).toBe('Did not meet acceptance criteria');
+    });
+
+    // -----------------------------------------------------------------------
+    // F-F: rejected → queued is gated to TL/orchestrator/system only
+    // -----------------------------------------------------------------------
+
+    it('F-F: agent CANNOT self-revive a rejected WorkItem (rejected → queued)', async () => {
+      const { id } = await makeRunning();
+      await service.transitionStatus(id, 'done_by_worker', 'agent');
+      await service.transitionStatus(id, 'rejected', REVIEWER_ACTOR);
+      // Attempt agent self-revival — must throw per F-F.
+      await expect(
+        service.transitionStatus(id, 'queued', 'agent'),
+      ).rejects.toThrow(/Forbidden transition.*actor='agent'/);
+    });
+
+    it('F-F: team_lead CAN re-queue a rejected WorkItem', async () => {
+      const { id } = await makeRunning();
+      await service.transitionStatus(id, 'done_by_worker', 'agent');
+      await service.transitionStatus(id, 'rejected', REVIEWER_ACTOR);
+      const requeued = await service.transitionStatus(id, 'queued', 'team_lead');
+      expect(requeued!.status).toBe('queued');
+    });
+
+    it('F-F: orchestrator CAN re-queue a rejected WorkItem', async () => {
+      const { id } = await makeRunning();
+      await service.transitionStatus(id, 'done_by_worker', 'agent');
+      await service.transitionStatus(id, 'rejected', REVIEWER_ACTOR);
+      const requeued = await service.transitionStatus(id, 'queued', 'orchestrator');
+      expect(requeued!.status).toBe('queued');
+    });
+
+    it('F-F: system actor (Reconciler) CAN re-queue a rejected WorkItem', async () => {
+      const { id } = await makeRunning();
+      await service.transitionStatus(id, 'done_by_worker', 'agent');
+      await service.transitionStatus(id, 'rejected', REVIEWER_ACTOR);
+      const requeued = await service.transitionStatus(id, 'queued', 'system');
+      expect(requeued!.status).toBe('queued');
+    });
+
+    it('F-F: agent CANNOT self-revive a failed WorkItem (failed → queued)', async () => {
+      const { id } = await makeRunning();
+      // Move to failed via the existing failItem path.
+      await service.failItem(id, 'simulated failure');
+      // Attempt agent self-revival — must throw per F-F.
+      await expect(
+        service.transitionStatus(id, 'queued', 'agent'),
+      ).rejects.toThrow(/Forbidden transition.*actor='agent'/);
+    });
+
+    it('system actor passes through any legal transition (Reconciler exemption)', async () => {
+      const { id } = await makeRunning();
+      // Reconciler stuck-running corrective: running → blocked.
+      const blocked = await service.transitionStatus(id, 'blocked', 'system');
+      expect(blocked!.status).toBe('blocked');
+    });
+
+    // -----------------------------------------------------------------------
+    // mutator atomicity
+    // -----------------------------------------------------------------------
+
+    it('mutator runs atomically with the status update', async () => {
+      const { id } = await makeRunning();
+      const updated = await service.transitionStatus(id, 'done', 'system', (wi) => {
+        wi.result = { reportPath: '/tmp/done.md' };
+        wi.cost = 0.42;
+      });
+      expect(updated!.status).toBe('done');
+      expect(updated!.result).toEqual({ reportPath: '/tmp/done.md' });
+      expect(updated!.cost).toBe(0.42);
+      expect(updated!.completedAt).toBeDefined();
+    });
+
+    it('refreshes startedAt on transition into running', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      const before = new Date().toISOString();
+      const updated = await service.transitionStatus(wi.id, 'running', 'system');
+      expect(updated!.status).toBe('running');
+      expect(updated!.startedAt).toBeDefined();
+      expect(updated!.startedAt! >= before).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // TRANS-1: updateItemStatus actor-role gate (Reconciler legacy entry)
+  // =========================================================================
+
+  describe('updateItemStatus — TRANS-1 V3 actor gate', () => {
+    it('defaults actorRole to "system" when omitted (Reconciler default)', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      // No third arg — defaults to system per backwards compat.
+      await service.updateItemStatus(wi.id, 'running', 'system');
+      const items = await service.getAvailableItems();
+      // Legacy callers continue to work unchanged.
+      expect(items.find((x) => x.id === wi.id)).toBeUndefined(); // no longer queued
+    });
+
+    it('rejects an agent attempting an unauthorised transition via updateItemStatus', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-test');
+      // agent moves to done_by_worker (allowed).
+      await service.updateItemStatus(wi.id, 'done_by_worker', 'agent');
+      // agent now attempts to verify themselves — must throw.
+      await expect(
+        service.updateItemStatus(wi.id, 'verified', 'agent'),
+      ).rejects.toThrow(/Forbidden transition.*actor='agent'/);
+    });
+  });
+
+  // =========================================================================
+  // TRANS-2: internal call sites route through transitionStatus(actor='system')
+  //
+  // Each test wraps `transitionStatus` on the prototype (so calls dispatched
+  // via `this.transitionStatus` from sibling methods like
+  // `completeSimpleItem` → `resolveBlockedDependents` are also captured) and
+  // asserts the expected (workItemId, newStatus, actorRole) tuple appears.
+  // This is the compile-time guard against a future contributor silently
+  // restoring a direct `storage.updateWorkItem` mutation that would bypass
+  // the V3 actor gate.
+  // =========================================================================
+
+  describe('TRANS-2: internal sites route through transitionStatus(actor="system")', () => {
+    /**
+     * Patch `transitionStatus` on the TaskPoolService prototype so every
+     * invocation is captured as a tuple of [workItemId, newStatus, actorRole].
+     * Patching the prototype (rather than a single instance own-property) is
+     * required because some internal callers (e.g. `resolveBlockedDependents`)
+     * dispatch through `this.transitionStatus` from sibling methods, and
+     * Jest's `spyOn(instance, 'method')` mock with `mockImplementation` does
+     * not always intercept those dispatches. The original implementation is
+     * still invoked unchanged so tests assert the call shape AND end-to-end
+     * behaviour together.
+     */
+    function spyTransitionStatus(): {
+      calls: Array<[string, string, string]>;
+      restore: () => void;
+    } {
+      const calls: Array<[string, string, string]> = [];
+      const proto = TaskPoolService.prototype as TaskPoolService;
+      const original = proto.transitionStatus;
+      proto.transitionStatus = async function (
+        this: TaskPoolService,
+        workItemId: string,
+        newStatus: Parameters<TaskPoolService['transitionStatus']>[1],
+        actorRole: Parameters<TaskPoolService['transitionStatus']>[2],
+        mutator?: Parameters<TaskPoolService['transitionStatus']>[3],
+      ) {
+        calls.push([workItemId, newStatus, typeof actorRole === 'string' ? actorRole : actorRole.role]);
+        return original.call(this, workItemId, newStatus, actorRole, mutator);
+      };
+      return {
+        calls,
+        restore: () => {
+          proto.transitionStatus = original;
+        },
+      };
+    }
+
+    it('claimFromPool calls transitionStatus(queued→running, system)', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      const { calls, restore } = spyTransitionStatus();
+      try {
+        const result = await service.claimFromPool('agent-leo');
+        expect(result).not.toBeNull();
+        expect(calls).toContainEqual([wi.id, 'running', 'system']);
+      } finally {
+        restore();
+      }
+    });
+
+    it('claimSpecificItem calls transitionStatus(queued→running, system)', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      const { calls, restore } = spyTransitionStatus();
+      try {
+        const result = await service.claimSpecificItem('agent-leo', wi.id);
+        expect(result).not.toBeNull();
+        expect(calls).toContainEqual([wi.id, 'running', 'system']);
+      } finally {
+        restore();
+      }
+    });
+
+    it('releaseBack from running calls transitionStatus(running→queued, system) without a retryCount bump', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      const { calls, restore } = spyTransitionStatus();
+      try {
+        await service.releaseBack(wi.id, 'agent busy');
+        expect(calls).toContainEqual([wi.id, 'queued', 'system']);
+
+        // Verify side-effect mutator ran atomically with the status flip.
+        const items = await service.getAllItems();
+        const released = items.find((i) => i.id === wi.id)!;
+        expect(released.status).toBe('queued');
+        // retryCount means failures only; a release bumps releaseCount.
+        expect(released.retryCount).toBe(0);
+        expect(released.releaseCount).toBe(1);
+        expect(released.startedAt).toBeUndefined();
+      } finally {
+        restore();
+      }
+    });
+
+    it('releaseBack from blocked preserves target via mutator', async () => {
+      const wi = makeWorkItem({ target: 'agent-leo' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      // Force the running item to blocked so releaseBack hits the
+      // blocked → queued branch (which already had a TRANS-1 permission
+      // entry; this test confirms the same path now flows through the
+      // shared transitionStatus helper).
+      await service.updateItemStatus(wi.id, 'blocked', 'system');
+      const { calls, restore } = spyTransitionStatus();
+      try {
+        await service.releaseBack(wi.id, 'dependency stalled');
+        expect(calls).toContainEqual([wi.id, 'queued', 'system']);
+
+        const items = await service.getAllItems();
+        const released = items.find((i) => i.id === wi.id)!;
+        expect(released.status).toBe('queued');
+        // Target preserved for the previously-blocked path so the same
+        // agent can re-claim via target filter.
+        expect(released.target).toBe('agent-leo');
+      } finally {
+        restore();
+      }
+    });
+
+    it('resolveBlockedDependents calls transitionStatus(blocked→queued, system)', async () => {
+      const upstream = makeWorkItem({ type: 'cron_run', title: 'upstream' });
+      await service.addToPool(upstream);
+      const downstream = makeWorkItem({
+        type: 'cron_run',
+        title: 'downstream',
+        dependsOn: [upstream.id],
+      });
+      await service.addToPool(downstream);
+      // Drive the upstream to running so it can complete.
+      await service.claimFromPool('agent-a');
+
+      const { calls, restore } = spyTransitionStatus();
+      try {
+        await service.completeItem(upstream.id, undefined, AGENT_ACTOR);
+        // The resolver fires inside completeSimpleItem after the
+        // upstream completes; we expect a blocked→queued promotion for
+        // the downstream item with system actor.
+        expect(calls).toContainEqual([downstream.id, 'queued', 'system']);
+      } finally {
+        restore();
+      }
+    });
+
+    it('failItem calls transitionStatus(running→failed, system) with error in mutator', async () => {
+      const wi = makeWorkItem();
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      const { calls, restore } = spyTransitionStatus();
+      try {
+        await service.failItem(wi.id, 'agent crashed');
+        expect(calls).toContainEqual([wi.id, 'failed', 'system']);
+
+        const items = await service.getAllItems();
+        const failed = items.find((i) => i.id === wi.id)!;
+        expect(failed.status).toBe('failed');
+        expect(failed.error).toBe('agent crashed');
+        expect(failed.completedAt).toBeDefined();
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // P1 1ffffb84 component (b): atomic-transition invariant
+  //
+  // The b7840fe8 partial-write bug: WorkItem b7840fe8 was observed in
+  // pool.json with status='queued' AND completedAt='2026-05-06T00:47:59Z'
+  // AND retryCount=1 AND no startedAt/target — fingerprint of the
+  // `failed -> queued` retry path leaving a stale completedAt from the
+  // prior terminal trip.
+  //
+  // Root cause: transitionStatus + updateItemStatus only SET completedAt
+  // on terminal landings; non-terminal landings (queued, blocked, ...)
+  // had no else branch to CLEAR it. So `rejected -> queued`,
+  // `failed -> queued`, and `running -> queued` (releaseBack) all left
+  // disagreeing fields.
+  //
+  // Fix invariant: completedAt is set IFF status in {done, failed,
+  // verified, done_by_worker, rejected}. Pinned by these tests.
+  // -----------------------------------------------------------------------
+  describe('atomic transition invariant (P1 1ffffb84 component b)', () => {
+    async function makeFailedWi() {
+      const wi = makeWorkItem({ requestId: 'req-bug-fix' });
+      await service.addToPool(wi);
+      await service.transitionStatus(wi.id, 'running', 'system');
+      await service.transitionStatus(wi.id, 'failed', 'system', (m) => {
+        m.error = 'simulated upstream failure';
+      });
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.status).toBe('failed');
+      expect(after?.completedAt).toBeDefined();
+      return wi;
+    }
+
+    it('stamps statusChangedAt on every status change, so a stopped item has an end for usage attribution', async () => {
+      const wi = makeWorkItem({ requestId: 'req-status-changed' });
+      await service.addToPool(wi);
+      await service.transitionStatus(wi.id, 'running', 'system');
+      // findWorkItem returns the live object; keep the value, not the item.
+      const runningAt = (await service.findWorkItem(wi.id))?.statusChangedAt;
+      expect(runningAt).toBeDefined();
+
+      await new Promise((r) => setTimeout(r, 5));
+      await service.updateItemStatus(wi.id, 'blocked', 'system');
+      const blocked = await service.findWorkItem(wi.id);
+      expect(blocked?.completedAt).toBeUndefined();
+      expect(new Date(blocked!.statusChangedAt!).getTime()).toBeGreaterThan(new Date(runningAt!).getTime());
+    });
+
+    it('transitionStatus(failed -> queued) atomically clears completedAt (BRIDGE-1 retry path)', async () => {
+      const wi = await makeFailedWi();
+      await service.transitionStatus(wi.id, 'queued', 'system');
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.status).toBe('queued');
+      // CRITICAL: pre-fix this would have been the failed-state timestamp,
+      // post-fix the explicit else branch clears it atomically.
+      expect(after?.completedAt).toBeUndefined();
+    });
+
+    it('transitionStatus(rejected -> queued) atomically clears completedAt (TL re-queue path)', async () => {
+      const wi = makeWorkItem({ requestId: 'req-rejected' });
+      await service.addToPool(wi);
+      await service.transitionStatus(wi.id, 'running', 'system');
+      await service.transitionStatus(wi.id, 'done_by_worker', 'agent', (m) => {
+        m.result = { ok: true };
+      });
+      await service.transitionStatus(wi.id, 'rejected', REVIEWER_ACTOR, (m) => {
+        m.error = 'TL did not accept';
+      });
+      const rejected = await service.findWorkItem(wi.id);
+      expect(rejected?.status).toBe('rejected');
+      expect(rejected?.completedAt).toBeDefined();
+
+      await service.transitionStatus(wi.id, 'queued', 'team_lead');
+
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.status).toBe('queued');
+      expect(after?.completedAt).toBeUndefined();
+    });
+
+    it('transitionStatus(queued -> running) clears stale completedAt on re-claim', async () => {
+      const wi = await makeFailedWi();
+      await service.transitionStatus(wi.id, 'queued', 'system');
+      const beforeClaim = await service.findWorkItem(wi.id);
+      expect(beforeClaim?.completedAt).toBeUndefined();
+
+      await service.transitionStatus(wi.id, 'running', 'system');
+
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.status).toBe('running');
+      expect(after?.startedAt).toBeDefined();
+      expect(after?.completedAt).toBeUndefined();
+    });
+
+    it('atomicity: invalid transition throws and BOTH status + completedAt remain unchanged', async () => {
+      const wi = await makeFailedWi();
+      const before = await service.findWorkItem(wi.id);
+      const beforeStatus = before!.status;
+      const beforeCompletedAt = before!.completedAt;
+
+      await expect(
+        service.transitionStatus(wi.id, 'done', 'system'),
+      ).rejects.toThrow(/Invalid status transition/);
+
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.status).toBe(beforeStatus);
+      expect(after?.completedAt).toBe(beforeCompletedAt);
+    });
+
+    it('integration repro (b7840fe8 timeline): running -> failed -> queued ends with completedAt cleared', async () => {
+      const wi = makeWorkItem({ requestId: 'req-b7840fe8-repro' });
+      await service.addToPool(wi);
+
+      await service.transitionStatus(wi.id, 'running', 'system');
+      const running = await service.findWorkItem(wi.id);
+      expect(running?.startedAt).toBeDefined();
+      expect(running?.completedAt).toBeUndefined();
+
+      await service.transitionStatus(wi.id, 'failed', 'system', (m) => {
+        m.error = 'simulated';
+      });
+      const failed = await service.findWorkItem(wi.id);
+      expect(failed?.status).toBe('failed');
+      expect(failed?.completedAt).toBeDefined();
+
+      await service.transitionStatus(wi.id, 'queued', 'system');
+
+      const after = await service.findWorkItem(wi.id);
+      // POST-FIX assertion — pre-fix this would carry the failed-state
+      // timestamp, matching b7840fe8's exact shape.
+      expect(after?.status).toBe('queued');
+      expect(after?.completedAt).toBeUndefined();
+    });
+
+    it('updateItemStatus path also enforces the invariant on non-terminal landings', async () => {
+      const wi = makeWorkItem({ requestId: 'req-update-item' });
+      await service.addToPool(wi);
+      await service.updateItemStatus(wi.id, 'running', 'system');
+      await service.updateItemStatus(wi.id, 'failed', 'system');
+      const failed = await service.findWorkItem(wi.id);
+      expect(failed?.completedAt).toBeDefined();
+
+      await service.updateItemStatus(wi.id, 'queued', 'system');
+      const requeued = await service.findWorkItem(wi.id);
+      expect(requeued?.status).toBe('queued');
+      expect(requeued?.completedAt).toBeUndefined();
+    });
+
+    it('coverage: every retry/re-queue source clears completedAt when reaching queued', async () => {
+      const sources: Array<{
+        name: string;
+        actor: 'system' | 'team_lead';
+        build: () => Promise<{ id: string }>;
+      }> = [
+        {
+          name: 'failed -> queued',
+          actor: 'system',
+          build: async () => {
+            const w = makeWorkItem({ requestId: 'cov-failed' });
+            await service.addToPool(w);
+            await service.transitionStatus(w.id, 'running', 'system');
+            await service.transitionStatus(w.id, 'failed', 'system');
+            return w;
+          },
+        },
+        {
+          name: 'rejected -> queued',
+          actor: 'team_lead',
+          build: async () => {
+            const w = makeWorkItem({ requestId: 'cov-rejected' });
+            await service.addToPool(w);
+            await service.transitionStatus(w.id, 'running', 'system');
+            await service.transitionStatus(w.id, 'done_by_worker', 'agent');
+            await service.transitionStatus(w.id, 'rejected', REVIEWER_ACTOR);
+            return w;
+          },
+        },
+        {
+          name: 'running -> queued (releaseBack-equivalent)',
+          actor: 'system',
+          build: async () => {
+            const w = makeWorkItem({ requestId: 'cov-running' });
+            await service.addToPool(w);
+            await service.transitionStatus(w.id, 'running', 'system');
+            return w;
+          },
+        },
+      ];
+
+      for (const s of sources) {
+        const w = await s.build();
+        await service.transitionStatus(w.id, 'queued', s.actor);
+        const after = await service.findWorkItem(w.id);
+        expect(after?.status).toBe('queued');
+        expect(after?.completedAt).toBeUndefined();
+      }
+    });
+  });
+
+  describe('cancelReason persistence (2026-05-15)', () => {
+    it('persists the reason when transitioning to cancelled', async () => {
+      const wi = makeWorkItem({ title: 'cancel-reason test', owner: 'orchestrator' });
+      await service.addToPool(wi);
+
+      await service.updateItemStatus(
+        wi.id,
+        'cancelled',
+        'system',
+        'WorkItem has been queued for 61 minutes without pickup',
+      );
+
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.cancelReason).toBe(
+        'WorkItem has been queued for 61 minutes without pickup',
+      );
+    });
+
+    it('leaves cancelReason undefined when caller passes no reason', async () => {
+      const wi = makeWorkItem({ title: 'no-reason cancel', owner: 'orchestrator' });
+      await service.addToPool(wi);
+
+      await service.updateItemStatus(wi.id, 'cancelled', 'system');
+
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.cancelReason).toBeUndefined();
+    });
+
+    it('ignores the reason argument on non-cancel transitions', async () => {
+      const wi = makeWorkItem({ title: 'reason-on-non-cancel', owner: 'orchestrator' });
+      await service.addToPool(wi);
+
+      // running is a valid transition target and is not 'cancelled' —
+      // a reason passed in must NOT spuriously populate cancelReason.
+      await service.updateItemStatus(wi.id, 'running', 'system', 'should be ignored');
+
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.cancelReason).toBeUndefined();
+    });
+
+    // Code-review P0 follow-up (2026-05-15) — transitionStatus is the
+    // path V3 SLA subscriber uses, and was missing reason propagation.
+    it('transitionStatus persists cancelReason when target is cancelled', async () => {
+      const wi = makeWorkItem({ title: 'transitionStatus-cancel-reason', owner: 'orchestrator' });
+      await service.addToPool(wi);
+
+      await service.transitionStatus(
+        wi.id,
+        'cancelled',
+        'system',
+        undefined,
+        'SLA auto-resolved: orc_reply',
+      );
+
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.cancelReason).toBe('SLA auto-resolved: orc_reply');
+    });
+
+    it('transitionStatus mutator can override cancelReason (escape hatch)', async () => {
+      const wi = makeWorkItem({ title: 'mutator-override', owner: 'orchestrator' });
+      await service.addToPool(wi);
+
+      await service.transitionStatus(
+        wi.id,
+        'cancelled',
+        'system',
+        (it) => {
+          it.cancelReason = 'mutator wins';
+        },
+        'default-from-param',
+      );
+
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.cancelReason).toBe('mutator wins');
+    });
+  });
+
+  describe('blockedReason persistence (Steve 2026-05-15)', () => {
+    // Mirrors cancelReason — when a WI transitions to (or is created in)
+    // `blocked`, the human-readable reason should land on the canonical
+    // `blockedReason` field so the UI activity timeline can render
+    // "Blocked: <reason>" instead of an opaque "Blocked" badge.
+
+    it('updateItemStatus persists the reason on blocked transitions', async () => {
+      const wi = makeWorkItem({ owner: 'orchestrator' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      await service.updateItemStatus(
+        wi.id,
+        'blocked',
+        'system',
+        'Agent crewly-product-leo-21a5477e is inactive',
+      );
+
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.status).toBe('blocked');
+      expect(after?.blockedReason).toBe('Agent crewly-product-leo-21a5477e is inactive');
+      // cancelReason must NOT be polluted by a blocked transition
+      expect(after?.cancelReason).toBeUndefined();
+    });
+
+    it('updateItemStatus leaves blockedReason undefined when caller passes no reason', async () => {
+      const wi = makeWorkItem({ owner: 'orchestrator' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+      await service.updateItemStatus(wi.id, 'blocked', 'system');
+
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.blockedReason).toBeUndefined();
+    });
+
+    it('transitionStatus persists blockedReason when target is blocked', async () => {
+      const wi = makeWorkItem({ owner: 'orchestrator' });
+      await service.addToPool(wi);
+      await service.claimFromPool('agent-leo');
+
+      await service.transitionStatus(
+        wi.id,
+        'blocked',
+        'system',
+        undefined,
+        'Waiting on dependency: Plan: foo',
+      );
+
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.blockedReason).toBe('Waiting on dependency: Plan: foo');
+    });
+
+    it('a reason passed on a non-blocked, non-cancel transition is ignored (no field pollution)', async () => {
+      const wi = makeWorkItem({ owner: 'orchestrator' });
+      await service.addToPool(wi);
+      await service.updateItemStatus(wi.id, 'running', 'system', 'this should be ignored');
+
+      const after = await service.findWorkItem(wi.id);
+      expect(after?.blockedReason).toBeUndefined();
+      expect(after?.cancelReason).toBeUndefined();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 2026-09-25 (WI 92327d6d): an explicitly blocked WorkItem stays blocked
+  // -----------------------------------------------------------------------
+
+  describe('explicit block stays blocked across reconciler ticks', () => {
+    const AGENT = 'crewly-team-sam-1';
+
+    /**
+     * A reconciler provider over the REAL pool, shaped like the production
+     * ReconcilerDataProvider: `requeueWorkItem` is a plain
+     * `releaseBack(…, 'reconciler_requeue')` with no guard, so these tests
+     * exercise the rules themselves.
+     */
+    function makeProvider(health: Map<string, AgentHealth>): ReconcilerDataProvider & { wakes: WakeAction[] } {
+      const wakes: WakeAction[] = [];
+      return {
+        wakes,
+        getActiveWorkItems: async () =>
+          (await service.getAllItems()).filter((wi) => !TERMINAL_WORK_ITEM_STATUSES.has(wi.status)),
+        getWorkItemsForRequest: async () => [],
+        getActiveRequests: async () => [],
+        getActiveClaims: () => service.getActiveClaims(),
+        getAgentHealthMap: async () => health,
+        applyCorrection: async (c) => {
+          if (c.entityType === 'work_item') await service.updateItemStatus(c.entityId, c.newState as WorkItemStatus, 'system');
+        },
+        releaseToPool: (id, reason) => service.releaseBack(id, reason),
+        requeueWorkItem: (id) => service.releaseBack(id, 'reconciler_requeue'),
+        markClaimExpiring: (id) => service.markClaimExpiring(id),
+        revokeClaimAndRelease: (id, reason) => service.revokeAndRelease(id, reason),
+        getAvailablePoolItems: async () => (await service.getAllItems()).filter((wi) => wi.status === 'queued'),
+        executeWakeAction: async (action) => {
+          wakes.push(action);
+          return false;
+        },
+      };
+    }
+
+    const activeHealth = (): Map<string, AgentHealth> =>
+      new Map([[AGENT, { sessionName: AGENT, status: 'active', lastSeenAt: new Date().toISOString() }]]);
+
+    async function claimAndBlock(): Promise<string> {
+      const wi = makeWorkItem({ title: 'needs owner input', target: AGENT });
+      await service.addToPool(wi);
+      const claim = await service.claimFromPool(AGENT);
+      expect(claim?.workItem.id).toBe(wi.id);
+      await service.blockItem(wi.id, { agentId: AGENT, reason: 'blocked on Steve' });
+      return wi.id;
+    }
+
+    it('block releases the claim, frees the slot, and records who/why', async () => {
+      const id = await claimAndBlock();
+
+      const wi = (await service.getAllItems()).find((w) => w.id === id)!;
+      expect(wi.status).toBe('blocked');
+      expect(wi.blockSource).toBe(WORK_ITEM_BLOCK_SOURCES.EXPLICIT);
+      expect(wi.blockedReason).toBe('blocked on Steve');
+      expect(wi.metadata?.blockedBy).toBe(AGENT);
+      expect(wi.target).toBe(AGENT);
+      expect((await service.getActiveClaims()).filter((c) => c.workItemId === id)).toHaveLength(0);
+
+      // The slot is free: the agent can claim other work instead of being
+      // handed the blocked item back as `alreadyHeld`.
+      const other = makeWorkItem({ title: 'other work', target: AGENT });
+      await service.addToPool(other);
+      const next = await service.claimFromPool(AGENT);
+      expect(next?.workItem.id).toBe(other.id);
+      expect(next?.alreadyHeld).toBeFalsy();
+    });
+
+    it('block tells the owner-thread sentinel, with the owner thread the work came from (not for ticket work)', async () => {
+      const noteBlocking = jest.fn(async () => 0);
+      setOwnerThreadSentinel({ noteBlocking } as unknown as OwnerThreadSentinelService);
+      try {
+        const wi = makeWorkItem({ title: 'read the PDFs', target: AGENT, metadata: { origin: { kind: 'owner', slackChannelId: 'C1', threadTs: '1.1' } } });
+        await service.addToPool(wi);
+        await service.claimFromPool(AGENT);
+        await service.blockItem(wi.id, { agentId: AGENT, reason: 'awaiting owner browser approval' });
+        expect(noteBlocking).toHaveBeenCalledWith(AGENT, {
+          kind: 'work_blocked',
+          reason: 'awaiting owner browser approval',
+          thread: { slackChannelId: 'C1', threadTs: '1.1' },
+        });
+
+        noteBlocking.mockClear();
+        const ticket = makeWorkItem({ title: 'ticket work', target: AGENT, metadata: { projectTicket: { projectPath: '/p', id: 'CE-1' } } });
+        await service.addToPool(ticket);
+        await service.claimFromPool(AGENT);
+        await service.blockItem(ticket.id, { agentId: AGENT, reason: 'x' });
+        expect(noteBlocking).not.toHaveBeenCalled();
+      } finally {
+        setOwnerThreadSentinel(null);
+      }
+    });
+
+    it('block → reconciler ticks (agent active) → still blocked, not claimable, never woken or redelivered', async () => {
+      const id = await claimAndBlock();
+      const provider = makeProvider(activeHealth());
+      const reconciler = new ReconcilerService(provider);
+
+      for (let tick = 0; tick < 3; tick++) {
+        const result = await reconciler.runFull();
+        expect(result.corrections.filter((c) => c.entityId === id)).toEqual([]);
+      }
+
+      const wi = (await service.getAllItems()).find((w) => w.id === id)!;
+      expect(wi.status).toBe('blocked');
+      expect(wi.releaseCount ?? 0).toBe(0);
+      expect(await service.claimFromPool(AGENT)).toBeNull();
+      expect(provider.wakes.filter((w) => w.workItemId === id)).toEqual([]);
+    });
+
+    it('an explicit block is not undone by resolved dependencies either', async () => {
+      const dep = makeWorkItem({ type: 'cron_run', title: 'dep' });
+      await service.addToPool(dep);
+      await service.claimFromPool('someone-else');
+      await service.completeItem(dep.id, undefined, AGENT_ACTOR);
+
+      const wi = makeWorkItem({ title: 'has deps', target: AGENT, dependsOn: [dep.id] });
+      await service.addToPool(wi);
+      // Deps were already done, so it is claimable.
+      const current = (await service.getAllItems()).find((w) => w.id === wi.id)!;
+      if (current.status === 'blocked') await service.updateItemStatus(wi.id, 'queued', 'system');
+      expect((await service.claimFromPool(AGENT))?.workItem.id).toBe(wi.id);
+      await service.blockItem(wi.id, { agentId: AGENT, reason: 'need creds' });
+
+      await new ReconcilerService(makeProvider(activeHealth())).runFull();
+      expect((await service.getAllItems()).find((w) => w.id === wi.id)!.status).toBe('blocked');
+    });
+
+    it('unblock (release) → queued for the same agent, marker cleared, claimable again', async () => {
+      const id = await claimAndBlock();
+      await service.releaseBack(id, 'unblocked: Steve answered');
+
+      const wi = (await service.getAllItems()).find((w) => w.id === id)!;
+      expect(wi.status).toBe('queued');
+      expect(wi.blockSource).toBeUndefined();
+      expect(typeof wi.metadata?.unblockedAt).toBe('string');
+      expect(wi.target).toBe(AGENT);
+      expect((await service.claimFromPool(AGENT))?.workItem.id).toBe(id);
+    });
+
+    it('control: a SYSTEM block (agent went inactive) is still recovered when the agent returns', async () => {
+      const wi = makeWorkItem({ title: 'in progress', target: AGENT });
+      await service.addToPool(wi);
+      await service.claimFromPool(AGENT);
+      // CE-232: with a live lease a dead-looking agent is not blocked; the
+      // lease has to have run out as well.
+      for (const claim of await service.getActiveClaims()) {
+        await storage.updateClaim(claim.id, (c) => {
+          c.leaseExpiresAt = new Date(Date.now() - 60_000).toISOString();
+        });
+      }
+
+      const inactive = new Map<string, AgentHealth>([[AGENT, { sessionName: AGENT, status: 'inactive' }]]);
+      await new ReconcilerService(makeProvider(inactive)).runFull();
+      let after = (await service.getAllItems()).find((w) => w.id === wi.id)!;
+      expect(after.status).toBe('blocked');
+      expect(after.blockSource).toBeUndefined();
+
+      await new ReconcilerService(makeProvider(activeHealth())).runFull();
+      after = (await service.getAllItems()).find((w) => w.id === wi.id)!;
+      expect(after.status).toBe('queued');
+    });
+
+    it('blocking a non-running item is refused by the state machine', async () => {
+      const wi = makeWorkItem({ title: 'queued only', target: AGENT });
+      await service.addToPool(wi);
+      await expect(service.blockItem(wi.id, { agentId: AGENT })).rejects.toThrow(/Invalid status transition/);
+    });
+
+    // block-task `until`: work that can only proceed at a known time parks
+    // itself and comes back on its own — no holding the item `running`
+    // while waiting, no reporting it done before it is.
+    describe('block with `until`', () => {
+      const find = async (id: string) => (await service.getAllItems()).find((w) => w.id === id)!;
+
+      it('records the time; the reconciler lifts the block once it has passed, back to queued for the same agent', async () => {
+        const wi = makeWorkItem({ title: 'GA4 readout after the window closes', target: AGENT });
+        await service.addToPool(wi);
+        await service.claimFromPool(AGENT);
+        const until = new Date(Date.now() - 1_000).toISOString();
+        await service.blockItem(wi.id, { agentId: AGENT, reason: 'needs the full 7-day window', until });
+
+        let after = await find(wi.id);
+        expect(after.status).toBe('blocked');
+        expect(after.blockSource).toBe(WORK_ITEM_BLOCK_SOURCES.EXPLICIT);
+        expect(after.metadata?.blockedUntil).toBe(until);
+        expect((await service.getActiveClaims()).filter((c) => c.workItemId === wi.id)).toHaveLength(0);
+
+        await new ReconcilerService(makeProvider(activeHealth())).runFull();
+        after = await find(wi.id);
+        expect(after.status).toBe('queued');
+        expect(after.target).toBe(AGENT);
+        expect(after.metadata?.blockedUntil).toBeUndefined();
+        expect((await service.claimFromPool(AGENT))?.workItem.id).toBe(wi.id);
+      });
+
+      it('stays blocked on the tick while the time is still ahead', async () => {
+        const wi = makeWorkItem({ title: 'later', target: AGENT });
+        await service.addToPool(wi);
+        await service.claimFromPool(AGENT);
+        const until = new Date(Date.now() + 60 * 60_000).toISOString();
+        await service.blockItem(wi.id, { agentId: AGENT, reason: 'runs at 08:30Z', until });
+
+        await new ReconcilerService(makeProvider(activeHealth())).runFull();
+        const after = await find(wi.id);
+        expect(after.status).toBe('blocked');
+        expect(after.metadata?.blockedUntil).toBe(until);
+        expect(after.releaseCount ?? 0).toBe(0);
+        expect(await service.claimFromPool(AGENT)).toBeNull();
+      });
+
+      it('a later block without `until` does not inherit the earlier time', async () => {
+        const wi = makeWorkItem({ title: 'twice blocked', target: AGENT });
+        await service.addToPool(wi);
+        await service.claimFromPool(AGENT);
+        await service.blockItem(wi.id, { agentId: AGENT, reason: 'first', until: new Date(Date.now() + 60_000).toISOString() });
+        await service.releaseBack(wi.id, 'unblocked early');
+        expect((await find(wi.id)).metadata?.blockedUntil).toBeUndefined();
+
+        await service.claimFromPool(AGENT);
+        await service.blockItem(wi.id, { agentId: AGENT, reason: 'second, open-ended' });
+        const after = await find(wi.id);
+        expect(after.status).toBe('blocked');
+        expect(after.metadata?.blockedUntil).toBeUndefined();
+        await new ReconcilerService(makeProvider(activeHealth())).runFull();
+        expect((await find(wi.id)).status).toBe('blocked');
+      });
+
+      it('an unparsable `until` is refused before anything changes', async () => {
+        const wi = makeWorkItem({ title: 'bad time', target: AGENT });
+        await service.addToPool(wi);
+        await service.claimFromPool(AGENT);
+        await expect(service.blockItem(wi.id, { agentId: AGENT, reason: 'x', until: 'tomorrow 8:30' })).rejects.toThrow(/Invalid until/);
+        expect((await find(wi.id)).status).toBe('running');
+      });
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 2026-09-29 (WI f34f09b0, ticket CE-19): claim → batch → grace revoke →
+  // complete 409 → re-claim loop
+  // -----------------------------------------------------------------------
+
+  describe('claim/complete loop (WI f34f09b0, CE-19)', () => {
+    const VERA = 'ce-vera-d8f94e9c';
+    const OWEN = 'ce-owen-ad0320ab';
+    const veraActor = { role: 'agent' as const, session: VERA, via: 'POST /task-pool/complete' };
+
+    function makeProvider(health: Map<string, AgentHealth>): ReconcilerDataProvider {
+      return {
+        getActiveWorkItems: async () =>
+          (await service.getAllItems()).filter((wi) => !TERMINAL_WORK_ITEM_STATUSES.has(wi.status)),
+        getWorkItemsForRequest: async () => [],
+        getActiveRequests: async () => [],
+        getActiveClaims: () => service.getActiveClaims(),
+        getAgentHealthMap: async () => health,
+        applyCorrection: async (c) => {
+          if (c.entityType === 'work_item') await service.updateItemStatus(c.entityId, c.newState as WorkItemStatus, 'system');
+        },
+        releaseToPool: (id, reason) => service.releaseBack(id, reason),
+        requeueWorkItem: (id) => service.releaseBack(id, 'reconciler_requeue'),
+        markClaimExpiring: (id) => service.markClaimExpiring(id),
+        revokeClaimAndRelease: (id, reason) => service.revokeAndRelease(id, reason),
+        renewClaim: async (id) => {
+          await service.renewClaim(id);
+        },
+      };
+    }
+
+    /** Vera's session is up; `activeAgoMs` = when she last produced output (undefined = never seen). */
+    const veraHealth = (activeAgoMs?: number): Map<string, AgentHealth> =>
+      new Map([[VERA, {
+        sessionName: VERA,
+        status: 'active',
+        ...(activeAgoMs === undefined ? {} : { lastActivityAt: new Date(Date.now() - activeAgoMs).toISOString() }),
+      }]]);
+
+    const ticketItem = (ticket: string) =>
+      makeWorkItem({
+        title: `ticket ${ticket}`,
+        target: VERA,
+        metadata: { reviewer: OWEN, projectTicket: { projectPath: '/p/ce-core', id: ticket } },
+      });
+
+    /** Pool as it was on 2026-09-29: CE-8, CE-3, CE-19 and a plain item, all for Vera. */
+    async function seed(): Promise<{ ce19: string; others: string[] }> {
+      const items = [ticketItem('CE-8'), ticketItem('CE-3'), ticketItem('CE-19'), makeWorkItem({ title: 'refresh answer', target: VERA })];
+      for (const wi of items) await service.addToPool(wi);
+      return { ce19: items[2].id, others: [items[0].id, items[1].id, items[3].id] };
+    }
+
+    /** Move a claim's lease past expiry + grace (13+ min after the claim). */
+    async function ageLease(workItemId: string): Promise<string> {
+      const claim = (await service.getActiveClaims()).find((c) => c.workItemId === workItemId)!;
+      await storage.updateClaim(claim.id, (c) => {
+        c.leaseExpiresAt = new Date(Date.now() - 200_000).toISOString();
+      });
+      return claim.id;
+    }
+
+    it('reproduces the loop: quiet holder → grace revoke → queued; her own completion now lands and nothing re-claims it', async () => {
+      const { ce19 } = await seed();
+      expect((await service.claimSpecificItem(VERA, ce19))?.workItem.id).toBe(ce19);
+      await ageLease(ce19);
+
+      // No activity seen → the lease runs out → expiring → revoked, as before.
+      const reconciler = new ReconcilerService(makeProvider(veraHealth()));
+      await reconciler.runFast();
+      const second = await reconciler.runFast();
+      expect(second.claimsRevoked).toBe(1);
+      expect((await service.findWorkItem(ce19))?.status).toBe('queued');
+
+      // 23:55 — Vera finishes it and completes. This was a 409.
+      await service.completeItem(ce19, { summary: '485 entry points live (3237ddf)' }, veraActor);
+      const done = await service.findWorkItem(ce19);
+      expect(done?.status).toBe('done_by_worker');
+      expect(typeof done?.metadata?.completedWhileQueuedAt).toBe('string');
+
+      // 23:55:55 — AutoClaim used to re-claim the finished item for idle Vera.
+      expect(await service.claimSpecificItem(VERA, ce19)).toBeNull();
+      expect((await service.getActiveClaims()).filter((c) => c.agentId === VERA)).toHaveLength(0);
+    });
+
+    it('a holder that is visibly working keeps the claim across the old 13-minute limit', async () => {
+      const { ce19 } = await seed();
+      await service.claimSpecificItem(VERA, ce19);
+      const claimId = await ageLease(ce19);
+
+      const reconciler = new ReconcilerService(makeProvider(veraHealth(20_000)));
+      for (let tick = 0; tick < 3; tick++) {
+        const result = await reconciler.runFast();
+        expect(result.claimsRevoked).toBe(0);
+      }
+
+      const claim = await service.getClaimService().getClaimById(claimId);
+      expect(claim?.status).toBe('active');
+      expect(new Date(claim!.leaseExpiresAt).getTime()).toBeGreaterThan(Date.now());
+      expect((await service.findWorkItem(ce19))?.status).toBe('running');
+
+      await service.completeItem(ce19, { summary: 'done' }, veraActor);
+      expect((await service.findWorkItem(ce19))?.status).toBe('done_by_worker');
+      expect((await service.getClaimService().getClaimById(claimId))?.status).toBe('released');
+    });
+
+    describe('CE-232 / CREW-439 — redelivery-failure block must not refuse the worker', () => {
+      const deadVera = (): Map<string, AgentHealth> =>
+        new Map([[VERA, { sessionName: VERA, status: 'inactive' } as AgentHealth]]);
+
+      it('reproduces CE-232: the worker blocks her own running item, then completes it', async () => {
+        const { ce19 } = await seed();
+        await service.claimSpecificItem(VERA, ce19);
+        await service.blockItem(ce19, { agentId: VERA, reason: 'waiting on Owen' });
+        expect((await service.findWorkItem(ce19))?.status).toBe('blocked');
+
+        await service.completeItem(ce19, { summary: 'done anyway' }, veraActor);
+        const done = await service.findWorkItem(ce19);
+        expect(done?.status).toBe('done_by_worker');
+        expect(typeof done?.metadata?.completedWhileBlockedAt).toBe('string');
+      });
+
+      it('finishing a timed block early drops its until (CE-316 kept blockedUntil after verified)', async () => {
+        const { ce19 } = await seed();
+        await service.claimSpecificItem(VERA, ce19);
+        const until = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+        await service.blockItem(ce19, { agentId: VERA, reason: 'readout window', until });
+        expect((await service.findWorkItem(ce19))?.metadata?.blockedUntil).toBe(until);
+
+        await service.completeItem(ce19, { summary: 'readout sent early' }, veraActor);
+        const done = await service.findWorkItem(ce19);
+        expect(done?.status).toBe('done_by_worker');
+        expect(done?.metadata?.blockedUntil).toBeUndefined();
+        expect(typeof done?.metadata?.completedWhileBlockedAt).toBe('string');
+      });
+
+      it('a failed wake / dead-looking agent with a live claim lease does not flip the item to blocked', async () => {
+        const { ce19 } = await seed();
+        await service.claimSpecificItem(VERA, ce19);
+        const reconciler = new ReconcilerService(makeProvider(deadVera()));
+        await reconciler.runFast();
+        await reconciler.runFull();
+        expect((await service.findWorkItem(ce19))?.status).toBe('running');
+      });
+
+      it('a non-owner still cannot complete a blocked item', async () => {
+        const { ce19 } = await seed();
+        await service.claimSpecificItem(VERA, ce19);
+        await service.blockItem(ce19, { agentId: VERA, reason: 'waiting' });
+        await expect(
+          service.completeItem(ce19, { summary: 'not mine' }, { role: 'agent', session: OWEN, via: 'POST /task-pool/complete' }),
+        ).rejects.toThrow();
+        expect((await service.findWorkItem(ce19))?.status).toBe('blocked');
+      });
+
+      it('a waiting_on_human park is not resumed by a completion', async () => {
+        const { ce19 } = await seed();
+        await service.claimSpecificItem(VERA, ce19);
+        await service.updateItemStatus(ce19, 'blocked', 'system', 'parked', WORK_ITEM_BLOCK_SOURCES.WAITING_ON_HUMAN);
+        expect((await service.findWorkItem(ce19))?.blockSource).toBe(WORK_ITEM_BLOCK_SOURCES.WAITING_ON_HUMAN);
+        await expect(service.completeItem(ce19, { summary: 'x' }, veraActor)).rejects.toThrow();
+        expect((await service.findWorkItem(ce19))?.status).toBe('blocked');
+      });
+
+      it('a dependency-blocked item (never claimed) is not completable by its target', async () => {
+        const wi = makeWorkItem({ title: 'dep', target: VERA, status: 'blocked', dependsOn: ['unfinished-dep'] });
+        await service.addToPool(wi);
+        expect((await service.findWorkItem(wi.id))?.status).toBe('blocked');
+        await expect(service.completeItem(wi.id, { summary: 'x' }, veraActor)).rejects.toThrow();
+      });
+    });
+
+    it('accepts completion of a batched item its target worked without claiming it', async () => {
+      const { ce19, others } = await seed();
+      await service.claimSpecificItem(VERA, ce19);
+      // The batch reminder listed all four; she did CE-8 too while holding CE-19.
+      await service.completeItem(others[0], { summary: 'feed tab step 1' }, veraActor);
+      expect((await service.findWorkItem(others[0]))?.status).toBe('done_by_worker');
+      // Her real claim is untouched.
+      expect((await service.getClaimService().getActiveClaimByAgent(VERA))?.workItemId).toBe(ce19);
+    });
+
+    it('still refuses a completion of Vera\'s queued item from a different agent (409)', async () => {
+      const { ce19 } = await seed();
+      await expect(
+        service.completeItem(ce19, { summary: 'not mine' }, { role: 'agent', session: 'someone-else', via: 'test' }),
+      ).rejects.toThrow(/Invalid status transition/);
+      await expect(
+        service.completeItem(ce19, { summary: 'no identity' }, 'agent'),
+      ).rejects.toThrow(/Invalid status transition/);
+      expect((await service.findWorkItem(ce19))?.status).toBe('queued');
+    });
+
+    it('a broadcast item released after a revoke is completable by its last claimer only', async () => {
+      const wi = makeWorkItem({ title: 'broadcast', metadata: { reviewer: OWEN } });
+      await service.addToPool(wi);
+      await service.claimSpecificItem(VERA, wi.id);
+      await ageLease(wi.id);
+      const reconciler = new ReconcilerService(makeProvider(veraHealth()));
+      await reconciler.runFast();
+      await reconciler.runFast();
+      const released = await service.findWorkItem(wi.id);
+      expect(released?.status).toBe('queued');
+      expect(released?.target).toBeUndefined();
+
+      await expect(
+        service.completeItem(wi.id, { summary: 'x' }, { role: 'agent', session: 'someone-else', via: 'test' }),
+      ).rejects.toThrow(/Invalid status transition/);
+      await service.completeItem(wi.id, { summary: 'done' }, veraActor);
+      expect((await service.findWorkItem(wi.id))?.status).toBe('done_by_worker');
+    });
+
+    it('a completion racing a re-claim by the same agent completes the claimed item', async () => {
+      const { ce19 } = await seed();
+      await service.claimSpecificItem(VERA, ce19);
+      await service.completeItem(ce19, { summary: 'done' }, veraActor);
+      expect((await service.findWorkItem(ce19))?.status).toBe('done_by_worker');
+    });
+  });
+});

@@ -1,0 +1,388 @@
+#!/bin/bash
+# =============================================================================
+# Tests for lib.sh — shared skills library
+# Covers: --file preprocessor, read_json_input, require_param, error_exit,
+#         api_call output cap (CREWLY_SKILL_MAX_OUTPUT_BYTES),
+#         CREWLY_API_URL default (#777), agent badge header (#999)
+# =============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PASS=0
+FAIL=0
+TOTAL=0
+
+# Color output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
+assert_eq() {
+  local test_name="$1" expected="$2" actual="$3"
+  TOTAL=$((TOTAL + 1))
+  if [ "$expected" = "$actual" ]; then
+    echo -e "${GREEN}PASS${NC}: $test_name"
+    PASS=$((PASS + 1))
+  else
+    echo -e "${RED}FAIL${NC}: $test_name"
+    echo "  Expected: $expected"
+    echo "  Actual:   $actual"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local test_name="$1" expected_substr="$2" actual="$3"
+  TOTAL=$((TOTAL + 1))
+  if echo "$actual" | grep -q "$expected_substr"; then
+    echo -e "${GREEN}PASS${NC}: $test_name"
+    PASS=$((PASS + 1))
+  else
+    echo -e "${RED}FAIL${NC}: $test_name"
+    echo "  Expected to contain: $expected_substr"
+    echo "  Actual: $actual"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_exit_code() {
+  local test_name="$1" expected_code="$2"
+  shift 2
+  local actual_code=0
+  "$@" >/dev/null 2>&1 || actual_code=$?
+  TOTAL=$((TOTAL + 1))
+  if [ "$expected_code" = "$actual_code" ]; then
+    echo -e "${GREEN}PASS${NC}: $test_name"
+    PASS=$((PASS + 1))
+  else
+    echo -e "${RED}FAIL${NC}: $test_name"
+    echo "  Expected exit code: $expected_code"
+    echo "  Actual exit code:   $actual_code"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# Create a minimal test skill script that sources lib.sh and echoes $1
+TEMP_DIR=$(mktemp -d)
+trap "rm -rf $TEMP_DIR" EXIT
+
+cat > "$TEMP_DIR/test_skill.sh" << 'SKILL_EOF'
+#!/bin/bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Source lib.sh via the real path
+source "$LIB_PATH"
+# Output the first positional parameter (after preprocessor runs)
+echo "$1"
+SKILL_EOF
+chmod +x "$TEMP_DIR/test_skill.sh"
+
+# Also create a test skill that uses read_json_input
+cat > "$TEMP_DIR/test_read_json.sh" << 'SKILL_EOF'
+#!/bin/bash
+set -euo pipefail
+source "$LIB_PATH"
+INPUT=$(read_json_input "${1:-}")
+echo "$INPUT"
+SKILL_EOF
+chmod +x "$TEMP_DIR/test_read_json.sh"
+
+export LIB_PATH="$SCRIPT_DIR/lib.sh"
+# Sourcing lib.sh with CREWLY_SESSION_NAME set fires a real skill-start
+# heartbeat (curl in the background). Point it at a closed port so a test
+# run never writes to a Crewly backend running on this machine — it used to
+# post heartbeats for the fake sessions here to the live :8787.
+export CREWLY_API_URL="http://127.0.0.1:9"
+
+echo "=== lib.sh Test Suite ==="
+echo ""
+
+# ---- Test 1: --file flag reads JSON from file ----
+echo '{"key":"value","text":"hello world"}' > "$TEMP_DIR/input.json"
+RESULT=$(bash "$TEMP_DIR/test_skill.sh" --file "$TEMP_DIR/input.json")
+assert_eq "--file reads JSON from file" '{"key":"value","text":"hello world"}' "$RESULT"
+
+# ---- Test 2: --file with special characters (the whole point!) ----
+printf '%s' '{"summary":"text with '\''quotes'\'' and (parens) and `backticks`"}' > "$TEMP_DIR/special.json"
+RESULT=$(bash "$TEMP_DIR/test_skill.sh" --file "$TEMP_DIR/special.json")
+assert_contains "--file handles single quotes" "quotes" "$RESULT"
+assert_contains "--file handles parentheses" "(parens)" "$RESULT"
+assert_contains "--file handles backticks" "backticks" "$RESULT"
+
+# ---- Test 3: --file with multiline JSON ----
+cat > "$TEMP_DIR/multiline.json" << 'MULTI_EOF'
+{"summary":"line 1\nline 2\nline 3","status":"done"}
+MULTI_EOF
+RESULT=$(bash "$TEMP_DIR/test_skill.sh" --file "$TEMP_DIR/multiline.json")
+assert_contains "--file handles multiline content" "line 1" "$RESULT"
+
+# ---- Test 4: --file with nonexistent file fails ----
+RESULT=$(bash "$TEMP_DIR/test_skill.sh" --file "/tmp/nonexistent_crewly_test_file.json" 2>&1 || true)
+assert_contains "--file with missing file reports error" "File not found" "$RESULT"
+
+# ---- Test 5: Direct JSON argument still works (backward compat) ----
+RESULT=$(bash "$TEMP_DIR/test_skill.sh" '{"key":"direct"}')
+assert_eq "Direct JSON argument works" '{"key":"direct"}' "$RESULT"
+
+# ---- Test 6: read_json_input with --file ----
+echo '{"agentId":"dev-1","content":"test memory"}' > "$TEMP_DIR/read_input.json"
+RESULT=$(bash "$TEMP_DIR/test_read_json.sh" --file "$TEMP_DIR/read_input.json")
+assert_contains "read_json_input with --file" "dev-1" "$RESULT"
+
+# ---- Test 7: read_json_input with @filepath ----
+echo '{"agentId":"dev-2","content":"at-file test"}' > "$TEMP_DIR/at_input.json"
+RESULT=$(bash "$TEMP_DIR/test_read_json.sh" "@$TEMP_DIR/at_input.json")
+assert_contains "read_json_input with @filepath" "dev-2" "$RESULT"
+
+# ---- Test 8: read_json_input with stdin pipe ----
+RESULT=$(echo '{"agentId":"dev-3","content":"stdin test"}' | bash "$TEMP_DIR/test_read_json.sh")
+assert_contains "read_json_input with stdin pipe" "dev-3" "$RESULT"
+
+# ---- Test 9: read_json_input with direct JSON arg ----
+RESULT=$(bash "$TEMP_DIR/test_read_json.sh" '{"agentId":"dev-4"}')
+assert_contains "read_json_input with direct arg" "dev-4" "$RESULT"
+
+# ---- Test 10: --file with Unicode content ----
+printf '%s' '{"text":"Chinese: 你好世界, Japanese: こんにちは"}' > "$TEMP_DIR/unicode.json"
+RESULT=$(bash "$TEMP_DIR/test_skill.sh" --file "$TEMP_DIR/unicode.json")
+assert_contains "--file handles Unicode" "你好世界" "$RESULT"
+
+# ---- Test 11: --file with dollar signs and variables ----
+printf '%s' '{"text":"Price is $100, env is ${HOME}"}' > "$TEMP_DIR/dollar.json"
+RESULT=$(bash "$TEMP_DIR/test_skill.sh" --file "$TEMP_DIR/dollar.json")
+assert_contains "--file preserves dollar signs" '$100' "$RESULT"
+assert_contains "--file preserves \\\${} syntax" '${HOME}' "$RESULT"
+
+# ---- Test 12: --file with newlines in JSON values ----
+printf '%s' '{"text":"line1\nline2\nline3"}' > "$TEMP_DIR/newlines.json"
+RESULT=$(bash "$TEMP_DIR/test_skill.sh" --file "$TEMP_DIR/newlines.json")
+assert_contains "--file preserves escaped newlines" 'line1\\nline2' "$RESULT"
+
+# ---- Test 13: --file with empty JSON ----
+echo '{}' > "$TEMP_DIR/empty.json"
+RESULT=$(bash "$TEMP_DIR/test_read_json.sh" --file "$TEMP_DIR/empty.json")
+assert_eq "--file with empty JSON" '{}' "$RESULT"
+
+# ---- Test 14: --file with heredoc-created file (single quotes in JSON) ----
+# This simulates the exact pattern Gemini CLI agents now use:
+#   cat > /tmp/file << 'CREWLY_EOF'
+#   {"summary":"it's working — don't worry"}
+#   CREWLY_EOF
+cat > "$TEMP_DIR/heredoc_single_quotes.json" << 'CREWLY_EOF'
+{"summary":"it's working — don't worry about 'edge cases'"}
+CREWLY_EOF
+RESULT=$(bash "$TEMP_DIR/test_skill.sh" --file "$TEMP_DIR/heredoc_single_quotes.json")
+assert_contains "heredoc with single quotes" "it's working" "$RESULT"
+assert_contains "heredoc with multiple single quotes" "edge cases" "$RESULT"
+
+# ---- Test 15: --file with heredoc-created file (backticks and $vars) ----
+cat > "$TEMP_DIR/heredoc_special.json" << 'CREWLY_EOF'
+{"text":"Use `jq` to parse $HOME and $(whoami) safely"}
+CREWLY_EOF
+RESULT=$(bash "$TEMP_DIR/test_skill.sh" --file "$TEMP_DIR/heredoc_special.json")
+assert_contains "heredoc preserves backticks" '`jq`' "$RESULT"
+assert_contains "heredoc preserves \$HOME" '$HOME' "$RESULT"
+assert_contains "heredoc preserves \$()" '$(whoami)' "$RESULT"
+
+# ---- Test 16: --file with heredoc-created file (mixed quotes) ----
+cat > "$TEMP_DIR/heredoc_mixed.json" << 'CREWLY_EOF'
+{"text":"He said \"it's fine\" and she said 'OK'"}
+CREWLY_EOF
+RESULT=$(bash "$TEMP_DIR/test_skill.sh" --file "$TEMP_DIR/heredoc_mixed.json")
+assert_contains "heredoc handles mixed quotes" "it's fine" "$RESULT"
+
+# =============================================================================
+# api_call output cap (CREWLY_SKILL_MAX_OUTPUT_BYTES)
+# curl is mocked with a shell function that returns $MOCK_BODY + "\n200".
+# =============================================================================
+mkdir -p "$TEMP_DIR/skills/fake-skill"
+cat > "$TEMP_DIR/skills/fake-skill/execute.sh" << 'SKILL_EOF'
+#!/bin/bash
+set -euo pipefail
+source "$LIB_PATH"
+# Mock curl: emit the canned body followed by the http code line, like
+# `curl -w '\n%{http_code}'` does.
+curl() {
+  printf '%s\n%s' "$MOCK_BODY" "${MOCK_CODE:-200}"
+}
+api_call GET "/anything"
+SKILL_EOF
+chmod +x "$TEMP_DIR/skills/fake-skill/execute.sh"
+
+export CREWLY_HOME="$TEMP_DIR/crewly-home"
+CAP_DIR="$CREWLY_HOME/tmp/skill-output"
+
+# ---- Test 17: small body passes through untouched ----
+export MOCK_BODY='{"ok":true,"items":[1,2,3]}'
+RESULT=$(CREWLY_SKILL_MAX_OUTPUT_BYTES=100 bash "$TEMP_DIR/skills/fake-skill/execute.sh")
+assert_eq "api_call: body under cap passes through" '{"ok":true,"items":[1,2,3]}' "$RESULT"
+
+# ---- Test 17b: a missing CREWLY_SESSION_NAME is reported on stderr, not silent ----
+export MOCK_BODY='{"ok":true}'
+STDERR_OUT=$(CREWLY_SESSION_NAME= bash "$TEMP_DIR/skills/fake-skill/execute.sh" 2>&1 >/dev/null)
+assert_contains "api_call: warns when CREWLY_SESSION_NAME is unset" "CREWLY_SESSION_NAME is not set" "$STDERR_OUT"
+STDERR_OUT=$(CREWLY_SESSION_NAME=agent-1 bash "$TEMP_DIR/skills/fake-skill/execute.sh" 2>&1 >/dev/null)
+assert_eq "api_call: silent when CREWLY_SESSION_NAME is set" "" "$STDERR_OUT"
+
+# ---- Test 18: oversized body becomes a valid JSON envelope ----
+BIG=$(jq -nc '{ok:true, rows:[range(0;400)|{id:., text:"row-\(.)-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}]}')
+export MOCK_BODY="$BIG"
+RESULT=$(CREWLY_SKILL_MAX_OUTPUT_BYTES=1000 bash "$TEMP_DIR/skills/fake-skill/execute.sh")
+assert_eq "api_call: oversized body -> truncated=true" "true" "$(printf '%s' "$RESULT" | jq -r '.truncated')"
+assert_eq "api_call: envelope bytes == real byte count" "$(printf '%s' "$BIG" | LC_ALL=C wc -c | tr -d ' ')" "$(printf '%s' "$RESULT" | jq -r '.bytes')"
+assert_contains "api_call: envelope hint present" "pass --full or read the file" "$(printf '%s' "$RESULT" | jq -r '.hint')"
+assert_eq "api_call: envelope is a single line (tail -n 1 safe)" "1" "$(printf '%s\n' "$RESULT" | wc -l | tr -d ' ')"
+assert_eq "api_call: last line of envelope still parses" "true" "$(printf '%s\n' "$RESULT" | tail -n 1 | jq -r '.truncated')"
+assert_eq "api_call: head is the first 4000 chars" "${BIG:0:4000}" "$(printf '%s' "$RESULT" | jq -r '.head')"
+CAP_FILE=$(printf '%s' "$RESULT" | jq -r '.file')
+assert_contains "api_call: file lands under CREWLY_HOME/tmp/skill-output" "$CAP_DIR/fake-skill-" "$CAP_FILE"
+assert_eq "api_call: parked file holds the full body" "$BIG" "$(cat "$CAP_FILE")"
+
+# ---- Test 19: --full bypasses the cap (flag is detected at source time) ----
+RESULT=$(CREWLY_SKILL_MAX_OUTPUT_BYTES=1000 bash "$TEMP_DIR/skills/fake-skill/execute.sh" --full)
+assert_eq "api_call: --full returns the raw body" "$BIG" "$RESULT"
+
+# ---- Test 20: CREWLY_SKILL_FULL_OUTPUT=1 bypasses the cap ----
+RESULT=$(CREWLY_SKILL_MAX_OUTPUT_BYTES=1000 CREWLY_SKILL_FULL_OUTPUT=1 bash "$TEMP_DIR/skills/fake-skill/execute.sh")
+assert_eq "api_call: CREWLY_SKILL_FULL_OUTPUT=1 returns the raw body" "$BIG" "$RESULT"
+
+# ---- Test 21: cap of 0 disables truncation ----
+RESULT=$(CREWLY_SKILL_MAX_OUTPUT_BYTES=0 bash "$TEMP_DIR/skills/fake-skill/execute.sh")
+assert_eq "api_call: CREWLY_SKILL_MAX_OUTPUT_BYTES=0 disables the cap" "$BIG" "$RESULT"
+
+# ---- Test 22: parked files older than the TTL are pruned at the start of any api_call ----
+mkdir -p "$CAP_DIR"
+touch -t 202001010000 "$CAP_DIR/old-skill-stale.json"
+touch "$CAP_DIR/fresh-skill-recent.json"
+export MOCK_BODY='{"ok":true}'
+RESULT=$(CREWLY_SKILL_MAX_OUTPUT_BYTES=1000 bash "$TEMP_DIR/skills/fake-skill/execute.sh")
+assert_eq "api_call: prune runs even when the body is small" '{"ok":true}' "$RESULT"
+assert_eq "api_call: stale parked output is deleted" "missing" "$([ -f "$CAP_DIR/old-skill-stale.json" ] && echo present || echo missing)"
+assert_eq "api_call: fresh parked output is kept" "present" "$([ -f "$CAP_DIR/fresh-skill-recent.json" ] && echo present || echo missing)"
+
+# =============================================================================
+# api_call_full — callers that reduce the body themselves must see all of it
+# (2026-09-21: list-my-followups saw 0 of 335 triggers via the envelope).
+# =============================================================================
+mkdir -p "$TEMP_DIR/skills/fake-full"
+cat > "$TEMP_DIR/skills/fake-full/execute.sh" << 'SKILL_EOF'
+#!/bin/bash
+set -euo pipefail
+source "$LIB_PATH"
+curl() {
+  printf '%s\n%s' "$MOCK_BODY" "${MOCK_CODE:-200}"
+}
+# MOCK_ENVELOPE, when set, swaps api_call for a double that always hands back a
+# truncated envelope pointing at that path — what an api_call that ignored the
+# bypass (or a future cap path) would do.
+if [ -n "${MOCK_ENVELOPE:-}" ]; then
+  api_call() { printf '{"truncated":true,"bytes":9,"file":"%s","head":"","hint":"x"}' "$MOCK_ENVELOPE"; }
+fi
+api_call_full GET "/anything"
+SKILL_EOF
+chmod +x "$TEMP_DIR/skills/fake-full/execute.sh"
+
+# ---- Test 24: an oversized body comes back whole, and nothing is parked ----
+export MOCK_BODY="$BIG"; unset MOCK_ENVELOPE MOCK_CODE
+RESULT=$(CREWLY_SKILL_MAX_OUTPUT_BYTES=1000 bash "$TEMP_DIR/skills/fake-full/execute.sh")
+assert_eq "api_call_full: oversized body returned whole" "$BIG" "$RESULT"
+assert_eq "api_call_full: nothing parked on disk" "0" "$(find "$CAP_DIR" -name 'fake-full-*' 2>/dev/null | wc -l | tr -d ' ')"
+
+# ---- Test 25: an envelope that still arrives is resolved from its parked file ----
+printf '%s' '{"data":[1,2,3]}' > "$TEMP_DIR/parked.json"
+RESULT=$(MOCK_ENVELOPE="$TEMP_DIR/parked.json" bash "$TEMP_DIR/skills/fake-full/execute.sh")
+assert_eq "api_call_full: envelope resolved from its parked file" '{"data":[1,2,3]}' "$RESULT"
+
+# ---- Test 26: an envelope whose parked file is unreadable fails loudly ----
+FULL_CODE=0
+RESULT=$(MOCK_ENVELOPE="$TEMP_DIR/missing.json" bash "$TEMP_DIR/skills/fake-full/execute.sh" 2>&1) || FULL_CODE=$?
+assert_eq "api_call_full: unreadable parked file -> exit 1" "1" "$FULL_CODE"
+assert_contains "api_call_full: the error names the truncation" '"truncated":true' "$RESULT"
+assert_eq "api_call_full: no body on stdout for the caller to mistake for empty" "" \
+  "$(MOCK_ENVELOPE="$TEMP_DIR/missing.json" bash "$TEMP_DIR/skills/fake-full/execute.sh" 2>/dev/null || true)"
+
+# ---- Test 27: HTTP errors still propagate as a non-zero return ----
+export MOCK_BODY='{"error":"nope"}' MOCK_CODE=500; unset MOCK_ENVELOPE
+FULL_CODE=0
+bash "$TEMP_DIR/skills/fake-full/execute.sh" >/dev/null 2>&1 || FULL_CODE=$?
+assert_eq "api_call_full: non-2xx returns 1" "1" "$FULL_CODE"
+unset MOCK_BODY MOCK_CODE
+
+# ---- Test 23: error responses are untouched by the cap ----
+export MOCK_BODY='{"error":"nope"}' MOCK_CODE=500
+RESULT=$(CREWLY_SKILL_MAX_OUTPUT_BYTES=5 bash "$TEMP_DIR/skills/fake-skill/execute.sh" 2>&1 || true)
+assert_contains "api_call: non-2xx still reports the error object" '"status":500' "$RESULT"
+unset MOCK_BODY MOCK_CODE CREWLY_HOME
+
+# ---- Test 24: CREWLY_API_URL default follows the instance's port (#777) ----
+RESULT=$(env -u CREWLY_API_URL WEB_PORT=8797 bash -c 'source "$1"; echo "$CREWLY_API_URL"' _ "$SCRIPT_DIR/lib.sh")
+assert_eq "lib.sh: default API URL uses WEB_PORT" "http://localhost:8797" "$RESULT"
+RESULT=$(env -u CREWLY_API_URL -u WEB_PORT bash -c 'source "$1"; echo "$CREWLY_API_URL"' _ "$SCRIPT_DIR/lib.sh")
+assert_eq "lib.sh: default API URL without WEB_PORT is 8787" "http://localhost:8787" "$RESULT"
+RESULT=$(CREWLY_API_URL=http://localhost:9001 WEB_PORT=8797 bash -c 'source "$1"; echo "$CREWLY_API_URL"' _ "$SCRIPT_DIR/lib.sh")
+assert_eq "lib.sh: CREWLY_API_URL set by the backend wins" "http://localhost:9001" "$RESULT"
+
+# ---- Test 28: api_call sends the agent badge (#999) ----
+mkdir -p "$TEMP_DIR/skills/fake-badge"
+cat > "$TEMP_DIR/skills/fake-badge/execute.sh" << 'SKILL_EOF'
+#!/bin/bash
+set -euo pipefail
+source "$LIB_PATH"
+# Record every argument curl got, one per line, then answer 200.
+curl() {
+  printf '%s\n' "$@" > "$ARGS_OUT"
+  printf '%s\n%s' '{"ok":true}' 200
+}
+api_call POST "/decisions" '{}'
+SKILL_EOF
+chmod +x "$TEMP_DIR/skills/fake-badge/execute.sh"
+export ARGS_OUT="$TEMP_DIR/curl-args.txt"
+CREWLY_SESSION_NAME=dev-1 CREWLY_AGENT_BADGE=cab1.ZGV2LTE.sig bash "$TEMP_DIR/skills/fake-badge/execute.sh" >/dev/null 2>&1
+assert_contains "api_call: sends X-Agent-Badge when the harness set CREWLY_AGENT_BADGE" "X-Agent-Badge: cab1.ZGV2LTE.sig" "$(cat "$ARGS_OUT")"
+assert_contains "api_call: still sends X-Agent-Session" "X-Agent-Session: dev-1" "$(cat "$ARGS_OUT")"
+env -u CREWLY_AGENT_BADGE CREWLY_SESSION_NAME=dev-1 bash "$TEMP_DIR/skills/fake-badge/execute.sh" >/dev/null 2>&1
+assert_eq "api_call: no badge header when there is no badge" "0" "$(grep -c 'X-Agent-Badge' "$ARGS_OUT" || true)"
+
+# ---- Test 29: agent_auth_curl_args for skills that run their own curl ----
+RESULT=$(CREWLY_SESSION_NAME=dev-1 CREWLY_AGENT_BADGE=b1 bash -c 'source "$1"; agent_auth_curl_args' _ "$SCRIPT_DIR/lib.sh" 2>/dev/null)
+assert_eq "agent_auth_curl_args: badge and session as curl args" "$(printf '%s\n' -H 'X-Agent-Badge: b1' -H 'X-Agent-Session: dev-1')" "$RESULT"
+unset ARGS_OUT
+
+# ---- Test 30: api_call from a scheduled command (CREWLY_SCHEDULER_CREDENTIAL) ----
+export ARGS_OUT="$TEMP_DIR/curl-args.txt"
+ERR_OUT="$TEMP_DIR/sched-stderr.txt"
+env -u CREWLY_SESSION_NAME -u CREWLY_AGENT_BADGE CREWLY_SCHEDULER_CREDENTIAL=scheduler.sig CREWLY_SCHEDULER_NAME=crewly-web-release bash "$TEMP_DIR/skills/fake-badge/execute.sh" >/dev/null 2>"$ERR_OUT"
+assert_contains "api_call: a scheduled command sends X-Crewly-Internal" "X-Crewly-Internal: scheduler.sig" "$(cat "$ARGS_OUT")"
+assert_contains "api_call: a scheduled command names itself in X-Crewly-Scheduler" "X-Crewly-Scheduler: crewly-web-release" "$(cat "$ARGS_OUT")"
+assert_eq "api_call: a scheduled command sends no X-Agent-Session" "0" "$(grep -c 'X-Agent-Session' "$ARGS_OUT" || true)"
+assert_eq "api_call: a scheduled command gets no missing-session warning" "0" "$(grep -c 'CREWLY_SESSION_NAME is not set' "$ERR_OUT" || true)"
+env -u CREWLY_SESSION_NAME -u CREWLY_AGENT_BADGE -u CREWLY_SCHEDULER_CREDENTIAL bash "$TEMP_DIR/skills/fake-badge/execute.sh" >/dev/null 2>&1
+assert_eq "api_call: no credential header without CREWLY_SCHEDULER_CREDENTIAL" "0" "$(grep -c 'X-Crewly-Internal' "$ARGS_OUT" || true)"
+CREWLY_SESSION_NAME=dev-1 CREWLY_SCHEDULER_CREDENTIAL=scheduler.sig bash "$TEMP_DIR/skills/fake-badge/execute.sh" >/dev/null 2>&1
+assert_eq "api_call: an agent session wins over a leaked scheduler credential" "0" "$(grep -c 'X-Crewly-Internal' "$ARGS_OUT" || true)"
+unset ARGS_OUT
+
+# ---- Test 31: unknown_arg_exit — the error is the LAST line, one JSON object, exit 2 ----
+UA_OUT=$(bash -c 'source "$1"; unknown_arg_exit app; ' _ "$SCRIPT_DIR/lib.sh" 2>&1 >/dev/null; echo "rc=$?")
+assert_contains "unknown_arg_exit: bare word → nothing sent + quoting hint" "nothing was sent" "$UA_OUT"
+assert_contains "unknown_arg_exit: hint names content-file" "content-file" "$UA_OUT"
+assert_contains "unknown_arg_exit: exit code 2" "rc=2" "$UA_OUT"
+assert_eq "unknown_arg_exit: success:false" "false" "$(printf '%s' "$UA_OUT" | head -1 | jq -r .success)"
+UA_FLAG=$(bash -c 'source "$1"; unknown_arg_exit --bogus' _ "$SCRIPT_DIR/lib.sh" 2>&1 >/dev/null || true)
+assert_eq "unknown_arg_exit: unknown flag → bare message, no quoting hint" "Unknown argument: --bogus" "$(printf '%s' "$UA_FLAG" | jq -r .error)"
+
+# ---- Test 32: reply-channel with a split --content (the 2026-10-12 incident) ----
+RC_OUT=$(CREWLY_SESSION_NAME=t bash "$SCRIPT_DIR/../agent/core/reply-channel/execute.sh" --channel C1 --content 是我理解错了:我问要不要先不用 app 画面 2>&1 | tail -1; echo "rc=${PIPESTATUS[0]}")
+assert_contains "reply-channel split content: LAST line is the JSON error" '"success":false' "$RC_OUT"
+assert_contains "reply-channel split content: says nothing was sent" "nothing was sent" "$RC_OUT"
+RC_RC=$(CREWLY_SESSION_NAME=t bash "$SCRIPT_DIR/../agent/core/reply-channel/execute.sh" --channel C1 --content a b c >/dev/null 2>&1; echo $?)
+assert_eq "reply-channel split content: exit code 2" "2" "$RC_RC"
+AF_RC=$(CREWLY_SESSION_NAME=t bash "$SCRIPT_DIR/../agent/core/attach-file/execute.sh" --channel C1 --path /x --comment a b c 2>&1 | tail -1 || true)
+assert_contains "attach-file split comment: LAST line is the JSON error" '"success":false' "$AF_RC"
+
+echo ""
+echo "=== Results: $PASS/$TOTAL passed, $FAIL failed ==="
+
+if [ "$FAIL" -gt 0 ]; then
+  exit 1
+fi

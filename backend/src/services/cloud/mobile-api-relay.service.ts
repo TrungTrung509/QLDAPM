@@ -1,0 +1,421 @@
+/**
+ * Mobile API Relay — generic REST passthrough over the Cloud relay queue.
+ *
+ * The Cloud relay's chat adapter (`ChatV2RelayAdapter`) services a CLOSED set
+ * of chat RPCs. The mobile app needs more than chat — approvals, escalations,
+ * teams, requests, task-pool, backups — and adding each as a bespoke RPC would
+ * never keep up with the REST surface. Instead this service forwards a SMALL,
+ * ALLOWLISTED subset of the local REST API over the relay:
+ *
+ *   phone →(relay queue)→ `api_request {id, method, path, body}`
+ *     → allowlist check → local HTTP `http://127.0.0.1:<webPort>/api<path>`
+ *     → `api_response {id, status, body}` →(relay queue)→ phone
+ *
+ * Security model: the relay only pairs devices under the SAME cloud account
+ * (sha256 pairing code derived from the JWT sub — see RelayContext/PWA), so the
+ * caller is the account owner. The allowlist below still constrains the surface
+ * to read endpoints + a few explicitly-safe mutations (approve/resolve/send),
+ * so a compromised phone session cannot, e.g., rewrite settings or run skills.
+ *
+ * @module services/cloud/mobile-api-relay.service
+ */
+
+import { TICKET_CONSTANTS } from '../../constants.js';
+import { LoggerService, type ComponentLogger } from '../core/logger.service.js';
+import { API_SECURITY_CONSTANTS } from '../../../../config/constants.js';
+import { getApiToken } from '../core/api-token.service.js';
+import { internalCredentialHeaders } from '../core/owner-auth.service.js';
+import { HARNESS_IDS } from '../harness/harness.types.js';
+
+// ---------------------------------------------------------------------------
+// Wire types
+// ---------------------------------------------------------------------------
+
+/** Inbound request payload (mirrors the chat_request envelope shape). */
+export interface ApiRequestPayload {
+  id: string;
+  method: 'GET' | 'POST';
+  /** Path under `/api`, e.g. `/escalations` or `/task-pool/items`. */
+  path: string;
+  body?: unknown;
+}
+
+/** Outbound response payload. */
+export interface ApiResponsePayload {
+  id: string;
+  status: number;
+  body: unknown;
+}
+
+/** Minimal cloud-sync surface (mirrors ChatV2RelayAdapter's ICloudSyncLike). */
+export interface IMobileRelayCloudSync {
+  on(event: 'message', handler: (msg: MobileRelayIncomingMessage) => void): void;
+  off(event: 'message', handler: (msg: MobileRelayIncomingMessage) => void): void;
+  sendMessage(toDeviceId: string, type: string, payload: unknown): Promise<unknown>;
+  /**
+   * Reply straight to a relay queue id. The portal is not a registered
+   * device — it stamps its queue id into `fromDeviceName` — so a reply by
+   * device id would fail with "Device not found".
+   */
+  sendToPeerQueueId?(peerQueueId: string, type: string, payload: unknown): Promise<unknown>;
+}
+
+/** Minimal incoming-message shape from CloudSyncService. */
+export interface MobileRelayIncomingMessage {
+  type: string;
+  payload: unknown;
+  from?: string;
+  fromDeviceName?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Allowlist
+// ---------------------------------------------------------------------------
+
+/**
+ * Allowed `method path-prefix` pairs. A request passes when its method matches
+ * and its path starts with one of the prefixes for that method — and, when an
+ * entry has a `suffix`, also ends with it (for a route with an id in the
+ * middle, e.g. `POST /templates/:id/deploy`). An `exact` entry matches only
+ * that path. Keep this tight: reads broadly, mutations only where the mobile
+ * UX needs them.
+ */
+export const MOBILE_API_ALLOWLIST: ReadonlyArray<{ method: 'GET' | 'POST'; prefix: string; suffix?: string; exact?: boolean }> = [
+  // Reads — status surfaces.
+  { method: 'GET', prefix: '/teams' },
+  { method: 'GET', prefix: '/requests' },
+  { method: 'GET', prefix: '/tickets' },
+  { method: 'GET', prefix: '/task-pool' },
+  { method: 'GET', prefix: '/escalations' },
+  { method: 'GET', prefix: '/approvals' },
+  { method: 'GET', prefix: '/health' },
+  { method: 'GET', prefix: '/cloud/status' },
+  { method: 'GET', prefix: '/cloud/devices' },
+  { method: 'GET', prefix: '/team-health' },
+  { method: 'GET', prefix: '/projects' },   // list + /:id + /:id/status|stats
+  { method: 'GET', prefix: '/wiki/' },      // vaults/tree/page/search reads
+  { method: 'GET', prefix: '/chat/' },      // LAN-parity chat reads (messages incl. ?cursor=)
+  // An agent's merged timeline across surfaces (specs/unified-conversations-cloud-store.md
+  // §A.5). Already under `/chat/`; listed on its own so narrowing that entry
+  // never drops the portal's timeline during the Cloud-store rollout.
+  { method: 'GET', prefix: '/chat/agents/' },
+  // Slack team channels — the portal manages them for an instance the
+  // owner is not sitting at (create/link a channel, see status, agent bots).
+  { method: 'GET', prefix: '/slack/team-channels' },
+  { method: 'GET', prefix: '/slack/cloud/status' },
+  { method: 'GET', prefix: '/slack/agent-identities' },
+  { method: 'POST', prefix: '/slack/team-channels' },  // create or link
+  { method: 'POST', prefix: '/slack/cloud/agents/sync' },
+  // Live browser view. Reads let an owner who is not at this machine see
+  // what an agent is doing in a browser; the writes under /browser/sessions
+  // are the owner-side controls only — stop, take the wheel, give it back,
+  // answer a held action, and `/browser/sessions/:id/input` (the owner's own
+  // taps and typing, accepted only while the owner has taken the wheel). The
+  // agent driving endpoints (/browser/navigate, /browser/click, …) are
+  // deliberately NOT here: those are how an agent acts, and nothing on the
+  // internet should be able to act as one.
+  { method: 'GET', prefix: '/browser/sessions' },
+  { method: 'POST', prefix: '/browser/sessions' },
+  // "Back up now" from the portal: start a cloud backup of this machine and
+  // watch it finish. Restoring is left to the machine itself — overwriting a
+  // workspace should need someone at it.
+  { method: 'GET', prefix: '/backup/push' },
+  { method: 'POST', prefix: '/backup/push' },
+  // Desktop control, deliberately lopsided. Seeing what a machine is doing
+  // and being able to stop it are exactly what an owner who is not sitting
+  // at it needs, and neither can do harm. Driving the mouse is left off:
+  // `/desktop/act` moves a real keyboard on a real Mac, and that should not
+  // be reachable from the internet just because the phone app can reach
+  // everything else here (2026-09-20).
+  { method: 'GET', prefix: '/desktop/status' },
+  // The owner's live view and hands on this machine. Both refuse unless
+  // remote control was switched on AT the machine (PUT /desktop/remote,
+  // loopback only, and deliberately not listed here).
+  { method: 'GET', prefix: '/desktop/remote' },
+  { method: 'POST', prefix: '/desktop/remote/frame' },
+  { method: 'POST', prefix: '/desktop/remote/input' },
+  // Load the extension build on disk, so an update applies from the phone.
+  { method: 'POST', prefix: '/browser/extension/reload' },
+  { method: 'POST', prefix: '/desktop/look' },
+  { method: 'POST', prefix: '/desktop/stop' },
+  // Mutations — human-in-the-loop actions only.
+  { method: 'POST', prefix: '/escalations/' }, // …/:id/resolve
+  { method: 'POST', prefix: '/approvals/' },   // …/:id/approve|reject
+  { method: 'POST', prefix: '/tickets/' },     // …/:id/dismiss|verify|reject|acceptance|update|self-check
+  // Project tickets (specs/2026-09-28-project-tickets.md): the project's own
+  // backlog. Reads, plus create / update / transition / assign / log from the
+  // portal. The v1 migration lives on `/project-tickets-migrate/` on purpose
+  // so it stays machine-only. Note `/project-tickets/` (with the slash) —
+  // `/project-tickets-migrate` must not match the POST prefix.
+  { method: 'GET', prefix: '/project-tickets' },
+  { method: 'POST', prefix: '/project-tickets/' },
+  // WhatsApp reply drafts: the owner reviews and sends / discards from the
+  // phone or portal (reading the inbox itself stays on the machine).
+  { method: 'GET', prefix: '/whatsapp/drafts' },
+  { method: 'POST', prefix: '/whatsapp/drafts/' },
+  // Harness setup (specs/onboarding-harness-login.md): the owner is usually not
+  // at the machine, so the phone / portal drives install, the orc choice and
+  // the login broker (read the URL / code, type Claude's code back, cancel).
+  // `POST /harness/orc` is the relay twin of `PUT /harness/orc`.
+  // Deliberately NOT here: `POST /harness/:id/api-key` — an API key would sit
+  // in the Cloud relay queue; keys are entered on the machine or the LAN dashboard.
+  { method: 'GET', prefix: '/harness' },
+  { method: 'POST', prefix: '/harness/orc' },
+  { method: 'POST', prefix: '/harness/login/' }, // …/:sessionId/input|cancel
+  ...HARNESS_IDS.flatMap((id) => [
+    { method: 'POST' as const, prefix: `/harness/${id}/install` },
+    { method: 'POST' as const, prefix: `/harness/${id}/login` },
+  ]),
+  // First-run checklist (onboarding Phase 3): the phone / portal reads the
+  // steps and drives the owner's choices — starter team, first task, hiding
+  // the card. The Cloud Portal's onboarding *sessions* under the same prefix
+  // are deliberately not here. Cloud sign-in needs no route: a phone on the
+  // relay is already signed in to Cloud.
+  { method: 'GET', prefix: '/onboarding/checklist' },
+  { method: 'GET', prefix: '/onboarding/starters' },
+  { method: 'POST', prefix: '/onboarding/checklist/dismiss' },
+  { method: 'POST', prefix: '/onboarding/starter-team' },
+  { method: 'POST', prefix: '/onboarding/first-task' },
+  // Device-code Cloud pairing (owner-only routes): show the link + code and
+  // watch it connect. It carries no credential either way — the owner
+  // approves on crewlyai.com and the tokens go Cloud → this machine. Useful
+  // from a phone paired to this machine over the LAN when it is signed out of
+  // Cloud, or to re-pair it under another account.
+  { method: 'GET', prefix: '/cloud/device/status' },
+  { method: 'POST', prefix: '/cloud/device/start' },
+  { method: 'POST', prefix: '/cloud/device/cancel' },
+  // Solution bundles (specs/solution-bundles.md): the owner picks a bundle,
+  // answers its questions and deploys it from the phone, then watches the
+  // job. `GET /bundles` covers the list, the detail and `/bundles/apply/:jobId`.
+  { method: 'GET', prefix: '/bundles' },
+  { method: 'POST', prefix: '/bundles/apply' },
+  // Cloud Portal Marketplace (crewly-web#146). Team Templates: the plain
+  // (non-bundle) templates on this machine, and deploying one as a team.
+  // Skills: the catalogue with this machine's installed state, install (a
+  // background job with OS setup) and remove. All owner actions; the relay
+  // carries only the Cloud-authenticated owner's calls.
+  { method: 'GET', prefix: '/templates' },
+  { method: 'POST', prefix: '/templates/', suffix: '/deploy' },
+  { method: 'GET', prefix: '/skill-setup/catalog' },
+  { method: 'GET', prefix: '/skill-setup/jobs/' },
+  { method: 'POST', prefix: '/skill-setup/install' },
+  { method: 'POST', prefix: '/skill-setup/uninstall' },
+  // Marketplace app templates (specs/2026-10-08-app-templates.md): the owner
+  // taps "Use this template" in the portal and picks this machine; it makes
+  // the app (the orchestrator looks after it) and tells the orchestrator.
+  { method: 'POST', prefix: '/apps/templates/', suffix: '/use' },
+  // Owner Upgrade / Restart (specs/2026-10-01-upgrade-restart-controls.md):
+  // the owner is rarely at the machine. Both actions are graceful (agents
+  // finish their turn), always come back, and refuse agent sessions; the
+  // relay carries only the Cloud-authenticated owner's calls.
+  { method: 'GET', prefix: '/system/update-status' },
+  { method: 'POST', prefix: '/system/upgrade' },
+  { method: 'POST', prefix: '/system/restart' },
+  // Talk voice (#1074): the portal records a short clip and this machine
+  // transcribes it with whisper.cpp; the text goes back to the phone for the
+  // owner to check before anything is sent. Owner-only routes; audio is
+  // never logged or kept. `/setup` installs the engine (transcribe-audio).
+  { method: 'GET', prefix: '/talk/transcribe/status' },
+  { method: 'POST', prefix: '/talk/transcribe' },
+  // Drive mode (specs/2026-10-08-drive-mode.md): the voice briefer reads the
+  // owner's queue and carries out their answers; the phone gets a Gemini Live
+  // token minted here (the API key never leaves the machine). Owner-only
+  // routes; nothing the owner says is logged. Each POST is listed on its own.
+  { method: 'GET', prefix: '/briefing', exact: true },
+  ...['/answer', '/skip', '/later', '/ask'].map((suffix) => ({ method: 'POST' as const, prefix: '/briefing/', suffix })),
+  { method: 'GET', prefix: '/talk/live-token/status', exact: true },
+  { method: 'POST', prefix: '/talk/live-token', exact: true },
+  // Remote MCP servers (Zoho MCP first) from the portal's Integrations page,
+  // for a machine the owner is not at: list (URLs masked), add, test, rename,
+  // remove, each server's own role allowlist, and starting an OAuth sign-in
+  // (`/authorize` returns the phone link). Rename / remove / access use their
+  // POST twins. The agent proxy (`/:id/mcp`) is agents-only and not here. The add body carries the server URL — a secret —
+  // so nothing here logs a body (see `pathForLog`). The connector-wide
+  // `PUT /connectors/access/:id` (Google, Canva, …) is deliberately not here.
+  { method: 'GET', prefix: '/connectors/remote-mcp' },
+  { method: 'GET', prefix: '/connectors/access', exact: true },
+  { method: 'POST', prefix: '/connectors/remote-mcp', exact: true },
+  ...['/test', '/rename', '/remove', '/access', '/authorize'].map((suffix) => ({ method: 'POST' as const, prefix: '/connectors/remote-mcp/', suffix })),
+];
+
+/**
+ * A request path as it may appear in a log line. Connector paths drop their
+ * query string, so a secret pasted into one by mistake never reaches the log.
+ * Bodies are never logged at all.
+ *
+ * @param path - Path under `/api`
+ * @returns The path to log
+ */
+export function pathForLog(path: string): string {
+  return path.startsWith('/connectors') ? path.split('?')[0] : path;
+}
+
+/**
+ * The owner's API token header for relayed calls (empty when no token).
+ *
+ * @returns Header map
+ */
+function ownerTokenHeader(): Record<string, string> {
+  try {
+    const token = getApiToken();
+    return token ? { [API_SECURITY_CONSTANTS.TOKEN_HEADER]: token } : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Check a request against {@link MOBILE_API_ALLOWLIST}. Also rejects path
+ * traversal (`..`), protocol-relative tricks, and non-`/`-rooted paths.
+ *
+ * @param method - HTTP method of the proxied request.
+ * @param path - Path under `/api`.
+ * @returns true when the request may be proxied.
+ */
+export function isAllowedMobileApiCall(method: string, path: string): boolean {
+  if (method !== 'GET' && method !== 'POST') return false;
+  if (!path.startsWith('/') || path.includes('..') || path.startsWith('//')) return false;
+  return MOBILE_API_ALLOWLIST.some(
+    (e) => e.method === method && (e.exact ? path === e.prefix : path.startsWith(e.prefix)) && (e.suffix === undefined || (path.endsWith(e.suffix) && path.length > e.prefix.length + e.suffix.length)),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+/** Constructor options. */
+export interface MobileApiRelayOptions {
+  cloudSync: IMobileRelayCloudSync;
+  /** Local web port the REST API listens on (e.g. 8787). */
+  webPort: number;
+  logger?: ComponentLogger;
+  /** Override fetch for tests. */
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * Listens for `api_request` messages on the relay and proxies allowlisted
+ * calls to the local REST API, replying with `api_response`. Lifecycle
+ * mirrors ChatV2RelayAdapter (start/stop, idempotent).
+ */
+export class MobileApiRelayService {
+  private readonly cloudSync: IMobileRelayCloudSync;
+  private readonly webPort: number;
+  private readonly logger: ComponentLogger;
+  private readonly fetchImpl: typeof fetch;
+  private handler: ((msg: MobileRelayIncomingMessage) => void) | null = null;
+
+  constructor(options: MobileApiRelayOptions) {
+    this.cloudSync = options.cloudSync;
+    this.webPort = options.webPort;
+    this.logger =
+      options.logger ?? LoggerService.getInstance().createComponentLogger('MobileApiRelay');
+    this.fetchImpl = options.fetchImpl ?? fetch;
+  }
+
+  /** Attach the relay listener. Idempotent. */
+  start(): void {
+    if (this.handler) {
+      this.logger.warn('MobileApiRelayService.start called twice — ignoring');
+      return;
+    }
+    this.handler = (msg: MobileRelayIncomingMessage): void => {
+      if (msg.type !== 'api_request') return;
+      void this.handleRequest(msg);
+    };
+    this.cloudSync.on('message', this.handler);
+    this.logger.info('MobileApiRelayService started — mobile app can call allowlisted REST over relay');
+  }
+
+  /** Detach the relay listener. Safe during shutdown. */
+  stop(): void {
+    if (this.handler) {
+      this.cloudSync.off('message', this.handler);
+      this.handler = null;
+    }
+  }
+
+  /**
+   * Validate, proxy, and reply to one `api_request`. Never throws — every
+   * outcome (including allowlist rejection and local fetch failure) is
+   * reported to the caller as an `api_response` so the phone never hangs.
+   *
+   * @param msg - The incoming relay message (payload: {@link ApiRequestPayload}).
+   */
+  private async handleRequest(msg: MobileRelayIncomingMessage): Promise<void> {
+    const fromDevice = msg.from || msg.fromDeviceName || '';
+    const payload = msg.payload as Partial<ApiRequestPayload> | undefined;
+    if (!fromDevice || !payload || typeof payload.id !== 'string') {
+      this.logger.warn('api_request missing sender or id — dropping');
+      return;
+    }
+
+    const reply = async (status: number, body: unknown): Promise<void> => {
+      const response: ApiResponsePayload = { id: payload.id as string, status, body };
+      try {
+        if (!msg.from && msg.fromDeviceName && typeof this.cloudSync.sendToPeerQueueId === 'function') {
+          // Portal: the sender is a queue id, not a device.
+          await this.cloudSync.sendToPeerQueueId(fromDevice, 'api_response', response);
+        } else {
+          await this.cloudSync.sendMessage(fromDevice, 'api_response', response);
+        }
+      } catch (err) {
+        this.logger.warn('Failed to send api_response (phone will retry)', {
+          id: payload.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+
+    const method = String(payload.method ?? '');
+    const path = String(payload.path ?? '');
+    if (!isAllowedMobileApiCall(method, path)) {
+      this.logger.warn('api_request blocked by allowlist', { method, path: pathForLog(path) });
+      await reply(403, { success: false, error: `not allowed: ${method} ${path}` });
+      return;
+    }
+
+    try {
+      const url = `http://127.0.0.1:${this.webPort}/api${path}`;
+      const res = await this.fetchImpl(url, {
+        method,
+        // Marks the call as the phone's, so an owner message it posts is
+        // filed as a `mobile` ticket (specs/ticket-loop.md).
+        // The relay only carries the Cloud-authenticated owner's calls, so it
+        // presents the owner's API token: owner-only actions (sending a
+        // WhatsApp draft) can tell it apart from an agent that merely left
+        // out its session header.
+        headers: {
+          'Content-Type': 'application/json',
+          [TICKET_CONSTANTS.CLIENT_HEADER]: TICKET_CONSTANTS.MOBILE_CLIENT,
+          ...ownerTokenHeader(),
+          // The relay credential (#999): in memory only, so no agent can
+          // present it. It makes the call `relay-owner` without the process
+          // check a raw API token from this machine gets.
+          ...internalCredentialHeaders('relay'),
+        },
+        ...(method === 'POST' && payload.body !== undefined
+          ? { body: JSON.stringify(payload.body) }
+          : {}),
+      });
+      let body: unknown = null;
+      try {
+        body = await res.json();
+      } catch {
+        body = null;
+      }
+      await reply(res.status, body);
+    } catch (err) {
+      this.logger.warn('api_request local proxy failed', {
+        method,
+        path: pathForLog(path),
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await reply(502, {
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}

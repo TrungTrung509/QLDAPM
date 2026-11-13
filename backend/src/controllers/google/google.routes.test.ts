@@ -1,0 +1,80 @@
+/**
+ * Google Workspace Routes Tests
+ *
+ * @module controllers/google/google.routes.test
+ */
+
+import type { Router } from 'express';
+import { createGoogleRouter } from './google.routes.js';
+
+interface Layer {
+  route?: { path: string; methods: Record<string, boolean> };
+}
+
+describe('Google Workspace Routes', () => {
+  let router: Router;
+
+  beforeEach(() => {
+    router = createGoogleRouter();
+  });
+
+  function has(method: string, path: string): boolean {
+    return (router.stack as Layer[]).some((l) => l.route?.path === path && l.route?.methods?.[method]);
+  }
+
+  it('registers every route in the contract', () => {
+    expect(has('get', '/status')).toBe(true);
+    expect(has('get', '/connect-url')).toBe(true);
+    expect(has('delete', '/disconnect')).toBe(true);
+    expect(has('get', '/gmail/search')).toBe(true);
+    expect(has('get', '/gmail/messages/:id')).toBe(true);
+    expect(has('get', '/gmail/messages/:id/attachments/:attachmentId')).toBe(true);
+    expect(has('post', '/gmail/send')).toBe(true);
+    expect(has('get', '/calendar/events')).toBe(true);
+    expect(has('post', '/calendar/events')).toBe(true);
+  });
+
+  it('registers the Drive / Docs / Sheets / Slides routes', () => {
+    for (const [method, path] of [
+      ['get', '/drive/files'], ['get', '/drive/files/:id'], ['get', '/drive/files/:id/content'], ['post', '/drive/files'],
+      ['get', '/docs/:id'], ['post', '/docs'], ['post', '/docs/:id/append'],
+      ['get', '/docs/:id/comments'], ['post', '/docs/:id/comments'],
+      ['post', '/docs/:id/comments/:commentId/replies'], ['post', '/docs/:id/comments/:commentId/resolve'],
+      ['get', '/sheets/:id'], ['get', '/sheets/:id/values'], ['post', '/sheets'], ['post', '/sheets/:id/values'],
+      ['get', '/slides/:id'], ['post', '/slides'],
+    ] as const) {
+      expect(has(method, path)).toBe(true);
+    }
+  });
+
+  it('registers exactly 37 routes', () => {
+    expect((router.stack as Layer[]).filter((l) => l.route)).toHaveLength(37);
+  });
+
+  it('registers POST /sharing ahead of the agent role gate (owner-only, checked in the handler) — issue #968', () => {
+    const stack = router.stack as Array<Layer & { name?: string }>;
+    const sharing = stack.findIndex((l) => l.route?.path === '/sharing' && l.route?.methods?.post);
+    const gate = stack.findIndex((l) => !l.route && l.name === 'connectorAccessGate');
+    expect(sharing).toBeGreaterThan(-1);
+    expect(gate === -1 || sharing < gate).toBe(true);
+  });
+
+  // Asking the owner to authorize is not a Google API call, but it must sit
+  // behind the same connector gate: only an agent allowed to use Google may
+  // post a card that connects the owner's account (2026-09-21).
+  it('puts the authorization card behind the connector gate, like every Google call', () => {
+    const paths = (router.stack as Layer[]).filter((l) => l.route).map((l) => l.route!.path);
+    expect(paths).toContain('/connect-card');
+    // The gate is router-level middleware installed before the routes, so a
+    // new route is covered by construction; assert it is still there.
+    expect((router.stack as Layer[]).some((l) => !l.route)).toBe(true);
+  });
+
+  it('registers the attachment download behind the connector gate, like the other Gmail reads', () => {
+    const stack = router.stack as Array<Layer & { name?: string }>;
+    const gate = stack.findIndex((l) => !l.route && l.name === 'connectorAccessGate');
+    const att = stack.findIndex((l) => l.route?.path === '/gmail/messages/:id/attachments/:attachmentId' && l.route?.methods?.get);
+    expect(gate).toBeGreaterThan(-1);
+    expect(att).toBeGreaterThan(gate);
+  });
+});

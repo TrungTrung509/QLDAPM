@@ -1,0 +1,210 @@
+# Dependencies
+node_modules/
+*/node_modules/
+backend/node_modules/
+frontend/node_modules/
+mcp-server/node_modules/
+cli/node_modules/
+
+# Build outputs
+dist/
+build/
+*/dist/
+*/build/
+frontend/dist/
+backend/dist/
+cli/dist/
+mcp-server/dist/
+
+# TypeScript build outputs
+*.tsbuildinfo
+*.d.ts
+*.d.ts.map
+*.js.map
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+
+# GitHub Workflows (avoid PAT workflow scope requirement)
+.github/workflows/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Eval results (generated, machine-specific)
+eval-results/
+
+# Coverage and test reports
+coverage/
+.nyc_output/
+*.lcov
+test-results/
+playwright-report/
+test-result.xml
+mcp-test-report.json
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+test-mcp-registration.js
+
+# Root-level debug/scratch files
+/screenshot_*
+/kill-*.sh
+/restart-*.sh
+/test-*.sh
+/test.sh
+/record-*.mjs
+/ui-*-screenshots.mjs
+
+# Internal business/competitive analysis docs
+/*-analysis.md
+/*-capability-report.md
+
+# Internal/operational data (not for public repo)
+ops/
+improvement_plans/
+.playwright-mcp/
+.crewly/tmp/
+.crewly/knowledge/*.db
+.crewly/knowledge/*.db-wal
+.crewly/knowledge/*.db-shm
+.crewly/knowledge/.json-archive/
+
+# Cache directories
+.cache/
+.parcel-cache/
+.next/
+.nuxt/
+
+# Misc
+*.tgz
+*.tar.gz
+
+# macOS
+.AppleDouble
+.LSOverride
+
+# Windows
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.fuse_hidden*
+
+# AgentMux specific
+# Add any project-specific ignores here
+# Example: agentmux data directories if they contain sensitive info
+.agentmux/
+
+# Crewly local project data
+.crewly/
+
+# Claude Code local config
+.claude/
+
+# Static assets (built/generated, not for OSS)
+backend/src/static/
+
+# Payment/billing (private, not for OSS)
+backend/src/controllers/payment/
+backend/src/services/payment/
+
+# Deployment configs (private, not for OSS)
+deploy/
+
+# Internal docs (private, not for OSS)
+docs/
+
+# Generated docs (stored in .crewly/docs/)
+docs/blog/
+docs/peer-review/
+docs/roadmap/
+docs/xhs-content/
+docs/remote-agent-prd-*.md
+# secrets/
+
+# Gemini CLI local config
+.gemini/
+
+# Auto-generated MCP config (contains localhost URLs, environment-specific)
+.mcp.json
+
+# Temporary orchestrator decomposition files
+decompose.json
+/tmp/decompose.json
+
+# Prototype and development files
+frontend_prototype/
+
+# Development and documentation files
+specs/
+TODO.md
+
+# 3D Models - Only include optimized *-fixed.glb files and RobotExpressive.glb
+# Exclude original, animated, and intermediate files
+frontend/public/models/**/*-original.glb
+frontend/public/models/**/original.glb
+frontend/public/models/**/model.glb
+frontend/public/models/**/*-animated.glb
+frontend/public/models/**/*.fbx
+frontend/public/models/**/actions/
+frontend/public/models/**/*.py
+frontend/public/models/**/*.sh
+# Exclude any .glb in subdirectories that isn't *-fixed.glb
+frontend/public/models/cow/cow.glb
+
+# Chrome Extension (lives in crewly-projects/chrome-extension/, not here).
+# Both the historical `chrome-extension/` shadow AND the renamed
+# `.OBSOLETE-*` marker dir stay ignored so future contributors can't
+# accidentally edit a stale copy.
+chrome-extension/
+chrome-extension.OBSOLETE-*/
+# Runtime message-queue data (not source)
+queue/
+
+# Crewly project tickets are tracked (specs/2026-09-28-project-tickets.md)
+!.crewly/
+.crewly/*
+!.crewly/tickets/
+!.crewly/tickets/**
+
+# Also ignore node_modules when it is a symlink (a trailing-slash rule only matches directories)
+node_modules
+
+# Python bytecode (skills with Python helpers)
+__pycache__/
+*.pyc

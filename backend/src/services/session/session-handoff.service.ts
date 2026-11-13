@@ -1,0 +1,1211 @@
+/**
+ * Session Handoff Service
+ *
+ * Generates a structured session summary on shutdown and pushes it to agents
+ * on restart. Replaces the old Slack-only pushRecentSlackHistory approach with
+ * a channel-agnostic summary that covers Slack, Google Chat, and Chat UI.
+ *
+ * Summary is stored at ~/.crewly/session-summaries/latest.md and is limited
+ * to 50 lines for prompt-budget friendliness.
+ *
+ * @module services/session/session-handoff.service
+ */
+
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import * as os from 'os';
+import { LoggerService } from '../core/logger.service.js';
+// Issue: SessionHandoff's resume-notification filter previously dynamic-
+// imported the thread-status-queue + isTerminalStatus, with a catch
+// block that silently swallowed any error. When the import / lookup
+// path threw (verified empirically 2026-05-16: the `Filtered terminal
+// threads` log line was missing from the post-restart cycle), terminal-
+// status threads slipped through the filter and orc was prompted to
+// re-reply to already-answered threads.
+//
+// Switch to static imports so module-resolution errors surface at boot
+// (not at first filter-call), and the catch now logs warn-level so any
+// remaining runtime failure is visible.
+import { ThreadStatusQueueService } from '../messaging/thread-status-queue.service.js';
+import { isTerminalStatus } from '../../types/thread-status.types.js';
+import { CREWLY_CONSTANTS, SLACK_THREAD_CONSTANTS, GCHAT_THREAD_CONSTANTS } from '../../constants.js';
+import type { RuntimeType } from '../../constants.js';
+import { RUNTIME_TYPES } from '../../constants.js';
+
+/** Maximum number of lines the summary may contain */
+const MAX_SUMMARY_LINES = 80;
+
+/** Maximum number of pending tasks to include in the summary */
+const MAX_PENDING_TASKS = 10;
+
+/** Maximum age in ms for a thread to be considered for resume notification (24 hours) */
+const RESUME_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** Maximum number of recent user messages to include per thread */
+const MAX_MESSAGES_PER_THREAD = 3;
+
+/** Maximum number of active threads to include in the summary */
+const MAX_ACTIVE_THREADS = 6;
+
+/**
+ * Maximum number of threads rendered into a `[CHAT_RESUME]` notification
+ * (newest first). Observed on a production box: an uncapped resume message
+ * cost ~150k input tokens on every restart. Override with
+ * `CREWLY_CHAT_RESUME_MAX_THREADS`.
+ */
+const RESUME_MAX_THREADS = 5;
+
+/**
+ * Maximum characters rendered per thread block inside `[CHAT_RESUME]`.
+ * Override with `CREWLY_CHAT_RESUME_MAX_CHARS_PER_THREAD`.
+ */
+const RESUME_MAX_CHARS_PER_THREAD = 600;
+
+/** Env var overriding {@link RESUME_MAX_THREADS}. */
+const RESUME_MAX_THREADS_ENV = 'CREWLY_CHAT_RESUME_MAX_THREADS';
+
+/** Env var overriding {@link RESUME_MAX_CHARS_PER_THREAD}. */
+const RESUME_MAX_CHARS_ENV = 'CREWLY_CHAT_RESUME_MAX_CHARS_PER_THREAD';
+
+/** Marker appended to a thread block that was cut at the per-thread cap. */
+const RESUME_TRUNCATION_MARKER = '  … (truncated — open the file for the rest)';
+
+/**
+ * Read a positive-integer override from the environment, falling back to
+ * the compiled default when unset or invalid.
+ *
+ * @param envName - Environment variable name
+ * @param fallback - Default value
+ * @returns The override or the fallback
+ */
+function positiveIntFromEnv(envName: string, fallback: number): number {
+  const raw = process.env[envName];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** Directory name for session summaries under crewly home */
+const SUMMARIES_DIR = 'session-summaries';
+
+/** Summary filename */
+const LATEST_SUMMARY = 'latest.md';
+
+/**
+ * Information about an active conversation thread.
+ */
+export interface ActiveThread {
+  /** Channel type: 'slack', 'gchat', or 'chat-ui' */
+  channelType: 'slack' | 'gchat' | 'chat-ui';
+  /** Channel or space identifier */
+  channelId: string;
+  /** Absolute path to the thread file */
+  filePath: string;
+  /** ISO timestamp of last modification */
+  lastActiveAt: string;
+  /** Last few message summaries */
+  recentMessages: string[];
+}
+
+/**
+ * Information about an active team member (agent).
+ */
+export interface ActiveAgentInfo {
+  /** Agent session name */
+  sessionName: string;
+  /** Agent role */
+  role: string;
+  /** Current working status */
+  workingStatus: string;
+  /** Current task description (if any) */
+  currentTask?: string;
+}
+
+/**
+ * Information about a pending (non-completed) task. Sourced from the V3
+ * task-pool (`pool.json`) — see {@link SessionHandoffService.scanPendingTasks}.
+ *
+ * Historically this was scraped from `.crewly/tasks/delegated/*.md`, but
+ * that path was retired with the V3↔.md bridge deprecation
+ * (`specs/2026-05-06-projecttask-md-deprecation.md`). The shape is preserved
+ * for downstream callers; `filePath` now points at the task-pool JSON file
+ * (a stable per-process location) rather than a per-task .md file.
+ */
+export interface PendingTaskInfo {
+  /** Task title (WorkItem.title) */
+  title: string;
+  /** Agent session name the task is assigned to (WorkItem.target) */
+  assignedTo: string;
+  /** Current WorkItem status — passed through verbatim (e.g. 'queued', 'running') */
+  status: string;
+  /** Priority if available; empty string when WorkItem doesn't carry one */
+  priority: string;
+  /** Stable identifier for the task — currently the WorkItem id */
+  filePath: string;
+}
+
+/**
+ * Full session handoff summary data.
+ */
+export interface HandoffSummary {
+  /** ISO timestamp of summary generation */
+  generatedAt: string;
+  /** Active conversation threads across all channels */
+  activeThreads: ActiveThread[];
+  /** Active agents and their status */
+  activeAgents: ActiveAgentInfo[];
+  /** Pending tasks that have not been completed */
+  pendingTasks: PendingTaskInfo[];
+}
+
+/**
+ * Thread info for the resume notification sent after orchestrator restart.
+ * Covers Slack, Google Chat, and Chat UI channels.
+ */
+export interface ResumeThread {
+  /** Channel type: 'slack', 'gchat', or 'chat-ui' */
+  channelType: 'slack' | 'gchat' | 'chat-ui';
+  /** Channel or space identifier */
+  channelId: string;
+  /** Thread identifier (threadTs for Slack, threadName for GChat, conversationId for Chat UI) */
+  threadId: string;
+  /** Absolute path to the thread file */
+  filePath: string;
+  /** ISO timestamp of last modification */
+  lastActiveAt: string;
+  /** Recent message previews */
+  recentMessages: string[];
+}
+
+/**
+ * @deprecated Use ResumeThread instead. Kept for backward compatibility.
+ */
+export type SlackResumeThread = ResumeThread;
+
+/**
+ * Service to send messages to agents.
+ * Minimal interface to avoid tight coupling with AgentRegistrationService.
+ */
+export interface AgentMessageSender {
+  sendMessageToAgent(session: string, content: string, runtimeType: RuntimeType): Promise<{ success: boolean }>;
+}
+
+/**
+ * Service to read team data.
+ * Minimal interface to avoid tight coupling with StorageService.
+ */
+export interface TeamDataReader {
+  getTeams(): Promise<Array<{
+    members: Array<{
+      sessionName: string;
+      role: string;
+      agentStatus: string;
+      workingStatus: string;
+      currentTickets?: string[];
+    }>;
+  }>>;
+}
+
+/**
+ * Manages generation of session summaries on shutdown and delivery on restart.
+ *
+ * @example
+ * ```typescript
+ * const handoff = SessionHandoffService.getInstance();
+ *
+ * // On shutdown:
+ * await handoff.generateSummary(storageService);
+ *
+ * // On agent registration:
+ * await handoff.pushSessionSummary(agentService, 'crewly-orc');
+ * ```
+ */
+export class SessionHandoffService {
+  private static instance: SessionHandoffService | null = null;
+  private readonly logger = LoggerService.getInstance().createComponentLogger('SessionHandoffService');
+
+  /**
+   * Channels whose threads are NOT the orchestrator's to resume. Slack team
+   * channels belong to their team: pushing their recent threads into the
+   * orchestrator's resume briefing made the orchestrator answer in the
+   * team's channel ("[Orc] 在的…" under a message meant for Think Tank).
+   */
+  private channelFilter: ((channelType: 'slack' | 'gchat', channelId: string) => boolean) | null = null;
+
+  private constructor() {}
+
+  /** Clock, overridable in tests. */
+  now: () => number = () => Date.now();
+
+  /**
+   * Install a predicate that marks channels to leave out of the resume
+   * briefing (true = exclude).
+   *
+   * @param filter - Predicate, or null to clear
+   */
+  setChannelFilter(filter: ((channelType: 'slack' | 'gchat', channelId: string) => boolean) | null): void {
+    this.channelFilter = filter;
+  }
+
+  /**
+   * Gets the singleton instance.
+   *
+   * @returns SessionHandoffService instance
+   */
+  static getInstance(): SessionHandoffService {
+    if (!SessionHandoffService.instance) {
+      SessionHandoffService.instance = new SessionHandoffService();
+    }
+    return SessionHandoffService.instance;
+  }
+
+  /**
+   * Resets the singleton instance (for testing).
+   */
+  static resetInstance(): void {
+    SessionHandoffService.instance = null;
+  }
+
+  /**
+   * Returns the directory path for session summaries.
+   *
+   * @returns Absolute path to ~/.crewly/session-summaries/
+   */
+  getSummariesDir(): string {
+    return path.join(os.homedir(), CREWLY_CONSTANTS.PATHS.CREWLY_HOME, SUMMARIES_DIR);
+  }
+
+  /**
+   * Returns the path to the latest summary file.
+   *
+   * @returns Absolute path to ~/.crewly/session-summaries/latest.md
+   */
+  getLatestSummaryPath(): string {
+    return path.join(this.getSummariesDir(), LATEST_SUMMARY);
+  }
+
+  /**
+   * Scans a thread directory for the most recently modified .md files.
+   * Works for both Slack (~/.crewly/slack-threads/) and GChat (~/.crewly/gchat-threads/).
+   *
+   * @param baseDir - Base directory to scan (e.g., ~/.crewly/slack-threads/)
+   * @param channelType - Type of channel ('slack' or 'gchat')
+   * @param maxThreads - Maximum number of threads to return
+   * @returns Array of ActiveThread info sorted by recency
+   */
+  async scanThreadDirectory(
+    baseDir: string,
+    channelType: 'slack' | 'gchat',
+    maxThreads: number = MAX_ACTIVE_THREADS,
+  ): Promise<ActiveThread[]> {
+    const threads: ActiveThread[] = [];
+
+    try {
+      const entries = await fs.readdir(baseDir).catch(() => [] as string[]);
+
+      // Collect all .md files across subdirectories
+      const candidates: Array<{ filePath: string; channelId: string; mtimeMs: number }> = [];
+
+      for (const entry of entries) {
+        if (entry.endsWith('.json')) continue; // Skip index files
+        if (this.channelFilter?.(channelType, entry)) continue; // a team's channel, not the orchestrator's
+
+        const entryPath = path.join(baseDir, entry);
+        const stat = await fs.stat(entryPath).catch(() => null);
+
+        if (stat?.isDirectory()) {
+          const files = await fs.readdir(entryPath).catch(() => [] as string[]);
+          for (const file of files) {
+            if (!file.endsWith('.md')) continue;
+            const filePath = path.join(entryPath, file);
+            const fileStat = await fs.stat(filePath).catch(() => null);
+            if (fileStat) {
+              candidates.push({ filePath, channelId: entry, mtimeMs: fileStat.mtimeMs });
+            }
+          }
+        }
+      }
+
+      // Sort by modification time (most recent first) and take top N
+      candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+      for (const candidate of candidates.slice(0, maxThreads)) {
+        const recentMessages = await this.extractRecentMessages(candidate.filePath);
+        threads.push({
+          channelType,
+          channelId: candidate.channelId,
+          filePath: candidate.filePath,
+          lastActiveAt: new Date(candidate.mtimeMs).toISOString(),
+          recentMessages,
+        });
+      }
+    } catch (error) {
+      this.logger.debug('Failed to scan thread directory', {
+        baseDir,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    return threads;
+  }
+
+  /**
+   * Scans Chat UI conversation storage for active conversations.
+   *
+   * @param chatDir - Path to chat storage directory (default: ~/.crewly/chat/)
+   * @param maxConversations - Maximum number of conversations to return
+   * @returns Array of ActiveThread info for Chat UI conversations
+   */
+  async scanChatUiConversations(
+    chatDir?: string,
+    maxConversations: number = MAX_ACTIVE_THREADS,
+  ): Promise<ActiveThread[]> {
+    const threads: ActiveThread[] = [];
+    const dir = chatDir || path.join(os.homedir(), CREWLY_CONSTANTS.PATHS.CREWLY_HOME, 'chat');
+
+    try {
+      const files = await fs.readdir(dir).catch(() => [] as string[]);
+      const jsonFiles = files.filter(f => f.endsWith('.json'));
+
+      const candidates: Array<{ filePath: string; id: string; mtimeMs: number }> = [];
+      for (const file of jsonFiles) {
+        const filePath = path.join(dir, file);
+        const stat = await fs.stat(filePath).catch(() => null);
+        if (stat) {
+          candidates.push({ filePath, id: file.replace('.json', ''), mtimeMs: stat.mtimeMs });
+        }
+      }
+
+      candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+      for (const candidate of candidates.slice(0, maxConversations)) {
+        const recentMessages = await this.extractChatUiMessages(candidate.filePath);
+        threads.push({
+          channelType: 'chat-ui',
+          channelId: candidate.id,
+          filePath: candidate.filePath,
+          lastActiveAt: new Date(candidate.mtimeMs).toISOString(),
+          recentMessages,
+        });
+      }
+    } catch (error) {
+      this.logger.debug('Failed to scan Chat UI conversations', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    return threads;
+  }
+
+  /**
+   * Extracts recent message summaries from a markdown thread file.
+   * Reads the last few message blocks (lines starting with **Name**).
+   *
+   * @param filePath - Absolute path to the thread .md file
+   * @returns Array of recent message summary strings
+   */
+  async extractRecentMessages(filePath: string): Promise<string[]> {
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+
+      // Skip frontmatter
+      const frontmatterEnd = content.indexOf('---', content.indexOf('---') + 3);
+      const body = frontmatterEnd > 0 ? content.slice(frontmatterEnd + 3).trim() : content;
+
+      // Extract lines that look like message headers (e.g., "**Steve** (2025-03-16 12:00):")
+      const messagePattern = /^\*\*(.+?)\*\*\s*\(([^)]+)\):\s*$/;
+      const lines = body.split('\n');
+      const messages: string[] = [];
+
+      for (let i = 0; i < lines.length; i++) {
+        const match = lines[i].match(messagePattern);
+        if (match) {
+          const sender = match[1];
+          // Grab the next non-empty line as content preview
+          let preview = '';
+          for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+            const trimmed = lines[j].trim();
+            if (trimmed && !trimmed.startsWith('**')) {
+              preview = trimmed.slice(0, 120);
+              break;
+            }
+          }
+          messages.push(`${sender}: ${preview || '(empty)'}`);
+        }
+      }
+
+      return messages.slice(-MAX_MESSAGES_PER_THREAD);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Extracts recent messages from a Chat UI JSON conversation file.
+   *
+   * @param filePath - Absolute path to the conversation .json file
+   * @returns Array of recent message summary strings
+   */
+  async extractChatUiMessages(filePath: string): Promise<string[]> {
+    try {
+      const raw = await fs.readFile(filePath, 'utf-8');
+      const data = JSON.parse(raw) as {
+        messages?: Array<{
+          content?: string;
+          from?: { name?: string; type?: string };
+        }>;
+      };
+
+      if (!data.messages || data.messages.length === 0) return [];
+
+      return data.messages
+        .slice(-MAX_MESSAGES_PER_THREAD)
+        .map(m => {
+          const sender = m.from?.name || m.from?.type || 'unknown';
+          const content = (m.content || '').slice(0, 120);
+          return `${sender}: ${content || '(empty)'}`;
+        });
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Collects active agent info from team storage.
+   *
+   * @param teamReader - Service to read team data
+   * @returns Array of active agent info
+   */
+  async collectActiveAgents(teamReader: TeamDataReader): Promise<ActiveAgentInfo[]> {
+    const agents: ActiveAgentInfo[] = [];
+
+    try {
+      const teams = await teamReader.getTeams();
+      for (const team of teams) {
+        for (const member of team.members) {
+          if (member.agentStatus === 'active' || member.agentStatus === 'started') {
+            agents.push({
+              sessionName: member.sessionName,
+              role: member.role,
+              workingStatus: member.workingStatus || 'idle',
+              currentTask: member.currentTickets?.[0],
+            });
+          }
+        }
+      }
+    } catch (error) {
+      this.logger.debug('Failed to collect active agents', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    return agents;
+  }
+
+  /**
+   * Returns pending (non-terminal) tasks from the V3 task-pool. Replaces the
+   * legacy `.crewly/tasks/delegated/{open,in_progress}/*.md` filesystem scan
+   * (retired per `specs/2026-05-06-projecttask-md-deprecation.md` —
+   * V3 WorkItem is the sole source of truth for delegated work).
+   *
+   * Selection: any WorkItem in a non-terminal status (`queued`, `scheduled`,
+   * `proposed`, `accepted`, `running`, `blocked`, `escalated`,
+   * `done_by_worker`, `rejected`) — i.e. anything that still demands
+   * attention on a session resume.
+   *
+   * Sort: running-first (workers actively engaged), then high-priority first.
+   *
+   * The legacy `tasksBaseDir` parameter is accepted for backwards compat
+   * with existing test fixtures but is unused — the source is now the
+   * task-pool singleton.
+   *
+   * @param _tasksBaseDir - Ignored. Kept so callers (e.g. session.controller)
+   *                        don't need to be updated in lockstep.
+   * @returns Array of PendingTaskInfo sorted, capped at {@link MAX_PENDING_TASKS}
+   */
+  async scanPendingTasks(_tasksBaseDir?: string): Promise<PendingTaskInfo[]> {
+    let workItems: Array<{
+      id: string;
+      title: string;
+      target?: string;
+      status: string;
+      priority?: string;
+    }>;
+
+    try {
+      // Lazy-import to avoid a hard load-order dependency between session-
+      // handoff and the V3 task-pool boot. Both are singletons; this dynamic
+      // import resolves once and is cached by the module loader.
+      const { TaskPoolService } = await import('../task-pool/task-pool.service.js');
+      workItems = await TaskPoolService.getInstance().getAllItems();
+    } catch (error) {
+      this.logger.debug('Failed to read V3 task-pool for pending tasks', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+
+    const NON_TERMINAL = new Set([
+      'queued',
+      'scheduled',
+      'proposed',
+      'accepted',
+      'running',
+      'blocked',
+      'escalated',
+      'done_by_worker',
+      'rejected',
+    ]);
+
+    const pending: PendingTaskInfo[] = workItems
+      .filter((wi) => NON_TERMINAL.has(wi.status))
+      .map((wi) => {
+        // Truncate long titles to keep the handoff summary readable.
+        let title = wi.title || wi.id;
+        if (title.length > 100) title = title.slice(0, 97) + '...';
+        return {
+          title,
+          assignedTo: wi.target ?? 'unassigned',
+          status: wi.status,
+          priority: (wi.priority ?? '').toLowerCase(),
+          filePath: wi.id,
+        };
+      });
+
+    // Sort: running-first (workers actively engaged), then high-priority.
+    const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+    const statusOrder: Record<string, number> = {
+      running: 0,
+      proposed: 1,
+      accepted: 1,
+      queued: 2,
+      scheduled: 2,
+      done_by_worker: 3,
+      blocked: 4,
+      escalated: 4,
+      rejected: 5,
+    };
+    pending.sort((a, b) => {
+      const statusDiff = (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9);
+      if (statusDiff !== 0) return statusDiff;
+      return (priorityOrder[a.priority] ?? 1) - (priorityOrder[b.priority] ?? 1);
+    });
+
+    return pending.slice(0, MAX_PENDING_TASKS);
+  }
+
+  /**
+   * Generates a full session handoff summary by scanning all thread stores
+   * and collecting active agent status. Saves to ~/.crewly/session-summaries/latest.md.
+   *
+   * @param teamReader - Service to read team data for agent status
+   * @param tasksBaseDir - Override for the tasks base directory (for testing)
+   * @returns The generated summary data
+   */
+  async generateSummary(teamReader: TeamDataReader, tasksBaseDir?: string): Promise<HandoffSummary> {
+    this.logger.info('Generating session handoff summary...');
+
+    const crewlyHome = path.join(os.homedir(), CREWLY_CONSTANTS.PATHS.CREWLY_HOME);
+
+    // Scan all thread stores and pending tasks in parallel
+    const [slackThreads, gchatThreads, chatUiThreads, activeAgents, pendingTasks] = await Promise.all([
+      this.scanThreadDirectory(
+        path.join(crewlyHome, SLACK_THREAD_CONSTANTS.STORAGE_DIR),
+        'slack',
+        3,
+      ),
+      this.scanThreadDirectory(
+        path.join(crewlyHome, GCHAT_THREAD_CONSTANTS.STORAGE_DIR),
+        'gchat',
+        3,
+      ),
+      this.scanChatUiConversations(undefined, 2),
+      this.collectActiveAgents(teamReader),
+      this.scanPendingTasks(tasksBaseDir),
+    ]);
+
+    const allThreads = [...slackThreads, ...gchatThreads, ...chatUiThreads]
+      .sort((a, b) => new Date(b.lastActiveAt).getTime() - new Date(a.lastActiveAt).getTime())
+      .slice(0, MAX_ACTIVE_THREADS);
+
+    const summary: HandoffSummary = {
+      generatedAt: new Date().toISOString(),
+      activeThreads: allThreads,
+      activeAgents,
+      pendingTasks,
+    };
+
+    // Format and save
+    const markdown = this.formatSummaryMarkdown(summary);
+    const summariesDir = this.getSummariesDir();
+    await fs.mkdir(summariesDir, { recursive: true });
+    await fs.writeFile(this.getLatestSummaryPath(), markdown, 'utf-8');
+
+    this.logger.info('Session handoff summary saved', {
+      threadCount: allThreads.length,
+      agentCount: activeAgents.length,
+      pendingTaskCount: pendingTasks.length,
+      path: this.getLatestSummaryPath(),
+    });
+
+    return summary;
+  }
+
+  /**
+   * Formats a HandoffSummary into a markdown string, capped at MAX_SUMMARY_LINES.
+   *
+   * @param summary - The summary data
+   * @returns Markdown string
+   */
+  formatSummaryMarkdown(summary: HandoffSummary): string {
+    const lines: string[] = [];
+
+    lines.push('# Session Handoff Summary');
+    lines.push(`Generated: ${summary.generatedAt}`);
+    lines.push('');
+
+    // Active threads section. Each is marked by who spoke last: a thread
+    // whose last word is the orchestrator's has been answered, and listing
+    // it as "active" made the orchestrator post into it again after every
+    // restart — a status report under a question answered two days before
+    // (2026-09-23).
+    if (summary.activeThreads.length > 0) {
+      lines.push('## Active Conversations');
+      for (const thread of summary.activeThreads) {
+        // Only a recent unanswered message is still waiting. A "hi" from two
+        // days ago or a thread from May is not something to answer now.
+        const recent = Date.parse(summary.generatedAt) - Date.parse(thread.lastActiveAt) <= RESUME_MAX_AGE_MS;
+        const label = !awaitsReply(thread.recentMessages)
+          ? ' — already answered (context only)'
+          : recent
+            ? ' — WAITING FOR A REPLY'
+            : ' — unanswered but old (context only, do not reply now)';
+        lines.push(`### ${thread.channelType.toUpperCase()} — ${thread.channelId}${label}`);
+        lines.push(`- File: \`${thread.filePath}\``);
+        lines.push(`- Last active: ${thread.lastActiveAt}`);
+        if (thread.recentMessages.length > 0) {
+          lines.push('- Recent:');
+          for (const msg of thread.recentMessages) {
+            lines.push(`  - ${msg}`);
+          }
+        }
+        lines.push('');
+      }
+    } else {
+      lines.push('## Active Conversations');
+      lines.push('No active conversations found.');
+      lines.push('');
+    }
+
+    // Active agents section
+    if (summary.activeAgents.length > 0) {
+      lines.push('## Active Agents');
+      for (const agent of summary.activeAgents) {
+        const taskInfo = agent.currentTask ? ` — task: ${agent.currentTask}` : '';
+        lines.push(`- **${agent.sessionName}** (${agent.role}): ${agent.workingStatus}${taskInfo}`);
+      }
+      lines.push('');
+    }
+
+    // Pending tasks section
+    if (summary.pendingTasks && summary.pendingTasks.length > 0) {
+      lines.push('## Pending Tasks');
+      lines.push(`${summary.pendingTasks.length} task(s) require attention after restart:`);
+      lines.push('');
+      for (const task of summary.pendingTasks) {
+        const statusLabel = task.status === 'in_progress' ? '🔄 IN PROGRESS' : '📋 OPEN';
+        lines.push(`- ${statusLabel} [${task.priority}] **${task.title}**`);
+        lines.push(`  - Assigned to: ${task.assignedTo}`);
+        lines.push(`  - File: \`${task.filePath}\``);
+      }
+      lines.push('');
+    }
+
+    // Truncate to max lines
+    return lines.slice(0, MAX_SUMMARY_LINES).join('\n');
+  }
+
+  /**
+   * Pushes the latest session summary to an agent after registration.
+   * Replaces the old pushRecentSlackHistory function.
+   *
+   * Reads ~/.crewly/session-summaries/latest.md and sends it as a
+   * [SESSION_CONTEXT] system message. Only sends if the summary exists
+   * and is non-empty.
+   *
+   * @param agentService - Service to send messages to agents
+   * @param sessionName - Target agent session name
+   */
+  async pushSessionSummary(
+    agentService: AgentMessageSender,
+    sessionName: string,
+  ): Promise<void> {
+    const summaryPath = this.getLatestSummaryPath();
+
+    try {
+      const content = await fs.readFile(summaryPath, 'utf-8');
+      if (!content || content.trim().length === 0) {
+        this.logger.debug('No session summary to push', { sessionName });
+        return;
+      }
+
+      // Labels are re-checked against the clock here: the file was written
+      // at shutdown, possibly by an older Crewly, and a restart can come
+      // long after it.
+      const labelled = relabelStaleWaiting(content, this.now());
+      const message =
+        `[SESSION_CONTEXT] Crewly restarted. Background from the previous session, for continuity only:\n` +
+        `- Do NOT message anyone because of this restart: no status report, no recap, no "I'm back".\n` +
+        `- Reply only in a conversation marked WAITING FOR A REPLY, and only to what was asked there.\n` +
+        `- Everything marked "already answered" or "old" is context. Leave it alone.\n\n` +
+        labelled.trim();
+
+      await agentService.sendMessageToAgent(
+        sessionName,
+        message,
+        RUNTIME_TYPES.CLAUDE_CODE as RuntimeType,
+      );
+
+      this.logger.info('Pushed session summary to agent', {
+        sessionName,
+        summaryLength: content.length,
+      });
+    } catch (error) {
+      this.logger.warn('Failed to push session summary', {
+        sessionName,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Scans a thread directory (Slack or GChat format) for threads modified within maxAge.
+   * Filters by file modification time and returns ResumeThread objects.
+   *
+   * @param baseDir - Directory to scan (e.g., ~/.crewly/slack-threads/)
+   * @param channelType - Channel type ('slack' or 'gchat')
+   * @param cutoffMs - Cutoff timestamp in ms (threads older than this are excluded)
+   * @returns Array of ResumeThread for qualifying threads
+   */
+  private async scanRecentMdThreads(
+    baseDir: string,
+    channelType: 'slack' | 'gchat',
+    cutoffMs: number,
+  ): Promise<ResumeThread[]> {
+    const threads: ResumeThread[] = [];
+
+    try {
+      const entries = await fs.readdir(baseDir).catch(() => [] as string[]);
+
+      for (const entry of entries) {
+        if (entry.endsWith('.json')) continue;
+        if (this.channelFilter?.(channelType, entry)) continue; // a team's channel, not the orchestrator's
+        const channelDir = path.join(baseDir, entry);
+        const stat = await fs.stat(channelDir).catch(() => null);
+        if (!stat?.isDirectory()) continue;
+
+        const files = await fs.readdir(channelDir).catch(() => [] as string[]);
+        for (const file of files) {
+          if (!file.endsWith('.md')) continue;
+          const filePath = path.join(channelDir, file);
+          const fileStat = await fs.stat(filePath).catch(() => null);
+          if (!fileStat || fileStat.mtimeMs < cutoffMs) continue;
+
+          const threadId = file.replace('.md', '');
+          const recentMessages = await this.extractRecentMessages(filePath);
+          threads.push({
+            channelType,
+            channelId: entry,
+            threadId,
+            filePath,
+            lastActiveAt: new Date(fileStat.mtimeMs).toISOString(),
+            recentMessages,
+          });
+        }
+      }
+    } catch (error) {
+      this.logger.debug('Failed to scan recent threads', {
+        baseDir,
+        channelType,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    return threads;
+  }
+
+  /**
+   * Scans Chat UI conversations for those modified within maxAge.
+   *
+   * @param chatDir - Chat UI directory path
+   * @param cutoffMs - Cutoff timestamp in ms
+   * @returns Array of ResumeThread for qualifying conversations
+   */
+  private async scanRecentChatUiThreads(
+    chatDir: string,
+    cutoffMs: number,
+  ): Promise<ResumeThread[]> {
+    const threads: ResumeThread[] = [];
+
+    try {
+      const files = await fs.readdir(chatDir).catch(() => [] as string[]);
+
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue;
+        const filePath = path.join(chatDir, file);
+        const fileStat = await fs.stat(filePath).catch(() => null);
+        if (!fileStat || fileStat.mtimeMs < cutoffMs) continue;
+
+        const conversationId = file.replace('.json', '');
+        const recentMessages = await this.extractChatUiMessages(filePath);
+        threads.push({
+          channelType: 'chat-ui',
+          channelId: conversationId,
+          threadId: conversationId,
+          filePath,
+          lastActiveAt: new Date(fileStat.mtimeMs).toISOString(),
+          recentMessages,
+        });
+      }
+    } catch (error) {
+      this.logger.debug('Failed to scan recent Chat UI conversations', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    return threads;
+  }
+
+  /**
+   * Finds threads across all chat channels (Slack, GChat, Chat UI) that were
+   * active within the specified time window.
+   *
+   * @param maxAge - Maximum age in ms for a thread to qualify (default: 24h)
+   * @param dirOverrides - Optional directory overrides for testing
+   * @returns Array of ResumeThread sorted by most recent first
+   */
+  async findRecentThreads(
+    maxAge: number = RESUME_MAX_AGE_MS,
+    dirOverrides?: { slackDir?: string; gchatDir?: string; chatDir?: string },
+  ): Promise<ResumeThread[]> {
+    const crewlyHome = path.join(os.homedir(), CREWLY_CONSTANTS.PATHS.CREWLY_HOME);
+    const slackDir = dirOverrides?.slackDir || path.join(crewlyHome, SLACK_THREAD_CONSTANTS.STORAGE_DIR);
+    const gchatDir = dirOverrides?.gchatDir || path.join(crewlyHome, GCHAT_THREAD_CONSTANTS.STORAGE_DIR);
+    const chatDir = dirOverrides?.chatDir || path.join(crewlyHome, 'chat');
+    const cutoff = Date.now() - maxAge;
+
+    const [slackThreads, gchatThreads, chatUiThreads] = await Promise.all([
+      this.scanRecentMdThreads(slackDir, 'slack', cutoff),
+      this.scanRecentMdThreads(gchatDir, 'gchat', cutoff),
+      this.scanRecentChatUiThreads(chatDir, cutoff),
+    ]);
+
+    const all = [...slackThreads, ...gchatThreads, ...chatUiThreads];
+    return all.sort((a, b) =>
+      new Date(b.lastActiveAt).getTime() - new Date(a.lastActiveAt).getTime(),
+    );
+  }
+
+  /**
+   * @deprecated Use findRecentThreads() instead. Kept for backward compatibility.
+   * Finds Slack threads that were active within the last 24 hours.
+   *
+   * @param maxAge - Maximum age in ms for a thread to qualify (default: 24h)
+   * @param slackDirOverride - Optional directory override (for testing)
+   * @returns Array of ResumeThread sorted by most recent first (Slack only)
+   */
+  async findRecentSlackThreads(
+    maxAge: number = RESUME_MAX_AGE_MS,
+    slackDirOverride?: string,
+  ): Promise<ResumeThread[]> {
+    // Scan Slack alone. Routing through findRecentThreads() with a made-up
+    // '/nonexistent' directory for the other channels only worked while no
+    // such directory existed: on a machine where it does, its files came back
+    // as chat-ui threads.
+    const crewlyHome = path.join(os.homedir(), CREWLY_CONSTANTS.PATHS.CREWLY_HOME);
+    const slackDir = slackDirOverride || path.join(crewlyHome, SLACK_THREAD_CONSTANTS.STORAGE_DIR);
+    const threads = await this.scanRecentMdThreads(slackDir, 'slack', Date.now() - maxAge);
+    return threads.sort((a, b) =>
+      new Date(b.lastActiveAt).getTime() - new Date(a.lastActiveAt).getTime(),
+    );
+  }
+
+  /**
+   * Pushes a [CHAT_RESUME] notification to the orchestrator after registration,
+   * containing info about recently active threads across all channels (Slack,
+   * GChat, Chat UI) so it can proactively send a greeting message.
+   *
+   * @param agentService - Service to send messages to agents
+   * @param sessionName - Target agent session name (typically the orchestrator)
+   */
+  async pushResumeNotification(
+    agentService: AgentMessageSender,
+    sessionName: string,
+  ): Promise<void> {
+    try {
+      const allThreads = await this.findRecentThreads();
+
+      if (allThreads.length === 0) {
+        this.logger.debug('No recent threads for resume notification', { sessionName });
+        return;
+      }
+
+      // Filter out threads that are already completed in the Thread Status Queue.
+      // This prevents the orchestrator from re-engaging with threads it already
+      // handled before the restart (e.g. email processing, answered questions).
+      let threads = allThreads;
+      try {
+        // Static-imported above so module-resolution errors surface at
+        // boot. The catch below is now a real fail-loud signal, not a
+        // shrug-and-include-all.
+        const tsq = ThreadStatusQueueService.getInstance();
+
+        let closedByTombstone = 0;
+        threads = allThreads.filter(thread => {
+          // Build the threadKey the same way the Slack bridge does
+          const threadKey = `${thread.channelId}:${thread.threadId}`;
+          const entry = tsq.get(threadKey);
+          if (entry && isTerminalStatus(entry.status)) {
+            this.logger.debug('Filtering out terminal thread from resume', {
+              threadKey,
+              status: entry.status,
+            });
+            return false;
+          }
+          // No entry is not "unreplied": cleanup drops terminal entries after
+          // CLEANUP_RETENTION_HOURS, while this scan goes by thread-file
+          // mtime, which can be later (an agent's completion report). A
+          // tombstone says the thread was closed; without one, nothing is
+          // known and the thread is kept (#757).
+          if (!entry && tsq.getTombstone(threadKey)) {
+            this.logger.debug('Filtering out closed thread whose status entry aged out', { threadKey });
+            closedByTombstone++;
+            return false;
+          }
+          // For chat-ui threads: also check by conversationId since chat-ui
+          // files use the conversation ID as the channelId, and the TSQ
+          // entries store the matching sourceConversationItemId.
+          if (thread.channelType === 'chat-ui') {
+            const byConvId = tsq.getByConversationId(thread.channelId);
+            if (byConvId && isTerminalStatus(byConvId.status)) {
+              this.logger.debug('Filtering out terminal chat-ui thread from resume', {
+                channelId: thread.channelId,
+                status: byConvId.status,
+              });
+              return false;
+            }
+            if (!entry && !byConvId && tsq.getTombstoneByConversationId(thread.channelId)) {
+              this.logger.debug('Filtering out closed chat-ui thread whose status entry aged out', {
+                channelId: thread.channelId,
+              });
+              closedByTombstone++;
+              return false;
+            }
+          }
+          return true;
+        });
+
+        if (allThreads.length !== threads.length) {
+          this.logger.info('Filtered terminal threads from resume notification', {
+            total: allThreads.length,
+            kept: threads.length,
+            filtered: allThreads.length - threads.length,
+            closedByTombstone,
+          });
+        }
+      } catch (err) {
+        // Was previously a silent `catch {}` — empirically masked a real
+        // failure (2026-05-16: filter never executed at the 17:07 restart,
+        // and orc was prompted with 5 threads including one already in
+        // replied_completed status, leading to a duplicate file upload).
+        // Now surfaces the error and includes the thread count we
+        // would have filtered against so the next debug pass has a
+        // starting point.
+        this.logger.warn('SessionHandoff resume-notification filter threw — including all threads (potential duplicate-reply risk)', {
+          sessionName,
+          allThreadsCount: allThreads.length,
+          error: err instanceof Error ? err.message : String(err),
+          stack: err instanceof Error ? err.stack : undefined,
+        });
+      }
+
+      if (threads.length === 0) {
+        this.logger.debug('All recent threads are terminal, skipping resume notification', { sessionName });
+        return;
+      }
+
+      const { message, included, omitted } = SessionHandoffService.buildResumeMessage(threads);
+
+      await agentService.sendMessageToAgent(
+        sessionName,
+        message,
+        RUNTIME_TYPES.CLAUDE_CODE as RuntimeType,
+      );
+
+      this.logger.info('Pushed resume notification', {
+        sessionName,
+        threadCount: threads.length,
+        includedThreads: included,
+        omittedThreads: omitted,
+        messageChars: message.length,
+        channels: [...new Set(threads.map(t => t.channelType))],
+      });
+    } catch (error) {
+      this.logger.warn('Failed to push resume notification', {
+        sessionName,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Render the `[CHAT_RESUME]` message body for a set of pending threads.
+   *
+   * Bounded on purpose: at most {@link RESUME_MAX_THREADS} threads (newest
+   * first) and at most {@link RESUME_MAX_CHARS_PER_THREAD} characters per
+   * thread block; anything beyond is summarised as a single "and K more"
+   * line. The orchestrator re-reads this message on every restart, so its
+   * size is paid at full input-token price each time.
+   *
+   * @param threads - Pending threads (any order; sorted newest-first here)
+   * @returns The message plus how many threads were included / omitted
+   */
+  static buildResumeMessage(threads: ResumeThread[]): {
+    message: string;
+    included: number;
+    omitted: number;
+  } {
+    const maxThreads = positiveIntFromEnv(RESUME_MAX_THREADS_ENV, RESUME_MAX_THREADS);
+    const maxChars = positiveIntFromEnv(RESUME_MAX_CHARS_ENV, RESUME_MAX_CHARS_PER_THREAD);
+
+    const newestFirst = [...threads].sort(
+      (a, b) => new Date(b.lastActiveAt).getTime() - new Date(a.lastActiveAt).getTime(),
+    );
+    const shown = newestFirst.slice(0, maxThreads);
+    const omitted = newestFirst.length - shown.length;
+
+    const lines: string[] = [
+      '[CHAT_RESUME] You just restarted. The following threads have PENDING or UNREPLIED messages.',
+      'Review them and reply where needed. Do NOT re-process threads that were already handled.',
+      '',
+    ];
+
+    for (const thread of shown) {
+      lines.push(SessionHandoffService.renderResumeThread(thread, maxChars));
+      lines.push('');
+    }
+
+    if (omitted > 0) {
+      lines.push(`and ${omitted} more — use list-my-followups`);
+      lines.push('');
+    }
+
+    return { message: lines.join('\n'), included: shown.length, omitted };
+  }
+
+  /**
+   * Render one thread block for `[CHAT_RESUME]`, cut at a line boundary so
+   * the block never exceeds `maxChars` (a truncation marker is appended when
+   * lines were dropped; the heading line is always kept).
+   *
+   * @param thread - Thread to render
+   * @param maxChars - Character budget for the block
+   * @returns Rendered block (no trailing newline)
+   */
+  private static renderResumeThread(thread: ResumeThread, maxChars: number): string {
+    const label = thread.channelType.toUpperCase();
+    const lines: string[] = [
+      `## ${label} Thread: ${thread.channelId} / ${thread.threadId}`,
+      `- Source: ${thread.channelType}`,
+      `- File: \`${thread.filePath}\``,
+      `- Channel: ${thread.channelId}`,
+      `- Thread ID: ${thread.threadId}`,
+      `- Last active: ${thread.lastActiveAt}`,
+    ];
+    if (thread.recentMessages.length > 0) {
+      lines.push('- Recent messages:');
+      for (const msg of thread.recentMessages) {
+        lines.push(`  - ${msg}`);
+      }
+    }
+
+    const full = lines.join('\n');
+    if (full.length <= maxChars) return full;
+
+    const budget = Math.max(0, maxChars - RESUME_TRUNCATION_MARKER.length - 1);
+    const kept: string[] = [lines[0]];
+    let used = lines[0].length;
+    for (const line of lines.slice(1)) {
+      if (used + 1 + line.length > budget) break;
+      kept.push(line);
+      used += 1 + line.length;
+    }
+    kept.push(RESUME_TRUNCATION_MARKER);
+    return kept.join('\n');
+  }
+
+  /**
+   * @deprecated Use pushResumeNotification() instead.
+   */
+  async pushSlackResumeNotification(
+    agentService: AgentMessageSender,
+    sessionName: string,
+  ): Promise<void> {
+    return this.pushResumeNotification(agentService, sessionName);
+  }
+}
+
+/** Senders that are the assistant side of a conversation. */
+const ASSISTANT_SENDERS = new Set(['crewly', 'orchestrator', 'crewly-orc', 'assistant', 'agent', 'system']);
+
+/**
+ * Whether a conversation's last message is from a person and still unanswered.
+ *
+ * @param recentMessages - "sender: preview" lines, oldest first
+ * @returns True when the last line is not the assistant's
+ */
+export function awaitsReply(recentMessages: readonly string[]): boolean {
+  const last = recentMessages[recentMessages.length - 1];
+  if (!last) return false;
+  const idx = last.indexOf(':');
+  const sender = (idx >= 0 ? last.slice(0, idx) : last).trim().toLowerCase();
+  const preview = idx >= 0 ? last.slice(idx + 1).trim() : '';
+  if (ASSISTANT_SENDERS.has(sender) || preview.startsWith('[Orc]')) return false;
+  return true;
+}
+
+/**
+ * Turn "WAITING FOR A REPLY" into "old" for a conversation last active more
+ * than a day before `nowMs`, and add the answered/waiting label to headings
+ * written by a Crewly that did not label them — treating an unlabelled one
+ * as old unless it is recent.
+ *
+ * @param markdown - The summary as written at shutdown
+ * @param nowMs - Now
+ * @returns The summary with labels that hold now
+ */
+export function relabelStaleWaiting(markdown: string, nowMs: number): string {
+  const lines = markdown.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^### (SLACK|GCHAT|CHAT-UI) — (\S+)(.*)$/);
+    if (!m) continue;
+    const labelled = m[3].trim();
+    if (labelled.includes('already answered')) continue;
+    let last = NaN;
+    const said: string[] = [];
+    for (let j = i + 1; j < lines.length && !lines[j].startsWith('#'); j++) {
+      const t = lines[j].match(/^- Last active: (\S+)/);
+      if (t) last = Date.parse(t[1]);
+      const r = lines[j].match(/^ {2}- (.*)$/);
+      if (r) said.push(r[1]);
+    }
+    if (!awaitsReply(said)) {
+      lines[i] = `### ${m[1]} — ${m[2]} — already answered (context only)`;
+      continue;
+    }
+    const recent = Number.isFinite(last) && nowMs - last <= RESUME_MAX_AGE_MS;
+    const label = recent ? ' — WAITING FOR A REPLY' : ' — unanswered but old (context only, do not reply now)';
+    lines[i] = `### ${m[1]} — ${m[2]}${label}`;
+  }
+  return lines.join('\n');
+}

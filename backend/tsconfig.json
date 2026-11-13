@@ -1,0 +1,21 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "../dist/backend"
+  },
+  "include": [
+    "src/**/*",
+    "../config/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/**/*.test.ts",
+    "src/**/__tests__/**",
+    "src/controllers/payment/**",
+    "src/services/payment/**",
+    "src/**/eval/fixtures/**",
+    "../config/*.test.ts",
+    "../config/*.test.js"
+  ]
+}

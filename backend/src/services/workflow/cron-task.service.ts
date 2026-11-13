@@ -1,0 +1,1225 @@
+/**
+ * Cron Task Service
+ *
+ * Manages user-defined recurring tasks that run on cron schedules.
+ * Unlike scheduled messages (agent-created/cancellable), cron tasks
+ * can only be cancelled by user or orchestrator.
+ *
+ * Storage: Per-team at ~/.crewly/teams/{teamId}/cron-tasks.json
+ * Migration: Global ~/.crewly/cron-tasks.json is auto-migrated on first startup.
+ *
+ * @module services/workflow/cron-task.service
+ */
+
+import { isSessionPaused, isTeamIdPaused } from '../team/team-pause.registry.js';
+import * as path from 'path';
+import { existsSync } from 'fs';
+import { readFile, writeFile, mkdir, readdir } from 'fs/promises';
+import { v4 as uuidv4 } from 'uuid';
+import { LoggerService, ComponentLogger } from '../core/logger.service.js';
+import { atomicWriteFile, quarantineCorruptFile } from '../../utils/file-io.utils.js';
+import { CRON_SCHEDULE_CONSTANTS } from '../../constants.js';
+import { getCrewlyHomePath } from '../core/crewly-home.utils.js';
+import { RestartDrainService } from '../restart/restart-drain.service.js';
+import type {
+	CronTask,
+	CronTaskStore,
+	CreateCronTaskRequest,
+	UpdateCronTaskRequest,
+} from '../../types/cron-task.types.js';
+
+/**
+ * Check interval for cron task evaluation (60 seconds).
+ */
+const CRON_CHECK_INTERVAL_MS = 60_000;
+
+/**
+ * Issue #305: when a cron task fires against an offline agent, we
+ * kick off auto-start, then poll the agent's online status until it
+ * reports ready or this deadline fires.
+ *
+ * 15s covers a cold tmux + Claude-Code init (~5-10s typically) with
+ * some headroom. Tasks that miss this window are skipped with
+ * `lastSkipReason: 'agent_offline_not_ready'`.
+ */
+const CRON_AUTO_START_READY_TIMEOUT_MS = 15_000;
+
+/** How often to re-check the agent's status during the readiness wait. */
+const CRON_AUTO_START_READY_POLL_MS = 500;
+
+/**
+ * #611 transient-skip retry budget. When an auto-start fails because the
+ * PTY spawn momentarily can't acquire a slot (`posix_spawnp failed.` —
+ * observed 2026-05-28 when the user proc count hit 353 against a
+ * `maxProcPerUid` of 1333 → kernel briefly rejected new spawns), the
+ * cron-eval path used to permanently skip the slot. The error itself is
+ * transient ("Wait ~30 s and the next attempt should succeed") so we
+ * instead push `nextRunAt` forward by a short backoff and let the cron
+ * loop retry the same slot up to {@link CRON_TRANSIENT_SKIP_MAX_ATTEMPTS}
+ * times before permanently skipping.
+ */
+const CRON_TRANSIENT_SKIP_MAX_ATTEMPTS = 3;
+
+/**
+ * Base backoff for transient skip retries (#611). Total time waited
+ * across all attempts ≈ BACKOFF × (1 + 2 + 3) = 60 s with the default
+ * 10s base — enough for the PTY spawn limit to clear without unduly
+ * delaying tasks. Multiplied by `transientSkipAttempts` for a linear
+ * backoff (a multi-process spike clears in a small handful of seconds,
+ * exponential would over-delay).
+ */
+const CRON_TRANSIENT_SKIP_BACKOFF_MS = 10_000;
+
+/** Name of the per-team cron task file */
+const CRON_TASKS_FILENAME = 'cron-tasks.json';
+
+/** Suffix appended to the global file after successful migration */
+const MIGRATED_SUFFIX = '.migrated';
+
+/** Team ID value used for orchestrator-level cron tasks (not team-scoped) */
+const ORCHESTRATOR_TEAM_ID = 'orchestrator';
+
+/**
+ * Extract date/time parts from a Date in a specific IANA timezone.
+ *
+ * Uses Intl.DateTimeFormat to convert the UTC instant into the target
+ * timezone, then extracts numeric minute, hour, dayOfWeek, dayOfMonth,
+ * and month fields.
+ *
+ * @param date - The Date object (represents a UTC instant)
+ * @param tz - IANA timezone string (e.g. "America/New_York", "Asia/Shanghai")
+ * @returns Object with minute, hour, dayOfWeek (0=Sun), dayOfMonth, month (1-12)
+ */
+export function getDatePartsInTimezone(
+	date: Date,
+	tz: string,
+): { minute: number; hour: number; dayOfWeek: number; dayOfMonth: number; month: number } {
+	const formatter = new Intl.DateTimeFormat('en-US', {
+		timeZone: tz,
+		hour: 'numeric',
+		minute: 'numeric',
+		weekday: 'short',
+		day: 'numeric',
+		month: 'numeric',
+		hour12: false,
+	});
+	const partsMap = new Map<string, string>();
+	for (const p of formatter.formatToParts(date)) {
+		partsMap.set(p.type, p.value);
+	}
+
+	const weekdayStr = partsMap.get('weekday') || '';
+	const weekdayMap: Record<string, number> = {
+		Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
+	};
+
+	return {
+		minute: parseInt(partsMap.get('minute') || '0', 10),
+		// Some ICU/Node versions format midnight as "24" under hour12:false;
+		// normalize 24→0 so a `0 0 * * *` (midnight) cron actually matches
+		// instead of never matching → falling through to the drift fallback.
+		hour: parseInt(partsMap.get('hour') || '0', 10) % 24,
+		dayOfWeek: weekdayMap[weekdayStr] ?? 0,
+		dayOfMonth: parseInt(partsMap.get('day') || '1', 10),
+		month: parseInt(partsMap.get('month') || '1', 10),
+	};
+}
+
+/**
+ * Validate an IANA timezone, falling back to UTC for an invalid/empty one.
+ *
+ * `new Intl.DateTimeFormat(..., { timeZone })` THROWS `RangeError` on a bad
+ * tz. That throw was previously uncaught inside `getNextRunTime`'s minute scan,
+ * so a single cron task with a malformed/empty timezone would crash the whole
+ * `evaluateTasks` tick and stall EVERY cron. Defaulting to UTC (with a one-time
+ * warn) keeps the scheduler resilient to one bad task.
+ *
+ * @param tz - Candidate IANA timezone
+ * @returns The tz if valid, otherwise 'UTC'
+ */
+export function safeTimezone(tz: string | undefined | null): string {
+	const candidate = (tz ?? '').trim();
+	if (!candidate) return 'UTC';
+	try {
+		new Intl.DateTimeFormat('en-US', { timeZone: candidate });
+		return candidate;
+	} catch {
+		console.warn(`[cron] Invalid timezone "${candidate}" — falling back to UTC`);
+		return 'UTC';
+	}
+}
+
+/**
+ * Parse a single cron field spec into a set of allowed values.
+ * Supports: `*`, single number, ranges (`1-5`), lists (`1,3,5`),
+ * and step values (`*\/5`, `10-30/5`).
+ *
+ * @param spec - The cron field string (e.g. "*", "5", "1-5", "1,3,5", "*\/10")
+ * @param min - Minimum allowed value for this field (inclusive)
+ * @param max - Maximum allowed value for this field (inclusive)
+ * @returns Set of matching integer values, or null for wildcard (match any)
+ */
+export function parseCronField(spec: string, min: number, max: number): Set<number> | null {
+	if (spec === '*') return null; // wildcard
+
+	const result = new Set<number>();
+
+	for (const part of spec.split(',')) {
+		const stepMatch = part.match(/^(.+)\/(\d+)$/);
+		if (stepMatch) {
+			const [, rangePart, stepStr] = stepMatch;
+			const step = parseInt(stepStr, 10);
+			let start = min;
+			let end = max;
+
+			if (rangePart !== '*') {
+				const dashIdx = rangePart.indexOf('-');
+				if (dashIdx !== -1) {
+					start = parseInt(rangePart.slice(0, dashIdx), 10);
+					end = parseInt(rangePart.slice(dashIdx + 1), 10);
+				} else {
+					start = parseInt(rangePart, 10);
+					end = max;
+				}
+			}
+
+			for (let v = start; v <= end; v += step) {
+				result.add(v);
+			}
+		} else if (part.includes('-')) {
+			const [startStr, endStr] = part.split('-');
+			const start = parseInt(startStr, 10);
+			const end = parseInt(endStr, 10);
+			for (let v = start; v <= end; v++) {
+				result.add(v);
+			}
+		} else {
+			result.add(parseInt(part, 10));
+		}
+	}
+
+	return result;
+}
+
+/** Minutes in a calendar day, used for in-day skips. */
+const MINUTES_PER_DAY = 24 * 60;
+
+let cronHelperLogger: ComponentLogger | undefined;
+
+/**
+ * Logger for the module-level cron helpers, created on first use.
+ *
+ * `getNextRunTime` is a free function with no service instance, so it cannot
+ * use `CronTaskService`'s logger. Lazy so importing this module never touches
+ * the logger singleton.
+ *
+ * @returns The shared component logger for cron helpers
+ */
+function helperLogger(): ComponentLogger {
+	if (!cronHelperLogger) {
+		cronHelperLogger = LoggerService.getInstance().createComponentLogger('CronSchedule');
+	}
+	return cronHelperLogger;
+}
+
+/**
+ * Parse a cron expression and calculate the next run time.
+ * Supports standard 5-field cron: minute hour day-of-month month day-of-week.
+ * Each field supports: `*`, numbers, ranges (`1-5`), lists (`1,3,5`),
+ * and step values (`*\/5`).
+ *
+ * All field matching is done in the specified timezone so that a cron like
+ * "0 9 * * *" in Asia/Shanghai fires at 09:00 Shanghai time regardless of
+ * the server's local timezone.
+ *
+ * The search covers `CRON_SCHEDULE_CONSTANTS.NEXT_RUN_HORIZON_DAYS` (a full
+ * year) without stepping every minute: a day whose date fields do not match
+ * is skipped in one hop (to just before its end, then hour-by-hour to the
+ * boundary), and an hour that does not match is skipped to the next hour
+ * boundary. Every hop stays inside the unit it is skipping, so no matching
+ * minute can be jumped over — including across DST transitions.
+ *
+ * @param cronExpression - Standard 5-field cron expression
+ * @param timezone - IANA timezone (e.g. "UTC", "America/New_York")
+ * @param after - Calculate next run after this date (defaults to now)
+ * @returns ISO string of next run time (always UTC). For an expression with
+ *          no match inside the horizon (e.g. "0 0 31 2 *") returns now+24h,
+ *          which is NOT schedule-aligned, and logs a WARN naming the expression
+ * @throws Error if the expression does not have exactly 5 fields
+ */
+export function getNextRunTime(cronExpression: string, timezone: string, after?: Date): string {
+	const now = after || new Date();
+	const parts = cronExpression.trim().split(/\s+/);
+	if (parts.length !== 5) {
+		throw new Error(`Invalid cron expression: expected 5 fields, got ${parts.length}`);
+	}
+	// A bad/empty tz must not crash the whole evaluate tick (it would throw
+	// inside the scan below); fall back to UTC.
+	const tz = safeTimezone(timezone);
+
+	const minuteSet = parseCronField(parts[0], 0, 59);
+	const hourSet = parseCronField(parts[1], 0, 23);
+	const domSet = parseCronField(parts[2], 1, 31);
+	const monthSet = parseCronField(parts[3], 1, 12);
+	const dowSet = parseCronField(parts[4], 0, 6);
+
+	const candidate = new Date(now.getTime());
+	// Advance by 1 minute minimum to avoid re-triggering
+	candidate.setSeconds(0, 0);
+	candidate.setMinutes(candidate.getMinutes() + 1);
+
+	const horizonMs = CRON_SCHEDULE_CONSTANTS.NEXT_RUN_HORIZON_DAYS * MINUTES_PER_DAY * 60_000;
+	const limit = now.getTime() + horizonMs;
+	const buffer = CRON_SCHEDULE_CONSTANTS.DAY_END_SKIP_BUFFER_MINUTES;
+	let candidatesExamined = 0;
+
+	while (candidate.getTime() <= limit) {
+		candidatesExamined += 1;
+		// Extract fields in the TARGET timezone, not server-local
+		const tp = getDatePartsInTimezone(candidate, tz);
+
+		const domMatch = !domSet || domSet.has(tp.dayOfMonth);
+		const monthMatch = !monthSet || monthSet.has(tp.month);
+		const dowMatch = !dowSet || dowSet.has(tp.dayOfWeek);
+		if (!(domMatch && monthMatch && dowMatch)) {
+			// Wrong day: skip to ~buffer minutes before its end, then hour by
+			// hour to the day boundary. Both hops stay inside this day.
+			const minutesLeftInDay = MINUTES_PER_DAY - (tp.hour * 60 + tp.minute);
+			const hop = minutesLeftInDay > buffer ? minutesLeftInDay - buffer : Math.max(1, 60 - tp.minute);
+			candidate.setMinutes(candidate.getMinutes() + hop);
+			continue;
+		}
+
+		const hourMatch = !hourSet || hourSet.has(tp.hour);
+		if (!hourMatch) {
+			// Wrong hour: skip to the next hour boundary (in tz).
+			candidate.setMinutes(candidate.getMinutes() + Math.max(1, 60 - tp.minute));
+			continue;
+		}
+
+		const minuteMatch = !minuteSet || minuteSet.has(tp.minute);
+		if (minuteMatch) {
+			return candidate.toISOString();
+		}
+		candidate.setMinutes(candidate.getMinutes() + 1);
+	}
+
+	// No match inside a full year. With tz validated (UTC fallback) this only
+	// happens for a genuinely impossible expression (e.g. "0 0 31 2 *" — Feb
+	// 31) or a DOM/DOW contradiction. Warn loudly instead of silently
+	// returning a non-cron-aligned now+24h that would drift the task forever
+	// (the #678 fire-time-drift symptom). We still return a value so the eval
+	// loop never throws; the WARN + the resulting daily WorkItem make the
+	// broken expression visible so it can be fixed/disabled.
+	helperLogger().warn(
+		'getNextRunTime: no run time within the horizon — expression is impossible (e.g. an invalid ' +
+			'day/month combo). Returning now+24h, which will NOT align to the schedule. Fix or disable this cron.',
+		{
+			cronExpression,
+			timezone: tz,
+			horizonDays: CRON_SCHEDULE_CONSTANTS.NEXT_RUN_HORIZON_DAYS,
+			candidatesExamined,
+		},
+	);
+	return new Date(now.getTime() + CRON_SCHEDULE_CONSTANTS.IMPOSSIBLE_EXPRESSION_FALLBACK_MS).toISOString();
+}
+
+/**
+ * Callback type for checking whether an agent is online.
+ * Should return true if the agent is reachable and can receive tasks.
+ *
+ * @param sessionName - The agent's PTY session name
+ * @param teamId - The team ID the agent belongs to
+ * @returns True if the agent is online and ready
+ */
+export type AgentStatusCallback = (sessionName: string, teamId: string) => Promise<boolean>;
+
+/**
+ * Callback type for auto-starting an offline agent.
+ *
+ * @param sessionName - The agent's PTY session name
+ * @param teamId - The team ID the agent belongs to
+ * @returns True if the agent was successfully started
+ */
+export type AgentStartCallback = (sessionName: string, teamId: string) => Promise<boolean>;
+
+/**
+ * Service for managing cron tasks with per-team scoped storage.
+ *
+ * Storage layout:
+ *   ~/.crewly/teams/{teamId}/cron-tasks.json
+ *
+ * On first startup, migrates the legacy global file
+ * (~/.crewly/cron-tasks.json) by grouping tasks by targetTeamId
+ * and writing per-team files. The global file is renamed to
+ * cron-tasks.json.migrated to prevent re-migration.
+ *
+ * Lifecycle:
+ * 1. Get singleton via `getInstance()`
+ * 2. Wire callbacks: `setExecutionCallback()`, `setAgentStatusCallback()`, `setAgentStartCallback()`
+ * 3. Call `migrateGlobalToTeamScoped()` to auto-migrate legacy storage
+ * 4. Call `start()` to begin the evaluation loop
+ * 5. On startup, call `recalculateAllNextRunTimes()` to self-heal stale values
+ */
+export class CronTaskService {
+	private static instance: CronTaskService | null = null;
+	private logger: ComponentLogger;
+	/** Store files found corrupt and already copied aside (copy once, not on every read). */
+	private readonly setAsideStores = new Set<string>();
+	/** Root crewly home directory (e.g. ~/.crewly) */
+	private crewlyHome: string;
+	private timer: ReturnType<typeof setInterval> | null = null;
+	private executionCallback: ((task: CronTask) => Promise<void>) | null = null;
+	private agentStatusCallback: AgentStatusCallback | null = null;
+	private agentStartCallback: AgentStartCallback | null = null;
+
+	constructor(crewlyHome?: string) {
+		this.logger = LoggerService.getInstance().createComponentLogger('CronTaskService');
+		// CREWLY_HOME-aware: a test profile or trial must not write into the
+		// developer's real ~/.crewly (crewly-home.utils).
+		this.crewlyHome = crewlyHome || getCrewlyHomePath();
+	}
+
+	/**
+	 * Get singleton instance.
+	 */
+	static getInstance(): CronTaskService {
+		if (!CronTaskService.instance) {
+			CronTaskService.instance = new CronTaskService();
+		}
+		return CronTaskService.instance;
+	}
+
+	/**
+	 * Reset singleton (for testing).
+	 */
+	static resetInstance(): void {
+		if (CronTaskService.instance) {
+			CronTaskService.instance.stop();
+		}
+		CronTaskService.instance = null;
+	}
+
+	/**
+	 * Get the store file path for a specific team.
+	 *
+	 * @param teamId - Team ID
+	 * @returns Absolute path to the team's cron-tasks.json
+	 */
+	getStoreFile(teamId: string): string {
+		return path.join(this.crewlyHome, 'teams', teamId, CRON_TASKS_FILENAME);
+	}
+
+	/**
+	 * Get the legacy global store file path.
+	 *
+	 * @returns Absolute path to the global cron-tasks.json
+	 */
+	private getGlobalStoreFile(): string {
+		return path.join(this.crewlyHome, CRON_TASKS_FILENAME);
+	}
+
+	/**
+	 * Migrate legacy global cron-tasks.json to per-team files.
+	 *
+	 * Orchestrator-targeted tasks (targetTeamId === 'orchestrator') are kept
+	 * in the global file since they don't belong to any specific team.
+	 * All other tasks are grouped by targetTeamId and written to per-team files.
+	 *
+	 * After migration, the global file is rewritten to contain only orchestrator
+	 * tasks, and a .migrated marker is created to prevent re-running.
+	 *
+	 * Idempotent: skips if the .migrated marker already exists or no global file exists.
+	 *
+	 * @returns Number of tasks migrated to per-team files (excludes orchestrator tasks kept in global)
+	 */
+	async migrateGlobalToTeamScoped(): Promise<number> {
+		const globalFile = this.getGlobalStoreFile();
+		const migratedFile = globalFile + MIGRATED_SUFFIX;
+
+		// Skip if already migrated or no global file exists
+		if (existsSync(migratedFile) || !existsSync(globalFile)) {
+			return 0;
+		}
+
+		let globalStore: CronTaskStore;
+		try {
+			const data = await readFile(globalFile, 'utf-8');
+			globalStore = JSON.parse(data) as CronTaskStore;
+		} catch {
+			// Cannot read/parse global file — nothing to migrate
+			return 0;
+		}
+
+		if (globalStore.tasks.length === 0) {
+			// Empty store — write marker and skip
+			await writeFile(migratedFile, '', 'utf-8');
+			return 0;
+		}
+
+		// Partition: orchestrator tasks stay global, everything else goes per-team
+		const orchestratorTasks: CronTask[] = [];
+		const teamGroups = new Map<string, CronTask[]>();
+
+		for (const task of globalStore.tasks) {
+			if (task.targetTeamId === ORCHESTRATOR_TEAM_ID) {
+				orchestratorTasks.push(task);
+			} else {
+				const teamId = task.targetTeamId;
+				if (!teamGroups.has(teamId)) {
+					teamGroups.set(teamId, []);
+				}
+				teamGroups.get(teamId)!.push(task);
+			}
+		}
+
+		// Write team-scoped tasks to per-team files
+		let migratedCount = 0;
+		for (const [teamId, tasks] of teamGroups) {
+			const teamStore = await this.loadTeamStore(teamId);
+			// Merge: add migrated tasks that don't already exist
+			const existingIds = new Set(teamStore.tasks.map(t => t.id));
+			for (const task of tasks) {
+				if (!existingIds.has(task.id)) {
+					teamStore.tasks.push(task);
+					migratedCount++;
+				}
+			}
+			await this.saveTeamStore(teamId, teamStore);
+		}
+
+		// Rewrite global file with only orchestrator tasks
+		await this.saveGlobalStore({ tasks: orchestratorTasks });
+
+		// Write migration marker to prevent re-running
+		await writeFile(migratedFile, new Date().toISOString(), 'utf-8');
+
+		this.logger.info('Migrated global cron-tasks.json to per-team storage', {
+			migratedCount,
+			orchestratorKept: orchestratorTasks.length,
+			teamCount: teamGroups.size,
+		});
+
+		return migratedCount;
+	}
+
+	/**
+	 * Set the callback invoked when a cron task is due for execution.
+	 * The callback receives the task and should delegate it to the target agent.
+	 *
+	 * @param callback - Async function that executes a cron task
+	 */
+	setExecutionCallback(callback: (task: CronTask) => Promise<void>): void {
+		this.executionCallback = callback;
+	}
+
+	/**
+	 * Set the callback for checking agent online status.
+	 * Called before executing a task to verify the target agent is reachable.
+	 * Should treat both 'active' and 'started' states as online.
+	 *
+	 * @param callback - Async function returning true if agent is online
+	 */
+	setAgentStatusCallback(callback: AgentStatusCallback): void {
+		this.agentStatusCallback = callback;
+	}
+
+	/**
+	 * Set the callback for auto-starting an offline agent.
+	 * Called when a cron task fires but the target agent is offline.
+	 *
+	 * @param callback - Async function that starts an agent, returns true on success
+	 */
+	setAgentStartCallback(callback: AgentStartCallback): void {
+		this.agentStartCallback = callback;
+	}
+
+	/**
+	 * Start the cron task evaluation loop.
+	 * Checks every minute for tasks whose nextRunAt has passed.
+	 */
+	start(): void {
+		if (this.timer) return;
+
+		this.logger.info('Starting cron task service', { intervalMs: CRON_CHECK_INTERVAL_MS });
+
+		this.timer = setInterval(async () => {
+			try {
+				await this.evaluateTasks();
+			} catch (error) {
+				this.logger.error('Cron task evaluation error', {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}, CRON_CHECK_INTERVAL_MS);
+	}
+
+	/**
+	 * Stop the cron task evaluation loop.
+	 */
+	stop(): void {
+		if (this.timer) {
+			clearInterval(this.timer);
+			this.timer = null;
+			this.logger.info('Stopped cron task service');
+		}
+	}
+
+	/**
+	 * Whether the service is running.
+	 */
+	isRunning(): boolean {
+		return this.timer !== null;
+	}
+
+	/**
+	 * Recalculate nextRunAt for all enabled tasks using the stored timezone.
+	 * This self-heals stale values from older versions that computed nextRunAt
+	 * in the server's local timezone instead of the task's specified timezone.
+	 *
+	 * Should be called once on backend startup, before start().
+	 *
+	 * @returns Number of tasks whose nextRunAt was updated
+	 */
+	async recalculateAllNextRunTimes(): Promise<number> {
+		const now = new Date();
+		let updated = 0;
+
+		// Per store: one unreadable store (a corrupt file that could not be
+		// copied aside, an EMFILE) must not keep every other team's schedule
+		// stale.
+		await this.forEachStore('recalculate nextRunAt', async (store) => {
+			let dirty = false;
+			for (const task of store.tasks) {
+				if (!task.enabled) continue;
+
+				// If task has never run AND its nextRunAt is in the past, this is a missed first run.
+				if (!task.lastRunAt && task.nextRunAt && new Date(task.nextRunAt) <= now) {
+					this.logger.info('Missed first run detected — keeping stale nextRunAt for immediate execution', {
+						id: task.id,
+						nextRunAt: task.nextRunAt,
+						timezone: task.timezone,
+					});
+					continue;
+				}
+
+				const after = task.lastRunAt ? new Date(task.lastRunAt) : undefined;
+				const recalculated = getNextRunTime(task.cronExpression, task.timezone, after);
+
+				if (recalculated !== task.nextRunAt) {
+					this.logger.info('Self-healed stale nextRunAt', {
+						id: task.id,
+						old: task.nextRunAt,
+						new: recalculated,
+						timezone: task.timezone,
+					});
+					task.nextRunAt = recalculated;
+					updated++;
+					dirty = true;
+				}
+			}
+			return dirty;
+		});
+
+		if (updated > 0) this.logger.info('Recalculated nextRunAt for stale tasks', { count: updated });
+		return updated;
+	}
+
+	/**
+	 * Run `fn` on the global store and on every team store, each on its own:
+	 * a store that cannot be read (or saved) is logged and skipped, and the
+	 * rest still run. `fn` returns true when the store changed and must be
+	 * saved.
+	 *
+	 * @param action - What is being done, for the log
+	 * @param fn - Work on one store
+	 */
+	private async forEachStore(action: string, fn: (store: CronTaskStore) => Promise<boolean>): Promise<void> {
+		const run = async (label: string, load: () => Promise<CronTaskStore>, save: (s: CronTaskStore) => Promise<void>): Promise<void> => {
+			try {
+				const store = await load();
+				if (await fn(store)) await save(store);
+			} catch (error) {
+				this.logger.error(`Cron store skipped (${action})`, {
+					store: label,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		};
+
+		await run('global', () => this.loadGlobalStore(), (st) => this.saveGlobalStore(st));
+
+		let teamIds: string[] = [];
+		try {
+			teamIds = await this.getTeamIds();
+		} catch (error) {
+			this.logger.error(`Cron team stores could not be listed (${action})`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		for (const teamId of teamIds) {
+			await run(teamId, () => this.loadTeamStore(teamId), (st) => this.saveTeamStore(teamId, st));
+		}
+	}
+
+	/**
+	 * Create a new cron task.
+	 *
+	 * @param request - Cron task creation parameters
+	 * @returns The created cron task
+	 */
+	async create(request: CreateCronTaskRequest): Promise<CronTask> {
+		const timezone = request.timezone || 'UTC';
+		const isOrchestratorTask = request.targetTeamId === ORCHESTRATOR_TEAM_ID;
+
+		// Load the destination store up front so we can both dedup against it
+		// and append to it (orchestrator tasks live in the global store,
+		// team tasks in their per-team store).
+		const store = isOrchestratorTask
+			? await this.loadGlobalStore()
+			: await this.loadTeamStore(request.targetTeamId);
+
+		// Idempotency guard (#613, #621). A cron is logically identified by its
+		// target agent + team + schedule + timezone + description. If an
+		// identical task already exists, return it instead of pushing a
+		// duplicate. Without this, repeated create-cron calls — an agent
+		// self-scheduling on every restart (#621), or the orchestrator
+		// re-running a startup routine — accumulate duplicate entries in the
+		// store file, and `evaluateTasks` fires EVERY copy, delivering N
+		// identical reports per trigger (#613). create() generates a fresh
+		// random id per call, so id-based dedup cannot catch this; we match on
+		// the logical key. Genuinely distinct schedules (different time,
+		// timezone, or description) are never collapsed.
+		const existing = store.tasks.find(t =>
+			t.targetAgent === request.targetAgent &&
+			t.targetTeamId === request.targetTeamId &&
+			t.cronExpression === request.cronExpression &&
+			(t.timezone || 'UTC') === timezone &&
+			t.taskDescription === request.taskDescription,
+		);
+		if (existing) {
+			this.logger.info('Cron task create deduplicated — identical task already exists', {
+				id: existing.id,
+				cron: existing.cronExpression,
+				target: existing.targetAgent,
+				teamId: existing.targetTeamId,
+			});
+			return existing;
+		}
+
+		const nextRunAt = getNextRunTime(request.cronExpression, timezone);
+
+		const task: CronTask = {
+			id: `cron-${uuidv4().slice(0, 8)}`,
+			cronExpression: request.cronExpression,
+			timezone,
+			targetAgent: request.targetAgent,
+			targetTeamId: request.targetTeamId,
+			taskDescription: request.taskDescription,
+			createdBy: request.createdBy || 'user',
+			createdAt: new Date().toISOString(),
+			enabled: true,
+			lastRunAt: null,
+			nextRunAt,
+		};
+
+		// Orchestrator tasks go to global store; team tasks go to per-team store
+		store.tasks.push(task);
+		if (isOrchestratorTask) {
+			await this.saveGlobalStore(store);
+		} else {
+			await this.saveTeamStore(task.targetTeamId, store);
+		}
+
+		this.logger.info('Cron task created', { id: task.id, cron: task.cronExpression, target: task.targetAgent, teamId: task.targetTeamId });
+		return task;
+	}
+
+	/**
+	 * List all cron tasks across all teams, optionally filtered.
+	 *
+	 * @param filter - Optional filter criteria
+	 * @returns Array of matching cron tasks
+	 */
+	async list(filter?: { targetAgent?: string; enabled?: boolean }): Promise<CronTask[]> {
+		let tasks = await this.loadAllTasks();
+
+		if (filter?.targetAgent) {
+			tasks = tasks.filter(t => t.targetAgent === filter.targetAgent);
+		}
+		if (filter?.enabled !== undefined) {
+			tasks = tasks.filter(t => t.enabled === filter.enabled);
+		}
+
+		return tasks;
+	}
+
+	/**
+	 * List cron tasks for a specific team.
+	 *
+	 * @param teamId - Team ID to filter by
+	 * @param filter - Optional additional filter criteria
+	 * @returns Array of matching cron tasks for the team
+	 */
+	async getByTeam(teamId: string, filter?: { targetAgent?: string; enabled?: boolean }): Promise<CronTask[]> {
+		const store = await this.loadTeamStore(teamId);
+		let tasks = store.tasks;
+
+		if (filter?.targetAgent) {
+			tasks = tasks.filter(t => t.targetAgent === filter.targetAgent);
+		}
+		if (filter?.enabled !== undefined) {
+			tasks = tasks.filter(t => t.enabled === filter.enabled);
+		}
+
+		return tasks;
+	}
+
+	/**
+	 * Get a single cron task by ID. Searches across all teams.
+	 *
+	 * @param id - Cron task ID
+	 * @returns The cron task or null
+	 */
+	async get(id: string): Promise<CronTask | null> {
+		const allTasks = await this.loadAllTasks();
+		return allTasks.find(t => t.id === id) || null;
+	}
+
+	/**
+	 * Update a cron task. Searches across all teams to find the task.
+	 *
+	 * @param id - Cron task ID
+	 * @param updates - Fields to update
+	 * @returns Updated task or null if not found
+	 */
+	async update(id: string, updates: UpdateCronTaskRequest): Promise<CronTask | null> {
+		// Helper to apply updates to a task
+		const applyUpdates = (task: CronTask): void => {
+			if (updates.cronExpression !== undefined) {
+				task.cronExpression = updates.cronExpression;
+				task.nextRunAt = getNextRunTime(updates.cronExpression, task.timezone);
+			}
+			if (updates.timezone !== undefined) {
+				task.timezone = updates.timezone;
+				task.nextRunAt = getNextRunTime(task.cronExpression, task.timezone);
+			}
+			if (updates.taskDescription !== undefined) {
+				task.taskDescription = updates.taskDescription;
+			}
+			if (updates.enabled !== undefined) {
+				task.enabled = updates.enabled;
+			}
+		};
+
+		// Search global store first (orchestrator tasks)
+		const globalStore = await this.loadGlobalStore();
+		const globalTask = globalStore.tasks.find(t => t.id === id);
+		if (globalTask) {
+			applyUpdates(globalTask);
+			await this.saveGlobalStore(globalStore);
+			this.logger.info('Cron task updated', { id, location: 'global', updates: Object.keys(updates) });
+			return globalTask;
+		}
+
+		// Search per-team stores
+		const teamIds = await this.getTeamIds();
+		for (const teamId of teamIds) {
+			const store = await this.loadTeamStore(teamId);
+			const task = store.tasks.find(t => t.id === id);
+			if (!task) continue;
+
+			applyUpdates(task);
+			await this.saveTeamStore(teamId, store);
+			this.logger.info('Cron task updated', { id, teamId, updates: Object.keys(updates) });
+			return task;
+		}
+
+		return null;
+	}
+
+	/**
+	 * Delete a cron task. Searches across all teams to find and remove it.
+	 *
+	 * @param id - Cron task ID
+	 * @returns true if deleted, false if not found
+	 */
+	async delete(id: string): Promise<boolean> {
+		// Search global store first (orchestrator tasks)
+		const globalStore = await this.loadGlobalStore();
+		const globalIndex = globalStore.tasks.findIndex(t => t.id === id);
+		if (globalIndex !== -1) {
+			globalStore.tasks.splice(globalIndex, 1);
+			await this.saveGlobalStore(globalStore);
+			this.logger.info('Cron task deleted', { id, location: 'global' });
+			return true;
+		}
+
+		// Search per-team stores
+		const teamIds = await this.getTeamIds();
+		for (const teamId of teamIds) {
+			const store = await this.loadTeamStore(teamId);
+			const index = store.tasks.findIndex(t => t.id === id);
+			if (index === -1) continue;
+
+			store.tasks.splice(index, 1);
+			await this.saveTeamStore(teamId, store);
+			this.logger.info('Cron task deleted', { id, teamId });
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Evaluate all enabled tasks and execute those whose nextRunAt has passed.
+	 * If an agentStatusCallback is set, checks whether the target agent is online
+	 * before execution. If the agent is offline and an agentStartCallback is set,
+	 * attempts to auto-start the agent before executing.
+	 */
+	async evaluateTasks(): Promise<void> {
+		// Winding down for a shutdown / restart: no cron fires; due tasks run after the next start.
+		if (RestartDrainService.getInstance().isWindingDown()) return;
+		const now = new Date();
+		// Each store (global, then every team) on its own: one that throws is
+		// logged and skipped, the others still fire this tick.
+		await this.forEachStore('evaluate tasks', async (store) => {
+			let updated = false;
+			for (const task of store.tasks) {
+				if (await this.evaluateSingleTask(task, now)) updated = true;
+			}
+			return updated;
+		});
+	}
+
+	/**
+	 * Evaluate a single cron task: check if due, verify agent status, execute.
+	 * Mutates the task in-place (lastRunAt, nextRunAt).
+	 *
+	 * @param task - The cron task to evaluate
+	 * @param now - Current time for comparison
+	 * @returns true if the task was modified (needs saving)
+	 */
+	private async evaluateSingleTask(task: CronTask, now: Date): Promise<boolean> {
+		if (!task.enabled || !task.nextRunAt) return false;
+
+		const nextRun = new Date(task.nextRunAt);
+		if (nextRun > now) return false;
+
+		// A paused team's cron does not run (and does not start its agent):
+		// the slot is skipped and recorded (specs/2026-10-04-team-pause.md).
+		if (isSessionPaused(task.targetAgent) || isTeamIdPaused(task.targetTeamId)) {
+			this.logger.info('Skipping cron task — its team is paused by the owner', {
+				id: task.id,
+				target: task.targetAgent,
+				teamId: task.targetTeamId,
+			});
+			task.lastSkippedAt = now.toISOString();
+			task.lastSkipReason = 'team_paused';
+			task.nextRunAt = getNextRunTime(task.cronExpression, task.timezone, now);
+			return true;
+		}
+
+		// Task is due — check agent status before executing
+		let agentOnline = true;
+		if (this.agentStatusCallback) {
+			try {
+				agentOnline = await this.agentStatusCallback(task.targetAgent, task.targetTeamId);
+			} catch (error) {
+				this.logger.warn('Agent status check failed, assuming offline', {
+					id: task.id,
+					target: task.targetAgent,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				agentOnline = false;
+			}
+		}
+
+		// Auto-start offline agent if callback is available. Issue #305:
+		// the callback returns immediately when it kicks off the registration
+		// flow, but the agent takes a few seconds to actually report
+		// `active` / `started`. Without a readiness wait, the execution
+		// callback fires while the agent is still booting and the message
+		// is lost. We now poll `agentStatusCallback` up to the configured
+		// wait window before proceeding.
+		let skipReason: CronTask['lastSkipReason'] | null = null;
+		if (!agentOnline && this.agentStartCallback) {
+			this.logger.info('Agent offline for cron task, attempting auto-start', {
+				id: task.id,
+				target: task.targetAgent,
+			});
+			let kicked = false;
+			try {
+				kicked = await this.agentStartCallback(task.targetAgent, task.targetTeamId);
+				if (kicked) {
+					this.logger.info('Agent auto-start kicked off, waiting for ready', {
+						id: task.id,
+						target: task.targetAgent,
+						maxWaitMs: CRON_AUTO_START_READY_TIMEOUT_MS,
+					});
+				}
+			} catch (error) {
+				this.logger.error('Agent auto-start failed', {
+					id: task.id,
+					target: task.targetAgent,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				skipReason = 'agent_offline_start_failed';
+			}
+
+			if (kicked && this.agentStatusCallback) {
+				// Poll until ready or timeout. The status callback already
+				// treats both `active` and `started` as online (#286).
+				const deadline = Date.now() + CRON_AUTO_START_READY_TIMEOUT_MS;
+				while (Date.now() < deadline) {
+					try {
+						if (await this.agentStatusCallback(task.targetAgent, task.targetTeamId)) {
+							agentOnline = true;
+							break;
+						}
+					} catch {
+						// Transient — keep retrying until deadline.
+					}
+					await new Promise((res) => setTimeout(res, CRON_AUTO_START_READY_POLL_MS));
+				}
+				if (!agentOnline) {
+					skipReason = 'agent_offline_not_ready';
+					this.logger.warn('Agent did not become ready before cron auto-start deadline', {
+						id: task.id,
+						target: task.targetAgent,
+						maxWaitMs: CRON_AUTO_START_READY_TIMEOUT_MS,
+					});
+				} else {
+					this.logger.info('Agent auto-started and ready', {
+						id: task.id,
+						target: task.targetAgent,
+					});
+				}
+			} else if (!kicked && skipReason === null) {
+				skipReason = 'agent_offline_start_failed';
+			}
+		} else if (!agentOnline) {
+			skipReason = 'agent_offline_no_callback';
+		}
+
+		if (!agentOnline) {
+			// #611: transient-skip retry budget. The reasons that fire here
+			// (`agent_offline_not_ready` / `agent_offline_start_failed`) can
+			// be caused by short-lived PTY spawn failures that clear in
+			// seconds (observed 2026-05-28: kernel briefly rejected
+			// posix_spawnp at user-proc-count 353/1333). Push `nextRunAt`
+			// forward by a small linear backoff and retry the SAME slot up
+			// to CRON_TRANSIENT_SKIP_MAX_ATTEMPTS before surrendering to the
+			// old "advance + mark skipped" path. Surplus skip reasons
+			// (`agent_offline_no_callback`) are NOT transient — they go
+			// straight to permanent skip.
+			const isTransient =
+				skipReason === 'agent_offline_not_ready' ||
+				skipReason === 'agent_offline_start_failed';
+			if (isTransient) {
+				const attempts = (task.transientSkipAttempts ?? 0) + 1;
+				if (attempts < CRON_TRANSIENT_SKIP_MAX_ATTEMPTS) {
+					const backoffMs = CRON_TRANSIENT_SKIP_BACKOFF_MS * attempts;
+					task.transientSkipAttempts = attempts;
+					task.nextRunAt = new Date(Date.now() + backoffMs).toISOString();
+					this.logger.warn('Cron transient-skip — retrying slot after backoff', {
+						id: task.id,
+						target: task.targetAgent,
+						skipReason,
+						attempt: attempts,
+						maxAttempts: CRON_TRANSIENT_SKIP_MAX_ATTEMPTS,
+						backoffMs,
+						nextRunAt: task.nextRunAt,
+					});
+					return true;
+				}
+				// Budget exhausted — fall through to permanent skip with a
+				// distinct reason so dashboards can tell "we tried" vs "gave
+				// up first round". Reset the counter so the next regular
+				// firing starts fresh.
+				skipReason = 'agent_offline_retries_exhausted';
+				task.transientSkipAttempts = 0;
+			}
+			this.logger.warn('Skipping cron task — agent offline and auto-start unavailable', {
+				id: task.id,
+				target: task.targetAgent,
+				skipReason,
+			});
+			// Mark the skip distinctly from "never ran" so the user can tell
+			// from API surfaces why `lastRunAt` is still null. Issue #305.
+			task.lastSkippedAt = now.toISOString();
+			task.lastSkipReason = skipReason ?? 'agent_offline_no_callback';
+			// Still advance nextRunAt to prevent re-evaluating the same missed slot
+			task.nextRunAt = getNextRunTime(task.cronExpression, task.timezone, now);
+			return true;
+		}
+
+		this.logger.info('Cron task due, executing', {
+			id: task.id,
+			target: task.targetAgent,
+			nextRunAt: task.nextRunAt,
+		});
+
+		try {
+			if (this.executionCallback) {
+				await this.executionCallback(task);
+			}
+		} catch (error) {
+			this.logger.error('Cron task execution failed', {
+				id: task.id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+
+		// Update run times regardless of execution success
+		task.lastRunAt = now.toISOString();
+		task.nextRunAt = getNextRunTime(task.cronExpression, task.timezone, now);
+		// #611: a successful (or attempted) execution clears the
+		// transient-skip retry counter so the NEXT slot starts with a
+		// fresh budget. Without this reset, a string of bad-luck runs
+		// would carry attempt-counts across firings and exhaust the
+		// budget prematurely.
+		if ((task.transientSkipAttempts ?? 0) > 0) {
+			task.transientSkipAttempts = 0;
+		}
+		return true;
+	}
+
+	// ============ Storage Methods ============
+
+	/**
+	 * Load cron task store for a specific team.
+	 *
+	 * @param teamId - Team ID
+	 * @returns Team's cron task store (empty if file doesn't exist)
+	 */
+	private async loadTeamStore(teamId: string): Promise<CronTaskStore> {
+		return this.readStore(this.getStoreFile(teamId));
+	}
+
+	/**
+	 * Read a cron store file.
+	 *
+	 * - missing: empty;
+	 * - corrupt (a truncated write, a full disk): copied aside once to
+	 *   `<file>.corrupt-<ts>` and logged as an error, then empty — the owner's
+	 *   schedules survive in the copy when the next save replaces the file;
+	 * - the copy fails, or the file cannot be read at all (EMFILE, EIO…):
+	 *   throws, so no read-modify-write can save over it.
+	 *
+	 * specs/2026-10-03-usage-ledger-durability.md
+	 *
+	 * @param filePath - Store file
+	 * @returns Store (empty when missing or corrupt)
+	 */
+	private async readStore(filePath: string): Promise<CronTaskStore> {
+		let raw: string;
+		try {
+			raw = await readFile(filePath, 'utf-8');
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { tasks: [] };
+			throw err;
+		}
+		let reason: string;
+		try {
+			const parsed = JSON.parse(raw) as CronTaskStore;
+			if (parsed && Array.isArray(parsed.tasks)) {
+				this.setAsideStores.delete(filePath);
+				return parsed;
+			}
+			reason = 'no tasks array';
+		} catch (err) {
+			reason = `invalid JSON: ${err instanceof Error ? err.message : String(err)}`;
+		}
+		if (!this.setAsideStores.has(filePath)) {
+			await quarantineCorruptFile(filePath, reason, this.logger);
+			this.setAsideStores.add(filePath);
+		}
+		return { tasks: [] };
+	}
+
+	/**
+	 * Save cron task store for a specific team.
+	 *
+	 * @param teamId - Team ID
+	 * @param store - Store data to persist
+	 */
+	private async saveTeamStore(teamId: string, store: CronTaskStore): Promise<void> {
+		const filePath = this.getStoreFile(teamId);
+		const dir = path.dirname(filePath);
+		await mkdir(dir, { recursive: true });
+		await atomicWriteFile(filePath, JSON.stringify(store, null, 2));
+	}
+
+	/**
+	 * Load the global cron task store (orchestrator tasks only).
+	 *
+	 * @returns Global store (empty if file doesn't exist)
+	 */
+	private async loadGlobalStore(): Promise<CronTaskStore> {
+		return this.readStore(this.getGlobalStoreFile());
+	}
+
+	/**
+	 * Save the global cron task store (orchestrator tasks only).
+	 *
+	 * @param store - Store data to persist
+	 */
+	private async saveGlobalStore(store: CronTaskStore): Promise<void> {
+		const filePath = this.getGlobalStoreFile();
+		const dir = path.dirname(filePath);
+		await mkdir(dir, { recursive: true });
+		await atomicWriteFile(filePath, JSON.stringify(store, null, 2));
+	}
+
+	/**
+	 * Load all tasks from all team stores plus the global store,
+	 * aggregated into a single array.
+	 *
+	 * @returns All cron tasks across all teams and the global orchestrator store
+	 */
+	private async loadAllTasks(): Promise<CronTask[]> {
+		const teamIds = await this.getTeamIds();
+		const allTasks: CronTask[] = [];
+
+		// Load orchestrator tasks from global store
+		const globalStore = await this.loadGlobalStore();
+		allTasks.push(...globalStore.tasks);
+
+		// Load per-team tasks
+		for (const teamId of teamIds) {
+			const store = await this.loadTeamStore(teamId);
+			allTasks.push(...store.tasks);
+		}
+
+		return allTasks;
+	}
+
+	/**
+	 * Discover all team IDs that have cron task files.
+	 *
+	 * Scans ~/.crewly/teams/ for directories containing cron-tasks.json.
+	 *
+	 * @returns Array of team IDs
+	 */
+	private async getTeamIds(): Promise<string[]> {
+		const teamsDir = path.join(this.crewlyHome, 'teams');
+		try {
+			const entries = await readdir(teamsDir, { withFileTypes: true });
+			const teamIds: string[] = [];
+
+			for (const entry of entries) {
+				if (!entry.isDirectory()) continue;
+				const cronFile = path.join(teamsDir, entry.name, CRON_TASKS_FILENAME);
+				if (existsSync(cronFile)) {
+					teamIds.push(entry.name);
+				}
+			}
+
+			return teamIds;
+		} catch {
+			// teams directory doesn't exist yet
+			return [];
+		}
+	}
+}

@@ -1,0 +1,1842 @@
+/**
+ * Wiki REST Controller
+ *
+ * Exposes the LLM-wiki ingest/query operations over HTTP so the bash
+ * skills (`wiki-ingest`, `wiki-query`) and in-process subscribers
+ * (`WikiChatSubscriberService`) all funnel through the same code path.
+ *
+ * @module controllers/wiki/wiki.controller
+ */
+
+import type { Request, Response, NextFunction } from 'express';
+import { LoggerService } from '../../services/core/logger.service.js';
+import {
+  WikiIngestService,
+  WikiSourceType,
+} from '../../services/wiki/wiki-ingest.service.js';
+import { WikiQueryService } from '../../services/wiki/wiki-query.service.js';
+import {
+  WikiQueueService,
+  WikiQueueStatus,
+} from '../../services/wiki/wiki-queue.service.js';
+import { WikiProcessService } from '../../services/wiki/wiki-process.service.js';
+import { WikiBookkeepService } from '../../services/wiki/wiki-bookkeep.service.js';
+import { WikiBookkeepTriggerService } from '../../services/wiki/wiki-bookkeep-trigger.service.js';
+import { discoverWikiVaults } from '../../services/wiki/wiki-bookkeep-trigger.service.js';
+import { WikiReflectTriggerService } from '../../services/wiki/wiki-reflect-trigger.service.js';
+import { SchemaLoaderService } from '../../services/wiki/schema-loader.service.js';
+import { WikiSearchService } from '../../services/wiki/wiki-search.service.js';
+import { WikiBacklinksService } from '../../services/wiki/wiki-backlinks.service.js';
+import { WikiLintService } from '../../services/wiki/wiki-lint.service.js';
+import { WikiRecentService } from '../../services/wiki/wiki-recent.service.js';
+import { WikiMigrateService } from '../../services/wiki/wiki-migrate.service.js';
+import { WikiCleanupService } from '../../services/wiki/wiki-cleanup.service.js';
+import {
+  overlayRootFor,
+  resolveOverlayFilePath,
+} from '../../services/wiki/wiki-overlay.resolver.js';
+import { SopCatalogService } from '../../services/wiki/sop-catalog.service.js';
+import * as path from 'path';
+import * as os from 'os';
+import * as fs from 'fs/promises';
+import { existsSync } from 'fs';
+
+import { WikiCurationService } from '../../services/wiki/wiki-curation.service.js';
+import { WikiIndexService } from '../../services/wiki/wiki-index.service.js';
+import { WikiHistoryService } from '../../services/wiki/wiki-history.service.js';
+import { WikiUsageService } from '../../services/wiki/wiki-usage.service.js';
+import { StorageService } from '../../services/core/storage.service.js';
+import { ORCHESTRATOR_SESSION_NAME } from '../../constants.js';
+import { viewerPersonOf } from '../../services/people/acting-for.service.js';
+
+const logger = LoggerService.getInstance().createComponentLogger('WikiController');
+
+/**
+ * Who is calling: the agent session from the skills' `X-Agent-Session`
+ * header and its role as stored in the team config (never a role the
+ * caller claims). No header = the owner via the dashboard.
+ *
+ * @param req - Request
+ * @returns `{ session, role }` — both undefined for the owner
+ */
+export async function resolveCaller(req: Request): Promise<{ session?: string; role?: string }> {
+  const hdr = req.headers['x-agent-session'] ?? req.headers['x-crewly-agent-session'];
+  const session = typeof hdr === 'string' && hdr.trim().length > 0 ? hdr.trim() : undefined;
+  if (!session) return {};
+  if (session === ORCHESTRATOR_SESSION_NAME) return { session, role: 'orchestrator' };
+  try {
+    const found = await StorageService.getInstance().findMemberBySessionName(session);
+    return { session, role: found ? String(found.member.role) : 'worker' };
+  } catch {
+    return { session, role: 'worker' };
+  }
+}
+
+const VALID_SOURCE_TYPES: ReadonlySet<WikiSourceType> = new Set<WikiSourceType>([
+  'user_chat',
+  'slack_message',
+  'spec_file',
+  'pr_merge',
+  'record_learning',
+  'task_verified',
+]);
+
+/**
+ * POST /api/wiki/ingest
+ *
+ * Write a single source into a vault's `llm-curated/log.md` (or other
+ * non-frozen target). The handler enforces request validation; per-call
+ * routing / frozen-path / size limits live in `WikiIngestService`.
+ *
+ * Request body:
+ *   {
+ *     vaultPath: string,
+ *     sourceType: WikiSourceType,
+ *     sourceRef: string,
+ *     sourceBody: string,
+ *     callerSession?: string,
+ *     targetRelativePath?: string
+ *   }
+ *
+ * Response:
+ *   200 { success: true,  result: WikiIngestOutcome (ok=true variant) }
+ *   400 { success: false, error: string, outcome?: WikiIngestOutcome }
+ *   422 { success: false, error: 'frozen_path', outcome: WikiIngestOutcome }
+ */
+export async function ingest(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const {
+      vaultPath,
+      sourceType,
+      sourceRef,
+      sourceBody,
+      callerSession,
+      targetRelativePath,
+      title,
+      summary,
+      keepBecause,
+      tags,
+      visibility,
+      replace,
+    } = req.body ?? {};
+    const caller = await resolveCaller(req);
+
+    if (typeof vaultPath !== 'string' || vaultPath.length === 0) {
+      res.status(400).json({ success: false, error: 'vaultPath (string) is required' });
+      return;
+    }
+    if (typeof sourceType !== 'string' || !VALID_SOURCE_TYPES.has(sourceType as WikiSourceType)) {
+      res.status(400).json({
+        success: false,
+        error: `sourceType must be one of: ${[...VALID_SOURCE_TYPES].join(', ')}`,
+      });
+      return;
+    }
+    if (typeof sourceRef !== 'string' || sourceRef.length === 0) {
+      res.status(400).json({ success: false, error: 'sourceRef (string) is required' });
+      return;
+    }
+    if (typeof sourceBody !== 'string') {
+      res.status(400).json({ success: false, error: 'sourceBody (string) is required' });
+      return;
+    }
+    if (callerSession !== undefined && typeof callerSession !== 'string') {
+      res.status(400).json({ success: false, error: 'callerSession must be a string when provided' });
+      return;
+    }
+    if (targetRelativePath !== undefined && typeof targetRelativePath !== 'string') {
+      res.status(400).json({ success: false, error: 'targetRelativePath must be a string when provided' });
+      return;
+    }
+
+    const outcome = await WikiIngestService.getInstance().ingest({
+      vaultPath,
+      sourceType: sourceType as WikiSourceType,
+      sourceRef,
+      sourceBody,
+      callerSession: callerSession ?? caller.session,
+      callerRole: caller.role,
+      targetRelativePath,
+      ...(typeof title === 'string' ? { title } : {}),
+      ...(typeof summary === 'string' ? { summary } : {}),
+      ...(typeof keepBecause === 'string' ? { keepBecause } : {}),
+      ...(Array.isArray(tags) ? { tags: tags.filter((t: unknown): t is string => typeof t === 'string') } : {}),
+      ...(Array.isArray(visibility) ? { visibility: visibility.filter((v: unknown): v is string => typeof v === 'string') } : {}),
+      ...(replace === true ? { replace: true } : {}),
+    });
+
+    if (outcome.ok) {
+      res.status(200).json({ success: true, result: outcome });
+      return;
+    }
+
+    // Refusal — surface a stable status code per reason so callers can branch.
+    if (outcome.reason === 'frozen_path') {
+      res.status(422).json({ success: false, error: 'frozen_path', outcome });
+      return;
+    }
+    if (outcome.reason === 'retention_gate' || outcome.reason === 'secret_detected' || outcome.reason === 'pii_refused') {
+      res.status(422).json({ success: false, error: outcome.reason, outcome });
+      return;
+    }
+    if (outcome.reason === 'schema_missing') {
+      res.status(404).json({ success: false, error: 'schema_missing', outcome });
+      return;
+    }
+    res.status(400).json({ success: false, error: outcome.reason, outcome });
+  } catch (err) {
+    logger.error('wiki/ingest threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/query
+ *
+ * Build the system-context payload for a single-vault read. The skill /
+ * caller's runtime concatenates this with its per-LLM task-instruction
+ * prompt (`config/skills/<role>/wiki-query/prompts/<runtime>.md`) before
+ * the actual LLM call.
+ *
+ * Request body:
+ *   {
+ *     vaultPath: string,
+ *     query: string,
+ *     topK?: number,
+ *     recentLogEntries?: number
+ *   }
+ *
+ * Response:
+ *   200 { success: true,  result: { context: WikiQuerySystemContext } }
+ *   400 { success: false, error: string, outcome?: failure }
+ *   404 { success: false, error: 'schema_missing', outcome }
+ */
+export async function queryVault(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { vaultPath, query, topK, recentLogEntries, pages, includeSuperseded } = req.body ?? {};
+    const caller = await resolveCaller(req);
+
+    if (typeof vaultPath !== 'string' || vaultPath.length === 0) {
+      res.status(400).json({ success: false, error: 'vaultPath (string) is required' });
+      return;
+    }
+    if (typeof query !== 'string' || query.length === 0) {
+      res.status(400).json({ success: false, error: 'query (string) is required' });
+      return;
+    }
+    if (topK !== undefined && (!Number.isInteger(topK) || topK <= 0)) {
+      res.status(400).json({ success: false, error: 'topK must be a positive integer' });
+      return;
+    }
+    if (
+      recentLogEntries !== undefined &&
+      (!Number.isInteger(recentLogEntries) || recentLogEntries < 0)
+    ) {
+      res.status(400).json({
+        success: false,
+        error: 'recentLogEntries must be a non-negative integer',
+      });
+      return;
+    }
+
+    if (pages !== undefined && (!Array.isArray(pages) || pages.some((p: unknown) => typeof p !== 'string'))) {
+      res.status(400).json({ success: false, error: 'pages must be an array of vault-relative paths' });
+      return;
+    }
+    const outcome = await WikiQueryService.getInstance().query({
+      vaultPath,
+      query,
+      topK,
+      recentLogEntries,
+      pages,
+      agent: caller.session ?? 'owner',
+      viewerRole: caller.role,
+      viewerPerson: viewerPersonOf(caller.session),
+      includeSuperseded: includeSuperseded === true,
+    });
+
+    if (outcome.ok) {
+      res.status(200).json({ success: true, result: { context: outcome.context } });
+      return;
+    }
+
+    if (outcome.reason === 'schema_missing') {
+      res.status(404).json({ success: false, error: 'schema_missing', outcome });
+      return;
+    }
+    res.status(400).json({ success: false, error: outcome.reason, outcome });
+  } catch (err) {
+    logger.error('wiki/query threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+// =============================================================================
+// Wiki Queue (Steve 2026-05-22 redesign — agents enqueue, agents process)
+// =============================================================================
+
+const VALID_QUEUE_STATUSES: ReadonlySet<WikiQueueStatus> = new Set<WikiQueueStatus>([
+  'pending',
+  'claimed',
+  'processed',
+  'skipped',
+]);
+
+// Note: VALID_SOURCE_TYPES is already declared above for the /ingest route.
+// The queue-add handler below reuses that same set.
+
+/**
+ * POST /api/wiki/queue
+ *
+ * Enqueue a candidate item. Agents call this when a turn produces
+ * content worth saving to the wiki. The `reason` is REQUIRED — the
+ * agent has to justify why this is wiki-worthy (audit trail + helps
+ * the processor decide where it goes).
+ */
+export async function queueAdd(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { vaultPath, queuedBy, sourceType, sourceRef, content, reason } =
+      req.body ?? {};
+    if (typeof vaultPath !== 'string' || vaultPath.length === 0) {
+      res.status(400).json({ success: false, error: 'vaultPath (string) is required' });
+      return;
+    }
+    if (typeof queuedBy !== 'string' || queuedBy.length === 0) {
+      res.status(400).json({ success: false, error: 'queuedBy (string) is required' });
+      return;
+    }
+    if (
+      typeof sourceType !== 'string' ||
+      !VALID_SOURCE_TYPES.has(sourceType as WikiSourceType)
+    ) {
+      res.status(400).json({
+        success: false,
+        error: `sourceType must be one of: ${[...VALID_SOURCE_TYPES].join(', ')}`,
+      });
+      return;
+    }
+    if (typeof sourceRef !== 'string' || sourceRef.length === 0) {
+      res.status(400).json({ success: false, error: 'sourceRef (string) is required' });
+      return;
+    }
+    if (typeof content !== 'string' || content.length === 0) {
+      res.status(400).json({ success: false, error: 'content (string) is required' });
+      return;
+    }
+    if (typeof reason !== 'string' || reason.length === 0) {
+      res.status(400).json({
+        success: false,
+        error: 'reason (string) is required — agents must justify why this is wiki-worthy',
+      });
+      return;
+    }
+    const item = await WikiQueueService.getInstance().add({
+      vaultPath,
+      queuedBy,
+      sourceType: sourceType as Parameters<WikiQueueService['add']>[0]['sourceType'],
+      sourceRef,
+      content,
+      reason,
+    });
+    res.status(201).json({ success: true, item });
+  } catch (err) {
+    // Service-level validation errors bubble up as 400; everything else 500.
+    const msg = (err as Error).message;
+    if (/exceeds|empty|absolute|required/i.test(msg)) {
+      res.status(400).json({ success: false, error: msg });
+      return;
+    }
+    logger.error('wiki/queue add threw', { error: msg });
+    next(err);
+  }
+}
+
+/**
+ * GET /api/wiki/queue?vaultPath=…&status=…&queuedBy=…&limit=…
+ */
+export async function queueList(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const vaultPath = typeof req.query.vaultPath === 'string' ? req.query.vaultPath : undefined;
+    const queuedBy = typeof req.query.queuedBy === 'string' ? req.query.queuedBy : undefined;
+    const statusRaw = typeof req.query.status === 'string' ? req.query.status : undefined;
+    if (statusRaw !== undefined && !VALID_QUEUE_STATUSES.has(statusRaw as WikiQueueStatus)) {
+      res.status(400).json({
+        success: false,
+        error: `status must be one of: ${[...VALID_QUEUE_STATUSES].join(', ')}`,
+      });
+      return;
+    }
+    const limitRaw = typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
+    if (limitRaw !== undefined && (!Number.isInteger(limitRaw) || limitRaw <= 0)) {
+      res.status(400).json({ success: false, error: 'limit must be a positive integer' });
+      return;
+    }
+    const items = await WikiQueueService.getInstance().list({
+      vaultPath,
+      queuedBy,
+      status: statusRaw as WikiQueueStatus | undefined,
+      limit: limitRaw,
+    });
+    res.status(200).json({ success: true, items, count: items.length });
+  } catch (err) {
+    logger.error('wiki/queue list threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/queue/:id/claim
+ *   body: { claimedBy: string }
+ */
+export async function queueClaim(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { id } = req.params;
+    const { claimedBy } = req.body ?? {};
+    if (typeof claimedBy !== 'string' || claimedBy.length === 0) {
+      res.status(400).json({ success: false, error: 'claimedBy (string) is required' });
+      return;
+    }
+    const item = await WikiQueueService.getInstance().claim(id, claimedBy);
+    res.status(200).json({ success: true, item });
+  } catch (err) {
+    const msg = (err as Error).message;
+    if (/not found/i.test(msg)) {
+      res.status(404).json({ success: false, error: msg });
+      return;
+    }
+    if (/pending|claimed|status/i.test(msg)) {
+      res.status(409).json({ success: false, error: msg });
+      return;
+    }
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/queue/:id/process
+ *   body: { ingested: boolean, pagesWritten?: string[], targetPath?: string, summary?: string }
+ *
+ * Cascade audit (2026-05-26 — Karpathy 10-15-pages-per-source rule):
+ *   The response includes `cascadeAudit: { pageCount, classification }` so
+ *   callers can self-assess whether they did the cascade work. Single-page
+ *   ingests (i.e. just the primary write, no cross-link, no related-page
+ *   update) emit a `warn`-level audit log so we can later quantify how
+ *   often agents skip cascade — the wiki's compounding value lives in
+ *   cascade touches, not in the primary write.
+ *
+ * Classification:
+ *   - `single`     — 1 page written. Likely a missed cascade. Audited (warn).
+ *   - `light`      — 2 pages. Acceptable for routine learnings.
+ *   - `cascading`  — 3+ pages. Karpathy-shaped: load-bearing content with cross-refs.
+ */
+export async function queueProcess(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { id } = req.params;
+    const { ingested, pagesWritten, targetPath, summary } = req.body ?? {};
+    if (typeof ingested !== 'boolean') {
+      res.status(400).json({ success: false, error: 'ingested (boolean) is required' });
+      return;
+    }
+    if (pagesWritten !== undefined && !Array.isArray(pagesWritten)) {
+      res.status(400).json({ success: false, error: 'pagesWritten must be an array' });
+      return;
+    }
+    const item = await WikiQueueService.getInstance().markProcessed(id, {
+      ingested,
+      pagesWritten,
+      targetPath,
+      summary,
+    });
+
+    // Cascade audit. Only when the agent actually wrote (ingested === true).
+    let cascadeAudit: {
+      pageCount: number;
+      classification: 'single' | 'light' | 'cascading' | 'n/a';
+    } = { pageCount: 0, classification: 'n/a' };
+    if (ingested) {
+      const pageCount = Array.isArray(pagesWritten) ? pagesWritten.length : 0;
+      const classification: 'single' | 'light' | 'cascading' =
+        pageCount <= 1 ? 'single' : pageCount === 2 ? 'light' : 'cascading';
+      cascadeAudit = { pageCount, classification };
+      if (classification === 'single') {
+        logger.warn('wiki-process: cascade missed — single-page ingest', {
+          queueItemId: id,
+          targetPath,
+          pageCount,
+          summary: typeof summary === 'string' ? summary.slice(0, 80) : undefined,
+          karpathy: '"a single source might touch 10-15 wiki pages" — see wiki-process-queue SKILL.md',
+        });
+      }
+    }
+
+    res.status(200).json({ success: true, item, cascadeAudit });
+  } catch (err) {
+    const msg = (err as Error).message;
+    if (/not found/i.test(msg)) {
+      res.status(404).json({ success: false, error: msg });
+      return;
+    }
+    if (/claimed|status/i.test(msg)) {
+      res.status(409).json({ success: false, error: msg });
+      return;
+    }
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/queue/:id/skip
+ *   body: { skipReason: string }
+ */
+export async function queueSkip(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { id } = req.params;
+    const { skipReason } = req.body ?? {};
+    if (typeof skipReason !== 'string' || skipReason.length === 0) {
+      res.status(400).json({ success: false, error: 'skipReason (string) is required' });
+      return;
+    }
+    const item = await WikiQueueService.getInstance().markSkipped(id, skipReason);
+    res.status(200).json({ success: true, item });
+  } catch (err) {
+    const msg = (err as Error).message;
+    if (/not found/i.test(msg)) {
+      res.status(404).json({ success: false, error: msg });
+      return;
+    }
+    if (/claimed|status/i.test(msg)) {
+      res.status(409).json({ success: false, error: msg });
+      return;
+    }
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/queue/claim-next
+ *   body: { claimedBy: string, vaultPath?: string, offset?: number, topK?: number, recentLogEntries?: number }
+ *
+ * Claims the next pending item AND returns the vault context the
+ * agent's LLM should classify against. The agent then picks a target
+ * page, calls /wiki/ingest, and commits via /queue/:id/process.
+ */
+export async function queueClaimNext(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { claimedBy, vaultPath, offset, topK, recentLogEntries } = req.body ?? {};
+    if (typeof claimedBy !== 'string' || claimedBy.length === 0) {
+      res.status(400).json({ success: false, error: 'claimedBy (string) is required' });
+      return;
+    }
+    if (vaultPath !== undefined && typeof vaultPath !== 'string') {
+      res.status(400).json({ success: false, error: 'vaultPath must be a string when provided' });
+      return;
+    }
+    if (offset !== undefined && (!Number.isInteger(offset) || offset < 0)) {
+      res.status(400).json({ success: false, error: 'offset must be a non-negative integer' });
+      return;
+    }
+    const outcome = await WikiProcessService.getInstance().claimNext({
+      claimedBy,
+      vaultPath,
+      offset,
+      topK,
+      recentLogEntries,
+    });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, result: outcome.result });
+      return;
+    }
+    if (outcome.reason === 'no_pending_items') {
+      res.status(404).json({ success: false, error: 'no_pending_items', message: outcome.message });
+      return;
+    }
+    res.status(400).json({ success: false, error: outcome.reason, message: outcome.message });
+  } catch (err) {
+    logger.error('wiki/queue claim-next threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/bookkeep
+ *   body: { vaultPath: string, windowDays?: number, threshold?: number }
+ */
+export async function bookkeep(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { vaultPath, windowDays, threshold } = req.body ?? {};
+    if (typeof vaultPath !== 'string' || vaultPath.length === 0) {
+      res.status(400).json({ success: false, error: 'vaultPath (string) is required' });
+      return;
+    }
+    if (windowDays !== undefined && (!Number.isInteger(windowDays) || windowDays <= 0)) {
+      res.status(400).json({ success: false, error: 'windowDays must be a positive integer' });
+      return;
+    }
+    if (threshold !== undefined && (!Number.isInteger(threshold) || threshold <= 0)) {
+      res.status(400).json({ success: false, error: 'threshold must be a positive integer' });
+      return;
+    }
+    const outcome = await WikiBookkeepService.getInstance().generate({
+      vaultPath,
+      windowDays,
+      threshold,
+    });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, report: outcome.report });
+      return;
+    }
+    const status =
+      outcome.reason === 'vault_missing' || outcome.reason === 'schema_missing' ? 404 : 400;
+    res.status(status).json({ success: false, error: outcome.reason, message: outcome.message });
+  } catch (err) {
+    logger.error('wiki/bookkeep threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+// =============================================================================
+// Browse endpoints — power the OSS /wiki UI.
+// =============================================================================
+
+const MAX_TREE_ENTRIES = 500;
+const MAX_PAGE_BYTES = 256 * 1024;
+
+interface WikiTreeNode {
+  name: string;
+  /** Path relative to the vault root, with forward slashes. */
+  relativePath: string;
+  type: 'file' | 'directory';
+  /** Frozen flag (per SCHEMA.md hardcoded list). */
+  frozen?: boolean;
+  /**
+   * Human-readable description of the frozen folder, pulled from
+   * `hardcoded[].description` in SCHEMA.md. Populated for the FROZEN
+   * directory node (not its children). Surfaces as a hover tooltip.
+   */
+  frozenDescription?: string;
+  /** File size in bytes. Files only. */
+  bytes?: number;
+  /** Last-modified ISO timestamp. Files only. */
+  modifiedAt?: string;
+  /** Sorted children. Directories only. */
+  children?: WikiTreeNode[];
+}
+
+/**
+ * Resolve a human-readable label for a vault. Team vaults use the team's
+ * `name` from `<team-dir>/config.json` (the schema vault_id is a UUID);
+ * project vaults look up `~/.crewly/projects.json` by path; otherwise the
+ * schema vault_id (or path basename) is used.
+ *
+ * @param vaultPath - Absolute vault path.
+ * @param scope - Vault scope.
+ * @param vaultId - Schema vault_id (fallback label).
+ * @returns The resolved label.
+ */
+async function resolveVaultLabel(
+  vaultPath: string,
+  scope: 'project' | 'team' | 'global' | 'unknown',
+  vaultId: string,
+): Promise<string> {
+  let label = vaultId || path.basename(path.dirname(vaultPath));
+  if (scope === 'team') {
+    try {
+      const cfg = JSON.parse(
+        await fs.readFile(path.join(path.dirname(vaultPath), 'config.json'), 'utf8'),
+      ) as { name?: string; teamName?: string };
+      const friendly = cfg.name ?? cfg.teamName;
+      if (typeof friendly === 'string' && friendly.length > 0) label = friendly;
+    } catch {
+      // fall back to UUID label
+    }
+  } else if (scope === 'project') {
+    try {
+      const projects = JSON.parse(
+        await fs.readFile(path.join(os.homedir(), '.crewly/projects.json'), 'utf8'),
+      ) as Array<{ name?: string; path?: string }>;
+      const projectRoot = path.dirname(path.dirname(vaultPath));
+      const hit = projects.find((p) => p.path === projectRoot);
+      if (hit && typeof hit.name === 'string' && hit.name.length > 0) label = hit.name;
+    } catch {
+      // fall back to vault_id / basename
+    }
+  }
+  return label;
+}
+
+/**
+ * Discover all vaults with scope + human label (no stats). Shared by
+ * `/vaults` and `/search-all`.
+ *
+ * @returns Vault descriptors.
+ */
+async function discoverVaultsWithLabels(): Promise<
+  Array<{ vaultPath: string; scope: 'project' | 'team' | 'global' | 'unknown'; label: string }>
+> {
+  const vaultPaths = await discoverWikiVaults();
+  const schemaLoader = new SchemaLoaderService();
+  return Promise.all(
+    vaultPaths.map(async (vaultPath) => {
+      let scope = 'unknown' as 'project' | 'team' | 'global' | 'unknown';
+      let vaultId = '';
+      try {
+        const schema = await schemaLoader.load(vaultPath);
+        scope = schema.vault_scope;
+        vaultId = schema.vault_id;
+      } catch {
+        // malformed schema — still surface
+      }
+      return { vaultPath, scope, label: await resolveVaultLabel(vaultPath, scope, vaultId) };
+    }),
+  );
+}
+
+/**
+ * GET /api/wiki/vaults
+ *
+ * Returns the list of all known vaults (project + team + global) with
+ * stats so the UI can render a sidebar. Discovery uses the same logic
+ * the bookkeep trigger uses.
+ */
+export async function listVaults(
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const vaultPaths = await discoverWikiVaults();
+    const schemaLoader = new SchemaLoaderService();
+    const entries = await Promise.all(
+      vaultPaths.map(async (vaultPath) => {
+        let scope = 'unknown' as 'project' | 'team' | 'global' | 'unknown';
+        let vaultId = '';
+        try {
+          const schema = await schemaLoader.load(vaultPath);
+          scope = schema.vault_scope;
+          vaultId = schema.vault_id;
+        } catch {
+          // skip — vault present but malformed; still surface to UI
+        }
+
+        let bookkeepReport: { totalMdCount: number; recentMdCount: number; queue: { pending: number; processed: number; total: number } } | null = null;
+        try {
+          const outcome = await WikiBookkeepService.getInstance().generate({ vaultPath });
+          if (outcome.ok) {
+            bookkeepReport = {
+              totalMdCount: outcome.report.totalMdCount,
+              recentMdCount: outcome.report.recentMdCount,
+              queue: {
+                pending: outcome.report.queue.pending,
+                processed: outcome.report.queue.processed,
+                total: outcome.report.queue.total,
+              },
+            };
+          }
+        } catch {
+          // ignore — show vault anyway with null stats
+        }
+
+        // Human-readable label (team name / project name / vault_id).
+        const label = await resolveVaultLabel(vaultPath, scope, vaultId);
+
+        return {
+          vaultPath,
+          scope,
+          vaultId,
+          label,
+          stats: bookkeepReport,
+        };
+      }),
+    );
+    res.status(200).json({ success: true, vaults: entries });
+  } catch (err) {
+    logger.error('wiki/vaults threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * GET /api/wiki/tree?vaultPath=...
+ *
+ * Walks the vault directory and returns the file tree. Frozen folders
+ * are marked so the UI can render them differently. SCHEMA.md is
+ * surfaced as a top-level file.
+ */
+export async function getVaultTree(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const vaultPath = typeof req.query.vaultPath === 'string' ? req.query.vaultPath : undefined;
+    if (!vaultPath || !path.isAbsolute(vaultPath)) {
+      res.status(400).json({ success: false, error: 'vaultPath (absolute) is required' });
+      return;
+    }
+    if (!existsSync(vaultPath)) {
+      res.status(404).json({ success: false, error: 'vault_missing' });
+      return;
+    }
+
+    const schemaLoader = new SchemaLoaderService();
+    const frozenSet = new Set<string>();
+    // path (without trailing slash) → description from SCHEMA.md hardcoded[]
+    const frozenDescriptions = new Map<string, string>();
+    try {
+      const schema = await schemaLoader.load(vaultPath);
+      for (const entry of schema.hardcoded) {
+        const folder = entry.path.replace(/[/\\]+$/, '');
+        frozenSet.add(folder);
+        if (entry.description) frozenDescriptions.set(folder, entry.description);
+      }
+    } catch {
+      // proceed without frozen markers
+    }
+
+    let scanned = 0;
+
+    /**
+     * Walk an external overlay source dir (e.g. config/sops), producing nodes
+     * whose relativePath is rooted under `relPrefix` so the page endpoint can
+     * read them back through the same overlay. All nodes are marked frozen
+     * (read-through, read-only).
+     */
+    const buildOverlayTree = async (
+      absDir: string,
+      relPrefix: string,
+    ): Promise<WikiTreeNode[]> => {
+      const out: WikiTreeNode[] = [];
+      let entries: import('fs').Dirent[];
+      try {
+        entries = await fs.readdir(absDir, { withFileTypes: true });
+      } catch {
+        return [];
+      }
+      for (const entry of entries) {
+        if (scanned >= MAX_TREE_ENTRIES) break;
+        if (entry.name.startsWith('.')) continue;
+        scanned++;
+        const abs = path.join(absDir, entry.name);
+        const rel = `${relPrefix}/${entry.name}`;
+        if (entry.isDirectory()) {
+          out.push({
+            name: entry.name,
+            relativePath: rel,
+            type: 'directory',
+            frozen: true,
+            children: (await buildOverlayTree(abs, rel)).sort((a, b) => sortTree(a, b)),
+          });
+        } else if (entry.isFile() && entry.name.endsWith('.md')) {
+          try {
+            const stat = await fs.stat(abs);
+            out.push({
+              name: entry.name,
+              relativePath: rel,
+              type: 'file',
+              frozen: true,
+              bytes: stat.size,
+              modifiedAt: new Date(stat.mtimeMs).toISOString(),
+            });
+          } catch {
+            // ignore unreadable file
+          }
+        }
+      }
+      return out;
+    };
+
+    const buildTree = async (absDir: string): Promise<WikiTreeNode[]> => {
+      const out: WikiTreeNode[] = [];
+      let entries: import('fs').Dirent[];
+      try {
+        entries = await fs.readdir(absDir, { withFileTypes: true });
+      } catch {
+        return [];
+      }
+      for (const entry of entries) {
+        if (scanned >= MAX_TREE_ENTRIES) break;
+        if (entry.name.startsWith('.')) continue;
+        scanned++;
+        const abs = path.join(absDir, entry.name);
+        const rel = path.relative(vaultPath, abs).replace(/\\/g, '/');
+        if (entry.isDirectory()) {
+          const folderKey = rel.replace(/[/\\]+$/, '');
+          const isFrozen =
+            frozenSet.has(folderKey) || frozenSet.has(`${folderKey}/`);
+          // Live read-through: top-level canonical folders (sop/, team-norm/)
+          // are reserved homes whose content lives elsewhere on disk. Source
+          // their children from the real location instead of the empty vault dir.
+          const overlayRoot =
+            absDir === vaultPath ? overlayRootFor(vaultPath, folderKey) : null;
+          const children = overlayRoot
+            ? await buildOverlayTree(overlayRoot, folderKey)
+            : await buildTree(abs);
+          out.push({
+            name: entry.name,
+            relativePath: rel,
+            type: 'directory',
+            frozen: isFrozen || undefined,
+            frozenDescription: isFrozen
+              ? frozenDescriptions.get(folderKey)
+              : undefined,
+            children: children.sort((a, b) => sortTree(a, b)),
+          });
+        } else if (entry.isFile()) {
+          // Surface markdown + SCHEMA.md only — skip other binaries.
+          if (!entry.name.endsWith('.md')) continue;
+          try {
+            const stat = await fs.stat(abs);
+            // Determine frozen via parent dir.
+            const parts = rel.split('/');
+            const parentRel = parts.slice(0, -1).join('/');
+            const isFrozen =
+              frozenSet.has(parentRel) || frozenSet.has(`${parentRel}/`);
+            out.push({
+              name: entry.name,
+              relativePath: rel,
+              type: 'file',
+              frozen: isFrozen || undefined,
+              bytes: stat.size,
+              modifiedAt: new Date(stat.mtimeMs).toISOString(),
+            });
+          } catch {
+            // ignore unreadable file
+          }
+        }
+      }
+      return out;
+    };
+
+    const tree = (await buildTree(vaultPath)).sort((a, b) => sortTree(a, b));
+    res.status(200).json({
+      success: true,
+      vaultPath,
+      tree,
+      truncated: scanned >= MAX_TREE_ENTRIES,
+    });
+  } catch (err) {
+    logger.error('wiki/tree threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+function sortTree(a: WikiTreeNode, b: WikiTreeNode): number {
+  // Directories first, then files; both alphabetical.
+  if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
+  return a.name.localeCompare(b.name);
+}
+
+/**
+ * GET /api/wiki/page?vaultPath=...&relativePath=...
+ *
+ * Returns the raw markdown content of a single page. The relativePath
+ * is validated to ensure it doesn't escape the vault directory.
+ */
+export async function getPage(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const vaultPath = typeof req.query.vaultPath === 'string' ? req.query.vaultPath : undefined;
+    const relativePath =
+      typeof req.query.relativePath === 'string' ? req.query.relativePath : undefined;
+    if (!vaultPath || !path.isAbsolute(vaultPath)) {
+      res.status(400).json({ success: false, error: 'vaultPath (absolute) is required' });
+      return;
+    }
+    if (!relativePath || relativePath.length === 0) {
+      res.status(400).json({ success: false, error: 'relativePath is required' });
+      return;
+    }
+    if (!relativePath.endsWith('.md')) {
+      res.status(400).json({ success: false, error: 'only .md files can be read' });
+      return;
+    }
+    // Live read-through: pages under canonical overlay folders (sop/,
+    // team-norm/) live outside the vault; resolve them to their real source
+    // (the resolver applies its own traversal guard against the source root).
+    let requested: string;
+    try {
+      const overlayFile = resolveOverlayFilePath(vaultPath, relativePath);
+      if (overlayFile) {
+        requested = overlayFile;
+      } else {
+        // Resolve and verify containment — path-traversal guard.
+        requested = path.resolve(vaultPath, relativePath);
+        const vaultRoot = path.resolve(vaultPath);
+        if (!requested.startsWith(vaultRoot + path.sep) && requested !== vaultRoot) {
+          res.status(400).json({ success: false, error: 'relativePath escapes vault root' });
+          return;
+        }
+      }
+    } catch {
+      res.status(400).json({ success: false, error: 'relativePath escapes vault root' });
+      return;
+    }
+    if (!existsSync(requested)) {
+      res.status(404).json({ success: false, error: 'page_not_found' });
+      return;
+    }
+    const stat = await fs.stat(requested);
+    if (stat.size > MAX_PAGE_BYTES) {
+      res.status(413).json({
+        success: false,
+        error: 'page_too_large',
+        bytes: stat.size,
+        maxBytes: MAX_PAGE_BYTES,
+      });
+      return;
+    }
+    const content = await fs.readFile(requested, 'utf8');
+    res.status(200).json({
+      success: true,
+      vaultPath,
+      relativePath,
+      bytes: stat.size,
+      modifiedAt: new Date(stat.mtimeMs).toISOString(),
+      content,
+    });
+  } catch (err) {
+    logger.error('wiki/page threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * GET /api/wiki/search?vaultPath=…&q=…
+ *
+ * Full-text search across the vault. Walks every `.md` file, matches
+ * case-insensitive substrings, returns up to `WIKI_SEARCH_MAX_RESULTS`
+ * hits with line-number snippets.
+ */
+export async function searchVault(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const vaultPath = typeof req.query.vaultPath === 'string' ? req.query.vaultPath : '';
+    const query = typeof req.query.q === 'string' ? req.query.q : '';
+    const outcome = await WikiSearchService.getInstance().search({ vaultPath, query });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, ...outcome });
+      return;
+    }
+    const status = outcome.reason === 'vault_missing' ? 404 : 400;
+    res
+      .status(status)
+      .json({ success: false, error: outcome.reason, message: outcome.message });
+  } catch (err) {
+    logger.error('wiki/search threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * GET /api/wiki/search-all?q=…
+ *
+ * Search EVERY vault and return one merged BM25-ranked list. Each hit carries
+ * its owning vaultPath + vaultLabel so the UI can show where it lives and jump
+ * to it. IDF is computed over the combined corpus for cross-vault comparability.
+ */
+export async function searchAllVaults(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const query = typeof req.query.q === 'string' ? req.query.q : '';
+    const vaults = await discoverVaultsWithLabels();
+    const outcome = await WikiSearchService.getInstance().searchAllVaults({
+      vaults: vaults.map((v) => ({ vaultPath: v.vaultPath, label: v.label })),
+      query,
+    });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, ...outcome });
+      return;
+    }
+    res.status(400).json({ success: false, error: outcome.reason, message: outcome.message });
+  } catch (err) {
+    logger.error('wiki/search-all threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+const sopCatalog = new SopCatalogService();
+
+/**
+ * GET /api/wiki/sop-catalog?vaultPath=…
+ *
+ * List the SOP catalog (`config/sops/`), annotated with whether the given team
+ * (resolved from its vault path) has each entry installed.
+ */
+export async function listSopCatalog(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const vaultPath = typeof req.query.vaultPath === 'string' ? req.query.vaultPath : undefined;
+    if (!vaultPath || !path.isAbsolute(vaultPath)) {
+      res.status(400).json({ success: false, error: 'vaultPath (absolute) is required' });
+      return;
+    }
+    const catalog = await sopCatalog.list(vaultPath);
+    res.status(200).json({ success: true, catalog });
+  } catch (err) {
+    logger.error('wiki/sop-catalog threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/sop-catalog/install   { vaultPath, sopPath }
+ *
+ * Copy a catalog SOP into the team's installed store. Idempotent.
+ */
+export async function installSop(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { vaultPath, sopPath } = req.body ?? {};
+    if (typeof vaultPath !== 'string' || !path.isAbsolute(vaultPath)) {
+      res.status(400).json({ success: false, error: 'vaultPath (absolute) is required' });
+      return;
+    }
+    if (typeof sopPath !== 'string' || sopPath.length === 0) {
+      res.status(400).json({ success: false, error: 'sopPath is required' });
+      return;
+    }
+    const result = await sopCatalog.install(vaultPath, sopPath);
+    res.status(200).json({ success: true, ...result });
+  } catch (err) {
+    const message = (err as Error).message;
+    if (/escapes|\.md|sopPath/.test(message)) {
+      res.status(400).json({ success: false, error: message });
+      return;
+    }
+    if (/ENOENT/.test(message)) {
+      res.status(404).json({ success: false, error: 'catalog_sop_not_found' });
+      return;
+    }
+    logger.error('wiki/sop-install threw', { error: message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/sop-catalog/uninstall   { vaultPath, sopPath }
+ *
+ * Remove a SOP from the team's installed store (catalog original untouched).
+ * Idempotent.
+ */
+export async function uninstallSop(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { vaultPath, sopPath } = req.body ?? {};
+    if (typeof vaultPath !== 'string' || !path.isAbsolute(vaultPath)) {
+      res.status(400).json({ success: false, error: 'vaultPath (absolute) is required' });
+      return;
+    }
+    if (typeof sopPath !== 'string' || sopPath.length === 0) {
+      res.status(400).json({ success: false, error: 'sopPath is required' });
+      return;
+    }
+    const result = await sopCatalog.uninstall(vaultPath, sopPath);
+    res.status(200).json({ success: true, ...result });
+  } catch (err) {
+    const message = (err as Error).message;
+    if (/escapes|\.md|sopPath/.test(message)) {
+      res.status(400).json({ success: false, error: message });
+      return;
+    }
+    logger.error('wiki/sop-uninstall threw', { error: message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/overlay-page   { vaultPath, relativePath, content }
+ *
+ * Create or overwrite an owner-authored page in a per-team overlay folder
+ * (`team-norm/` or `sop/`). Only overlay folders are writable here — the rest
+ * of the vault is agent-curated / schema-frozen, so a relativePath that does
+ * not resolve to an overlay source is rejected. Used by the wiki editor for
+ * owner-authored team norms and custom SOPs.
+ */
+export async function writeOverlayPage(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { vaultPath, relativePath, content } = req.body ?? {};
+    if (typeof vaultPath !== 'string' || !path.isAbsolute(vaultPath)) {
+      res.status(400).json({ success: false, error: 'vaultPath (absolute) is required' });
+      return;
+    }
+    if (typeof relativePath !== 'string' || !relativePath.endsWith('.md')) {
+      res.status(400).json({ success: false, error: 'relativePath (.md) is required' });
+      return;
+    }
+    if (typeof content !== 'string') {
+      res.status(400).json({ success: false, error: 'content (string) is required' });
+      return;
+    }
+    if (Buffer.byteLength(content, 'utf8') > MAX_PAGE_BYTES) {
+      res.status(413).json({ success: false, error: 'page_too_large', maxBytes: MAX_PAGE_BYTES });
+      return;
+    }
+    let target: string | null;
+    try {
+      target = resolveOverlayFilePath(vaultPath, relativePath);
+    } catch {
+      res.status(400).json({ success: false, error: 'relativePath escapes overlay root' });
+      return;
+    }
+    if (!target) {
+      res.status(403).json({
+        success: false,
+        error: 'not_writable',
+        message: 'Only team-norm/ and sop/ folders are editable here.',
+      });
+      return;
+    }
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, content, 'utf8');
+    res.status(200).json({ success: true, relativePath });
+  } catch (err) {
+    logger.error('wiki/overlay-page write threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * DELETE /api/wiki/overlay-page   { vaultPath, relativePath }
+ *
+ * Delete an owner-authored overlay page (team norm / custom SOP) and prune any
+ * emptied parent dirs. Idempotent. Only overlay folders are eligible.
+ */
+export async function deleteOverlayPage(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { vaultPath, relativePath } = req.body ?? {};
+    if (typeof vaultPath !== 'string' || !path.isAbsolute(vaultPath)) {
+      res.status(400).json({ success: false, error: 'vaultPath (absolute) is required' });
+      return;
+    }
+    if (typeof relativePath !== 'string' || !relativePath.endsWith('.md')) {
+      res.status(400).json({ success: false, error: 'relativePath (.md) is required' });
+      return;
+    }
+    let target: string | null;
+    try {
+      target = resolveOverlayFilePath(vaultPath, relativePath);
+    } catch {
+      res.status(400).json({ success: false, error: 'relativePath escapes overlay root' });
+      return;
+    }
+    if (!target) {
+      res.status(403).json({ success: false, error: 'not_writable' });
+      return;
+    }
+    const topFolder = relativePath.replace(/\\/g, '/').split('/')[0];
+    const root = overlayRootFor(vaultPath, topFolder);
+    try {
+      await fs.unlink(target);
+    } catch {
+      // already absent — idempotent
+    }
+    // Prune emptied parent dirs up to the overlay root.
+    if (root) {
+      let dir = path.dirname(target);
+      while (dir.startsWith(root + path.sep) && dir !== root) {
+        try {
+          await fs.rmdir(dir);
+        } catch {
+          break;
+        }
+        dir = path.dirname(dir);
+      }
+    }
+    res.status(200).json({ success: true, relativePath });
+  } catch (err) {
+    logger.error('wiki/overlay-page delete threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * GET /api/wiki/backlinks?vaultPath=…&relativePath=…
+ *
+ * For the target page, find every other page in the vault whose markdown
+ * contains a `[[wikilink]]` that resolves to it. Used by the UI's right
+ * sidebar.
+ */
+export async function getBacklinks(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const vaultPath = typeof req.query.vaultPath === 'string' ? req.query.vaultPath : '';
+    const relativePath =
+      typeof req.query.relativePath === 'string' ? req.query.relativePath : '';
+    const outcome = await WikiBacklinksService.getInstance().find({ vaultPath, relativePath });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, ...outcome });
+      return;
+    }
+    const status = outcome.reason === 'vault_missing' ? 404 : 400;
+    res
+      .status(status)
+      .json({ success: false, error: outcome.reason, message: outcome.message });
+  } catch (err) {
+    logger.error('wiki/backlinks threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/migrate/scan
+ *
+ * Dry-run preview of a migration from the legacy `.crewly/knowledge/`
+ * stores (+ optional agent memory.json copies) into the v2.1 vault.
+ *
+ * Body: `{ projectRoot: string, includeAgentMemory?: boolean }`
+ */
+export async function migrateScan(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const body = req.body ?? {};
+    const projectRoot =
+      typeof body.projectRoot === 'string' ? body.projectRoot : process.cwd();
+    const includeAgentMemory =
+      typeof body.includeAgentMemory === 'boolean' ? body.includeAgentMemory : true;
+    const outcome = await WikiMigrateService.getInstance().scan({
+      projectRoot,
+      includeAgentMemory,
+    });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, ...outcome });
+      return;
+    }
+    const status = outcome.reason === 'project_root_missing' ? 404 : 400;
+    res
+      .status(status)
+      .json({ success: false, error: outcome.reason, message: outcome.message });
+  } catch (err) {
+    logger.error('wiki/migrate/scan threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/migrate/apply
+ *
+ * Execute the migration: bootstrap missing vaults, write proposed pages,
+ * persist manifest. Legacy files are never deleted.
+ *
+ * Body: `{ projectRoot: string, includeAgentMemory?: boolean, confirm: true }`
+ * `confirm: true` is mandatory — guards against accidental triggering.
+ */
+export async function migrateApply(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const body = req.body ?? {};
+    if (body.confirm !== true) {
+      res.status(400).json({
+        success: false,
+        error: 'confirm_required',
+        message: 'Pass `confirm: true` to execute. Use /migrate/scan for dry-run.',
+      });
+      return;
+    }
+    const projectRoot =
+      typeof body.projectRoot === 'string' ? body.projectRoot : process.cwd();
+    const includeAgentMemory =
+      typeof body.includeAgentMemory === 'boolean' ? body.includeAgentMemory : true;
+    const outcome = await WikiMigrateService.getInstance().apply({
+      projectRoot,
+      includeAgentMemory,
+    });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, ...outcome });
+      return;
+    }
+    const status = outcome.reason === 'project_root_missing' ? 404 : 400;
+    res
+      .status(status)
+      .json({ success: false, error: outcome.reason, message: outcome.message });
+  } catch (err) {
+    logger.error('wiki/migrate/apply threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/cleanup/scan
+ *
+ * Dry-run: walk the vault's `llm-curated/` tree and return a list of
+ * pages flagged by the cleanup rules (low confidence, agent memory
+ * dump, per-agent cap). No filesystem mutation.
+ *
+ * Body: `{ vaultPath: string, rules?: { minConfidence?, dropAgentMemoryDumps?, maxPerAgent? } }`
+ */
+export async function cleanupScan(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const body = req.body ?? {};
+    if (typeof body.vaultPath !== 'string') {
+      res
+        .status(400)
+        .json({ success: false, error: 'invalid_input', message: 'vaultPath is required' });
+      return;
+    }
+    const outcome = await WikiCleanupService.getInstance().scan({
+      vaultPath: body.vaultPath,
+      rules: body.rules,
+    });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, ...outcome });
+      return;
+    }
+    const status = outcome.reason === 'vault_missing' ? 404 : 400;
+    res
+      .status(status)
+      .json({ success: false, error: outcome.reason, message: outcome.message });
+  } catch (err) {
+    logger.error('wiki/cleanup/scan threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/cleanup/apply
+ *
+ * Execute the cleanup: delete the listed pages, archive their bodies
+ * to `.wiki-cleanup-archive.json`, and invalidate matching migrate
+ * manifest entries so the same source can't re-import the page.
+ *
+ * Body: `{ vaultPath: string, pages: string[], confirm: true }`
+ *   - `pages`: explicit relative paths to delete (caller has already
+ *     decided which scan candidates to act on)
+ *   - `confirm: true` is mandatory — guards against accidental triggering.
+ */
+export async function cleanupApply(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const body = req.body ?? {};
+    if (body.confirm !== true) {
+      res.status(400).json({
+        success: false,
+        error: 'confirm_required',
+        message: 'Pass `confirm: true` to execute. Use /cleanup/scan for dry-run.',
+      });
+      return;
+    }
+    if (typeof body.vaultPath !== 'string') {
+      res
+        .status(400)
+        .json({ success: false, error: 'invalid_input', message: 'vaultPath is required' });
+      return;
+    }
+    if (!Array.isArray(body.pages) || body.pages.length === 0) {
+      res
+        .status(400)
+        .json({ success: false, error: 'invalid_input', message: 'pages must be a non-empty array' });
+      return;
+    }
+    const outcome = await WikiCleanupService.getInstance().apply({
+      vaultPath: body.vaultPath,
+      pages: body.pages,
+    });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, ...outcome });
+      return;
+    }
+    const status = outcome.reason === 'vault_missing' ? 404 : 400;
+    res
+      .status(status)
+      .json({ success: false, error: outcome.reason, message: outcome.message });
+  } catch (err) {
+    logger.error('wiki/cleanup/apply threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/migrate/oss-sops
+ *
+ * Migrate OSS-distributed SOPs (`config/sops`, `config/domain-sops`) into
+ * the global vault's `llm-curated/sops/` tree so `wiki-query` can find them.
+ *
+ * Body: `{ crewlySourceRoot?: string, confirm?: true }`
+ *   - When `confirm: true` is set, writes files (apply). Otherwise dry-run.
+ *   - Default crewlySourceRoot = process.cwd() (works when OSS runs from its own source).
+ */
+export async function migrateOssSops(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const body = req.body ?? {};
+    const crewlySourceRoot =
+      typeof body.crewlySourceRoot === 'string' ? body.crewlySourceRoot : undefined;
+    const apply = body.confirm === true;
+    const outcome = await WikiMigrateService.getInstance().migrateOssSops({
+      crewlySourceRoot,
+      apply,
+    });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, ...outcome });
+      return;
+    }
+    const status = outcome.reason === 'project_root_missing' ? 404 : 400;
+    res
+      .status(status)
+      .json({ success: false, error: outcome.reason, message: outcome.message });
+  } catch (err) {
+    logger.error('wiki/migrate/oss-sops threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/reflect/trigger-now
+ *
+ * Fire ONE WikiReflectTrigger tick on demand. Used for verification —
+ * confirms the trigger emits `[REFLECT-WIKI]` messages to the right
+ * channel without waiting for the scheduled interval to elapse.
+ *
+ * Production cadence remains the scheduled scan.
+ */
+export async function reflectTriggerNow(
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const trigger = WikiReflectTriggerService.getInstance();
+    if (!trigger) {
+      res.status(503).json({
+        success: false,
+        error: 'wiki reflect trigger is not registered — boot wiring did not complete',
+      });
+      return;
+    }
+    // Force a fire past the debounce window so a manual trigger is never
+    // silently suppressed by an earlier scheduled tick. Unlike clearing the
+    // ledger, this leaves other vaults' debounce + the persisted state intact,
+    // so the next scheduled tick won't re-burst.
+    const result = await trigger.tick({ ignoreDebounce: true });
+    res.status(200).json({ success: true, result });
+  } catch (err) {
+    logger.error('wiki/reflect/trigger-now threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * GET /api/wiki/recent?vaultPath=…&limit=…
+ *
+ * Returns the most-recently-modified `.md` pages in the vault. Powers
+ * the "What's new" widget in the page-pane empty state.
+ */
+export async function getRecent(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const vaultPath = typeof req.query.vaultPath === 'string' ? req.query.vaultPath : '';
+    const limitRaw = typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
+    const limit = limitRaw && Number.isFinite(limitRaw) ? limitRaw : undefined;
+    const outcome = await WikiRecentService.getInstance().list({ vaultPath, limit });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, ...outcome });
+      return;
+    }
+    const status = outcome.reason === 'vault_missing' ? 404 : 400;
+    res
+      .status(status)
+      .json({ success: false, error: outcome.reason, message: outcome.message });
+  } catch (err) {
+    logger.error('wiki/recent threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/lint
+ *
+ * Run a deterministic validation pass over the vault. Reports frozen-path
+ * violations, dangling wikilinks, orphan pages, stale claims, and
+ * restructure proposals. The service does not modify the vault — the
+ * agent reads the report and decides next actions.
+ */
+export async function lintVault(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const body = req.body ?? {};
+    const vaultPath = typeof body.vaultPath === 'string' ? body.vaultPath : '';
+    const staleDays = typeof body.staleDays === 'number' ? body.staleDays : undefined;
+    const outcome = await WikiLintService.getInstance().generate({ vaultPath, staleDays });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, report: outcome.report });
+      return;
+    }
+    const status =
+      outcome.reason === 'vault_missing' || outcome.reason === 'schema_missing' ? 404 : 400;
+    res.status(status).json({ success: false, error: outcome.reason, message: outcome.message });
+  } catch (err) {
+    logger.error('wiki/lint threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/wiki/bookkeep/trigger-now
+ *
+ * Force one tick of the bookkeep trigger NOW. Used for manual testing
+ * (curl, the chat UI, an admin button) — production cadence is the
+ * automatic interval scan, but operators sometimes want to invoke it
+ * synchronously to verify wiring or to clear a backlog.
+ */
+export async function bookkeepTriggerNow(
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const trigger = WikiBookkeepTriggerService.getInstance();
+    if (!trigger) {
+      res.status(503).json({
+        success: false,
+        error: 'wiki bookkeep trigger is not registered — boot wiring did not complete',
+      });
+      return;
+    }
+    const result = await trigger.tick();
+    res.status(200).json({ success: true, result });
+  } catch (err) {
+    logger.error('wiki/bookkeep/trigger-now threw', { error: (err as Error).message });
+    next(err);
+  }
+}
+
+/**
+ * GET /api/wiki/queue/stats?vaultPath=…
+ */
+export async function queueStats(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const vaultPath = typeof req.query.vaultPath === 'string' ? req.query.vaultPath : undefined;
+    const stats = await WikiQueueService.getInstance().getStats(vaultPath);
+    res.status(200).json({ success: true, stats, vaultPath: vaultPath ?? null });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// =============================================================================
+// Knowledge-base curation (2026-09-19): supersede, proposals, index, history, usage
+// =============================================================================
+
+function requireVault(req: Request, res: Response): string | null {
+  const vaultPath = (req.body?.vaultPath ?? req.query?.vaultPath) as unknown;
+  if (typeof vaultPath !== 'string' || !path.isAbsolute(vaultPath)) {
+    res.status(400).json({ success: false, error: 'vaultPath (absolute path) is required' });
+    return null;
+  }
+  return vaultPath;
+}
+
+function sendCuration(res: Response, outcome: { ok: boolean; reason?: string; message?: string }): void {
+  if (outcome.ok) {
+    res.json({ success: true, result: outcome });
+    return;
+  }
+  const status = outcome.reason === 'not_found' ? 404 : outcome.reason === 'forbidden' ? 403 : outcome.reason === 'schema_missing' ? 404 : outcome.reason === 'frozen_path' ? 422 : 400;
+  res.status(status).json({ success: false, error: outcome.reason, message: outcome.message });
+}
+
+/**
+ * POST /api/wiki/supersede — `{ vaultPath, oldPath, newPath, reason }`.
+ * Marks oldPath as replaced by newPath (canonical roles only).
+ */
+export async function supersedePage(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const vaultPath = requireVault(req, res);
+    if (!vaultPath) return;
+    const { oldPath, newPath, reason } = req.body ?? {};
+    if (typeof oldPath !== 'string' || typeof newPath !== 'string') {
+      res.status(400).json({ success: false, error: 'oldPath and newPath (strings) are required' });
+      return;
+    }
+    const caller = await resolveCaller(req);
+    sendCuration(res, await WikiCurationService.getInstance().supersede({
+      vaultPath, oldPath, newPath, reason: typeof reason === 'string' ? reason : '', callerSession: caller.session, callerRole: caller.role,
+    }));
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** GET /api/wiki/proposals?vaultPath= — pending proposals. */
+export async function listProposals(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const vaultPath = requireVault(req, res);
+    if (!vaultPath) return;
+    res.json({ success: true, proposals: await WikiCurationService.getInstance().listProposals(vaultPath) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** POST /api/wiki/proposals/accept — `{ vaultPath, proposedPath }`. */
+export async function acceptProposal(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const vaultPath = requireVault(req, res);
+    if (!vaultPath) return;
+    const { proposedPath } = req.body ?? {};
+    if (typeof proposedPath !== 'string') {
+      res.status(400).json({ success: false, error: 'proposedPath (string) is required' });
+      return;
+    }
+    const caller = await resolveCaller(req);
+    sendCuration(res, await WikiCurationService.getInstance().acceptProposal({ vaultPath, proposedPath, callerSession: caller.session, callerRole: caller.role }));
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** POST /api/wiki/proposals/reject — `{ vaultPath, proposedPath, reason? }`. */
+export async function rejectProposal(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const vaultPath = requireVault(req, res);
+    if (!vaultPath) return;
+    const { proposedPath, reason } = req.body ?? {};
+    if (typeof proposedPath !== 'string') {
+      res.status(400).json({ success: false, error: 'proposedPath (string) is required' });
+      return;
+    }
+    const caller = await resolveCaller(req);
+    sendCuration(res, await WikiCurationService.getInstance().rejectProposal({ vaultPath, proposedPath, reason: typeof reason === 'string' ? reason : undefined, callerSession: caller.session, callerRole: caller.role }));
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** POST /api/wiki/index/rebuild — `{ vaultPath }` (or `all: true` for every vault). */
+export async function rebuildIndex(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    if (req.body?.all === true) {
+      const results: Array<{ vaultPath: string; entries: number }> = [];
+      for (const vaultPath of await discoverWikiVaults()) {
+        results.push({ vaultPath, entries: await WikiIndexService.getInstance().rebuild(vaultPath) });
+      }
+      res.json({ success: true, results });
+      return;
+    }
+    const vaultPath = requireVault(req, res);
+    if (!vaultPath) return;
+    const entries = await WikiIndexService.getInstance().rebuild(vaultPath);
+    res.json({ success: true, result: { vaultPath, entries, coverage: await WikiIndexService.getInstance().coverage(vaultPath) } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** GET /api/wiki/history?vaultPath=&relativePath= — revisions of a page. */
+export async function pageHistory(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const vaultPath = requireVault(req, res);
+    if (!vaultPath) return;
+    const relativePath = req.query.relativePath;
+    if (typeof relativePath !== 'string' || relativePath.includes('..')) {
+      res.status(400).json({ success: false, error: 'relativePath (vault-relative) is required' });
+      return;
+    }
+    const revisions = await WikiHistoryService.getInstance().list(vaultPath, relativePath);
+    res.json({ success: true, revisions: revisions.map((r) => ({ at: r.at, author: r.author, action: r.action, bytes: r.bytes })) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** GET /api/wiki/usage?vaultPath=&days=7 — the retrieval ledger summary. */
+export async function usageReport(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const vaultPath = requireVault(req, res);
+    if (!vaultPath) return;
+    const days = Number(req.query.days ?? 7);
+    res.json({ success: true, report: await WikiUsageService.getInstance().report(vaultPath, Number.isFinite(days) && days > 0 ? days : 7) });
+  } catch (err) {
+    next(err);
+  }
+}

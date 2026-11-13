@@ -1,0 +1,824 @@
+#!/bin/bash
+# Tests for TL delegate-task execute.sh
+# Covers: CREWLY_SESSION_NAME resolution, fromSession fallback,
+#         graceful monitoring skip, delegation success, and the Request
+#         Contract checker (which scans BOTH `task` and `context`).
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PASS=0
+FAIL=0
+
+# ---------------------------------------------------------------------------
+# Extract the REAL warn_missing_request_contract out of execute.sh.
+#
+# This file used to keep a hand-copied duplicate of that function inside the
+# mock, with a comment asking future editors to keep it "byte-equivalent".
+# It did not stay byte-equivalent, and worse, nothing could detect that:
+# changing the function in execute.sh left all 16 assertions green, because
+# they were exercising the copy. Pulling the function straight out of the
+# shipped script means production edits are felt here immediately, and makes
+# the mutation test in the commit message meaningful.
+# ---------------------------------------------------------------------------
+REAL_FN_FILE="$(mktemp)"
+export REAL_FN_FILE
+sed -n '/^warn_missing_request_contract() {$/,/^}$/p' "$SCRIPT_DIR/execute.sh" > "$REAL_FN_FILE"
+if ! grep -q 'Request Contract incomplete' "$REAL_FN_FILE"; then
+  echo "FATAL: could not extract warn_missing_request_contract() from execute.sh" >&2
+  exit 1
+fi
+# Same for the progress-check interval resolution (default off, 30 min floor).
+sed -n '/^resolve_progress_check_minutes() {$/,/^}$/p' "$SCRIPT_DIR/execute.sh" >> "$REAL_FN_FILE"
+if ! grep -q 'min_minutes=' "$REAL_FN_FILE"; then
+  echo "FATAL: could not extract resolve_progress_check_minutes() from execute.sh" >&2
+  exit 1
+fi
+# The mock writes each /schedule request body here so scenarios can check the interval.
+SCHED_BODY_LOG="$(mktemp)"
+export SCHED_BODY_LOG
+# shellcheck source=/dev/null
+source "$REAL_FN_FILE"
+
+assert_succeeds() {
+  local desc="$1"
+  shift
+  if OUTPUT=$("$@" 2>&1); then
+    echo "  PASS: $desc"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $desc (expected success, got exit $? — output: $OUTPUT)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_fails() {
+  local desc="$1"
+  shift
+  if OUTPUT=$("$@" 2>&1); then
+    echo "  FAIL: $desc (expected failure, got success — output: $OUTPUT)"
+    FAIL=$((FAIL + 1))
+  else
+    echo "  PASS: $desc"
+    PASS=$((PASS + 1))
+  fi
+}
+
+assert_output_contains() {
+  local desc="$1" expected="$2"
+  shift 2
+  local OUTPUT=""
+  OUTPUT=$("$@" 2>&1) || true
+  if echo "$OUTPUT" | grep -q "$expected"; then
+    echo "  PASS: $desc"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $desc (expected '$expected' in output, got: $OUTPUT)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_output_not_contains() {
+  local desc="$1" unexpected="$2"
+  shift 2
+  local OUTPUT=""
+  OUTPUT=$("$@" 2>&1) || true
+  if echo "$OUTPUT" | grep -q "$unexpected"; then
+    echo "  FAIL: $desc (did NOT expect '$unexpected' in output, got: $OUTPUT)"
+    FAIL=$((FAIL + 1))
+  else
+    echo "  PASS: $desc"
+    PASS=$((PASS + 1))
+  fi
+}
+
+# Create a mock wrapper that overrides api_call to avoid real HTTP calls.
+MOCK_DIR=$(mktemp -d)
+MOCK_SCRIPT="$MOCK_DIR/run_delegate_task.sh"
+cat > "$MOCK_SCRIPT" << 'MOCK_EOF'
+#!/bin/bash
+# Mock wrapper for delegate-task execute.sh
+# Overrides api_call to return controlled responses, then sources the real script logic.
+set -euo pipefail
+
+REAL_SKILL_DIR="$1"
+shift
+
+# Load the real shared lib first
+source "${REAL_SKILL_DIR}/../_common/lib.sh"
+
+# Load the REAL warn_missing_request_contract, extracted from execute.sh by
+# the harness above. Do NOT re-declare it here — a hand-copy silently
+# decouples these scenarios from the code that actually ships.
+# shellcheck source=/dev/null
+source "$REAL_FN_FILE"
+
+# Track API calls for verification
+API_CALLS_LOG=$(mktemp)
+
+# Override api_call with mock
+api_call() {
+  local method="$1" endpoint="$2" body="${3:-}"
+  echo "${method} ${endpoint}" >> "$API_CALLS_LOG"
+
+  if [ "$method" = "GET" ] && echo "$endpoint" | grep -q "^/teams/"; then
+    cat << 'TEAMJSON'
+{"success":true,"data":{"id":"team-123","name":"Product","members":[{"id":"tl-001","sessionName":"crewly-product-sam-tl","role":"team-leader","parentMemberId":""},{"id":"worker-001","sessionName":"crewly-product-leo-dev","role":"developer","parentMemberId":"tl-001"}]}}
+TEAMJSON
+    return 0
+  fi
+
+  if [ "$method" = "POST" ] && echo "$endpoint" | grep -q "^/terminal/.*/deliver"; then
+    echo '{"success":true,"delivered":true}'
+    return 0
+  fi
+
+  if [ "$method" = "POST" ] && [ "$endpoint" = "/task-management/create" ]; then
+    echo '{"success":true,"taskPath":"/tmp/mock-task.md","taskId":"task-001"}'
+    return 0
+  fi
+
+  if [ "$method" = "POST" ] && [ "$endpoint" = "/events/subscribe" ]; then
+    echo '{"success":true,"data":{"id":"sub-001"}}'
+    return 0
+  fi
+
+  if [ "$method" = "POST" ] && [ "$endpoint" = "/schedule" ]; then
+    printf '%s\n' "$body" >> "$SCHED_BODY_LOG"
+    echo '{"success":true,"data":{"checkId":"sched-001"}}'
+    return 0
+  fi
+
+  if [ "$method" = "POST" ] && [ "$endpoint" = "/task-management/add-monitoring" ]; then
+    echo '{"success":true}'
+    return 0
+  fi
+
+  echo '{"success":true}'
+  return 0
+}
+
+export CREWLY_ROOT="$(cd "${REAL_SKILL_DIR}/../../../.." && pwd)"
+
+# Source and run the main script inline (cannot call execute.sh directly
+# because it would re-source lib.sh, overriding our mock api_call)
+INPUT="${1:-}"
+[ -z "$INPUT" ] && error_exit "Usage: execute.sh '{...}'"
+
+TO=$(echo "$INPUT" | jq -r '.to // empty')
+TASK=$(echo "$INPUT" | jq -r '.task // empty')
+PRIORITY=$(echo "$INPUT" | jq -r '.priority // "normal"')
+CONTEXT=$(echo "$INPUT" | jq -r '.context // empty')
+PROJECT_PATH=$(echo "$INPUT" | jq -r '.projectPath // empty')
+TEAM_ID=$(echo "$INPUT" | jq -r '.teamId // empty')
+TL_MEMBER_ID=$(echo "$INPUT" | jq -r '.tlMemberId // empty')
+FROM_SESSION=$(echo "$INPUT" | jq -r '.fromSession // empty')
+require_param "to" "$TO"
+require_param "task" "$TASK"
+
+# Request Contract warning (P0-3): emit the non-fatal warning when the brief
+# is missing Goal / Expected Outcome / Eval markers.
+#
+# Run the PRODUCTION call line verbatim, with this mock's $TASK / $CONTEXT
+# bound. Hardcoding the arguments here would let a regression at the real
+# call site — dropping $CONTEXT, say — slip past every scenario below, which
+# is exactly how the earlier hand-copied version of this mock went blind.
+eval "$(grep -E '^warn_missing_request_contract "' "${REAL_SKILL_DIR}/execute.sh")"
+
+# Validate hierarchy
+if [ -n "$TEAM_ID" ] && [ -n "$TL_MEMBER_ID" ]; then
+  TEAM_DATA=$(api_call GET "/teams/${TEAM_ID}" 2>/dev/null || echo '{}')
+  TEAM_SUCCESS=$(echo "$TEAM_DATA" | jq -r '.success // false' 2>/dev/null || echo "false")
+  if [ "$TEAM_SUCCESS" = "true" ]; then
+    WORKER_PARENT=$(echo "$TEAM_DATA" | jq -r --arg session "$TO" \
+      '.data.members[] | select(.sessionName == $session) | .parentMemberId // empty' 2>/dev/null || true)
+    if [ -n "$WORKER_PARENT" ] && [ "$WORKER_PARENT" != "$TL_MEMBER_ID" ]; then
+      error_exit "Hierarchy violation: worker ${TO} (parentMemberId=${WORKER_PARENT}) is not a subordinate of TL ${TL_MEMBER_ID}"
+    fi
+  fi
+fi
+
+# Resolve skill paths
+resolve_skill_paths() {
+  local input="$1"
+  perl -pe '
+    my $root = $ENV{"CREWLY_ROOT"};
+    s{\bbash\s+config/skills/}{bash $root/config/skills/}g;
+    s{(?<![A-Za-z0-9_./-])config/skills/}{$root/config/skills/}g;
+  ' <<< "$input"
+}
+
+TASK="$(CREWLY_ROOT="$CREWLY_ROOT" resolve_skill_paths "$TASK")"
+if [ -n "$CONTEXT" ]; then
+  CONTEXT="$(CREWLY_ROOT="$CREWLY_ROOT" resolve_skill_paths "$CONTEXT")"
+fi
+
+TASK_MESSAGE="New task from Team Leader (priority: ${PRIORITY}):\n\n${TASK}"
+[ -n "$CONTEXT" ] && TASK_MESSAGE="${TASK_MESSAGE}\n\nContext: ${CONTEXT}"
+TASK_MESSAGE="${TASK_MESSAGE}\n\nWhen done, report back with report-status, passing the workItemId from your [CREWLY-DISPATCH] notice: bash ${CREWLY_ROOT}/config/skills/agent/core/report-status/execute.sh '{\"sessionName\":\"${TO}\",\"workItemId\":\"<your WorkItem id>\",\"status\":\"done\",\"summary\":\"<brief summary>\"}'"
+
+BODY=$(jq -n --arg message "$TASK_MESSAGE" '{message: $message, waitForReady: true, waitTimeout: 15000}')
+api_call POST "/terminal/${TO}/deliver" "$BODY"
+
+TASK_FILE_PATH=""
+TASK_ID=""
+if [ -n "$PROJECT_PATH" ]; then
+  CREATE_BODY=$(jq -n \
+    --arg projectPath "$PROJECT_PATH" \
+    --arg task "$TASK" \
+    --arg priority "$PRIORITY" \
+    --arg sessionName "$TO" \
+    --arg milestone "delegated" \
+    '{projectPath: $projectPath, task: $task, priority: $priority, sessionName: $sessionName, milestone: $milestone}')
+  CREATE_RESULT=$(api_call POST "/task-management/create" "$CREATE_BODY" 2>/dev/null || true)
+  TASK_FILE_PATH=$(echo "$CREATE_RESULT" | jq -r '.taskPath // empty' 2>/dev/null || true)
+  TASK_ID=$(echo "$CREATE_RESULT" | jq -r '.taskId // empty' 2>/dev/null || true)
+fi
+
+# --- THIS IS THE CODE BEING TESTED ---
+MONITOR_IDLE=$(echo "$INPUT" | jq -r 'if .monitor.idleEvent == null then true else .monitor.idleEvent end')
+# Production line verbatim (the mock takes JSON only, so no --progress-check flag).
+PROGRESS_CHECK_ARG="${PROGRESS_CHECK_ARG:-}"
+eval "$(grep -E '^MONITOR_FALLBACK_MINUTES=' "${REAL_SKILL_DIR}/execute.sh")"
+
+COLLECTED_SCHEDULE_IDS="[]"
+COLLECTED_SUBSCRIPTION_IDS="[]"
+
+# Resolve the delegating TL's session name for event/schedule routing.
+RESOLVED_SESSION="${CREWLY_SESSION_NAME:-${FROM_SESSION:-}}"
+
+if [ -z "$RESOLVED_SESSION" ]; then
+  echo '{"warning":"CREWLY_SESSION_NAME not set and no fromSession provided — skipping idle event and schedule monitoring. Delegation still proceeds."}' >&2
+fi
+
+if [ "$MONITOR_IDLE" = "true" ] && [ -n "$RESOLVED_SESSION" ]; then
+  SUB_BODY=$(jq -n \
+    --arg eventType "agent:idle" \
+    --arg sessionName "$TO" \
+    --arg subscriber "$RESOLVED_SESSION" \
+    '{eventType: $eventType, filter: {sessionName: $sessionName}, subscriberSession: $subscriber, oneShot: true}')
+  SUB_RESULT=$(api_call POST "/events/subscribe" "$SUB_BODY" 2>/dev/null || true)
+  SUB_ID=$(echo "$SUB_RESULT" | jq -r '.data.id // empty' 2>/dev/null || true)
+  if [ -n "$SUB_ID" ]; then
+    COLLECTED_SUBSCRIPTION_IDS=$(echo "$COLLECTED_SUBSCRIPTION_IDS" | jq --arg id "$SUB_ID" '. + [$id]')
+  fi
+fi
+
+if [ "$MONITOR_FALLBACK_MINUTES" != "0" ] && [ -n "$MONITOR_FALLBACK_MINUTES" ] && [ -n "$RESOLVED_SESSION" ]; then
+  SCHED_BODY=$(jq -n \
+    --arg target "$RESOLVED_SESSION" \
+    --arg minutes "$MONITOR_FALLBACK_MINUTES" \
+    --arg message "TL progress check: review ${TO} status — task: ${TASK:0:100}" \
+    --arg taskId "$TASK_ID" \
+    '{targetSession: $target, minutes: ($minutes | tonumber), intervalMinutes: ($minutes | tonumber), message: $message, isRecurring: true} + (if $taskId != "" then {taskId: $taskId} else {} end)' 2>/dev/null) || true
+  [ -n "$SCHED_BODY" ] && SCHED_RESULT=$(api_call POST "/schedule" "$SCHED_BODY" 2>/dev/null || true)
+  SCHED_ID=$(echo "$SCHED_RESULT" | jq -r '.checkId // .data.checkId // empty' 2>/dev/null || true)
+  if [ -n "$SCHED_ID" ]; then
+    COLLECTED_SCHEDULE_IDS=$(echo "$COLLECTED_SCHEDULE_IDS" | jq --arg id "$SCHED_ID" '. + [$id]')
+  fi
+fi
+
+HAS_SCHEDULE_IDS=$(echo "$COLLECTED_SCHEDULE_IDS" | jq 'length > 0')
+HAS_SUBSCRIPTION_IDS=$(echo "$COLLECTED_SUBSCRIPTION_IDS" | jq 'length > 0')
+
+if [ "$HAS_SCHEDULE_IDS" = "true" ] || [ "$HAS_SUBSCRIPTION_IDS" = "true" ]; then
+  MONITOR_BODY=$(jq -n \
+    --arg sessionName "$TO" \
+    --argjson scheduleIds "$COLLECTED_SCHEDULE_IDS" \
+    --argjson subscriptionIds "$COLLECTED_SUBSCRIPTION_IDS" \
+    '{sessionName: $sessionName, scheduleIds: $scheduleIds, subscriptionIds: $subscriptionIds}')
+  api_call POST "/task-management/add-monitoring" "$MONITOR_BODY" 2>/dev/null || true
+fi
+
+# Output success with monitoring info (compact single-line for test parsing)
+jq -c -n \
+  --arg to "$TO" \
+  --arg taskId "$TASK_ID" \
+  --argjson scheduleIds "$COLLECTED_SCHEDULE_IDS" \
+  --argjson subscriptionIds "$COLLECTED_SUBSCRIPTION_IDS" \
+  --arg resolvedSession "${RESOLVED_SESSION:-}" \
+  '{success: true, delegatedTo: $to, taskId: $taskId, monitoring: {scheduleIds: $scheduleIds, subscriptionIds: $subscriptionIds, resolvedSession: $resolvedSession}}'
+
+rm -f "$API_CALLS_LOG"
+MOCK_EOF
+chmod +x "$MOCK_SCRIPT"
+
+SKILL_DIR="$SCRIPT_DIR"
+
+echo "=== TL delegate-task tests ==="
+
+# -----------------------------------------------------------------------
+# Scenario 1: Delegation with CREWLY_SESSION_NAME set — full monitoring
+# -----------------------------------------------------------------------
+echo "Scenario 1: CREWLY_SESSION_NAME set — full delegation with monitoring"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="crewly-product-sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"Implement feature X","priority":"high","teamId":"team-123","tlMemberId":"tl-001","projectPath":"/tmp/project"}' 2>&1)
+OUTPUT=$(echo "$RAW_OUTPUT" | grep '"monitoring"' | head -1)
+if echo "$OUTPUT" | jq -e '.success' > /dev/null 2>&1; then
+  RESOLVED=$(echo "$OUTPUT" | jq -r '.monitoring.resolvedSession')
+  if [ "$RESOLVED" = "crewly-product-sam-tl" ]; then
+    echo "  PASS: delegation succeeds with env var session"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: resolvedSession expected 'crewly-product-sam-tl', got '$RESOLVED'"
+    FAIL=$((FAIL + 1))
+  fi
+else
+  echo "  FAIL: delegation failed (output: $OUTPUT)"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 2: No CREWLY_SESSION_NAME, fromSession provided — uses fallback
+# -----------------------------------------------------------------------
+echo "Scenario 2: fromSession fallback when no env var"
+RAW_OUTPUT=$(env -u CREWLY_SESSION_NAME bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"Implement feature Y","fromSession":"crewly-product-sam-tl"}' 2>&1)
+OUTPUT=$(echo "$RAW_OUTPUT" | grep '"monitoring"' | head -1)
+if echo "$OUTPUT" | jq -e '.success' > /dev/null 2>&1; then
+  RESOLVED=$(echo "$OUTPUT" | jq -r '.monitoring.resolvedSession')
+  if [ "$RESOLVED" = "crewly-product-sam-tl" ]; then
+    echo "  PASS: delegation succeeds with fromSession fallback"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: resolvedSession expected 'crewly-product-sam-tl', got '$RESOLVED'"
+    FAIL=$((FAIL + 1))
+  fi
+else
+  echo "  FAIL: delegation failed (output: $OUTPUT)"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 3: No session at all — delegation succeeds, monitoring skipped
+# -----------------------------------------------------------------------
+echo "Scenario 3: No session identity — graceful degradation"
+RAW_OUTPUT=$(env -u CREWLY_SESSION_NAME bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"Implement feature Z"}' 2>&1)
+OUTPUT=$(echo "$RAW_OUTPUT" | grep '"monitoring"' | head -1)
+if echo "$OUTPUT" | jq -e '.success' > /dev/null 2>&1; then
+  # Verify monitoring was skipped (empty arrays)
+  SCHED_COUNT=$(echo "$OUTPUT" | jq '.monitoring.scheduleIds | length')
+  SUB_COUNT=$(echo "$OUTPUT" | jq '.monitoring.subscriptionIds | length')
+  if [ "$SCHED_COUNT" = "0" ] && [ "$SUB_COUNT" = "0" ]; then
+    echo "  PASS: delegation succeeds, monitoring correctly skipped"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: expected empty monitoring arrays, got schedules=$SCHED_COUNT subs=$SUB_COUNT"
+    FAIL=$((FAIL + 1))
+  fi
+else
+  echo "  FAIL: delegation should succeed without session (output: $OUTPUT)"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 4: No session, should emit warning
+# -----------------------------------------------------------------------
+echo "Scenario 4: Warning emitted when session not available"
+assert_output_contains "warning about missing session" \
+  "skipping idle event and schedule monitoring" \
+  env -u CREWLY_SESSION_NAME bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"Task without session"}'
+
+# -----------------------------------------------------------------------
+# Scenario 5: CREWLY_SESSION_NAME takes priority over fromSession
+# -----------------------------------------------------------------------
+echo "Scenario 5: Env var takes priority over fromSession"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="env-session" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"Test priority","fromSession":"json-session"}' 2>&1)
+OUTPUT=$(echo "$RAW_OUTPUT" | grep '"monitoring"' | head -1)
+RESOLVED=$(echo "$OUTPUT" | jq -r '.monitoring.resolvedSession')
+if [ "$RESOLVED" = "env-session" ]; then
+  echo "  PASS: env var takes priority over fromSession"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected 'env-session', got '$RESOLVED'"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 6: monitor.idleEvent=false — no idle subscription
+# -----------------------------------------------------------------------
+echo "Scenario 6: monitor.idleEvent=false skips idle subscription"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"Test no idle","monitor":{"idleEvent":false}}' 2>&1)
+OUTPUT=$(echo "$RAW_OUTPUT" | grep '"monitoring"' | head -1)
+SUB_COUNT=$(echo "$OUTPUT" | jq '.monitoring.subscriptionIds | length')
+if [ "$SUB_COUNT" = "0" ]; then
+  echo "  PASS: idle event subscription correctly skipped"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected 0 subscriptions, got $SUB_COUNT"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 7: monitor.fallbackCheckMinutes=0 — no schedule
+# -----------------------------------------------------------------------
+echo "Scenario 7: fallbackCheckMinutes=0 skips schedule"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"Test no schedule","monitor":{"fallbackCheckMinutes":0}}' 2>&1)
+OUTPUT=$(echo "$RAW_OUTPUT" | grep '"monitoring"' | head -1)
+SCHED_COUNT=$(echo "$OUTPUT" | jq '.monitoring.scheduleIds | length')
+if [ "$SCHED_COUNT" = "0" ]; then
+  echo "  PASS: scheduled check correctly skipped"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected 0 schedules, got $SCHED_COUNT"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 7b: no monitor field — no recurring progress check by default
+# (219 "TL progress check" wakes in 3.5 days with the old 5-minute default)
+# -----------------------------------------------------------------------
+echo "Scenario 7b: no recurring progress check by default"
+: > "$SCHED_BODY_LOG"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"Default monitoring"}' 2>&1)
+OUTPUT=$(echo "$RAW_OUTPUT" | grep '"monitoring"' | head -1)
+SCHED_COUNT=$(echo "$OUTPUT" | jq '.monitoring.scheduleIds | length')
+SUB_COUNT=$(echo "$OUTPUT" | jq '.monitoring.subscriptionIds | length')
+if [ "$SCHED_COUNT" = "0" ] && [ "$SUB_COUNT" = "1" ] && [ ! -s "$SCHED_BODY_LOG" ]; then
+  echo "  PASS: idle subscription only, no /schedule call"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected 0 schedules + 1 subscription, got schedules=$SCHED_COUNT subs=$SUB_COUNT body=$(cat "$SCHED_BODY_LOG")"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 7c: opt-in below the floor is raised to 30 minutes, with a note
+# -----------------------------------------------------------------------
+echo "Scenario 7c: fallbackCheckMinutes=5 is raised to the 30 min floor"
+: > "$SCHED_BODY_LOG"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"Opt in low","monitor":{"fallbackCheckMinutes":5}}' 2>&1)
+INTERVAL=$(jq -r '.intervalMinutes' "$SCHED_BODY_LOG" 2>/dev/null | head -1)
+RECURRING=$(jq -r '.isRecurring' "$SCHED_BODY_LOG" 2>/dev/null | head -1)
+if [ "$INTERVAL" = "30" ] && [ "$RECURRING" = "true" ] && echo "$RAW_OUTPUT" | grep -q "below the 30 min minimum"; then
+  echo "  PASS: interval raised to 30 and the lead is told"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected recurring interval 30 + warning, got interval=$INTERVAL recurring=$RECURRING output=$RAW_OUTPUT"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 7d: opt-in at or above the floor is kept as asked
+# -----------------------------------------------------------------------
+echo "Scenario 7d: progressCheckMinutes=45 is kept"
+: > "$SCHED_BODY_LOG"
+env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"Opt in 45","monitor":{"progressCheckMinutes":45}}' > /dev/null 2>&1 || true
+INTERVAL=$(jq -r '.intervalMinutes' "$SCHED_BODY_LOG" 2>/dev/null | head -1)
+if [ "$INTERVAL" = "45" ]; then
+  echo "  PASS: 45 min interval kept"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected interval 45, got '$INTERVAL'"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 7e: a non-numeric interval schedules nothing
+# -----------------------------------------------------------------------
+echo "Scenario 7e: non-numeric interval is ignored"
+: > "$SCHED_BODY_LOG"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"Bad interval","monitor":{"progressCheckMinutes":"soon"}}' 2>&1)
+if [ ! -s "$SCHED_BODY_LOG" ] && echo "$RAW_OUTPUT" | grep -q "expected whole minutes"; then
+  echo "  PASS: nothing scheduled, warning emitted"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected no schedule + warning, got body=$(cat "$SCHED_BODY_LOG") output=$RAW_OUTPUT"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 7f: --progress-check flag value wins over JSON; floor and default hold
+# -----------------------------------------------------------------------
+echo "Scenario 7f: --progress-check flag resolves through the real function"
+if [ "$(resolve_progress_check_minutes "10" '{}' 2>/dev/null)" = "30" ] \
+  && [ "$(resolve_progress_check_minutes "" '{}')" = "0" ] \
+  && [ "$(resolve_progress_check_minutes "60" '{"monitor":{"progressCheckMinutes":45}}')" = "60" ] \
+  && grep -q -- '--progress-check) PROGRESS_CHECK_ARG="$2"' "$SCRIPT_DIR/execute.sh"; then
+  echo "  PASS: flag wins over JSON, floor and default hold"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: resolve_progress_check_minutes / --progress-check parsing mismatch"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 8: Missing required params
+# -----------------------------------------------------------------------
+echo "Scenario 8: Missing required params"
+assert_fails "fails without 'to'" \
+  env -u CREWLY_SESSION_NAME bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"task":"Missing to param"}'
+
+assert_fails "fails without 'task'" \
+  env -u CREWLY_SESSION_NAME bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev"}'
+
+assert_fails "fails without any input" \
+  env -u CREWLY_SESSION_NAME bash "$MOCK_SCRIPT" "$SKILL_DIR" ''
+
+# -----------------------------------------------------------------------
+# Scenario 9 (P0-3): Request Contract warning — emitted when G/O/E missing
+# -----------------------------------------------------------------------
+echo "Scenario 9: Request Contract warning — bare task triggers G+O+E warning"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"do something useful"}' 2>&1)
+if echo "$RAW_OUTPUT" | grep -q "Request Contract incomplete"; then
+  echo "  PASS: warning emitted for bare task missing G+O+E"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected 'Request Contract incomplete' warning, got: $RAW_OUTPUT"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 10 (P0-3): Warning lists all three missing fields
+# -----------------------------------------------------------------------
+echo "Scenario 10: Warning lists Goal, Outcome, Eval when all three are missing"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"refactor things"}' 2>&1)
+if echo "$RAW_OUTPUT" | grep -q "Goal" && \
+   echo "$RAW_OUTPUT" | grep -q "Outcome" && \
+   echo "$RAW_OUTPUT" | grep -q "Eval"; then
+  echo "  PASS: warning enumerates all three missing fields"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected warning to list Goal+Outcome+Eval, got: $RAW_OUTPUT"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 11 (P0-3): Warning suppressed when full Request Contract present
+# -----------------------------------------------------------------------
+echo "Scenario 11: No warning when Goal + Expected Outcome + Eval Criteria are all present"
+TASK_WITH_RC="**Goal:** Implement feature X. **Expected Outcome:** Feature works in prod. **Eval Criteria:** All tests pass and demo passes UAT."
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  "{\"to\":\"crewly-product-leo-dev\",\"task\":\"$TASK_WITH_RC\"}" 2>&1)
+if echo "$RAW_OUTPUT" | grep -q "Request Contract incomplete"; then
+  echo "  FAIL: did not expect warning when G+O+E all present, got: $RAW_OUTPUT"
+  FAIL=$((FAIL + 1))
+else
+  echo "  PASS: no warning emitted when contract is complete"
+  PASS=$((PASS + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 12 (P0-3): Partial contract — only Goal present, warns about Outcome+Eval
+# -----------------------------------------------------------------------
+echo "Scenario 12: Partial contract — names only the missing field(s)"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"**Goal:** ship X. Just do it."}' 2>&1)
+if echo "$RAW_OUTPUT" | grep -q "Request Contract incomplete" && \
+   echo "$RAW_OUTPUT" | grep -q "Outcome" && \
+   echo "$RAW_OUTPUT" | grep -q "Eval"; then
+  echo "  PASS: warning emitted, names Outcome+Eval as missing"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected partial-contract warning, got: $RAW_OUTPUT"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 13 (P0-3): Warning is non-fatal — delegation still succeeds
+# -----------------------------------------------------------------------
+echo "Scenario 13: Warning is non-fatal — delegation completes despite missing G+O+E"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"unstructured task"}' 2>&1)
+OUTPUT=$(echo "$RAW_OUTPUT" | grep '"monitoring"' | head -1)
+if echo "$OUTPUT" | jq -e '.success' > /dev/null 2>&1; then
+  echo "  PASS: delegation succeeds despite missing contract markers"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: warning should be non-fatal, but delegation appears to have failed: $RAW_OUTPUT"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 14 (P0-3): Acceptance Criteria synonym recognized as Eval marker
+# -----------------------------------------------------------------------
+echo "Scenario 14: 'Acceptance Criteria' counts as the Eval marker"
+TASK_AC="**Goal:** ship Y. **Expected Outcome:** Y in prod. **Acceptance Criteria:** UAT pass."
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  "{\"to\":\"crewly-product-leo-dev\",\"task\":\"$TASK_AC\"}" 2>&1)
+if echo "$RAW_OUTPUT" | grep -q "Request Contract incomplete"; then
+  echo "  FAIL: did not expect warning when Acceptance Criteria stands in for Eval, got: $RAW_OUTPUT"
+  FAIL=$((FAIL + 1))
+else
+  echo "  PASS: Acceptance Criteria recognized as valid Eval marker"
+  PASS=$((PASS + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 15: Contract lives ENTIRELY in `context` — must NOT warn
+#
+# This is the reported bug. A delegator whose `task` is the one-line ask and
+# whose full Goal / Expected Outcome / Eval Criteria sit in `context` was
+# told the contract was "incomplete" even though every marker was present.
+# -----------------------------------------------------------------------
+echo "Scenario 15: full contract in context field only — no warning"
+CTX_FULL="**Goal:** Ship the importer. **Expected Outcome:** CSVs land in prod. **Eval Criteria:** all tests green."
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  "{\"to\":\"crewly-product-leo-dev\",\"task\":\"build the importer\",\"context\":\"$CTX_FULL\"}" 2>&1)
+if echo "$RAW_OUTPUT" | grep -q "Request Contract incomplete"; then
+  echo "  FAIL: contract present in context was still reported incomplete: $RAW_OUTPUT"
+  FAIL=$((FAIL + 1))
+else
+  echo "  PASS: contract in context suppresses the warning"
+  PASS=$((PASS + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 16: Contract SPLIT across task and context — must NOT warn
+# -----------------------------------------------------------------------
+echo "Scenario 16: contract split across task and context — no warning"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"**Goal:** ship the importer","context":"**Expected Outcome:** CSVs land in prod. **Eval Criteria:** all tests green."}' 2>&1)
+if echo "$RAW_OUTPUT" | grep -q "Request Contract incomplete"; then
+  echo "  FAIL: split contract was reported incomplete: $RAW_OUTPUT"
+  FAIL=$((FAIL + 1))
+else
+  echo "  PASS: split contract suppresses the warning"
+  PASS=$((PASS + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 17: Check is NOT weakened — a field absent from BOTH still warns
+# -----------------------------------------------------------------------
+echo "Scenario 17: field missing from both fields still warns (check not weakened)"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"**Goal:** ship it","context":"**Expected Outcome:** it ships."}' 2>&1)
+if echo "$RAW_OUTPUT" | grep -q "Request Contract incomplete" && \
+   echo "$RAW_OUTPUT" | grep -q "Eval"; then
+  echo "  PASS: still warns for the one marker absent from both fields"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected an Eval-missing warning, got: $RAW_OUTPUT"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 18: Nothing anywhere — all three still named
+# -----------------------------------------------------------------------
+echo "Scenario 18: empty contract in both fields names Goal+Outcome+Eval"
+RAW_OUTPUT=$(env CREWLY_SESSION_NAME="sam-tl" bash "$MOCK_SCRIPT" "$SKILL_DIR" \
+  '{"to":"crewly-product-leo-dev","task":"just do the thing","context":"here is some background prose"}' 2>&1)
+if echo "$RAW_OUTPUT" | grep -q "Request Contract incomplete" && \
+   echo "$RAW_OUTPUT" | grep -q "Goal" && \
+   echo "$RAW_OUTPUT" | grep -q "Outcome" && \
+   echo "$RAW_OUTPUT" | grep -q "Eval"; then
+  echo "  PASS: all three markers reported missing"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected all three named, got: $RAW_OUTPUT"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenarios 19-22: direct unit tests against the REAL extracted function.
+#
+# These call warn_missing_request_contract() itself (sourced from
+# execute.sh at the top of this file), so they pin the two-argument
+# signature and the scan surface with no mock in between.
+# -----------------------------------------------------------------------
+echo "Scenario 19: function scans arg 2 (context) for markers"
+FN_OUT=$(warn_missing_request_contract "bare ask" \
+  "Goal: x. Expected Outcome: y. Eval Criteria: z." 2>&1 || true)
+if [ -z "$FN_OUT" ]; then
+  echo "  PASS: no warning when all markers are in the context argument"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected silence, got: $FN_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario 20: function still scans arg 1 (task) on its own"
+FN_OUT=$(warn_missing_request_contract \
+  "Goal: x. Expected Outcome: y. Eval Criteria: z." "" 2>&1 || true)
+if [ -z "$FN_OUT" ]; then
+  echo "  PASS: no warning when all markers are in the task argument"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected silence, got: $FN_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario 21: function warns when a marker is in neither argument"
+FN_OUT=$(warn_missing_request_contract "Goal: x." "Expected Outcome: y." 2>&1 || true)
+if echo "$FN_OUT" | grep -q "Request Contract incomplete" && echo "$FN_OUT" | grep -q "Eval"; then
+  echo "  PASS: names Eval as missing from both arguments"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected Eval-missing warning, got: $FN_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario 22: markers are not fabricated across the task/context seam"
+# "go" + "al: ..." must not join into "goal:" — the newline join prevents it.
+FN_OUT=$(warn_missing_request_contract "please go" \
+  "al: nothing here. Expected Outcome: y. Eval Criteria: z." 2>&1 || true)
+if echo "$FN_OUT" | grep -q "Goal"; then
+  echo "  PASS: seam does not fabricate a Goal marker"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: 'go'+'al:' across the seam was accepted as a Goal marker: $FN_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 23: source-level guard on the production call site.
+#
+# The unit tests above cannot see which arguments execute.sh actually
+# passes. This asserts the call site itself, so reverting it to the
+# task-only form fails here even though the function stays correct.
+# -----------------------------------------------------------------------
+echo "Scenario 23: execute.sh calls the checker with BOTH task and context"
+SRC=$(cat "$SKILL_DIR/execute.sh")
+if printf '%s' "$SRC" | grep -q -- 'warn_missing_request_contract "$TASK" "$CONTEXT"'; then
+  echo "  PASS: call site passes \$TASK and \$CONTEXT"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: execute.sh does not call warn_missing_request_contract with both fields"
+  FAIL=$((FAIL + 1))
+fi
+
+if printf '%s' "$SRC" | grep -qE '^warn_missing_request_contract "\$TASK"$'; then
+  echo "  FAIL: execute.sh still has a task-only call to the contract checker"
+  FAIL=$((FAIL + 1))
+else
+  echo "  PASS: no task-only call to the contract checker remains"
+  PASS=$((PASS + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Scenario 24: delegation through project tickets (spec 2026-09-28 §11).
+#
+# Runs a COPY of the real execute.sh next to a lib.sh whose api_call is
+# stubbed (the same layout trick as the ORC delegate-task test), so the
+# production --ticket handling is exercised verbatim.
+# -----------------------------------------------------------------------
+echo "Scenario 24: --ticket, the ticket report, and a refused ticket"
+TK_PARENT=$(mktemp -d)
+TK_LOG=$(mktemp)
+mkdir -p "$TK_PARENT/_common" "$TK_PARENT/delegate-task"
+cat > "$TK_PARENT/_common/lib.sh" <<LIBEOF
+source "$(cd "$SCRIPT_DIR/../.." && pwd)/_common/lib.sh"
+api_call() {
+  local method="\$1" path="\$2" body="\${3:-}"
+  printf '%s %s %s\n' "\$method" "\$path" "\$(printf '%s' "\$body" | tr -d '\n')" >> "$TK_LOG"
+  case "\$path" in
+    /task-pool/add)
+      if [ "\${TEST_ADD_REFUSE:-0}" = "1" ]; then
+        echo '{"error":true,"status":409,"details":{"success":false,"error":"CE-2 is already being worked in WorkItem wi-9","code":"project_ticket_refused"}}' >&2
+        return 1
+      fi
+      echo '{"success":true,"data":{"id":"wi-tl","projectTicket":{"id":"CE-14","status":"in_progress","projectPath":"/p","project":"ce-core","created":true}}}'
+      ;;
+    *) echo '{"success":true}' ;;
+  esac
+}
+LIBEOF
+cp "$SKILL_DIR/execute.sh" "$TK_PARENT/delegate-task/execute.sh"
+
+OUT=$(CREWLY_SESSION_NAME=ce-owen bash "$TK_PARENT/delegate-task/execute.sh" --to ce-vera --task "Goal: a. Expected Outcome: b. Eval Criteria: c." --ticket CE-9 2>/dev/null || true)
+if grep -q '"projectTicketId": *"CE-9"' "$TK_LOG" && grep -q '"delegatedBy": *"ce-owen"' "$TK_LOG"; then
+  echo "  PASS: --ticket and the delegator travel to /task-pool/add"; PASS=$((PASS + 1))
+else
+  echo "  FAIL: projectTicketId/delegatedBy missing: $(cat "$TK_LOG")"; FAIL=$((FAIL + 1))
+fi
+if printf '%s' "$OUT" | grep -q 'Tracked as project ticket CE-14'; then
+  echo "  PASS: output names the project ticket"; PASS=$((PASS + 1))
+else
+  echo "  FAIL: no ticket line in output: $OUT"; FAIL=$((FAIL + 1))
+fi
+
+: > "$TK_LOG"
+set +e
+OUT=$(TEST_ADD_REFUSE=1 CREWLY_SESSION_NAME=ce-owen bash "$TK_PARENT/delegate-task/execute.sh" --to ce-vera --task "Goal: a. Expected Outcome: b. Eval Criteria: c." --ticket CE-2 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'already being worked'; then
+  echo "  PASS: a refused --ticket fails with the reason"; PASS=$((PASS + 1))
+else
+  echo "  FAIL: refused --ticket: rc=$RC out=$OUT"; FAIL=$((FAIL + 1))
+fi
+if grep -q '/deliver' "$TK_LOG"; then
+  echo "  FAIL: the brief was delivered despite the refusal"; FAIL=$((FAIL + 1))
+else
+  echo "  PASS: nothing delivered after a refusal"; PASS=$((PASS + 1))
+fi
+rm -rf "$TK_PARENT" "$TK_LOG"
+
+# Cleanup
+rm -f "$REAL_FN_FILE"
+rm -rf "$MOCK_DIR"
+
+echo ""
+echo "Results: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ] && exit 0 || exit 1

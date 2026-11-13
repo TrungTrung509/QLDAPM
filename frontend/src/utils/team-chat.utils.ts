@@ -1,0 +1,168 @@
+/**
+ * Derivation helpers feeding the consolidated `/team-chat` surface from the
+ * live teams directory (`GET /api/teams`).
+ *
+ * `LiveTeamChatPage` intentionally does not fetch a team directory itself —
+ * it asks the host to inject:
+ *   - `teamLabels`:    team-id → human display name (rail labels)
+ *   - `mentionables`:  the @-mention popover pool (teams + their agents)
+ *
+ * These pure functions build both from the `Team[]` already available via the
+ * `useTeams` hook, so no new backend endpoint is required.
+ *
+ * @module utils/team-chat.utils
+ */
+
+import type { Team } from '../types';
+import type { ChatPresenceStatus, MentionTarget } from '@crewly/chat-ui';
+
+/**
+ * Query-param key used to scope a route to a specific team.
+ *
+ * Shared contract between the link producers (the /teams Chat & Wiki buttons)
+ * and the consumers (`TeamChatRoute` for `/team-chat`, `Wiki` for `/wiki`) so
+ * a typo can't silently break the deep-link.
+ */
+export const TEAM_QUERY_PARAM = 'team';
+
+/**
+ * Query-param key that opens `/team-chat` on one agent's DM
+ * (`/team-chat?agent=<session>`, e.g. from the Dashboard crew list).
+ */
+export const AGENT_QUERY_PARAM = 'agent';
+
+/**
+ * Link to the DM with one agent.
+ *
+ * @param session - Agent session name
+ * @returns `/team-chat?agent=<session>`
+ */
+export function agentChatLink(session: string): string {
+  return `/team-chat?${AGENT_QUERY_PARAM}=${encodeURIComponent(session)}`;
+}
+
+/**
+ * Orchestrator agent session name. Mirrors
+ * `CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME` (`config/constants.ts`); the
+ * frontend bundle doesn't import the shared config, so it's restated here
+ * (same value other FE surfaces hardcode, e.g. TerminalPanel).
+ */
+export const ORCHESTRATOR_SESSION = 'crewly-orc';
+
+/** Display name for the orchestrator conversation in the chat surfaces. */
+export const ORCHESTRATOR_LABEL = 'Orchestrator';
+
+/**
+ * Whether a session is this machine's orchestrator.
+ *
+ * Cloud registers the orchestrator under a per-instance session
+ * (`crewly-orc@<instance>`) so two machines on one account do not share a
+ * Slack app, while locally it stays `crewly-orc`. Surfaces that read a
+ * session straight off a Cloud record therefore see the qualified spelling
+ * — matching on equality alone silently stopped recognising the
+ * orchestrator the moment that shipped (2026-09-21).
+ *
+ * @param agentSession - The session to test
+ * @returns True for either spelling
+ */
+export function isOrchestratorSession(agentSession: string): boolean {
+  return agentSession === ORCHESTRATOR_SESSION || agentSession.startsWith(`${ORCHESTRATOR_SESSION}@`);
+}
+
+/**
+ * Synthetic workspace id for the always-present "Direct Messages" entry in
+ * the consolidated chat. It is NOT a real team id — `useGroupedChannels`
+ * scopes team channels by `teamId`, so no `type='channel'` row matches this
+ * id and the workspace shows only DMs (orchestrator + agents). The `__`
+ * prefix keeps it collision-free against UUID team ids.
+ */
+export const DM_WORKSPACE_ID = '__direct__';
+
+/** Display name for the synthetic Direct Messages workspace. */
+export const DM_WORKSPACE_LABEL = 'Direct Messages';
+
+/**
+ * Map every team to a `teamId → name` label entry for the WorkspaceRail.
+ *
+ * Teams missing a non-empty name are skipped so the rail falls back to the
+ * raw teamId (never blank) rather than rendering an empty label.
+ *
+ * @param teams - Teams from `GET /api/teams`.
+ * @returns A record keyed by team id whose values are the team display names.
+ */
+export function buildTeamLabels(teams: Team[]): Record<string, string> {
+  const labels: Record<string, string> = {};
+  for (const team of teams) {
+    if (team.name && team.name.length > 0) {
+      labels[team.id] = team.name;
+    }
+  }
+  return labels;
+}
+
+/**
+ * Translate a member's agent status into the chat-ui presence vocabulary.
+ *
+ * The teams directory tracks a richer agent lifecycle than the chat presence
+ * dot; this collapses it to the states the UI renders (online / idle while
+ * starting / offline otherwise).
+ *
+ * @param agentStatus - The member's `agentStatus` from the teams directory.
+ * @returns The chat-ui presence status.
+ */
+export function agentStatusToPresence(agentStatus: string): ChatPresenceStatus {
+  switch (agentStatus) {
+    case 'active':
+    case 'started':
+      return 'online';
+    case 'starting':
+    case 'activating':
+      return 'idle';
+    default:
+      return 'offline';
+  }
+}
+
+/**
+ * Build the @-mention suggestion pool for the composer from the teams list.
+ *
+ * Emits one `team` target per team (routes to the team leader) followed by one
+ * `agent` target per member (routes as a direct ping). Member targets carry
+ * `agentSession` so the composer can hand the session id to the dispatcher,
+ * and a presence dot derived from the member's agent status.
+ *
+ * @param teams - Teams (with members) from `GET /api/teams`.
+ * @returns A de-duplicated, render-ready list of mention targets.
+ */
+export function buildMentionables(teams: Team[]): MentionTarget[] {
+  const targets: MentionTarget[] = [];
+  const seen = new Set<string>();
+
+  for (const team of teams) {
+    if (!seen.has(team.id)) {
+      seen.add(team.id);
+      targets.push({
+        id: team.id,
+        kind: 'team',
+        label: team.name || team.id,
+        routingHint: 'Routes to the team leader',
+      });
+    }
+
+    for (const member of team.members ?? []) {
+      const key = member.sessionName || member.id;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      targets.push({
+        id: member.id,
+        kind: 'agent',
+        label: member.name,
+        routingHint: member.role,
+        presence: agentStatusToPresence(member.agentStatus),
+        agentSession: member.sessionName,
+      });
+    }
+  }
+
+  return targets;
+}

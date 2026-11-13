@@ -1,0 +1,242 @@
+/**
+ * Tests for the Google API client — bearer/headers, URL building, and the
+ * mapping of Google failures (401 drops the token cache).
+ *
+ * @module services/google/google-api.client.test
+ */
+
+import { buildGoogleUrl, dropCachedToken, googleRequest, isInsufficientScopeError, type GoogleApiDeps } from './google-api.client.js';
+import { GoogleWorkspaceError } from './google-workspace-token.service.js';
+
+function response(status: number, body: unknown) {
+  const text = typeof body === 'string' ? body : JSON.stringify(body);
+  return { ok: status >= 200 && status < 300, status, text: async () => text };
+}
+
+let fetchMock: jest.Mock;
+let clearCache: jest.Mock;
+let deps: GoogleApiDeps;
+
+beforeEach(() => {
+  fetchMock = jest.fn();
+  clearCache = jest.fn();
+  deps = {
+    tokens: { getAccessToken: jest.fn().mockResolvedValue('ya29.tok'), clearCache },
+    fetchImpl: fetchMock as unknown as typeof fetch,
+  };
+});
+
+describe('buildGoogleUrl', () => {
+  it('skips undefined/empty values and repeats array values', () => {
+    const url = buildGoogleUrl('https://g/api', { q: 'is:unread', max: 5, skip: undefined, empty: '', h: ['A', 'B'] });
+    expect(url).toBe('https://g/api?q=is%3Aunread&max=5&h=A&h=B');
+  });
+});
+
+describe('googleRequest', () => {
+  it('sends the access token as Bearer, JSON body on POST, and parses the response', async () => {
+    fetchMock.mockResolvedValueOnce(response(200, { id: '1' }));
+    await expect(googleRequest(deps, 'https://g/x', { method: 'POST', body: { raw: 'abc' } })).resolves.toEqual({ id: '1' });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://g/x');
+    expect(init.method).toBe('POST');
+    expect(init.headers).toEqual({ Authorization: 'Bearer ya29.tok', Accept: 'application/json', 'Content-Type': 'application/json' });
+    expect(init.body).toBe('{"raw":"abc"}');
+  });
+
+  it('defaults to GET without a Content-Type and returns {} on an empty body', async () => {
+    fetchMock.mockResolvedValueOnce(response(200, ''));
+    await expect(googleRequest(deps, 'https://g/x')).resolves.toEqual({});
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.method).toBe('GET');
+    expect(init.headers).toEqual({ Authorization: 'Bearer ya29.tok', Accept: 'application/json' });
+    expect(init.body).toBeUndefined();
+  });
+
+  it('sends a raw body with its content type and can return the body as text (Drive export / upload)', async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, text: async () => 'a,b\n1,2' });
+    await expect(
+      googleRequest(deps, 'https://g/export', { method: 'PUT', rawBody: Buffer.from('bytes'), contentType: 'multipart/related; boundary=x', responseType: 'text' }),
+    ).resolves.toBe('a,b\n1,2');
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.method).toBe('PUT');
+    expect(init.headers).toEqual({ Authorization: 'Bearer ya29.tok', Accept: '*/*', 'Content-Type': 'multipart/related; boundary=x' });
+    expect(init.body).toEqual(Buffer.from('bytes'));
+  });
+
+  it('returns the raw bytes with responseType buffer, and still reads a failure as text', async () => {
+    const bytes = Buffer.from([0x50, 0x4b, 0xfd, 0xff, 0x80, 0x00]);
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      text: async () => { throw new Error('text() must not be used for a buffer response'); },
+      arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length),
+    });
+    const out = await googleRequest<Buffer>(deps, 'https://g/media', { responseType: 'buffer' });
+    expect(Buffer.isBuffer(out)).toBe(true);
+    expect(out.equals(bytes)).toBe(true);
+    expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toEqual({ Authorization: 'Bearer ya29.tok', Accept: '*/*' });
+
+    fetchMock.mockResolvedValueOnce(response(404, { error: { code: 404, message: 'File not found' } }));
+    await expect(googleRequest(deps, 'https://g/media', { responseType: 'buffer' })).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('drops the cached token on a Google 401 and reports it as 401 google_error', async () => {
+    fetchMock.mockResolvedValueOnce(response(401, { error: { code: 401, message: 'Invalid Credentials' } }));
+    await expect(googleRequest(deps, 'https://g/x')).rejects.toMatchObject({
+      status: 401,
+      code: 'google_error',
+      message: 'Google rejected the access token: Invalid Credentials',
+    });
+    expect(clearCache).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes 403/404/429 through and folds other failures into 502', async () => {
+    fetchMock.mockResolvedValueOnce(response(404, { error: { message: 'Requested entity was not found.' } }));
+    await expect(googleRequest(deps, 'https://g/x')).rejects.toMatchObject({ status: 404, message: 'Requested entity was not found.' });
+
+    fetchMock.mockResolvedValueOnce(response(500, 'boom'));
+    await expect(googleRequest(deps, 'https://g/x')).rejects.toMatchObject({ status: 502, code: 'google_error', message: 'boom' });
+    expect(clearCache).not.toHaveBeenCalled();
+  });
+
+  it('propagates token-service failures without calling Google', async () => {
+    (deps.tokens.getAccessToken as jest.Mock).mockRejectedValueOnce(new GoogleWorkspaceError(409, 'not_connected', 'nope'));
+    await expect(googleRequest(deps, 'https://g/x')).rejects.toMatchObject({ status: 409, code: 'not_connected' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('maps an unreachable Google to 502 network and non-JSON to 502 google_error', async () => {
+    fetchMock.mockRejectedValueOnce(new Error('ENOTFOUND'));
+    await expect(googleRequest(deps, 'https://g/x')).rejects.toMatchObject({ status: 502, code: 'network' });
+
+    fetchMock.mockResolvedValueOnce(response(200, '<html>'));
+    await expect(googleRequest(deps, 'https://g/x')).rejects.toMatchObject({ status: 502, code: 'google_error' });
+  });
+});
+
+describe('account and product plumbing', () => {
+  // A service is bound to one Google account and one product; every request
+  // it makes must carry both, or a Drive call could be served a token that
+  // only covers Calendar and fail at Google with an opaque 403.
+  it('passes the bound account and product to the token service', async () => {
+    const getAccessToken = jest.fn().mockResolvedValue('ya29.tok');
+    const bound = {
+      tokens: { getAccessToken, clearCache: jest.fn() },
+      fetchImpl: jest.fn().mockResolvedValue(response(200, '{}')) as unknown as typeof fetch,
+      product: 'drive' as const,
+      account: 'work@company.com',
+    };
+    await googleRequest(bound, 'https://g/x');
+    expect(getAccessToken).toHaveBeenCalledWith({ account: 'work@company.com', product: 'drive' });
+  });
+
+  it('asks for the default account when none is bound', async () => {
+    const getAccessToken = jest.fn().mockResolvedValue('ya29.tok');
+    const unbound = {
+      tokens: { getAccessToken, clearCache: jest.fn() },
+      fetchImpl: jest.fn().mockResolvedValue(response(200, '{}')) as unknown as typeof fetch,
+    };
+    await googleRequest(unbound, 'https://g/x');
+    expect(getAccessToken).toHaveBeenCalledWith({});
+  });
+
+  it('drops only the bound account\'s cached token on a 401', async () => {
+    const clearOne = jest.fn();
+    const bound = {
+      tokens: { getAccessToken: jest.fn().mockResolvedValue('ya29.tok'), clearCache: clearOne },
+      fetchImpl: jest.fn().mockResolvedValue(response(401, '{}')) as unknown as typeof fetch,
+      account: 'work@company.com',
+    };
+    await expect(googleRequest(bound, 'https://g/x')).rejects.toMatchObject({ status: 401 });
+    expect(clearOne).toHaveBeenCalledWith('work@company.com');
+  });
+});
+
+describe('dropCachedToken scoping', () => {
+  const failing = (account?: string) => {
+    const clearCacheFor = jest.fn();
+    const clearAll = jest.fn();
+    return {
+      clearCacheFor,
+      clearAll,
+      deps: {
+        tokens: { getAccessToken: jest.fn().mockResolvedValue('ya29.tok'), clearCache: clearAll, clearCacheFor },
+        fetchImpl: jest.fn().mockResolvedValue(response(401, '{}')) as unknown as typeof fetch,
+        ...(account ? { account } : {}),
+      },
+    };
+  };
+
+  it('a 401 on the DEFAULT account clears only the default slot, never every account', async () => {
+    const f = failing();
+    await expect(googleRequest(f.deps, 'https://g/x')).rejects.toMatchObject({ status: 401 });
+    expect(f.clearCacheFor).toHaveBeenCalledWith(undefined);
+    expect(f.clearAll).not.toHaveBeenCalled();
+  });
+
+  it('a 401 on a named account clears only that account', async () => {
+    const f = failing('work@company.com');
+    await expect(googleRequest(f.deps, 'https://g/x')).rejects.toMatchObject({ status: 401 });
+    expect(f.clearCacheFor).toHaveBeenCalledWith('work@company.com');
+    expect(f.clearAll).not.toHaveBeenCalled();
+  });
+
+  it('a provider without clearCacheFor falls back to clearCache(account)', () => {
+    const clear = jest.fn();
+    dropCachedToken({ getAccessToken: jest.fn(), clearCache: clear }, 'a@x.com');
+    expect(clear).toHaveBeenCalledWith('a@x.com');
+  });
+});
+
+// 2026-10-08: Gmail drafts.create answered exactly this body for a grant
+// without gmail.compose.
+const INSUFFICIENT_SCOPES = {
+  error: {
+    code: 403,
+    message: 'Request had insufficient authentication scopes.',
+    errors: [{ message: 'Insufficient Permission', domain: 'global', reason: 'insufficientPermissions' }],
+    status: 'PERMISSION_DENIED',
+    details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'ACCESS_TOKEN_SCOPE_INSUFFICIENT', domain: 'googleapis.com' }],
+  },
+};
+
+describe('insufficient scopes', () => {
+  it('recognises every way Google says the token lacks a scope', () => {
+    expect(isInsufficientScopeError(403, JSON.stringify(INSUFFICIENT_SCOPES))).toBe(true);
+    expect(isInsufficientScopeError(403, JSON.stringify({ error: { errors: [{ reason: 'insufficientPermissions' }] } }))).toBe(true);
+    expect(isInsufficientScopeError(403, JSON.stringify({ error: { details: [{ reason: 'ACCESS_TOKEN_SCOPE_INSUFFICIENT' }] } }))).toBe(true);
+    expect(isInsufficientScopeError(403, 'Request had insufficient authentication scopes.')).toBe(true);
+  });
+
+  it('does not mistake a file permission or another status for it', () => {
+    const file = { error: { code: 403, message: 'The user does not have sufficient permissions for this file.', errors: [{ reason: 'insufficientFilePermissions' }] } };
+    expect(isInsufficientScopeError(403, JSON.stringify(file))).toBe(false);
+    expect(isInsufficientScopeError(401, JSON.stringify(INSUFFICIENT_SCOPES))).toBe(false);
+  });
+
+  it('turns it into reauth_required for the bound product and account, and drops the cached token', async () => {
+    const clearOne = jest.fn();
+    const bound: GoogleApiDeps = {
+      tokens: { getAccessToken: jest.fn().mockResolvedValue('ya29.tok'), clearCache: clearOne },
+      fetchImpl: jest.fn().mockResolvedValue(response(403, INSUFFICIENT_SCOPES)) as unknown as typeof fetch,
+      product: 'gmail',
+      account: 'owner@gmail.com',
+    };
+    const err = await googleRequest(bound, 'https://gmail.googleapis.com/gmail/v1/users/me/drafts', { method: 'POST', body: {} }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GoogleWorkspaceError);
+    expect(err).toMatchObject({
+      status: 403,
+      code: 'reauth_required',
+      message: 'Request had insufficient authentication scopes.',
+      details: { reason: 'insufficient_scope', product: 'gmail', account: 'owner@gmail.com' },
+    });
+    expect(clearOne).toHaveBeenCalledWith('owner@gmail.com');
+  });
+
+  it('leaves other 403s as google_error', async () => {
+    fetchMock.mockResolvedValueOnce(response(403, { error: { code: 403, message: 'Forbidden', errors: [{ reason: 'forbidden' }] } }));
+    await expect(googleRequest(deps, 'https://g/x')).rejects.toMatchObject({ status: 403, code: 'google_error' });
+    expect(clearCache).not.toHaveBeenCalled();
+  });
+});

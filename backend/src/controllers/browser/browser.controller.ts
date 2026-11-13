@@ -1,0 +1,1727 @@
+/**
+ * Browser Controller
+ *
+ * REST API handlers for Crewly in Chrome. Each handler translates an
+ * HTTP request into a WebSocket command sent to the connected Chrome
+ * Extension, waits for the response, and returns it as JSON.
+ *
+ * @module controllers/browser/browser.controller
+ */
+
+import type { Request, Response } from 'express';
+import { BrowserBridgeService, type BrowserCommandResponse } from '../../services/browser/browser-bridge.service.js';
+import { BrowserProxyService } from '../../services/browser/browser-proxy.service.js';
+import { CloudClientService } from '../../services/cloud/cloud-client.service.js';
+import { getBrowserSessions, matchIrreversible } from '../../services/browser/browser-session.service.js';
+import { traceBrowserAction } from '../../services/trace/turn-origin.js';
+import { getBoardActivity } from '../../services/board/board-activity.tracker.js';
+import { getBrowserApprovals } from '../../services/browser/browser-approval.service.js';
+import {
+	parseOwnerInput,
+	planOwnerInput,
+	describeOwnerInput,
+	ownerInputLogFields,
+	legacyScrollFor,
+	isUnknownToolError,
+	parseViewportProbe,
+	estimateViewportFromFrame,
+	VIEWPORT_PROBE_SCRIPT,
+	type OwnerInput,
+	type Viewport,
+} from '../../services/browser/owner-browser-input.js';
+import { TaskPoolService } from '../../services/task-pool/task-pool.service.js';
+import { BROWSER_BRIDGE_CONSTANTS, BROWSER_OWNER_INPUT_CONSTANTS, BROWSER_SESSION_CONSTANTS } from '../../constants.js';
+import { LoggerService } from '../../services/core/logger.service.js';
+
+const logger = LoggerService.getInstance().createComponentLogger('BrowserController');
+
+/** Transport a browser command went out on, as named in the dispatch log. */
+type DispatchPath = 'proxy-instance' | 'direct-ws' | 'proxy-relay' | 'none';
+
+/**
+ * Log one browser command dispatch: which agent asked, which tab it named,
+ * and which tab the command was actually sent for.
+ *
+ * Every page command is logged, not only failures — the 2026-09-23 incident
+ * (read-text returning another agent's tab) could not be confirmed from the
+ * log because only navigate and bind left a trace. `dispatchedTabId` is the
+ * tab the backend sent: the explicit tabId, else the agent's binding after the
+ * call. `null` means none was sent and the extension picked a tab itself.
+ *
+ * @param path - Transport the command went out on
+ * @param tool - Extension tool name
+ * @param agentSession - Calling agent session, if any
+ * @param requestedTabId - tabId the caller put in the request body, if any
+ * @param dispatchedTabId - tabId the command was sent with, or null
+ * @param outcome - 'ok', or the error message when the path failed
+ */
+function logDispatch(
+	path: DispatchPath,
+	tool: string,
+	agentSession: string | undefined,
+	requestedTabId: number | undefined,
+	dispatchedTabId: number | null,
+	outcome: string,
+): void {
+	logger.info('Browser command dispatched', {
+		tool,
+		path,
+		agentSession: agentSession ?? null,
+		requestedTabId: requestedTabId ?? null,
+		dispatchedTabId,
+		relaySessionId: BrowserProxyService.getInstance().getSessionId(),
+		outcome,
+	});
+}
+
+/**
+ * The tab a dispatched command was sent for: the explicit tabId in params,
+ * else the calling agent's binding (read after the call, since the bridge
+ * auto-binds on first use), else null.
+ *
+ * @param bridge - Bridge that owns agent→tab bindings
+ * @param params - Params the command was sent with
+ * @param agentSession - Calling agent session, if any
+ * @returns The tab id sent, or null when the extension chose
+ */
+function dispatchedTabIdOf(
+	bridge: BrowserBridgeService,
+	params: Record<string, unknown> | undefined,
+	agentSession: string | undefined,
+): number | null {
+	if (typeof params?.tabId === 'number') return params.tabId;
+	if (agentSession) return bridge.getBinding(agentSession)?.tabId ?? null;
+	return null;
+}
+
+/**
+ * GET /api/browser/status
+ * Returns the current Crewly in Chrome connection status,
+ * including proxy relay state and available browser instances.
+ *
+ * @param _req - Express request (unused)
+ * @param res - Express response
+ */
+export function getStatus(_req: Request, res: Response): void {
+	const bridge = BrowserBridgeService.getInstance();
+	const proxy = BrowserProxyService.getInstance();
+	const bridgeStatus = bridge.getStatus();
+
+	// Transport-honest status (TRANSPORT-HONESTY + STATUS-DISTINCTION
+	// invariants): `drivable` is the single canonical predicate
+	// `proxy.isAvailable()` (relay socket connected AND >=1 browser in the
+	// account's relay registry). `transport` names the only browser-drivable
+	// transport so a caller can never mistake "cloud config socket connected"
+	// for "a browser is drivable". `instances[].deviceId` is observability
+	// only — it shows which device a browser is reachable from, never gating
+	// routing.
+	const instances = proxy.getInstances().map((i) => ({
+		instanceId: i.instanceId,
+		instanceName: i.instanceName,
+		...(i.deviceId ? { deviceId: i.deviceId } : {}),
+	}));
+
+	const drivable = proxy.isAvailable();
+	res.json({
+		...bridgeStatus,
+		transport: 'cloud-relay-ws',
+		drivable,
+		// `clientCount` above counts DIRECT local WebSocket extensions only. A
+		// browser reached through the Cloud relay never appears in it, so
+		// clientCount 0 with drivable true is normal; this says which it is
+		// (crewly#1080). null when nothing is drivable.
+		drivableVia: drivable ? 'proxy-relay' : null,
+		drivableNote: drivable
+			? 'drivable through the Cloud relay; clientCount counts direct local WebSocket extensions only'
+			: 'no browser is registered on the Cloud relay (clientCount counts direct local WebSocket extensions only)',
+		proxy: {
+			state: proxy.getState(),
+			available: proxy.isAvailable(),
+			deviceId: proxy.getDeviceId(),
+			instances: proxy.getInstances(),
+		},
+		instances,
+	});
+}
+
+/**
+ * GET /api/browser/instances
+ * List all connected browser instances available for command routing.
+ *
+ * @param _req - Express request (unused)
+ * @param res - Express response
+ */
+export function getInstances(_req: Request, res: Response): void {
+	const bridge = BrowserBridgeService.getInstance();
+	const proxy = BrowserProxyService.getInstance();
+
+	// Combine direct WS clients and relay proxy instances
+	const directClients = bridge.getStatus().clientCount;
+	const proxyInstances = proxy.getInstances();
+
+	res.json({
+		success: true,
+		instances: proxyInstances,
+		directClientCount: directClients,
+		proxyConnected: proxy.isConnected(),
+	});
+}
+
+/**
+ * POST /api/browser/proxy/connect
+ * Manually connect the BrowserProxyService to the Cloud Relay.
+ * Uses the current CloudClientService token. Call this when the proxy
+ * is disconnected but the cloud connection is active.
+ *
+ * @param _req - Express request (unused)
+ * @param res - Express response
+ */
+export async function connectProxy(_req: Request, res: Response): Promise<void> {
+	const proxy = BrowserProxyService.getInstance();
+
+	if (proxy.isConnected()) {
+		res.json({
+			success: true,
+			message: 'Proxy already connected',
+			state: proxy.getState(),
+			instances: proxy.getInstances(),
+		});
+		return;
+	}
+
+	try {
+		const cloudClient = CloudClientService.getInstance();
+		const token = cloudClient.getToken();
+
+		if (!token) {
+			res.status(400).json({
+				success: false,
+				error: 'No cloud token available. Connect to Cloud first via /api/cloud/connect.',
+			});
+			return;
+		}
+
+		// Ensure token resolver is wired up (idempotent — safe to call multiple times)
+		proxy.setTokenResolver(() => cloudClient.getToken());
+
+		proxy.connect(token);
+
+		// Wait a moment for the WS connection + registration to complete
+		await new Promise((resolve) => setTimeout(resolve, 3000));
+
+		res.json({
+			success: true,
+			message: 'Proxy connecting to Cloud Relay',
+			state: proxy.getState(),
+			instances: proxy.getInstances(),
+		});
+	} catch (err) {
+		res.status(500).json({
+			success: false,
+			error: (err as Error).message,
+		});
+	}
+}
+
+/**
+ * Extract the target browser instance from the request query or body.
+ *
+ * @param req - Express request
+ * @returns Instance name/ID string or undefined for auto-select
+ */
+function resolveInstanceParam(req: Request): string | undefined {
+	return (req.query.instance as string)
+		|| (req.body?.instance as string)
+		|| undefined;
+}
+
+/**
+ * Extract the agent name from request headers or body.
+ * Session names look like "crewly-product-max-118c0421" — extracts "max".
+ *
+ * @param req - Express request
+ * @returns Agent name string or undefined
+ */
+function extractAgentName(req: Request): string | undefined {
+	let agentName = (req.body?.agentName as string)
+		|| (req.headers['x-agent-name'] as string)
+		|| undefined;
+	if (!agentName) {
+		const session = req.headers['x-agent-session'] as string;
+		if (session) {
+			const parts = session.split('-');
+			if (parts.length >= 3) {
+				agentName = parts[parts.length - 2];
+			} else {
+				agentName = session;
+			}
+		}
+	}
+	return agentName;
+}
+
+/**
+ * Extract the agent session id from headers/body (`X-Agent-Session` or
+ * `agentSession` body field). Used to look up per-tab bindings.
+ *
+ * @param req Express request
+ * @returns The session string when present, else `undefined`
+ */
+function extractAgentSession(req: Request): string | undefined {
+	const fromHeader = req.headers['x-agent-session'];
+	if (typeof fromHeader === 'string' && fromHeader.length > 0) return fromHeader;
+	const fromBody = (req.body as { agentSession?: unknown } | undefined)?.agentSession;
+	if (typeof fromBody === 'string' && fromBody.length > 0) return fromBody;
+	return undefined;
+}
+
+/**
+ * Read the agent's stated goal from the `X-Agent-Goal` header.
+ *
+ * The skill library sends it as `b64:<base64 of UTF-8>`, because goals are
+ * often not ASCII and header values are Latin-1. A plain value is accepted
+ * as-is. The result is trimmed and capped at MAX_AGENT_GOAL_LENGTH.
+ *
+ * @param req - Express request
+ * @returns The goal, or undefined when none was sent
+ */
+export function readAgentGoalHeader(req: Request): string | undefined {
+	const raw = req.headers['x-agent-goal'];
+	if (typeof raw !== 'string' || raw.length === 0) return undefined;
+	let goal = raw;
+	if (raw.startsWith('b64:')) {
+		goal = Buffer.from(raw.slice(4), 'base64').toString('utf-8');
+	}
+	goal = goal.trim();
+	return goal ? goal.slice(0, BROWSER_BRIDGE_CONSTANTS.MAX_AGENT_GOAL_LENGTH) : undefined;
+}
+
+/**
+ * Extract the agent's goal/objective from request headers or body.
+ *
+ * Shown as a secondary line in the extension takeover banner so the user
+ * knows *what* the agent is trying to accomplish, not just which tool ran.
+ *
+ * Resolution order ("both" model):
+ *   1. Explicit override — `X-Agent-Goal` header or `agentGoal` body field
+ *      (the remote-browser skill's `--goal`). Always wins; most accurate.
+ *   2. Auto — the title of the agent's currently-claimed work item, looked
+ *      up by `agentSession`. Lets the banner show intent with zero agent
+ *      effort. Best-effort: any miss/error yields `undefined` (banner falls
+ *      back to a generic title).
+ *
+ * @param req - Express request
+ * @returns Goal string or undefined when none can be determined
+ */
+async function extractAgentGoal(req: Request): Promise<string | undefined> {
+	const fromHeader = readAgentGoalHeader(req);
+	if (fromHeader) return fromHeader;
+	const fromBody = (req.body as { agentGoal?: unknown } | undefined)?.agentGoal;
+	if (typeof fromBody === 'string' && fromBody.trim().length > 0) {
+		return fromBody.trim().slice(0, BROWSER_BRIDGE_CONSTANTS.MAX_AGENT_GOAL_LENGTH);
+	}
+
+	// Auto-derive from the agent's active work item (no override supplied).
+	const agentSession = extractAgentSession(req);
+	if (!agentSession) return undefined;
+	try {
+		const pool = TaskPoolService.getInstance();
+		const claim = await pool.getClaimService().getActiveClaimByAgent(agentSession);
+		if (!claim) return undefined;
+		const workItem = await pool.findWorkItem(claim.workItemId);
+		const title = workItem?.title?.trim();
+		return title ? title : undefined;
+	} catch {
+		// Task pool unavailable / lookup failed — banner just omits the goal.
+		return undefined;
+	}
+}
+
+/**
+ * Cross-agent ownership guard for the explicit `tabId` override path.
+ *
+ * Per spec §13.5: if a request supplies an explicit `tabId` that is bound
+ * to a DIFFERENT agentSession, reject with 403. Without this check an agent
+ * could forge a tabId in body and steal another agent's tab. We check the
+ * raw `req.body.tabId` (not the per-handler `params`) because individual
+ * handlers may strip or rename fields when projecting body → params.
+ *
+ * Returns the validated tabId so callers can fold it into params after
+ * the check passes.
+ *
+ * @returns `{ ok: true, tabId? }` when the request should proceed (tabId
+ *   present and owned, or absent). `{ ok: false }` when the response has
+ *   been written with a 403 — caller should return.
+ */
+function resolveAndAuthorizeTabId(
+	bridge: BrowserBridgeService,
+	agentSession: string | undefined,
+	req: Request,
+	res: Response
+): { ok: true; tabId?: number } | { ok: false } {
+	const raw = (req.body as { tabId?: unknown } | undefined)?.tabId;
+	if (raw === undefined || raw === null) return { ok: true };
+	if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+		// Non-numeric tabId in body — silently ignore (best-effort, matches
+		// pre-M2 behaviour of forwarding the body verbatim).
+		return { ok: true };
+	}
+
+	for (const binding of bridge.listBindings()) {
+		if (binding.tabId === raw && binding.agentSession !== agentSession) {
+			res.status(403).json({
+				success: false,
+				error: 'tab_owned_by_other_agent',
+				details: `tabId ${raw} is bound to a different agent session`,
+			});
+			return { ok: false };
+		}
+	}
+	return { ok: true, tabId: raw };
+}
+
+/**
+ * Classify an extension failure that has a precise HTTP meaning.
+ *
+ * The extension answers a refused or impossible command with
+ * `{ success: false, error }` over a transport that has no status codes, and
+ * the controller used to pass that through as a 200. Two failures matter to
+ * callers:
+ * - the tab belongs to another Crewly connection on the account (extension
+ *   >= 0.4.20 refuses with `tab_owned_by_other_client`) → 403
+ * - the named tab is gone (extension >= 0.4.19 fails instead of falling back
+ *   to another tab; Chrome says "No tab with id") → 404 `tab_not_found`,
+ *   which the remote-browser skill answers by dropping its cached tab and
+ *   binding a fresh one.
+ *
+ * @param result - The extension's response
+ * @returns The code and status, or null when the result passes through as-is
+ */
+export function classifyExtensionFailure(
+	result: BrowserCommandResponse,
+): { code: 'tab_owned_by_other_client' | 'tab_not_found'; status: number } | null {
+	if (result.success !== false || typeof result.error !== 'string') return null;
+	if (/tab_owned_by_other_client/.test(result.error)) {
+		return { code: 'tab_owned_by_other_client', status: 403 };
+	}
+	if (/no longer exists|No tab with id/i.test(result.error)) {
+		return { code: 'tab_not_found', status: 404 };
+	}
+	return null;
+}
+
+/**
+ * Write an extension response, with a real status for the failures
+ * {@link classifyExtensionFailure} recognises. The body is unchanged apart
+ * from an added `code`, so callers reading `error` still see the message.
+ *
+ * @param res - Express response
+ * @param result - The extension's response
+ */
+function sendExtensionResult(res: Response, result: BrowserCommandResponse): void {
+	const failure = classifyExtensionFailure(result);
+	if (failure) {
+		res.status(failure.status).json({ ...result, code: failure.code });
+		return;
+	}
+	res.json(result);
+}
+
+/**
+ * Helper: send a tool command to the Chrome Extension and return the result.
+ *
+ * Tries three paths in order:
+ * 1. Direct WebSocket (BrowserBridgeService) — fastest. When the request
+ *    carries an `X-Agent-Session` header (or body.agentSession), routing
+ *    flows through `BrowserBridgeService.sendCommandForAgent`, which auto-
+ *    binds a fresh tab on first use and injects the bound `tabId` on every
+ *    subsequent command. See §3.2 / §4.2 of the per-tab fix spec.
+ * 2. Browser Proxy (BrowserProxyService via Cloud Relay relay_to) — supports
+ *    multi-instance. NOT yet per-tab aware (deferred to v2).
+ * 3. Legacy relay adapter (BrowserRelayAdapter via CloudSync HTTP queue) —
+ *    fallback. Same deferral as Path 2.
+ *
+ * Supports `?instance=` query param for targeting a specific browser instance.
+ *
+ * @param req - Express request (for extracting agent metadata and instance param)
+ * @param res - Express response object
+ * @param tool - Chrome Extension tool name
+ * @param params - Tool parameters
+ * @param timeoutMs - Optional command timeout
+ */
+async function sendToolCommand(
+	req: Request,
+	res: Response,
+	tool: string,
+	params?: Record<string, unknown>,
+	timeoutMs?: number
+): Promise<void> {
+	const bridge = BrowserBridgeService.getInstance();
+	const proxy = BrowserProxyService.getInstance();
+	const instance = resolveInstanceParam(req);
+	const agentName = extractAgentName(req);
+	const agentSession = extractAgentSession(req);
+	const agentGoal = await extractAgentGoal(req);
+
+	// Per-tab ownership: explicit `tabId` in body must belong to this agent.
+	// When the check passes and a tabId was present, fold it into params so
+	// the bridge sees the override (handlers commonly strip body fields when
+	// projecting body → params).
+	const tabIdAuth = resolveAndAuthorizeTabId(bridge, agentSession, req, res);
+	if (!tabIdAuth.ok) return;
+	if (tabIdAuth.tabId !== undefined) {
+		params = { ...(params ?? {}), tabId: tabIdAuth.tabId };
+	}
+
+	// Who holds the wheel, and is this something the agent may do alone?
+	//
+	// This sits ahead of every transport path on purpose. The guards that
+	// decide whether an agent may send a message or submit a form all live at
+	// the skill layer, and driving a browser goes around every one of them —
+	// at this layer "send the email" is a click, shaped exactly like any
+	// other click. An owner asked for an email to be drafted and the agent
+	// sent it; nothing in the system was in a position to notice.
+	if (!agentSession) {
+		// No session header (`--no-bind`, a bare curl): nobody to hold the
+		// action for and no card to ask with. An irreversible action from an
+		// unidentified caller is refused outright — this was a bypass of the
+		// whole guard (2026-10-03 phantom-input review).
+		const matched = matchIrreversible(tool, params);
+		if (matched) {
+			res.status(403).json({
+				success: false,
+				code: 'agent_session_required',
+				error: `This looks irreversible (${matched}). Irreversible browser actions are only taken by an identified agent (X-Agent-Session), held for the owner's approval.`,
+			});
+			return;
+		}
+	}
+	if (agentSession) {
+		// Judge the action where the tab really is: ask the browser for the
+		// tab's current URL (writing tools only). The last navigate misses a
+		// page the agent clicked its way to, or a tab the owner opened.
+		const tab = WRITING_TOOLS_FOR_URL.has(tool)
+			? await currentTab(bridge, proxy, instance, agentSession, agentName, tabIdAuth.tabId)
+			: undefined;
+		const verdict = getBrowserSessions().authorize(agentSession, tool, params, {
+			...(tab?.url ? { url: tab.url } : {}),
+			...(typeof tab?.id === 'number' ? { tabId: tab.id } : typeof tabIdAuth.tabId === 'number' ? { tabId: tabIdAuth.tabId } : {}),
+		});
+		if (!verdict.allow) {
+			traceBrowserAction({
+				session: agentSession,
+				tool,
+				params,
+				url: getBrowserSessions().getSession(agentSession)?.url,
+				outcome: 'blocked',
+				reason: verdict.code,
+			});
+			res.status(409).json({
+				success: false,
+				error: verdict.reason,
+				code: verdict.code,
+				...(verdict.pendingId ? { pendingId: verdict.pendingId } : {}),
+			});
+			return;
+		}
+	}
+
+	// Collect errors from each path for diagnostics if all fail
+	const errors: string[] = [];
+	const requestedTabId = tabIdAuth.tabId;
+	const logPath = (path: DispatchPath, outcome: string): void =>
+		logDispatch(path, tool, agentSession, requestedTabId, dispatchedTabIdOf(bridge, params, agentSession), outcome);
+
+	// Path 1: If a specific instance is requested AND proxy is available, use proxy
+	if (instance && proxy.isAvailable()) {
+		try {
+			const result = await proxy.sendCommand(tool, params, instance, timeoutMs, agentName, agentSession, agentGoal);
+			logPath('proxy-instance', 'ok');
+			noteBrowserSessionAction(agentSession, tool, params, agentName, req);
+			sendExtensionResult(res, result);
+			return;
+		} catch (err) {
+			logPath('proxy-instance', (err as Error).message);
+			errors.push(`proxy(instance=${instance}): ${(err as Error).message}`);
+			// Fall through to try other paths
+		}
+	}
+
+	// Path 2: Direct WebSocket connection (fastest, no instance routing).
+	// Per-tab dispatch flows through here when an agentSession is present.
+	if (bridge.isConnected()) {
+		try {
+			const result = agentSession
+				? await bridge.sendCommandForAgent(agentSession, tool, params, timeoutMs, agentName, agentGoal)
+				: await bridge.sendCommand(tool, params, timeoutMs, agentName, agentGoal);
+			logPath('direct-ws', 'ok');
+			noteBrowserSessionAction(agentSession, tool, params, agentName, req);
+			sendExtensionResult(res, result);
+			return;
+		} catch (err) {
+			logPath('direct-ws', (err as Error).message);
+			errors.push(`direct-ws: ${(err as Error).message}`);
+			// Fall through to try proxy path
+		}
+	}
+
+	// Path 3: Proxy relay (relay_to addressed messaging)
+	if (proxy.isAvailable()) {
+		try {
+			const result = await proxy.sendCommand(tool, params, instance, timeoutMs, agentName, agentSession, agentGoal);
+			logPath('proxy-relay', 'ok');
+			noteBrowserSessionAction(agentSession, tool, params, agentName, req);
+			sendExtensionResult(res, result);
+			return;
+		} catch (err) {
+			logPath('proxy-relay', (err as Error).message);
+			errors.push(`proxy-relay: ${(err as Error).message}`);
+			// Fall through to error response
+		}
+	}
+
+	// No path available or all paths failed
+	if (errors.length === 0) logPath('none', 'no browser connected');
+	if (agentSession) {
+		traceBrowserAction({ session: agentSession, tool, params, url: getBrowserSessions().getSession(agentSession)?.url, outcome: 'failed', reason: 'no browser path' });
+	}
+	const failure = classifyDispatchFailure(tool, errors);
+	res.status(failure.status).json({
+		success: false,
+		error: failure.error,
+		code: failure.code,
+	});
+}
+
+/**
+ * Turn the per-path errors of a failed dispatch into an honest response.
+ * "All paths failed" used to be 503 NO_BROWSER_CLIENT even when the browser
+ * was connected and simply did not answer in time (a screenshot of a busy
+ * page), which sent callers hunting for a missing extension (crewly#1080).
+ *
+ * - no path was attempted: 503 `NO_BROWSER_CLIENT`
+ * - every attempt timed out: 504 `BROWSER_COMMAND_TIMEOUT`
+ * - an attempt failed on message / payload size: 413 `BROWSER_PAYLOAD_TOO_LARGE`
+ * - anything else: 503 `NO_BROWSER_CLIENT` with the per-path detail
+ *
+ * @param tool - Browser tool that failed
+ * @param errors - One message per attempted path
+ * @returns HTTP status, machine code and a message naming the real cause
+ */
+export function classifyDispatchFailure(tool: string, errors: string[]): { status: number; code: string; error: string } {
+	if (errors.length === 0) {
+		return { status: 503, code: 'NO_BROWSER_CLIENT', error: 'No Chrome browser connected. Please connect the Crewly Chrome Extension first.' };
+	}
+	const detail = errors.join('; ');
+	if (errors.some((e) => /too large|payload|message size|max.*size|\b1009\b/i.test(e))) {
+		return {
+			status: 413,
+			code: 'BROWSER_PAYLOAD_TOO_LARGE',
+			error: `The browser answered '${tool}' but the result is too large to relay. Try a smaller viewport or a plain screenshot instead of a full-page one. (${detail})`,
+		};
+	}
+	if (errors.every((e) => /timed out after/i.test(e))) {
+		return {
+			status: 504,
+			code: 'BROWSER_COMMAND_TIMEOUT',
+			error: `A browser is connected but did not answer '${tool}' in time (the page may be busy or the capture too large). Retry, or use read-text / a smaller capture. (${detail})`,
+		};
+	}
+	return { status: 503, code: 'NO_BROWSER_CLIENT', error: `All connection paths failed: ${detail}` };
+}
+
+/** Tools whose hold decision depends on the site the tab is on. */
+const WRITING_TOOLS_FOR_URL = new Set(['click', 'pressKey', 'selectOption', 'setFileInput', 'executeJs', 'executeScript', 'type', 'fill', 'insertText']);
+
+/** Tabs in Crewly's own tab group, from the extension's tab inventory. */
+const crewlyTabIds = new Set<number>();
+let crewlyTabsWatched = false;
+
+/**
+ * Keep the set of tabs in Crewly's tab group current (the inventory the
+ * extension pushes on connect).
+ *
+ * @param bridge - Direct WebSocket bridge
+ */
+export function watchCrewlyTabs(bridge: BrowserBridgeService): void {
+	if (crewlyTabsWatched) return;
+	crewlyTabsWatched = true;
+	try {
+		bridge.onTabInventory((tabs) => {
+			crewlyTabIds.clear();
+			for (const t of tabs) if (t.crewlyOwned) crewlyTabIds.add(t.tabId);
+		});
+	} catch {
+		// Older bridge: no inventory; the bound tab still works.
+	}
+}
+
+/**
+ * The agent's tab right now, read from the browser (`getTabs`): its bound
+ * tab, else the tab the call named, else the active tab in Crewly's own tab
+ * group — never just any active tab (that may be the owner's). Undefined
+ * when the browser cannot be asked in time or no such tab is known — the
+ * caller then falls back to the last URL it knows.
+ *
+ * @param bridge - Direct WebSocket bridge
+ * @param proxy - Relay proxy
+ * @param instance - Requested browser instance, if any
+ * @param agentSession - The agent
+ * @param agentName - Its display name
+ * @param tabId - Explicit tab, if the call named one
+ * @returns The tab's id and URL, or undefined
+ */
+async function currentTab(
+	bridge: BrowserBridgeService,
+	proxy: BrowserProxyService,
+	instance: string | undefined,
+	agentSession: string,
+	agentName: string | undefined,
+	tabId: number | undefined,
+): Promise<{ id?: number; url?: string } | undefined> {
+	try {
+		watchCrewlyTabs(bridge);
+		const timeout = BROWSER_SESSION_CONSTANTS.TAB_URL_LOOKUP_TIMEOUT_MS;
+		let response: BrowserCommandResponse | undefined;
+		if (bridge.isConnected() && !instance) {
+			response = await bridge.sendCommandForAgent(agentSession, 'getTabs', {}, timeout, agentName);
+		} else if (proxy.isAvailable()) {
+			response = await proxy.sendCommand('getTabs', {}, instance, timeout, agentName, agentSession);
+		}
+		const tabs = (response?.result as { tabs?: Array<{ id?: number; url?: string; active?: boolean }> } | undefined)?.tabs;
+		if (!Array.isArray(tabs)) return undefined;
+		const wanted = tabId ?? bridge.getBinding(agentSession)?.tabId;
+		const tab = typeof wanted === 'number'
+			? tabs.find((t) => t.id === wanted)
+			: tabs.find((t) => typeof t.id === 'number' && crewlyTabIds.has(t.id) && t.active)
+				?? tabs.find((t) => typeof t.id === 'number' && crewlyTabIds.has(t.id));
+		if (!tab) return undefined;
+		return { ...(typeof tab.id === 'number' ? { id: tab.id } : {}), ...(tab.url ? { url: tab.url } : {}) };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Forget the Crewly tab group (tests).
+ */
+export function resetCrewlyTabsForTesting(): void {
+	crewlyTabIds.clear();
+	crewlyTabsWatched = false;
+}
+
+/**
+ * Fold a successful browser action into the watchable session for its agent.
+ *
+ * Called from all three transport paths rather than from each handler, so a
+ * tool added later is covered without anyone remembering to wire it up.
+ * Deliberately fire-and-forget and never throwing: the agent's command has
+ * already succeeded, and a bookkeeping failure must not turn that into an
+ * error response.
+ *
+ * @param agentSession - Owning agent session, when the caller sent one
+ * @param tool - Tool that was dispatched
+ * @param params - Params it was dispatched with
+ * @param agentName - Display name for the UI, when sent
+ * @param req - Request, read for the agent's stated goal
+ */
+function noteBrowserSessionAction(
+	agentSession: string | undefined,
+	tool: string,
+	params: Record<string, unknown> | undefined,
+	agentName: string | undefined,
+	req: Request,
+): void {
+	if (!agentSession) return;
+	try {
+		const goalHeader = readAgentGoalHeader(req);
+		getBrowserSessions().noteAction({
+			agentSession,
+			tool,
+			params,
+			...(agentName ? { agentName } : {}),
+			...(goalHeader ? { goal: goalHeader } : {}),
+			...(typeof params?.tabId === 'number' ? { tabId: params.tabId } : {}),
+		});
+		// Every agent browser action is traced (2026-10-03: the LinkedIn post
+		// and the clicks before it were in no trace).
+		traceBrowserAction({ session: agentSession, tool, params, url: getBrowserSessions().getSession(agentSession)?.url, outcome: 'ok' });
+		getBoardActivity().recordBrowser(agentSession, tool, getBrowserSessions().getSession(agentSession)?.url);
+	} catch {
+		// Never let session bookkeeping affect the agent's command.
+	}
+}
+
+/**
+ * POST /api/browser/navigate
+ * Navigate the active tab to a URL.
+ *
+ * @param req - Express request with body { url: string }
+ * @param res - Express response
+ */
+export async function navigate(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'navigate', { url: req.body.url });
+}
+
+/**
+ * POST /api/browser/screenshot
+ * Capture a screenshot of the active tab.
+ *
+ * @param _req - Express request
+ * @param res - Express response
+ */
+export async function screenshot(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'screenshot', undefined, BROWSER_BRIDGE_CONSTANTS.SCREENSHOT_TIMEOUT_MS);
+}
+
+/**
+ * POST /api/browser/read-text
+ * Read visible text from the active tab, optionally scoped to a selector.
+ *
+ * @param req - Express request with optional body { selector?: string }
+ * @param res - Express response
+ */
+export async function readText(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'readText', req.body || {});
+}
+
+/**
+ * GET /api/browser/tabs
+ * List all open Chrome tabs.
+ *
+ * @param _req - Express request
+ * @param res - Express response
+ */
+export async function getTabs(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'getTabs');
+}
+
+/**
+ * POST /api/browser/extension/reload
+ *
+ * Make the Chrome extension load the build on disk. An unpacked extension
+ * keeps running the code it was loaded with until reloaded, so without this
+ * an update waited for someone to be at chrome://extensions. The extension
+ * answers first, then reloads and reconnects on its own. Needs extension
+ * 0.4.18+; an older one answers "unknown tool".
+ *
+ * @param req - Express request
+ * @param res - Express response
+ */
+export async function reloadExtension(req: Request, res: Response): Promise<void> {
+	// A reload may bring in a newer build: let each session find out again
+	// whether it has `wheel` and scroll-aware frames.
+	getBrowserSessions().clearLegacyExtensionMarks();
+	await sendToolCommand(req, res, 'reloadExtension');
+}
+
+/**
+ * POST /api/browser/execute
+ * Execute a safe predefined operation on the active tab.
+ * Supports: querySelectorAll, getTitle, getUrl, getSelection, getScrollPosition.
+ *
+ * @param req - Express request with body { operation: string, selector?: string }
+ * @param res - Express response
+ */
+export async function execute(req: Request, res: Response): Promise<void> {
+	const { operation, selector, code } = req.body || {};
+	// Support legacy { code } param by mapping to executeJs tool
+	if (code && !operation) {
+		await sendToolCommand(req, res, 'executeJs', { code });
+		return;
+	}
+	await sendToolCommand(req, res, 'executeScript', { operation, selector });
+}
+
+/**
+ * POST /api/browser/execute-js
+ * Execute arbitrary JavaScript code on the active tab.
+ * Returns the serialized result.
+ *
+ * @param req - Express request with body { code: string }
+ * @param res - Express response
+ */
+export async function executeJs(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'executeJs', { code: req.body?.code });
+}
+
+/**
+ * POST /api/browser/click
+ * Click an element by selector or coordinates.
+ *
+ * @param req - Express request with body { selector?: string, x?: number, y?: number }
+ * @param res - Express response
+ */
+export async function click(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'click', req.body || {});
+}
+
+/**
+ * POST /api/browser/fill
+ * Fill a form field with a value.
+ *
+ * @param req - Express request with body { selector: string, value: string }
+ * @param res - Express response
+ */
+export async function fill(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'fill', req.body || {});
+}
+
+/**
+ * POST /api/browser/type
+ * Type text into an element with optional delay.
+ *
+ * @param req - Express request with body { selector: string, text: string, delay?: number }
+ * @param res - Express response
+ */
+export async function type(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'type', req.body || {});
+}
+
+/**
+ * POST /api/browser/scroll
+ * Scroll the page by direction/amount or to coordinates.
+ *
+ * @param req - Express request with body { direction?: string, amount?: number, x?: number, y?: number, selector?: string }
+ * @param res - Express response
+ */
+export async function scroll(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'scroll', req.body || {});
+}
+
+/**
+ * POST /api/browser/scroll-in-element
+ * Scroll within a specific element.
+ *
+ * @param req - Express request with body { selector: string, direction?: string, amount?: number }
+ * @param res - Express response
+ */
+export async function scrollInElement(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'scroll', req.body || {});
+}
+
+/**
+ * POST /api/browser/hover
+ * Hover over an element.
+ *
+ * @param req - Express request with body { selector: string }
+ * @param res - Express response
+ */
+export async function hover(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'hover', req.body || {});
+}
+
+/**
+ * POST /api/browser/press-key
+ * Press a keyboard key with optional modifiers.
+ *
+ * @param req - Express request with body { key: string, modifiers?: string[] }
+ * @param res - Express response
+ */
+export async function pressKey(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'pressKey', req.body || {});
+}
+
+/**
+ * POST /api/browser/get-element
+ * Get element information by selector.
+ *
+ * @param req - Express request with body { selector: string }
+ * @param res - Express response
+ */
+export async function getElement(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'getElement', req.body || {});
+}
+
+/**
+ * POST /api/browser/wait-for-selector
+ * Wait for an element matching a selector to appear.
+ *
+ * @param req - Express request with body { selector: string, timeout?: number }
+ * @param res - Express response
+ */
+export async function waitForSelector(req: Request, res: Response): Promise<void> {
+	const timeout = req.body?.timeout;
+	await sendToolCommand(req, res, 'waitForSelector', req.body || {}, timeout ? timeout + 5000 : undefined);
+}
+
+/**
+ * GET /api/browser/cookies
+ * Get cookies, optionally filtered by domain.
+ *
+ * @param req - Express request with optional query { domain?: string }
+ * @param res - Express response
+ */
+export async function getCookies(req: Request, res: Response): Promise<void> {
+	const params: Record<string, unknown> = {};
+	if (req.query.domain) params.domain = req.query.domain;
+	await sendToolCommand(req, res, 'getCookies', params);
+}
+
+/**
+ * POST /api/browser/local-storage
+ * Get local storage entries, optionally filtered by keys.
+ *
+ * @param req - Express request with optional body { keys?: string[] }
+ * @param res - Express response
+ */
+export async function getLocalStorage(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'getLocalStorage', req.body || {});
+}
+
+/**
+ * GET /api/browser/console
+ * Get captured console messages, optionally clearing after read.
+ *
+ * @param req - Express request with optional query { clear?: string }
+ * @param res - Express response
+ */
+export async function getConsole(req: Request, res: Response): Promise<void> {
+	const params: Record<string, unknown> = {};
+	if (req.query.clear === 'true') params.clear = true;
+	await sendToolCommand(req, res, 'getConsoleMessages', params);
+}
+
+/**
+ * POST /api/browser/full-page-screenshot
+ * Capture a full-page screenshot.
+ *
+ * @param _req - Express request
+ * @param res - Express response
+ */
+export async function fullPageScreenshot(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'fullPageScreenshot', undefined, BROWSER_BRIDGE_CONSTANTS.SCREENSHOT_TIMEOUT_MS);
+}
+
+/**
+ * POST /api/browser/get-interactive-elements
+ * List interactive elements on the page.
+ *
+ * @param req - Express request with optional body { textContains?: string }
+ * @param res - Express response
+ */
+export async function getInteractiveElements(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'getInteractiveElements', req.body || {});
+}
+
+/**
+ * POST /api/browser/search-text
+ * Search for text on the page.
+ *
+ * @param req - Express request with body { text: string, exact?: boolean }
+ * @param res - Express response
+ */
+export async function searchText(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'searchText', req.body || {});
+}
+
+/**
+ * POST /api/browser/list-options
+ * List options in a select element.
+ *
+ * @param req - Express request with body { selector: string }
+ * @param res - Express response
+ */
+export async function listOptions(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'listOptions', req.body || {});
+}
+
+/**
+ * POST /api/browser/set-file-input
+ * Set files on a file input element using CDP, bypassing the OS file picker.
+ *
+ * @param req - Express request with body { selector: string, filePaths: string[] }
+ * @param res - Express response
+ */
+export async function setFileInput(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'setFileInput', req.body || {});
+}
+
+/**
+ * POST /api/browser/select-option
+ *
+ * Select an option in a native HTML `<select>` element. CDP click on
+ * a `<select>` does not open the dropdown (Chrome blocks synthetic
+ * events on native form controls), and `<option>` children are rendered
+ * by the OS rather than the DOM, so the existing `click` flow can't
+ * reach them. This endpoint forwards to the extension's `selectOption`
+ * tool, which sets `el.value` directly and dispatches `input` + `change`
+ * events with `bubbles: true` so frameworks (React, Vue, etc.) pick the
+ * change up via their controlled-component handlers.
+ *
+ * Selection precedence (one of these is required):
+ *   - `value`  — match `<option>` by its `value` attribute
+ *   - `label`  — match `<option>` by its visible text (`.text`)
+ *   - `index`  — match `<option>` by zero-based position
+ *
+ * @param req - Express request with body
+ *   `{ selector: string, value?: string, label?: string, index?: number,
+ *      strategy?: "native" | "aria", tabId?: number }`
+ * @param res - Express response — `{ success, selectedValue, selectedText }`
+ *   on hit; `{ success: false, error }` on miss.
+ */
+export async function selectOption(req: Request, res: Response): Promise<void> {
+	await sendToolCommand(req, res, 'selectOption', req.body || {});
+}
+
+// ---------------------------------------------------------------------------
+// Per-tab dispatch (§4.2) — bind / unbind / list bindings
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /api/browser/bind
+ *
+ * Explicitly bind a fresh Chrome tab for the calling agent. The agent is
+ * identified via the `X-Agent-Session` header (or `body.agentSession`).
+ * Idempotent: if the agent already has a bound tab, returns the existing
+ * binding without creating a new one.
+ *
+ * Body (all optional):
+ *   - `active` (boolean, default false) — when true, the new tab is created
+ *     in the foreground. Off by default to avoid disturbing the user.
+ *
+ * Responses:
+ *   - 200 `{ success: true, data: { tabId, windowId?, bindingCount } }`
+ *   - 400 `{ success: false, error: 'agent_session_required' }` when no
+ *     `X-Agent-Session` header is supplied.
+ *   - 503 `{ success: false, error: 'tab_pool_full', retryAfterMs }` when
+ *     the hard cap (`CREWLY_TAB_BIND_MAX`, default 50) has been reached.
+ *   - 503 `NO_BROWSER_CLIENT` when no Extension is connected.
+ */
+export async function bindTab(req: Request, res: Response): Promise<void> {
+	const bridge = BrowserBridgeService.getInstance();
+	const agentSession = extractAgentSession(req);
+	if (!agentSession) {
+		res.status(400).json({
+			success: false,
+			error: 'agent_session_required',
+			details: 'X-Agent-Session header (or body.agentSession) is required for bind/unbind',
+		});
+		return;
+	}
+
+	if (!bridge.isConnected()) {
+		res.status(503).json({
+			success: false,
+			error: 'No Chrome browser connected. Please connect the Crewly Chrome Extension first.',
+			code: 'NO_BROWSER_CLIENT',
+		});
+		return;
+	}
+
+	const foreground = (req.body as { active?: unknown } | undefined)?.active === true;
+	const agentName = extractAgentName(req);
+
+	try {
+		const binding = await bridge.bindAgentTab(agentSession, { foreground, agentName });
+		res.json({
+			success: true,
+			data: {
+				tabId: binding.tabId,
+				windowId: binding.windowId,
+				bindingCount: bridge.listBindings().length,
+			},
+		});
+	} catch (err) {
+		const code = (err as Error & { code?: string }).code;
+		if (code === 'tab_pool_full') {
+			res.status(503).json({
+				success: false,
+				error: 'tab_pool_full',
+				details: (err as Error).message,
+				retryAfterMs: BROWSER_BRIDGE_CONSTANTS.TAB_BIND_RETRY_AFTER_MS,
+			});
+			return;
+		}
+		res.status(502).json({
+			success: false,
+			error: 'bind_failed',
+			details: (err as Error).message,
+		});
+	}
+}
+
+/**
+ * POST /api/browser/unbind
+ *
+ * Release the calling agent's bound Chrome tab. Optionally tells the
+ * Extension to close the tab (default true).
+ *
+ * Body (all optional):
+ *   - `closeTab` (boolean, default true) — set to false to release the
+ *     binding while leaving the tab alive (useful for handoff scenarios).
+ *
+ * Always returns 200 — `data.released:false` indicates "no binding existed",
+ * which is not an error.
+ */
+export async function unbindTab(req: Request, res: Response): Promise<void> {
+	const bridge = BrowserBridgeService.getInstance();
+	const agentSession = extractAgentSession(req);
+	if (!agentSession) {
+		res.status(400).json({
+			success: false,
+			error: 'agent_session_required',
+			details: 'X-Agent-Session header (or body.agentSession) is required for bind/unbind',
+		});
+		return;
+	}
+
+	const closeTab = (req.body as { closeTab?: unknown } | undefined)?.closeTab !== false;
+
+	const result = await bridge.unbindAgentTab(agentSession, { closeTab, reason: 'agent_done' });
+	res.json({
+		success: true,
+		data: {
+			released: result.released,
+			tabClosed: result.tabClosed,
+			bindingCount: bridge.listBindings().length,
+		},
+	});
+}
+
+/**
+ * GET /api/browser/bindings
+ *
+ * Snapshot of all current agent→tab bindings. Used for diagnostics and
+ * eventually for a UI panel showing which tab each running agent owns.
+ *
+ * Response: `{ success: true, data: { bindings: AgentTabBinding[], hardCap, softWarn } }`
+ */
+export function getBindings(_req: Request, res: Response): void {
+	const bridge = BrowserBridgeService.getInstance();
+	const bindings = bridge.listBindings();
+	res.json({
+		success: true,
+		data: {
+			bindings,
+			hardCap: BROWSER_BRIDGE_CONSTANTS.TAB_BIND_HARD_CAP,
+			softWarn: BROWSER_BRIDGE_CONSTANTS.TAB_BIND_SOFT_WARN,
+		},
+	});
+}
+
+// =============================================================================
+// Live browser view
+// =============================================================================
+
+/**
+ * GET /api/browser/sessions
+ * List what each agent is doing in the browser right now.
+ *
+ * Returns metadata only. Frame bytes are fetched one at a time from
+ * `/sessions/:id/frame`, so listing costs nothing and so fetching a picture
+ * is an explicit, attributable act.
+ *
+ * @param req - Express request; `?active=1` hides finished sessions
+ * @param res - Express response
+ */
+export function listBrowserSessions(req: Request, res: Response): void {
+	const activeOnly = req.query.active === '1' || req.query.active === 'true';
+	const sessions = getBrowserSessions().listSessions(!activeOnly);
+	res.json({ success: true, data: { sessions } });
+}
+
+/**
+ * GET /api/browser/sessions/:id
+ * One agent's browser session.
+ *
+ * @param req - Express request with `:id` (the agent session name)
+ * @param res - Express response
+ */
+export function getBrowserSession(req: Request, res: Response): void {
+	const session = getBrowserSessions().getSession(req.params.id);
+	if (!session) {
+		res.status(404).json({ success: false, error: 'No browser session for that agent' });
+		return;
+	}
+	res.json({ success: true, data: { session } });
+}
+
+/**
+ * GET /api/browser/sessions/:id/frame
+ * The most recent picture of the page the agent is on.
+ *
+ * Responds with the image itself rather than JSON so a plain `<img>` can
+ * point at it. Fetching also registers the caller as a watcher, which is what
+ * raises the capture rate — there is no separate subscribe call to get out of
+ * sync, and interest expires on its own.
+ *
+ * Frames are owner-surface only: they are never persisted and never leave
+ * this endpoint. Marked no-store so a picture of whatever the owner is logged
+ * into does not linger in a disk cache or an intermediary.
+ *
+ * @param req - Express request with `:id`
+ * @param res - Express response carrying image bytes, or 404
+ */
+export function getBrowserSessionFrame(req: Request, res: Response): void {
+	const frame = getBrowserSessions().getFrame(req.params.id);
+	if (!frame) {
+		res.status(404).json({ success: false, error: 'No frame captured yet' });
+		return;
+	}
+	const body = Buffer.from(frame.base64, 'base64');
+	res.setHeader('Content-Type', frame.mimeType);
+	res.setHeader('Cache-Control', 'no-store, private');
+	res.setHeader('X-Frame-Captured-At', String(frame.capturedAt));
+	res.send(body);
+}
+
+/**
+ * GET /api/browser/sessions/:id/frame.json
+ * The same frame, as JSON, for callers that cannot carry image bytes.
+ *
+ * The Cloud portal and the phone app reach this instance over the relay,
+ * whose REST passthrough serialises everything as JSON. They cannot use the
+ * raw-bytes route, so they get the same picture base64-encoded and pay the
+ * ~33% for it — still tens of kilobytes, well inside the relay's frame
+ * limit.
+ *
+ * Fetching registers a watcher exactly as the bytes route does, so a remote
+ * viewer raises the capture rate the same way a local one does.
+ *
+ * @param req - Express request with `:id`
+ * @param res - Express response
+ */
+export function getBrowserSessionFrameJson(req: Request, res: Response): void {
+	const frame = getBrowserSessions().getFrame(req.params.id);
+	if (!frame) {
+		res.status(404).json({ success: false, error: 'No frame captured yet' });
+		return;
+	}
+	res.setHeader('Cache-Control', 'no-store, private');
+	res.json({
+		success: true,
+		data: {
+			base64: frame.base64,
+			mimeType: frame.mimeType,
+			capturedAt: frame.capturedAt,
+			...(frame.devicePixelRatio !== undefined ? { devicePixelRatio: frame.devicePixelRatio } : {}),
+		},
+	});
+}
+
+/**
+ * POST /api/browser/sessions/:id/stop
+ * Mark an agent's browser session as stopped by its owner.
+ *
+ * This ends the watchable session and its frames. It does not yet interrupt
+ * the agent itself — taking the wheel away mid-action is a separate change
+ * that needs the agent side to understand being pre-empted.
+ *
+ * @param req - Express request with `:id`
+ * @param res - Express response
+ */
+export function stopBrowserSession(req: Request, res: Response): void {
+	const sessions = getBrowserSessions();
+	if (!sessions.getSession(req.params.id)) {
+		res.status(404).json({ success: false, error: 'No browser session for that agent' });
+		return;
+	}
+	sessions.endSession(req.params.id, 'stopped');
+	res.json({ success: true, data: { session: sessions.getSession(req.params.id) } });
+}
+
+/**
+ * POST /api/browser/sessions/:id/take-control
+ * Take the wheel from the agent.
+ *
+ * While the owner holds it every browser call from that agent is refused, so
+ * the two can never drive the same page at once — which matters most in
+ * exactly the situation people take over for: typing a password.
+ *
+ * @param req - Express request with `:id`
+ * @param res - Express response
+ */
+export function takeBrowserControl(req: Request, res: Response): void {
+	const session = getBrowserSessions().takeControl(req.params.id);
+	if (!session) {
+		res.status(404).json({ success: false, error: 'No browser session for that agent' });
+		return;
+	}
+	res.json({ success: true, data: { session } });
+}
+
+/**
+ * Send one command for the owner, straight to a tab.
+ *
+ * The owner has no agent session, so this does not go through
+ * {@link sendToolCommand}: that path derives the tab from the calling agent's
+ * binding and runs the agent gate, and neither applies. It uses the same two
+ * transports the live-view capturer uses — the direct extension socket, else
+ * the relay proxy — and the same dispatch log line, which records the tool and
+ * tab but never the params (they carry what the owner typed).
+ *
+ * @param tool - Extension tool name
+ * @param params - Tool params, including the target `tabId`
+ * @returns The extension's response
+ * @throws When no transport is available or every one failed
+ */
+async function sendOwnerCommand(tool: string, params: Record<string, unknown>): Promise<BrowserCommandResponse> {
+	const bridge = BrowserBridgeService.getInstance();
+	const proxy = BrowserProxyService.getInstance();
+	const tabId = typeof params.tabId === 'number' ? params.tabId : null;
+	const timeoutMs = BROWSER_OWNER_INPUT_CONSTANTS.COMMAND_TIMEOUT_MS;
+	const errors: string[] = [];
+
+	if (bridge.isConnected()) {
+		try {
+			const result = await bridge.sendCommand(tool, params, timeoutMs);
+			logDispatch('direct-ws', tool, undefined, undefined, tabId, 'ok');
+			return result;
+		} catch (err) {
+			logDispatch('direct-ws', tool, undefined, undefined, tabId, (err as Error).message);
+			errors.push(`direct-ws: ${(err as Error).message}`);
+		}
+	}
+	if (proxy.isAvailable()) {
+		try {
+			const result = await proxy.sendCommand(tool, params, undefined, timeoutMs);
+			logDispatch('proxy-relay', tool, undefined, undefined, tabId, 'ok');
+			return result;
+		} catch (err) {
+			logDispatch('proxy-relay', tool, undefined, undefined, tabId, (err as Error).message);
+			errors.push(`proxy-relay: ${(err as Error).message}`);
+		}
+	}
+	if (errors.length === 0) logDispatch('none', tool, undefined, undefined, tabId, 'no browser connected');
+	throw new Error(
+		errors.length > 0
+			? `All connection paths failed: ${errors.join('; ')}`
+			: 'No Chrome browser connected. Please connect the Crewly Chrome Extension first.',
+	);
+}
+
+/** Measured viewports per session, so every tap is not an extra round trip. */
+const viewportCache = new Map<string, { viewport: Viewport; at: number }>();
+
+/**
+ * The CSS viewport of a session's tab, for mapping a tap.
+ *
+ * Measured in the page when possible; when the page cannot be measured (a
+ * restricted page, a transport hiccup) it is estimated from the frame the
+ * owner tapped and the capture settings, which is right whenever the
+ * extension applied its downscale.
+ *
+ * @param sessionId - Session being driven
+ * @param tabId - Its tab
+ * @param frameWidth - Natural width of the frame the owner tapped
+ * @param frameHeight - Natural height of that frame
+ * @returns The viewport in CSS pixels
+ */
+async function viewportFor(sessionId: string, tabId: number, frameWidth: number, frameHeight: number): Promise<Viewport> {
+	const measured = await measuredViewport(sessionId, tabId);
+	if (measured) return measured;
+	const frame = getBrowserSessions().getFrame(sessionId);
+	return estimateViewportFromFrame(frameWidth, frameHeight, frame?.devicePixelRatio, frame?.scale);
+}
+
+/**
+ * The viewport an owner input needs, if any.
+ *
+ * Taps and swipes are mapped from frame pixels; the scroll buttons wheel at
+ * the middle of the page. Text, keys, navigation and Back need none.
+ *
+ * @param sessionId - Session being driven
+ * @param tabId - Its tab
+ * @param input - What the owner did
+ * @returns The viewport, or undefined when the input does not need one
+ */
+async function ownerInputViewport(sessionId: string, tabId: number, input: OwnerInput): Promise<Viewport | undefined> {
+	if (input.kind === 'tap' || input.kind === 'swipe') {
+		return viewportFor(sessionId, tabId, input.frameWidth, input.frameHeight);
+	}
+	if (input.kind === 'scroll') return measuredViewport(sessionId, tabId);
+	return undefined;
+}
+
+/**
+ * The CSS viewport of a session's tab as measured in the page, cached for
+ * {@link BROWSER_OWNER_INPUT_CONSTANTS.VIEWPORT_CACHE_MS}.
+ *
+ * @param sessionId - Session being driven
+ * @param tabId - Its tab
+ * @returns The viewport, or undefined when the page could not be measured
+ */
+async function measuredViewport(sessionId: string, tabId: number): Promise<Viewport | undefined> {
+	const cached = viewportCache.get(sessionId);
+	if (cached && Date.now() - cached.at <= BROWSER_OWNER_INPUT_CONSTANTS.VIEWPORT_CACHE_MS) return cached.viewport;
+
+	try {
+		const probe = await sendOwnerCommand('executeJs', { code: VIEWPORT_PROBE_SCRIPT, tabId });
+		const measured = probe.success ? parseViewportProbe(probe.result) : null;
+		if (measured) {
+			viewportCache.set(sessionId, { viewport: measured, at: Date.now() });
+			return measured;
+		}
+	} catch {
+		// Not measurable; the caller decides what to do without it.
+	}
+	return undefined;
+}
+
+/** Forget cached viewports (tests). */
+export function clearOwnerViewportCache(): void {
+	viewportCache.clear();
+}
+
+/**
+ * POST /api/browser/sessions/:id/input
+ * Drive the browser as the owner, while the owner holds the wheel.
+ *
+ * "Take control" used to lock the agent out and then leave the owner — who is
+ * usually on a phone, not at the machine — with a picture they could not
+ * touch. This is the other half: a tap on the frame, text, a key, a scroll, a
+ * URL or Back, carried out on the session's own tab through the same
+ * extension operations an agent uses. The agent gate is bypassed here and
+ * only here, because the person driving is the one the gate protects.
+ *
+ * Refused unless:
+ * - the caller is not an agent (an `X-Agent-Session` header is a 403), and
+ * - the owner currently holds this session (`control === 'owner'`, else 409).
+ *
+ * Typed text is never logged, stored or echoed back: the session records
+ * "You typed N characters" and the log records the length.
+ *
+ * Replies with the updated session and, when one could be taken, a fresh
+ * frame, so the phone sees the result without waiting for its next poll.
+ *
+ * @param req - Express request with `:id` and an {@link OwnerInput} body
+ * @param res - Express response
+ */
+export async function sendOwnerBrowserInput(req: Request, res: Response): Promise<void> {
+	if (extractAgentSession(req)) {
+		res.status(403).json({
+			success: false,
+			code: 'agent_not_owner',
+			error: 'Only the owner can drive a browser they have taken over. Agents use the normal browser tools.',
+		});
+		return;
+	}
+
+	const sessionId = req.params.id;
+	const sessions = getBrowserSessions();
+	const session = sessions.getSession(sessionId);
+	if (!session) {
+		res.status(404).json({ success: false, error: 'No browser session for that agent' });
+		return;
+	}
+	if (session.control !== 'owner') {
+		res.status(409).json({
+			success: false,
+			code: 'not_owner_control',
+			error: 'Take control of this browser first.',
+		});
+		return;
+	}
+
+	const parsed = parseOwnerInput(req.body);
+	if (!parsed.ok) {
+		res.status(400).json({ success: false, code: 'invalid_input', error: parsed.error });
+		return;
+	}
+	const input: OwnerInput = parsed.input;
+
+	const tabId = BrowserBridgeService.getInstance().getBinding(sessionId)?.tabId ?? session.tabId;
+	if (typeof tabId !== 'number') {
+		res.status(409).json({
+			success: false,
+			code: 'no_bound_tab',
+			error: 'This agent has no browser tab right now, so there is nothing to drive.',
+		});
+		return;
+	}
+
+	try {
+		const viewport = await ownerInputViewport(sessionId, tabId, input);
+		const planned = planOwnerInput(input, viewport);
+		// Extensions before 0.4.23 have no `wheel` (and clip scrolled frames
+		// white). Once a session's extension has said so, go straight to the
+		// document scroll instead of asking again on every swipe.
+		const legacy = legacyScrollFor(planned);
+		const command = legacy && sessions.isLegacyExtension(sessionId) ? legacy : planned;
+		let result = await sendOwnerCommand(command.tool, { ...command.params, tabId });
+		if (legacy && command === planned && result.success === false && isUnknownToolError(result.error, command.tool)) {
+			sessions.markLegacyExtension(sessionId);
+			logger.info('Extension has no wheel; using document scroll and unscaled frames for this session', { sessionId });
+			result = await sendOwnerCommand(legacy.tool, { ...legacy.params, tabId });
+		}
+
+		const failure = classifyExtensionFailure(result);
+		const insertFailed =
+			command.tool === 'insertText' &&
+			(result.result as { success?: unknown } | undefined)?.success === false;
+		if (result.success === false || insertFailed) {
+			logger.warn('Owner browser input failed', { sessionId, ...ownerInputLogFields(input) });
+			res.status(failure?.status ?? 502).json({
+				success: false,
+				...(failure ? { code: failure.code } : { code: 'input_failed' }),
+				// The extension's message names the operation, never its text.
+				error: result.error ?? (result.result as { error?: string } | undefined)?.error ?? 'The browser did not accept that',
+			});
+			return;
+		}
+
+		logger.info('Owner drove a browser session', { sessionId, tabId, ...ownerInputLogFields(input) });
+		sessions.noteOwnerAction(sessionId, describeOwnerInput(input), input.kind === 'navigate' ? input.url : undefined);
+
+		if (input.kind !== 'navigate' && input.kind !== 'type') {
+			await new Promise((resolve) => setTimeout(resolve, BROWSER_OWNER_INPUT_CONSTANTS.SETTLE_BEFORE_FRAME_MS));
+		}
+		await sessions.captureFrame(sessionId);
+		const frame = sessions.getFrame(sessionId);
+
+		res.setHeader('Cache-Control', 'no-store, private');
+		res.json({
+			success: true,
+			data: {
+				session: sessions.getSession(sessionId),
+				...(frame
+					? {
+							frame: {
+								base64: frame.base64,
+								mimeType: frame.mimeType,
+								capturedAt: frame.capturedAt,
+								...(frame.devicePixelRatio !== undefined ? { devicePixelRatio: frame.devicePixelRatio } : {}),
+							},
+						}
+					: {}),
+			},
+		});
+	} catch (err) {
+		logger.warn('Owner browser input could not be delivered', {
+			sessionId,
+			...ownerInputLogFields(input),
+			error: (err as Error).message,
+		});
+		res.status(503).json({ success: false, code: 'NO_BROWSER_CLIENT', error: (err as Error).message });
+	}
+}
+
+/**
+ * POST /api/browser/sessions/:id/release-control
+ * Give the wheel back to the agent.
+ *
+ * Tells the agent where the page ended up, because the owner has been
+ * driving and it can no longer assume the page it last saw.
+ *
+ * @param req - Express request with `:id`
+ * @param res - Express response
+ */
+export async function releaseBrowserControl(req: Request, res: Response): Promise<void> {
+	const sessions = getBrowserSessions();
+	const before = sessions.getSession(req.params.id);
+	if (!before) {
+		res.status(404).json({ success: false, error: 'No browser session for that agent' });
+		return;
+	}
+
+	const session = sessions.releaseControl(req.params.id);
+	await notifyAgentControlReturned(req.params.id, session?.url);
+	res.json({ success: true, data: { session } });
+}
+
+/**
+ * POST /api/browser/sessions/:id/pending/:pendingId
+ * Approve or reject an action the agent was held on.
+ *
+ * Approval is one-shot: it lets the attempt the owner looked at through, and
+ * nothing else. The same hold is also on a Slack decision card; answering
+ * here settles the card too (see BrowserApprovalService). Approving does not replay the action — the agent retries,
+ * because it is the one that knows what it was in the middle of.
+ *
+ * @param req - Express request with `:id`, `:pendingId` and body `{ decision }`
+ * @param res - Express response
+ */
+export async function resolveBrowserPending(req: Request, res: Response): Promise<void> {
+	const decision = (req.body as { decision?: string } | undefined)?.decision;
+	if (decision !== 'approve' && decision !== 'reject') {
+		res.status(400).json({ success: false, error: "decision must be 'approve' or 'reject'" });
+		return;
+	}
+
+	// With the approval service the answer goes through the hold's Slack
+	// card, so the card, the agent and the hold all settle as one.
+	const approvals = getBrowserApprovals();
+	if (approvals) {
+		const answered = await approvals.answerFromBrowserPage(req.params.id, req.params.pendingId, decision);
+		if (!answered) {
+			res.status(404).json({ success: false, error: 'No such pending action' });
+			return;
+		}
+		res.json({ success: true, data: { session: answered } });
+		return;
+	}
+
+	const sessions = getBrowserSessions();
+	const held = sessions.getSession(req.params.id)?.pending;
+	const session = sessions.resolvePending(req.params.id, req.params.pendingId, decision);
+	if (!session) {
+		res.status(404).json({ success: false, error: 'No such pending action' });
+		return;
+	}
+
+	await tellAgent(
+		req.params.id,
+		decision === 'approve'
+			? `[BROWSER] The owner approved: ${held?.description ?? 'the action you were waiting on'}. Go ahead with exactly that, once.`
+			: `[BROWSER] The owner declined: ${held?.description ?? 'the action you were waiting on'}. Do not do it, do not work around it. Say what you will do instead, or ask.`,
+	);
+
+	res.json({ success: true, data: { session } });
+}
+
+/**
+ * Tell an agent that control has come back to it.
+ *
+ * The agent is not told what the owner did — only where the page is now,
+ * which is all it needs and all we can honestly report. The owner may have
+ * been typing a credential, and that is not ours to relay.
+ *
+ * @param agentSession - The agent getting control back
+ * @param url - Where the page ended up, when known
+ */
+async function notifyAgentControlReturned(agentSession: string, url?: string): Promise<void> {
+	await tellAgent(
+		agentSession,
+		`[BROWSER] The owner has finished and given control back to you. The page is now ${url ?? 'possibly somewhere else'}. Look at it before you act — do not assume it is where you left it.`,
+	);
+}
+
+/** How this module reaches an agent to tell it something. */
+export interface BrowserControlDeps {
+	/** Deliver a line into an agent's session */
+	sendMessageToAgent: (sessionName: string, message: string) => Promise<unknown>;
+}
+
+let controlDeps: BrowserControlDeps | null = null;
+
+/**
+ * Provide the way to reach agents.
+ *
+ * Injected from server startup rather than imported, because the agent
+ * registration service is constructed with the server and importing it here
+ * would be a cycle. Unset simply means the nudges are skipped.
+ *
+ * @param next - The dependencies, or null to clear them
+ */
+export function setBrowserControlDeps(next: BrowserControlDeps | null): void {
+	controlDeps = next;
+}
+
+/**
+ * Deliver a line into an agent's session, best-effort.
+ *
+ * Never allowed to throw: the owner's action has already been applied, and
+ * failing to notify the agent must not turn a successful takeover into an
+ * error the owner sees.
+ *
+ * @param agentSession - Target agent
+ * @param message - What to tell it
+ */
+async function tellAgent(agentSession: string, message: string): Promise<void> {
+	try {
+		await controlDeps?.sendMessageToAgent(agentSession, message);
+	} catch {
+		// Best-effort: the UI is the owner's source of truth, not this nudge.
+	}
+}

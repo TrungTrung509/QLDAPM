@@ -1,0 +1,2743 @@
+/**
+ * Slack-Orchestrator Bridge
+ *
+ * Routes messages between Slack and the Crewly orchestrator,
+ * enabling mobile control of AI teams.
+ *
+ * @module services/slack/bridge
+ */
+
+import { pausedTeamOfSession } from '../team/team-pause.registry.js';
+import { pausedSlackNotice, pausedThreadNotices } from '../team/team-pause-notice.js';
+import { EventEmitter } from 'events';
+import { promises as fs, createWriteStream } from 'fs';
+import path from 'path';
+import os from 'os';
+import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
+import { PDFParse } from 'pdf-parse';
+import { getSlackService, SlackService } from './slack.service.js';
+import { dedicatedDecisionFor } from '../people/dedicated-agent.js';
+import type { SourceMetadata } from '../../types/messaging.types.js';
+import { getSlackAgentIdentityService } from './slack-agent-identity.service.js';
+import { getChatV2Service } from '../chat-v2/chat-v2.singleton.js';
+import type { ChatV2Service } from '../chat-v2/chat-v2.service.js';
+import { synthesizeSlackConversationId } from '../chat-v2/legacy-dto.utils.js';
+import {
+  isOrchestratorActive,
+  isAgentActive,
+  getOrchestratorOfflineMessage,
+  triggerOrchestratorSetup,
+} from '../orchestrator/index.js';
+import {
+  SlackIncomingMessage,
+  SlackNotification,
+  SlackConversationContext,
+  SlackImageInfo,
+  SlackFileInfo,
+  SlackFile,
+  SlackBlock,
+  SlackTextObject,
+  SlackElement,
+  ParsedSlackCommand,
+  parseCommandIntent,
+} from '../../types/slack.types.js';
+import { ContentApprovalService } from '../onboarding/content-approval.service.js';
+import { getSlackImageService } from './slack-image.service.js';
+import type { MessageQueueService } from '../messaging/message-queue.service.js';
+import type { SlackThreadStoreService } from './slack-thread-store.service.js';
+import { getOwnerMessageWatchdog } from '../messaging/owner-message-watchdog.service.js';
+import { isOwnerAuthored } from './slack-auto-working.service.js';
+import { ORCHESTRATOR_SESSION_NAME, MESSAGE_QUEUE_CONSTANTS, SLACK_IMAGE_CONSTANTS, SLACK_FILE_DOWNLOAD_CONSTANTS, SLACK_FILE_FETCH_CONSTANTS, SLACK_BRIDGE_CONSTANTS, AUDITOR_SCHEDULER_CONSTANTS, THREAD_STATUS_CONSTANTS, OWNER_EVIDENCE_METADATA, WORKTREE_JANITOR_CONSTANTS } from '../../constants.js';
+import { readFreeBytes } from '../worktree/low-disk-guard.js';
+import { LoggerService } from '../core/logger.service.js';
+import { CROSS_MACHINE_PREFIX } from '../../types/cross-machine.types.js';
+import { getCrossMachineMessageService } from './cross-machine-message.service.js';
+import { getSlackTeamChannelService } from './slack-team-channel.service.js';
+import { getSlackAgentDmService } from './slack-agent-dm.service.js';
+import { contextKindFor, getSlackThreadContextService, renderSlackThreadContext } from './slack-thread-context.service.js';
+import {
+  getTicketIntakeService,
+  suppressTrivialOrShort,
+  suppressFileOnly,
+} from '../v3/ticket-intake.service.js';
+import {
+  appendTicketLine,
+  intakeWithin,
+  slackIntakeMessage,
+  ticketOfOutcome,
+} from '../v3/ticket-channel-hooks.js';
+import { toSlackMrkdwn } from './slack-mrkdwn.js';
+import type { ThreadStatusQueueService } from '../messaging/thread-status-queue.service.js';
+import type { Request } from '../../types/v2/request.types.js';
+import { deliverForcedMessage } from '../messaging/forced-delivery.js';
+import { inboundFileHint } from '../../utils/inbound-file-hint.utils.js';
+
+/**
+ * Bridge configuration
+ */
+export interface SlackBridgeConfig {
+  /** Orchestrator session name */
+  orchestratorSession: string;
+  /** Enable typing indicators */
+  showTypingIndicator: boolean;
+  /** Maximum response length before truncation */
+  maxResponseLength: number;
+  /** Enable proactive notifications */
+  enableNotifications: boolean;
+  /** Response timeout in ms */
+  responseTimeoutMs: number;
+  /** Time to wait for reply-slack skill before fallback delivery (ms) */
+  skillDeliveryWaitMs: number;
+}
+
+/**
+ * Internal envelope for orchestrator-bound responses.
+ *
+ * The orchestrator bridge needs to distinguish a real orc reply (delivered
+ * via the `slackResolve` callback fired by the orc's reply-slack skill)
+ * from a placeholder string returned on `responseTimeoutMs` /
+ * orchestrator-offline / queue-error fallbacks. Only real orc replies
+ * may auto-resolve the V3 SLA tracker (`markResolvedByThread`).
+ *
+ * Steve 2026-04-30 incident: a 30s timeout placeholder was firing
+ * `markResolvedByThread`, then PR #382's cascade closed the parent
+ * Request to `done` even though the orc never received the message
+ * (Bug 1: agent-registration skip-rewrite swallowed the input).
+ *
+ * @internal
+ */
+interface OrcResponse {
+  /** Response text shown to the user (real orc reply OR placeholder). */
+  response: string;
+  /**
+   * `true` only when the response originated from the orc's `slackResolve`
+   * callback (reply-slack skill). `false` for any timeout / offline /
+   * fallback path. Drives whether the SLA chain is auto-resolved.
+   */
+  fromOrcReply: boolean;
+}
+
+/**
+ * The ticket a bridged message belongs to. Its delivery line
+ * (`ticketDeliveryLine`) is added to the copy the agent receives, never to
+ * the chat-v2 row — that row is what the owner sees in history.
+ */
+type TicketRef = Pick<Request, 'id' | 'ticketNumber'> | null;
+
+/**
+ * Default bridge configuration
+ */
+const DEFAULT_CONFIG: SlackBridgeConfig = {
+  orchestratorSession: ORCHESTRATOR_SESSION_NAME,
+  showTypingIndicator: true,
+  maxResponseLength: 3000,
+  enableNotifications: true,
+  responseTimeoutMs: (MESSAGE_QUEUE_CONSTANTS?.DEFAULT_MESSAGE_TIMEOUT ?? 120000) + 5000,
+  skillDeliveryWaitMs: SLACK_BRIDGE_CONSTANTS?.SKILL_DELIVERY_WAIT_MS ?? 3000,
+};
+
+/**
+ * Maximum time to wait for an auto-recovery setup attempt before giving
+ * up and falling through to the offline path. Capped tight to avoid
+ * blocking the message ingress thread when setup is wedged.
+ */
+const AUTO_RECOVERY_TIMEOUT_MS = 5_000;
+
+// ---------------------------------------------------------------------------
+// Auto-Request suppression gates (Pipeline-#4 fix, Patch D) — moved into the
+// ticket intake (services/v3/ticket-intake.service.ts) so every channel uses
+// the same gate. Re-exported here for existing callers.
+// ---------------------------------------------------------------------------
+
+export { suppressTrivialOrShort, suppressFileOnly };
+
+/**
+ * Slack-Orchestrator Bridge singleton
+ */
+let bridgeInstance: SlackOrchestratorBridge | null = null;
+
+/**
+ * Derive a short, readable chat-v2 channel name from a Slack thread's first
+ * message — so the consolidated chat shows a meaningful title rather than the
+ * synthesized `slack-<chan>-<ts>` id (which is identical across a channel's
+ * threads). Collapses whitespace and truncates; falls back to "Slack thread".
+ *
+ * @param content - The first inbound message of the thread.
+ * @returns A title like `Slack: ship the v2 launch deck`.
+ */
+export function deriveSlackThreadName(content: string | undefined): string {
+  const oneLine = (content ?? '').replace(/\s+/g, ' ').trim();
+  if (!oneLine) return 'Slack thread';
+  const snippet = oneLine.length > 48 ? `${oneLine.slice(0, 48)}…` : oneLine;
+  return `Slack: ${snippet}`;
+}
+
+/**
+ * SlackOrchestratorBridge class
+ *
+ * Routes messages between Slack and the Crewly orchestrator.
+ * Handles command parsing, response formatting, and proactive notifications.
+ *
+ * @example
+ * ```typescript
+ * const bridge = getSlackOrchestratorBridge();
+ * await bridge.initialize();
+ *
+ * // Send notification when task completes
+ * await bridge.notifyTaskCompleted('Fix bug', 'Developer', 'MyProject');
+ * ```
+ */
+
+/**
+ * The Slack bot user ids a message `@`-mentions, in order.
+ *
+ * @param text - Raw Slack message text
+ * @returns Distinct `Uxxxx` ids
+ * @example
+ * mentionedBotUserIds('<@U01> hi <@U02>') // ['U01', 'U02']
+ */
+export function mentionedBotUserIds(text: string | undefined): string[] {
+  if (!text) return [];
+  const out: string[] = [];
+  for (const m of text.matchAll(/<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g)) {
+    const id = m[1];
+    if (id && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/**
+ * The acting-for part of a queued Slack message's source metadata (issue
+ * #968): the human who sent this very message (`actingForUserId`;
+ * `userId` is the thread starter), or — for a post an agent wrote — that
+ * agent (`authorAgentSession`), so its bot user id is never taken for a person.
+ *
+ * @param context - Conversation context (`messageUserId` = this message's sender)
+ * @param authorAgentSession - Set when an agent wrote the message
+ * @returns Metadata fields to spread into `sourceMetadata`
+ */
+export function slackActingForMetadata(
+  context: Pick<SlackConversationContext, 'messageUserId'> | undefined | null,
+  authorAgentSession: string | undefined,
+): Pick<SourceMetadata, 'actingForUserId' | 'authorAgentSession'> {
+  if (authorAgentSession) return { authorAgentSession };
+  return context?.messageUserId ? { actingForUserId: context.messageUserId } : {};
+}
+
+/**
+ * Put the Slack context block in front of the text an agent is handed.
+ * Only the delivered copy carries it; the persisted chat row does not, so
+ * the fetched messages are never recorded locally.
+ *
+ * @param text - The message text
+ * @param block - Rendered Slack context, or empty
+ * @returns The text to deliver
+ */
+export function withContextBlock(text: string, block: string | undefined): string {
+  return block ? `${block}\n\n${text}` : text;
+}
+
+export class SlackOrchestratorBridge extends EventEmitter {
+  private logger = LoggerService.getInstance().createComponentLogger('SlackBridge');
+  private slackService: SlackService;
+  private chatV2: ChatV2Service;
+  private messageQueueService: MessageQueueService | null = null;
+  private threadStatusQueue: ThreadStatusQueueService | null = null;
+  private threadStore: SlackThreadStoreService | null = null;
+  private config: SlackBridgeConfig;
+  private initialized = false;
+  /** Track if we've already logged the missing scope warning */
+  private loggedMissingScope = false;
+  /**
+   * Offered every inbound message before anything else (logging, file
+   * download, thread store, routing). Returns true when it consumed the
+   * message — used by the harness re-login so an owner's login code is
+   * never logged, stored or forwarded to the orchestrator.
+   */
+  private inboundInterceptor: ((message: SlackIncomingMessage) => boolean) | null = null;
+  /**
+   * Further interceptors, offered the message after {@link inboundInterceptor}
+   * (e.g. the owner's "skip all old cards" command in the orc DM).
+   */
+  private extraInterceptors: Array<{ name: string; fn: (message: SlackIncomingMessage) => boolean }> = [];
+
+  /**
+   * Pending completion reactions keyed by "channelId:threadTs".
+   * Stores the original message ts so that the ✅ reaction is added to the
+   * correct message when the reply-slack skill delivers a response.
+   */
+  private pendingReactions = new Map<string, string>();
+
+  /**
+   * Track channel+thread pairs where Slack delivery was already handled
+   * by the reply-slack skill (execute.sh). Used by sendSlackResponse to
+   * avoid sending a duplicate fallback message to the same thread.
+   */
+
+  /**
+   * Create a new SlackOrchestratorBridge
+   *
+   * @param config - Partial configuration to override defaults
+   */
+  constructor(config: Partial<SlackBridgeConfig> = {}) {
+    super();
+    this.slackService = getSlackService();
+    this.chatV2 = getChatV2Service();
+    this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+
+  /**
+   * Initialize the bridge
+   *
+   * Sets up message listeners and orchestrator subscriptions.
+   *
+   * @returns Promise that resolves when initialized
+   */
+  async initialize(): Promise<void> {
+    if (this.initialized) return;
+
+    // Listen for Slack messages
+    this.slackService.on('message', this.handleSlackMessage.bind(this));
+
+    // Initialize cross-machine messaging and route received messages to orchestrator
+    try {
+      const crossMachineService = getCrossMachineMessageService();
+      await crossMachineService.initialize();
+      crossMachineService.on('message', (msg) => {
+        this.handleCrossMachineMessage(msg);
+      });
+      this.logger.info('Cross-machine message listener registered');
+    } catch (err) {
+      this.logger.warn('Cross-machine messaging not available', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    this.initialized = true;
+    this.logger.info('Initialized');
+  }
+
+  /**
+   * Check if bridge is initialized
+   *
+   * @returns True if initialized
+   */
+  isInitialized(): boolean {
+    return this.initialized;
+  }
+
+  /**
+   * Set (or clear) the inbound interceptor. See {@link inboundInterceptor}.
+   *
+   * @param interceptor - Returns true when it consumed the message, or null to clear
+   */
+  setInboundInterceptor(interceptor: ((message: SlackIncomingMessage) => boolean) | null): void {
+    this.inboundInterceptor = interceptor;
+  }
+
+  /**
+   * Offer a message to the inbound interceptor. Never logs the text.
+   *
+   * @param message - Inbound Slack message
+   * @returns True when the interceptor consumed it
+   */
+  private interceptInbound(message: SlackIncomingMessage): boolean {
+    const chain = [
+      ...(this.inboundInterceptor ? [{ name: 'the harness re-login', fn: this.inboundInterceptor }] : []),
+      ...this.extraInterceptors,
+    ];
+    for (const { name, fn } of chain) {
+      try {
+        if (!fn(message)) continue;
+        this.logger.info(`Inbound Slack message consumed by ${name}`, { channelId: message.channelId });
+        return true;
+      } catch (err) {
+        this.logger.warn('Inbound interceptor failed (message routed normally)', { name, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Add an interceptor offered every inbound message after the primary one.
+   *
+   * @param name - What it is, for the log ("the skip-all command")
+   * @param interceptor - Returns true when it consumed the message
+   * @returns Remove function
+   */
+  addInboundInterceptor(name: string, interceptor: (message: SlackIncomingMessage) => boolean): () => void {
+    const entry = { name, fn: interceptor };
+    this.extraInterceptors.push(entry);
+    return () => {
+      this.extraInterceptors = this.extraInterceptors.filter((e) => e !== entry);
+    };
+  }
+
+  /**
+   * Set the message queue service for enqueuing messages to the orchestrator.
+   * Called during server initialization.
+   *
+   * @param service - The MessageQueueService instance
+   */
+  setMessageQueueService(service: MessageQueueService): void {
+    this.messageQueueService = service;
+  }
+
+  /**
+   * Set the thread status queue service for tracking inbound message lifecycle.
+   * Called during server initialization.
+   *
+   * @param service - The ThreadStatusQueueService instance
+   */
+  setThreadStatusQueue(service: ThreadStatusQueueService): void {
+    this.threadStatusQueue = service;
+  }
+
+  /**
+   * Set the Slack thread store service for persisting thread conversations.
+   * Called during server initialization.
+   *
+   * @param store - The SlackThreadStoreService instance
+   */
+  setSlackThreadStore(store: SlackThreadStoreService): void {
+    this.threadStore = store;
+  }
+
+  /**
+   * Get current configuration
+   *
+   * @returns A copy of the current configuration
+   */
+  getConfig(): SlackBridgeConfig {
+    return { ...this.config };
+  }
+
+  /**
+   * Handle incoming Slack message
+   *
+   * Parses the command, routes to appropriate handler, and sends response.
+   *
+   * @param message - Incoming Slack message
+   */
+  private async handleSlackMessage(message: SlackIncomingMessage): Promise<void> {
+    // Before the log line below: a consumed message (an owner's login code)
+    // must not appear in logs, the thread store or the orchestrator.
+    if (this.interceptInbound(message)) return;
+
+    this.logger.info('Received message', {
+      preview: (message.text || '').substring(0, 50),
+      hasImages: message.hasImages,
+      hasFiles: message.hasFiles,
+      fileCount: message.files?.length || 0,
+    });
+
+    try {
+      // Cross-machine message intercept — detect and route before normal processing
+      if (message.text && message.text.startsWith(CROSS_MACHINE_PREFIX)) {
+        const crossMachineService = getCrossMachineMessageService();
+        if (crossMachineService.isEnabled()) {
+          const handled = crossMachineService.handleIncomingMessage(message);
+          if (handled) {
+            this.logger.debug('Cross-machine message handled', {
+              preview: message.text.substring(0, 80),
+            });
+            return; // Don't process as a normal message
+          }
+        }
+      }
+
+      // Download files if present (both images and non-image files)
+      if (message.hasFiles && message.files) {
+        const imageFiles = message.files.filter(f => f.mimetype?.startsWith('image/'));
+        const nonImageFiles = message.files.filter(f => !f.mimetype?.startsWith('image/'));
+
+        // Download images via existing path (pass only imageFiles to avoid redundant API calls)
+        if (imageFiles.length > 0) {
+          await this.downloadMessageImages(message, imageFiles);
+        }
+
+        // Download non-image files
+        if (nonImageFiles.length > 0) {
+          await this.downloadMessageFiles(message, nonImageFiles);
+        }
+      }
+
+      // Slack files LINKED in the text — a colleague on another machine
+      // pointing at a file in a channel this machine's bots are not in.
+      await this.fetchLinkedFiles(message);
+
+      // What the Slack thread actually says — including posts by agents on
+      // other machines, which Cloud never forwards here. Prompt context only;
+      // read in the background, awaited right before a prompt is built.
+      this.loadThreadContext(message);
+
+      // Get or create conversation context. The bridge works on its own copy
+      // carrying this message's Slack ids (G5), so the shared per-thread
+      // context is never overwritten by a later message.
+      const context: SlackConversationContext = {
+        ...this.slackService.getConversationContext(
+          message.threadTs || message.ts,
+          message.channelId,
+          message.userId
+        ),
+        messageTs: message.ts,
+        messageUserId: message.userId,
+        ...(message.teamId ? { slackTeamId: message.teamId } : {}),
+      };
+
+      // Build enriched text with file references for the agent
+      const enrichedText = this.enrichTextWithFiles(message);
+
+      // Store inbound message in thread file (with image metadata). A
+      // hand-off is a message already stored, passed on to one agent.
+      if (this.threadStore && !message.handoffTo) {
+        const threadTs = message.threadTs || message.ts;
+        try {
+          const userName = message.user?.realName || message.user?.name || message.userId;
+          await this.threadStore.appendUserMessage(
+            message.channelId,
+            threadTs,
+            userName,
+            enrichedText,
+            message.images
+          );
+        } catch (err) {
+          this.logger.warn('Failed to store thread message', { error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+
+      // Override message text with enriched version for downstream processing
+      message.text = enrichedText;
+
+      // A dedicated agent (issue #968) DM'd by anyone but its person: a
+      // polite decline from its own bot, and nothing else — no turn is
+      // recorded, nothing is dispatched, the agent is not woken.
+      if (message.agentSession && (await this.declineForDedicatedAgent(message, message.agentSession))) {
+        this.emit('message_handled', { message, response: '', routedTo: 'dedicated-decline', agentSession: message.agentSession });
+        return;
+      }
+
+      // A DM to an agent's own Slack bot goes to that agent (its chat-v2 DM
+      // channel, activate-on-send) and never to the orchestrator.
+      if (message.agentSession) {
+        const agentDm = getSlackAgentDmService();
+        const routed = agentDm ? await agentDm.routeInbound(message) : null;
+        if (routed) {
+          this.emit('message_handled', {
+            message,
+            response: '',
+            routedTo: 'agent-dm',
+            agentSession: routed.link.agentSession,
+          });
+          return;
+        }
+      }
+
+      // Slack team channels: a channel mapped to a Crewly team goes to that
+      // team's huddle (every member sees it, @'d members must reply) and
+      // never to the orchestrator. Unmapped channels and DMs fall through
+      // to the existing routing below.
+      // (Any other channel where a local agent's bot is @'d is linked on
+      // the fly by routeInbound — the owner can pull agents of different
+      // teams into a private channel and address them there.)
+      const teamChannels = getSlackTeamChannelService();
+      if (teamChannels) {
+        const routed = await teamChannels.routeInbound(message);
+        if (routed) {
+          this.emit('message_handled', {
+            message,
+            response: '',
+            routedTo: 'team-channel',
+            teamId: routed.mapping.teamId,
+          });
+          return;
+        }
+      }
+
+      // A shared room that is another machine's: its agents take an un-@'d
+      // message there, so the orchestrator here must not pick it up and pass
+      // it to a local agent (2026-10-03: two "Ella"s answered one message).
+      if (
+        teamChannels &&
+        message.room &&
+        !(message.mentionedAgentSessions?.length) &&
+        (await teamChannels.sharedRoomOwnedElsewhere(message))
+      ) {
+        // Deferred only to an owner Cloud delivered this message to (it is in
+        // `delivery.targets`, or Cloud sent no delivery facts) — see
+        // roomOwnerInstance. Named here so a missing answer can be traced.
+        this.logger.info('Shared room message belongs to another machine — not recorded or dispatched here; the owner has it', {
+          channelId: message.channelId,
+          ts: message.ts,
+          cloudOwner: message.room.delivery?.owner ?? null,
+          cloudTargets: message.room.delivery?.targets ?? null,
+          cloudRule: message.room.delivery?.rule ?? null,
+        });
+        this.emit('message_handled', { message, response: '', routedTo: 'shared-room-elsewhere' });
+        return;
+      }
+
+      // Auditor prefix routing — intercept "auditor ...", "/auditor ...", or "@auditor ..." messages
+      const auditorMatch = enrichedText.match(/^[/@]?auditor[\s:]+(.+)/is);
+      if (auditorMatch) {
+        const auditorMessage = auditorMatch[1].trim();
+        try {
+          if (this.config.showTypingIndicator) {
+            await this.addTypingIndicator(message);
+          }
+          const { AuditorSchedulerService } = await import('../agent/auditor-scheduler.service.js');
+          const scheduler = AuditorSchedulerService.getInstance();
+          await scheduler.handleUserMessage(auditorMessage, {
+            channelId: message.channelId,
+            threadTs: message.threadTs || message.ts,
+          });
+          if (this.config.showTypingIndicator) {
+            await this.markComplete(message);
+          }
+        } catch (error) {
+          await this.sendErrorResponse(message, error as Error);
+        }
+        return;
+      }
+
+      // #177: @mention routing — route to specific agent if @name is detected
+      const mentionTarget = await this.resolveMentionTarget(enrichedText);
+      // A dedicated agent named by someone else (issue #968): decline, stop.
+      if (mentionTarget && (await this.declineForDedicatedAgent(message, mentionTarget.sessionName))) {
+        this.emit('message_handled', { message, response: '', routedTo: 'dedicated-decline', agentSession: mentionTarget.sessionName });
+        return;
+      }
+      // An agent of a paused team is not woken by an @ (specs/2026-10-04-team-pause.md):
+      // the thread is told once, and nothing is delivered.
+      const pausedMention = mentionTarget ? pausedTeamOfSession(mentionTarget.sessionName) : null;
+      if (mentionTarget && pausedMention) {
+        const threadTs = message.threadTs || message.ts;
+        if (pausedThreadNotices.claim(message.channelId, threadTs, pausedMention.teamId)) {
+          await this.slackService
+            .sendMessage({
+              channelId: message.channelId,
+              text: pausedSlackNotice(pausedMention, mentionTarget.name, { toAgent: !!message.authorAgentSession }),
+              threadTs,
+            })
+            .catch((err: unknown) => this.logger.warn('Could not post the paused-team notice', { error: err instanceof Error ? err.message : String(err) }));
+        }
+        this.emit('message_handled', { message, response: '', routedTo: 'paused-team', agentSession: mentionTarget.sessionName });
+        return;
+      }
+      if (mentionTarget) {
+        const isActive = await isAgentActive(mentionTarget.sessionName);
+        if (isActive) {
+          this.logger.info('Routing message to mentioned agent', {
+            agent: mentionTarget.name,
+            session: mentionTarget.sessionName,
+          });
+          if (this.config.showTypingIndicator) {
+            await this.addTypingIndicator(message);
+          }
+          // Strip the @mention prefix and send to the target agent
+          const cleanMessage = enrichedText.replace(new RegExp(`^@${mentionTarget.name}\\s*`, 'i'), '').trim();
+          // Ticket loop: an owner's ask addressed to one agent is a ticket
+          // assigned to that agent.
+          const mentionTicket = ticketOfOutcome(
+            await intakeWithin(
+              getTicketIntakeService(),
+              slackIntakeMessage(
+                {
+                  text: cleanMessage || enrichedText,
+                  slackChannelId: message.channelId,
+                  ts: message.ts,
+                  threadTs: message.threadTs,
+                  userId: message.userId,
+                  userName: message.user?.realName || message.user?.name,
+                  authorAgentSession: message.authorAgentSession,
+                  hasFiles: message.hasFiles,
+                  ownerUserId: this.slackService.getOwnerUserId?.() ?? null,
+                },
+                'legacy-bridge',
+                { targetAgent: mentionTarget.sessionName },
+              ),
+            ).catch(() => null),
+          );
+          const agentResponse = await this.sendToAgent(
+            mentionTarget.sessionName,
+            cleanMessage || enrichedText,
+            context,
+            message.authorAgentSession,
+            renderSlackThreadContext(await message.threadContext, {
+              botUserId: getSlackAgentIdentityService()?.getInstalled(mentionTarget.sessionName)?.botUserId,
+              name: mentionTarget.name,
+            }),
+            mentionTicket,
+          );
+          // Issue #394: `fromOrcReply` comes from the envelope — only
+          // `true` when slackResolve fired with a non-empty body. The
+          // pre-fix `response.length > 0` proxy false-positived on the
+          // 3 placeholder strings (timeout, direct-delivery, error),
+          // any of which would have auto-resolved the SLA tracker on a
+          // non-reply.
+          await this.sendSlackResponse(message, agentResponse.response, agentResponse.fromOrcReply);
+          if (this.config.showTypingIndicator) {
+            await this.markComplete(message);
+          }
+          return;
+        } else {
+          this.logger.info('Mentioned agent is inactive, falling back to orchestrator', {
+            agent: mentionTarget.name,
+          });
+        }
+      }
+
+      // Parse command intent
+      const command = this.parseCommand(message.text);
+
+      // Add typing indicator
+      if (this.config.showTypingIndicator) {
+        await this.addTypingIndicator(message);
+      }
+
+      // Handle based on intent.
+      // `response` is the user-visible text; `fromOrcReply` tracks whether
+      // the response came from the orc's reply-slack callback (true) or a
+      // local string / fallback / placeholder (false). Only true responses
+      // may auto-resolve the V3 SLA tracker downstream.
+      let response: string;
+      let fromOrcReply = false;
+      let isOrchestratorRoute = false;
+      switch (command.intent) {
+        case 'help':
+          response = this.getHelpMessage();
+          break;
+        case 'status': {
+          const r = await this.handleStatusCommand(command, context);
+          response = r.response;
+          fromOrcReply = r.fromOrcReply;
+          break;
+        }
+        case 'list_projects':
+        case 'list_teams':
+        case 'list_agents': {
+          const r = await this.handleListCommand(command, context);
+          response = r.response;
+          fromOrcReply = r.fromOrcReply;
+          break;
+        }
+        case 'pause':
+        case 'resume': {
+          const r = await this.handleControlCommand(command, context);
+          response = r.response;
+          fromOrcReply = r.fromOrcReply;
+          break;
+        }
+        default: {
+          // Ticket loop (specs/ticket-loop.md §2): the single intake decides
+          // whether this opens a ticket (receipt in this thread), joins the
+          // thread's open ticket, or is noise — and it runs BEFORE delivery
+          // so the orchestrator's copy carries `[TICKET:TKT-123 <id>]`. The
+          // source id keeps the 2026-05-13 shape (`slack-<ch>-<root>[-msg-<ts>]`)
+          // and the `slack` tag, so the SLA subscriber works unchanged.
+          const ticket = ticketOfOutcome(
+            await intakeWithin(
+              getTicketIntakeService(),
+              slackIntakeMessage(
+                {
+                  text: message.text || '',
+                  slackChannelId: message.channelId,
+                  ts: message.ts,
+                  threadTs: message.threadTs,
+                  userId: message.userId,
+                  userName: message.user?.realName || message.user?.name,
+                  authorAgentSession: message.authorAgentSession,
+                  hasFiles: message.hasFiles,
+                  ownerUserId: this.slackService.getOwnerUserId?.() ?? null,
+                },
+                'legacy-bridge',
+                { targetAgent: this.config.orchestratorSession },
+              ),
+            ).catch(() => null),
+          );
+          // Send to orchestrator for processing
+          {
+            const r = await this.sendToOrchestrator(
+              message.text,
+              context,
+              message.authorAgentSession,
+              await this.orchestratorContextBlock(message),
+              ticket,
+            );
+            response = r.response;
+            fromOrcReply = r.fromOrcReply;
+          }
+          isOrchestratorRoute = true;
+        }
+      }
+
+      // Send response back to Slack. The `fromOrcReply` flag gates the V3
+      // SLA auto-resolve hook inside sendSlackResponse — placeholders and
+      // fallbacks must NOT mark the respond_to_user WI as resolved.
+      await this.sendSlackResponse(message, response, fromOrcReply);
+
+      // For orchestrator-routed messages, defer ✅ until reply-slack delivers
+      // the actual response. Store pending reaction keyed by channel+thread
+      // so addCompletionReaction() can find it when the reply arrives.
+      if (isOrchestratorRoute && this.config.showTypingIndicator) {
+        const threadTs = message.threadTs || message.ts;
+        const key = `${message.channelId}:${threadTs}`;
+        this.pendingReactions.set(key, message.ts);
+      } else if (this.config.showTypingIndicator) {
+        // Non-orchestrator commands complete immediately
+        await this.markComplete(message);
+      }
+
+      this.emit('message_handled', { message, response });
+    } catch (error) {
+      this.logger.error('Error handling message', { error: error instanceof Error ? error.message : String(error) });
+      await this.sendErrorResponse(message, error as Error);
+      this.emit('error', error);
+    }
+  }
+
+  /**
+   * Handle an incoming cross-machine message.
+   * Routes the message payload to the local orchestrator via the message queue.
+   *
+   * @param msg - Parsed cross-machine message
+   */
+  private async handleCrossMachineMessage(msg: import('../../types/cross-machine.types.js').CrossMachineMessage): Promise<void> {
+    this.logger.info('Routing cross-machine message to orchestrator', {
+      from: msg.fromName,
+      type: msg.type,
+      messageId: msg.messageId,
+    });
+
+    // Format as a human-readable message for the orchestrator
+    const orchestratorMessage = [
+      `[Cross-Machine] from ${msg.fromName} (${msg.from})`,
+      `Type: ${msg.type}`,
+      msg.payload.message ? `Message: ${msg.payload.message}` : '',
+      msg.payload.task ? `Task: ${msg.payload.task}` : '',
+      msg.payload.priority ? `Priority: ${msg.payload.priority}` : '',
+      msg.payload.context ? `Context: ${msg.payload.context}` : '',
+      msg.payload.summary ? `Summary: ${msg.payload.summary}` : '',
+    ].filter(Boolean).join('\n');
+
+    if (this.messageQueueService) {
+      try {
+        this.messageQueueService.enqueue({
+          content: orchestratorMessage,
+          conversationId: `x-machine-${msg.from}-${Date.now()}`,
+          source: 'cross-machine',
+          sourceMetadata: {
+            fromDevice: msg.from,
+            fromDeviceName: msg.fromName,
+            messageType: msg.type,
+            messageId: msg.messageId,
+          },
+        });
+        this.logger.info('Cross-machine message enqueued to orchestrator');
+      } catch (err) {
+        this.logger.error('Failed to enqueue cross-machine message', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    } else {
+      this.logger.warn('Cannot route cross-machine message — MessageQueueService not available');
+    }
+  }
+
+  /**
+   * Parse command from message text
+   *
+   * Cleans the message and extracts the command intent.
+   *
+   * @param text - Raw message text
+   * @returns Parsed command with intent and parameters
+   */
+  parseCommand(text: string): ParsedSlackCommand {
+    // Remove bot mention if present
+    const cleanedText = text.replace(/<@[A-Z0-9]+>/g, '').trim();
+
+    return {
+      intent: parseCommandIntent(cleanedText),
+      rawText: cleanedText,
+      parameters: this.extractParameters(cleanedText),
+    };
+  }
+
+  /**
+   * Extract parameters from command text
+   *
+   * @param text - Command text
+   * @returns Extracted parameters
+   */
+  private extractParameters(text: string): Record<string, string> {
+    const params: Record<string, string> = {};
+
+    // Extract quoted strings
+    const quotedMatch = text.match(/"([^"]+)"/);
+    if (quotedMatch) {
+      params.quoted = quotedMatch[1];
+    }
+
+    // Extract @mentions
+    const mentionMatch = text.match(/@(\w+)/);
+    if (mentionMatch) {
+      params.mention = mentionMatch[1];
+    }
+
+    // Extract project/team names after keywords
+    const forMatch = text.match(/(?:for|on|in)\s+(\w+)/i);
+    if (forMatch) {
+      params.target = forMatch[1];
+    }
+
+    return params;
+  }
+
+  /**
+   * Get help message
+   *
+   * @returns Formatted help message for Slack
+   */
+  getHelpMessage(): string {
+    return `*Crewly Commands:*
+
+:clipboard: *Status*
+• \`status\` - Get overall status
+• \`status [project name]\` - Get project status
+• \`how is [team] doing\` - Get team progress
+
+:page_facing_up: *Lists*
+• \`list projects\` - Show all projects
+• \`list teams\` - Show all teams
+• \`list agents\` or \`who's working\` - Show active agents
+
+:gear: *Actions*
+• \`assign [task] to [agent/team]\` - Assign work
+• \`create task: [description]\` - Create a new task
+• \`pause [agent/team]\` - Pause work
+• \`resume [agent/team]\` - Resume work
+
+:speech_balloon: *Chat*
+Just type naturally to chat with the orchestrator!`;
+  }
+
+  /**
+   * Handle status command
+   *
+   * @param command - Parsed command
+   * @param context - Conversation context
+   * @returns Status response
+   */
+  private async handleStatusCommand(
+    command: ParsedSlackCommand,
+    context: SlackConversationContext
+  ): Promise<OrcResponse> {
+    return await this.sendToOrchestrator(
+      `Give me a brief status update. ${command.rawText}`,
+      context
+    );
+  }
+
+  /**
+   * Handle list commands (projects, teams, agents)
+   *
+   * @param command - Parsed command
+   * @param context - Conversation context
+   * @returns List response
+   */
+  private async handleListCommand(
+    command: ParsedSlackCommand,
+    context: SlackConversationContext
+  ): Promise<OrcResponse> {
+    const prompts: Record<string, string> = {
+      list_projects: 'List all active projects with their status.',
+      list_teams: 'List all teams and their current assignments.',
+      list_agents: 'List all agents, their status, and what they are working on.',
+    };
+
+    return await this.sendToOrchestrator(
+      prompts[command.intent] || command.rawText,
+      context
+    );
+  }
+
+  /**
+   * Handle control commands (pause, resume)
+   *
+   * @param command - Parsed command
+   * @param context - Conversation context
+   * @returns Control response
+   */
+  private async handleControlCommand(
+    command: ParsedSlackCommand,
+    context: SlackConversationContext
+  ): Promise<OrcResponse> {
+    const action = command.intent === 'pause' ? 'Pause' : 'Resume';
+    const target = command.parameters.target || command.parameters.mention || 'all agents';
+
+    return await this.sendToOrchestrator(`${action} ${target}.`, context);
+  }
+
+  /**
+   * Attempt to auto-recover the orchestrator with a hard timeout.
+   *
+   * Calls `triggerOrchestratorSetup()` from the orchestrator service module
+   * directly (bypassing HTTP). Wraps the attempt in a 5-second deadline so
+   * a wedged setup cannot stall the Slack message ingress thread.
+   *
+   * Behavior:
+   * - Timeout: rejects with a TimeoutError-like message after 5s.
+   * - Setup error: rejects with the underlying error.
+   * - Setup returning `success: false`: rejects with the recorded error
+   *   (the caller treats this the same as a thrown error and falls
+   *   through to the offline path).
+   *
+   * Caller is expected to wrap the call in try/catch and continue down
+   * the offline path on rejection — auto-recovery is best-effort.
+   *
+   * @returns Resolves when setup completes successfully (or was skipped
+   *          because the orc was already healthy)
+   * @throws Error on timeout or setup failure
+   * @internal Visible for tests via class member access.
+   */
+  private async attemptAutoRecovery(): Promise<void> {
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        reject(new Error(`auto-recovery setup timed out after ${AUTO_RECOVERY_TIMEOUT_MS}ms`));
+      }, AUTO_RECOVERY_TIMEOUT_MS);
+      // Don't keep the process alive just for this timer
+      timeoutHandle.unref?.();
+    });
+
+    try {
+      const result = await Promise.race([triggerOrchestratorSetup(), timeoutPromise]);
+      if (!result.success) {
+        throw new Error(result.error || 'orchestrator setup returned success=false');
+      }
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
+  }
+
+  /**
+   * Decline a message to a dedicated agent from anyone but its person
+   * (issue #968): post the polite pointer from the agent's own bot, in the
+   * message's thread.
+   *
+   * @param message - Inbound message
+   * @param agentSession - The addressed agent
+   * @returns True when declined (the caller stops routing)
+   */
+  private async declineForDedicatedAgent(message: SlackIncomingMessage, agentSession: string): Promise<boolean> {
+    try {
+      const { StorageService } = await import('../core/storage.service.js');
+      const decision = await dedicatedDecisionFor(StorageService.getInstance(), agentSession, {
+        slackUserId: message.userId,
+        authorAgentSession: message.authorAgentSession,
+      });
+      if (!decision.decline) return false;
+      const botToken = getSlackAgentIdentityService()?.getInstalled(agentSession)?.botToken;
+      await this.slackService
+        .sendMessage({ channelId: message.channelId, text: decision.text, threadTs: message.threadTs || message.ts, ...(botToken ? { botToken } : {}) })
+        .catch((err: unknown) => this.logger.warn('Could not post the dedicated-agent decline', { agentSession, error: err instanceof Error ? err.message : String(err) }));
+      this.logger.info('Dedicated agent declined a message from someone else', { agentSession, slackUserId: message.userId });
+      return true;
+    } catch (err) {
+      this.logger.warn('Dedicated-agent check failed — routing as usual', { agentSession, error: err instanceof Error ? err.message : String(err) });
+      return false;
+    }
+  }
+
+  /**
+   * Send message to orchestrator via the message queue and wait for response.
+   *
+   * Checks if the orchestrator is active before sending. Enqueues the message
+   * and waits for the response via a resolve callback injected into sourceMetadata.
+   *
+   * @param message - Message to send
+   * @param context - Optional conversation context
+   * @param authorAgentSession - Set when a Crewly agent (not a human) wrote
+   *   the Slack message; persisted so the owner-approval gate ignores it
+   * @param slackContextBlock - Slack thread context for the delivered copy
+   * @param ticket - The message's ticket, if any. Its line is added to the
+   *   copy delivered to the agent only — the chat-v2 row keeps what the
+   *   person wrote.
+   * @returns Orchestrator response or offline/error message
+   */
+  private async sendToOrchestrator(
+    message: string,
+    context?: SlackConversationContext,
+    authorAgentSession?: string,
+    slackContextBlock?: string,
+    ticket: TicketRef = null,
+  ): Promise<OrcResponse> {
+    try {
+      // Check if orchestrator is active before attempting to send
+      let isActive = await isOrchestratorActive();
+
+      // Auto-recovery (B0 hot-fix, defense-in-depth):
+      // ESTestNode regression — `isActive` falsely reports offline when the
+      // orchestrator is an in-process Crewly Agent runtime that has lost its
+      // status registration but is otherwise healthy. Before falling
+      // through to the offline path, attempt one synchronous setup call.
+      // This is intentionally once-per-message (not retry-loop). On
+      // success we re-check isActive and proceed normally; on failure we
+      // continue down the existing offline branch (Auditor + queue).
+      if (!isActive) {
+        const recoveryStart = Date.now();
+        this.logger.info('Orchestrator offline — attempting auto-recovery via triggerOrchestratorSetup', {
+          timeoutMs: AUTO_RECOVERY_TIMEOUT_MS,
+        });
+        try {
+          await this.attemptAutoRecovery();
+          isActive = await isOrchestratorActive();
+          this.logger.info('Auto-recovery setup attempt complete', {
+            elapsedMs: Date.now() - recoveryStart,
+            isActiveAfter: isActive,
+          });
+        } catch (err) {
+          this.logger.warn('Auto-recovery setup attempt failed (falling through to offline path)', {
+            elapsedMs: Date.now() - recoveryStart,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      if (!isActive) {
+        // Fallback: route to Auditor agent if it's active
+        const auditorSession = AUDITOR_SCHEDULER_CONSTANTS.AUDITOR_SESSION_NAME;
+        const auditorActive = await isAgentActive(auditorSession);
+        if (auditorActive) {
+          this.logger.info('Orchestrator offline — routing message to Auditor agent');
+          // Auditor fallback is NOT an orc reply — caller must not auto-resolve SLA.
+          const fallback = await this.sendToAuditorFallback(message, context, authorAgentSession, ticket);
+          return { response: fallback, fromOrcReply: false };
+        }
+
+        // #247: Queue the message for replay when orchestrator comes back online,
+        // instead of silently dropping it. The queue processor defers delivery
+        // until the orchestrator registers (agentStatus === 'active').
+        // NOTE: This is an offline-path acknowledgement, NOT a real orc reply —
+        // every return from this branch must set `fromOrcReply: false`.
+        if (this.messageQueueService) {
+          this.logger.info('Orchestrator offline — queuing message for replay when it comes back online');
+
+          // Enrich message with thread file path hint for orchestrator context.
+          // The ticket line goes on the delivered copy only (never persisted).
+          let enrichedMessage = message;
+          let deliveredMessage = appendTicketLine(message, ticket);
+          if (this.threadStore && context) {
+            const threadFilePath = this.threadStore.getThreadFilePath(context.channelId, context.threadTs);
+            enrichedMessage = `${message}\n\n[Thread context file: ${threadFilePath}]`;
+            deliveredMessage = `${deliveredMessage}\n\n[Thread context file: ${threadFilePath}]`;
+          }
+
+          // Store in canonical chat-v2 for persistence
+          const result = {
+            conversation: {
+              id: this.persistSlackInbound({
+                content: enrichedMessage,
+                conversationId: context?.conversationId,
+                agentSession: 'crewly-orc',
+                channelId: context?.channelId,
+                threadTs: context?.threadTs,
+                userId: context?.userId,
+                authorAgentSession,
+                ...persistIdsOf(context),
+              }).conversationId,
+            },
+          };
+
+          try {
+            this.messageQueueService.enqueue({
+              content: withContextBlock(deliveredMessage, slackContextBlock),
+              conversationId: result.conversation.id,
+              source: 'slack',
+              sourceMetadata: {
+                // Whom the turn acts for (issue #968): this message's human sender, or
+                // the agent that wrote it — never the agent's bot user id.
+                ...slackActingForMetadata(context, authorAgentSession),
+                userId: context?.userId,
+                channelId: context?.channelId,
+                threadTs: context?.threadTs,
+              },
+            });
+            this.watchOwnerMessage(context, authorAgentSession, message, result.conversation.id, ORCHESTRATOR_SESSION_NAME);
+
+            // Track inbound thread for offline message recovery
+            if (this.threadStatusQueue && context?.channelId) {
+              try {
+                const threadKey = context.threadTs
+                  ? `${context.channelId}:${context.threadTs}`
+                  : `${context.channelId}:${Date.now()}`;
+                this.threadStatusQueue.trackInbound({
+                  source: 'slack',
+                  threadKey,
+                  conversationId: result.conversation.id,
+                  messagePreview: message.slice(0, THREAD_STATUS_CONSTANTS.MAX_PREVIEW_LENGTH),
+                  sourceMetadata: {
+                    channelId: context.channelId,
+                    threadTs: context.threadTs,
+                    userId: context.userId,
+                  },
+                });
+              } catch (trackErr) {
+                this.logger.warn('Failed to track inbound thread status (offline path)', {
+                  error: trackErr instanceof Error ? trackErr.message : String(trackErr),
+                });
+              }
+            }
+
+            return {
+              response: 'The orchestrator is currently offline. Your message has been queued and will be processed when it comes back online.',
+              fromOrcReply: false,
+            };
+          } catch (enqueueErr) {
+            this.logger.warn('Failed to queue message for offline orchestrator', {
+              error: enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr),
+            });
+          }
+        }
+
+        this.logger.info('Orchestrator is not active, returning offline message');
+        return { response: getOrchestratorOfflineMessage(true), fromOrcReply: false };
+      }
+
+      // Check if message queue service is available
+      if (!this.messageQueueService) {
+        this.logger.error('Message queue service not configured');
+        return {
+          response: 'The Slack bridge is not properly configured. Please restart the server.',
+          fromOrcReply: false,
+        };
+      }
+
+      // Enrich message with thread file path hint for orchestrator context.
+      // The ticket line goes on the delivered copy only (never persisted).
+      let enrichedMessage = message;
+      let deliveredMessage = appendTicketLine(message, ticket);
+      if (this.threadStore && context) {
+        const threadFilePath = this.threadStore.getThreadFilePath(context.channelId, context.threadTs);
+        enrichedMessage = `${message}\n\n[Thread context file: ${threadFilePath}]`;
+        deliveredMessage = `${deliveredMessage}\n\n[Thread context file: ${threadFilePath}]`;
+      }
+
+      // Persist user message in canonical chat-v2 store
+      const result = {
+        conversation: {
+          id: this.persistSlackInbound({
+            content: enrichedMessage,
+            conversationId: context?.conversationId,
+            agentSession: 'crewly-orc',
+            channelId: context?.channelId,
+            threadTs: context?.threadTs,
+            userId: context?.userId,
+            authorAgentSession,
+            ...persistIdsOf(context),
+          }).conversationId,
+        },
+      };
+      this.watchOwnerMessage(context, authorAgentSession, message, result.conversation.id, ORCHESTRATOR_SESSION_NAME);
+
+      // Enqueue the message with a resolve callback for response routing.
+      // The QueueProcessorService will call slackResolve() when the
+      // orchestrator responds, unblocking this promise.
+      //
+      // The promise resolves with `{response, fromOrcReply}`. `fromOrcReply`
+      // is `true` ONLY when slackResolve fires (orc's reply-slack skill
+      // delivered an actual reply). On responseTimeoutMs or enqueue failure
+      // it is `false` — the placeholder must NOT auto-resolve the SLA
+      // tracker (Steve 2026-04-30 incident: false-done Request cascade).
+      const orcResponse = await new Promise<OrcResponse>((resolve) => {
+        let resolved = false;
+
+        const timeoutId = setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            resolve({
+              response: 'The orchestrator is still processing your request. It will reply here when ready — no need to resend.',
+              fromOrcReply: false,
+            });
+          }
+        }, this.config.responseTimeoutMs);
+
+        try {
+          this.messageQueueService!.enqueue({
+            content: withContextBlock(deliveredMessage, slackContextBlock),
+            conversationId: result.conversation.id,
+            source: 'slack',
+            sourceMetadata: {
+              // Whom the turn acts for (issue #968): this message's human sender, or
+              // the agent that wrote it — never the agent's bot user id.
+              ...slackActingForMetadata(context, authorAgentSession),
+              slackResolve: (resp: string) => {
+                if (!resolved) {
+                  resolved = true;
+                  clearTimeout(timeoutId);
+                  // 2026-05-12 dogfood bug: the QueueProcessor fires
+                  // `routeResponse(message, '')` immediately after PTY
+                  // delivery to unblock this promise (see
+                  // queue-processor.service.ts:692 "fire-and-forget"
+                  // comment). That call carries an EMPTY response — orc
+                  // has only RECEIVED the message, not REPLIED. The
+                  // previous shape of this callback always returned
+                  // `fromOrcReply: true`, so every Slack delivery
+                  // triggered `markResolvedByThread('orc_reply')` →
+                  // `maybeCloseRequest` → Request cascaded to `done`
+                  // with `result: "Auto-closed by SLA: orc_reply"`
+                  // before the user ever saw a reply.
+                  //
+                  // Real orc replies (via the reply-slack skill) come
+                  // through a different route — the orc invokes
+                  // `POST /slack/send`, which posts to Slack directly;
+                  // the SLA tracker is resolved when the
+                  // `respond_to_user` WI transitions to `verified` and
+                  // the cascade subscriber picks it up. That path
+                  // produces a non-empty response payload only when
+                  // a worker explicitly drives reply text back through
+                  // the queue (rare; most orc replies are direct API).
+                  //
+                  // Gate: treat empty resp as a delivery ack ONLY
+                  // (fromOrcReply=false). Non-empty resp keeps the
+                  // legacy `true` semantics for any worker path that
+                  // does echo a reply through the queue.
+                  const fromOrcReply = resp.length > 0;
+                  resolve({ response: resp, fromOrcReply });
+                }
+              },
+              userId: context?.userId,
+              channelId: context?.channelId,
+              threadTs: context?.threadTs,
+            },
+          });
+
+          // Track inbound thread for lifecycle monitoring and restart recovery
+          if (this.threadStatusQueue && context?.channelId) {
+            try {
+              const threadKey = context.threadTs
+                ? `${context.channelId}:${context.threadTs}`
+                : `${context.channelId}:${Date.now()}`;
+              this.threadStatusQueue.trackInbound({
+                source: 'slack',
+                threadKey,
+                conversationId: result.conversation.id,
+                messagePreview: message.slice(0, THREAD_STATUS_CONSTANTS.MAX_PREVIEW_LENGTH),
+                sourceMetadata: {
+                  channelId: context.channelId,
+                  threadTs: context.threadTs,
+                  userId: context.userId,
+                },
+              });
+            } catch (trackErr) {
+              this.logger.warn('Failed to track inbound thread status', {
+                error: trackErr instanceof Error ? trackErr.message : String(trackErr),
+              });
+            }
+          }
+        } catch (enqueueErr) {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeoutId);
+            resolve({
+              response: `Failed to enqueue message: ${enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)}`,
+              fromOrcReply: false,
+            });
+          }
+        }
+      });
+
+      return orcResponse;
+    } catch (error) {
+      this.logger.error('Error sending to orchestrator', { error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  }
+
+  /**
+   * Route a message to the Auditor agent as a fallback when the orchestrator is offline.
+   *
+   * Enqueues the message targeting the Auditor's session so the queue processor
+   * delivers it to the Auditor PTY instead of the orchestrator. Includes Slack
+   * context (channel, thread) so the Auditor can respond.
+   *
+   * **Thread file enrichment (parity with `sendToOrchestrator` ~line 712):**
+   * When a `threadStore` and Slack `context` are available, the enriched
+   * message also carries a `[Thread context file: <path>]` line. Without
+   * this, the Auditor receives only the bare `[SLACK_CONTEXT:...]` prefix
+   * and cannot read prior thread history, causing context-blind replies.
+   * This is the bug Steve hit on 2026-04-25 (StevesPrompt deploy thread):
+   * orchestrator dropped, Slack fell through here, Auditor responded with
+   * "I cannot see the rest of the conversation" because the thread file
+   * pointer was missing. Bringing the enrichment in line with the
+   * orchestrator path closes the gap.
+   *
+   * @param message - Original user message
+   * @param context - Slack conversation context
+   * @param authorAgentSession - Set when an agent wrote the Slack message
+   * @param ticket - The message's ticket, if any (delivered copy only)
+   * @returns Acknowledgement message to the user
+   */
+  private async sendToAuditorFallback(
+    message: string,
+    context?: SlackConversationContext,
+    authorAgentSession?: string,
+    ticket: TicketRef = null,
+  ): Promise<string> {
+    const auditorSession = AUDITOR_SCHEDULER_CONSTANTS.AUDITOR_SESSION_NAME;
+
+    // Build a context-enriched message so the Auditor knows the source
+    const slackPrefix = context
+      ? `[SLACK_CONTEXT:channelId=${context.channelId},threadTs=${context.threadTs || ''}]`
+      : '';
+    const deliveredText = appendTicketLine(message, ticket);
+    let enrichedMessage = `${slackPrefix} [FALLBACK] Orchestrator is offline. User message:\n${message}`;
+    // The ticket line goes on the delivered copy only (never persisted).
+    let deliveredMessage = `${slackPrefix} [FALLBACK] Orchestrator is offline. User message:\n${deliveredText}`;
+    if (this.threadStore && context) {
+      const threadFilePath = this.threadStore.getThreadFilePath(
+        context.channelId,
+        context.threadTs,
+      );
+      enrichedMessage += `\n\n[Thread context file: ${threadFilePath}]`;
+      deliveredMessage += `\n\n[Thread context file: ${threadFilePath}]`;
+    }
+
+    // Try to enqueue via the message queue (same path as orchestrator delivery)
+    if (this.messageQueueService) {
+      try {
+        const result = {
+          conversation: {
+            id: this.persistSlackInbound({
+              content: enrichedMessage,
+              conversationId: context?.conversationId,
+              agentSession: auditorSession,
+              channelId: context?.channelId,
+              threadTs: context?.threadTs,
+              userId: context?.userId,
+              authorAgentSession,
+              ...persistIdsOf(context),
+            }).conversationId,
+          },
+        };
+
+        this.messageQueueService.enqueue({
+          content: deliveredMessage,
+          conversationId: result.conversation.id,
+          source: 'slack',
+          targetSession: auditorSession,
+          sourceMetadata: {
+            // Whom the turn acts for (issue #968): this message's human sender, or
+            // the agent that wrote it — never the agent's bot user id.
+            ...slackActingForMetadata(context, authorAgentSession),
+            slackResolve: undefined,
+            userId: context?.userId,
+            channelId: context?.channelId,
+          },
+        });
+
+        this.logger.info('Message routed to Auditor agent via queue', { auditorSession });
+        return 'The orchestrator is currently offline. Your message has been forwarded to the Auditor agent.';
+      } catch (err) {
+        this.logger.error('Failed to route message to Auditor via queue', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Last resort: direct delivery via AuditorSchedulerService
+    try {
+      const { AuditorSchedulerService } = await import('../agent/auditor-scheduler.service.js');
+      const scheduler = AuditorSchedulerService.getInstance();
+      await scheduler.handleUserMessage(
+        `[FALLBACK] Orchestrator is offline. User message: ${deliveredText}`,
+        { channelId: context?.channelId || '', threadTs: context?.threadTs || '' },
+      );
+      return 'The orchestrator is currently offline. Your message has been forwarded to the Auditor agent.';
+    } catch (err) {
+      this.logger.error('Failed to route message to Auditor via scheduler', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    return getOrchestratorOfflineMessage(true);
+  }
+
+  /**
+   * Read the Slack thread (or, for a top-level @-mention, the channel)
+   * before this message and attach the pending read as `message.threadContext`.
+   *
+   * Cloud drops events written by the account's own bots, so a post by an
+   * agent on another machine never reaches this one; without this, "look at
+   * the items above" pointed at something the agent had never seen
+   * (2026-09-28, #daily-info). Never throws; the promise never rejects.
+   *
+   * @param message - The inbound message (mutated: `threadContext`)
+   */
+  private loadThreadContext(message: SlackIncomingMessage): void {
+    const req = { channelId: message.channelId, ts: message.ts, threadTs: message.threadTs, text: message.text };
+    if (!message.channelId || !message.ts || !contextKindFor(req)) return;
+    try {
+      message.threadContext = getSlackThreadContextService()
+        .getContext(req, this.contextTokenCandidates(message))
+        .catch(() => null);
+    } catch (err) {
+      this.logger.debug('Slack thread context skipped', { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /**
+   * Tokens that can read this message's conversation, best first: the app
+   * that delivered this copy (in the channel by definition), then the same
+   * order file downloads use (DM bot, @-mentioned bots, room agents, the
+   * workspace bot).
+   *
+   * @param message - The inbound message
+   * @returns Distinct tokens
+   */
+  private contextTokenCandidates(message: SlackIncomingMessage): string[] {
+    const receiving = message.receivedVia
+      ? getSlackAgentIdentityService()?.getInstalled(message.receivedVia)?.botToken
+      : undefined;
+    return [...new Set([...(receiving ? [receiving] : []), ...this.fileTokenCandidates(message)])];
+  }
+
+  /**
+   * The Slack context block as the orchestrator should see it (its own
+   * lines marked: its per-machine app when installed, else the workspace bot).
+   *
+   * @param message - The inbound message
+   * @returns The rendered block, or ''
+   */
+  private async orchestratorContextBlock(message: SlackIncomingMessage): Promise<string> {
+    const ctx = await message.threadContext;
+    if (!ctx) return '';
+    const botUserId =
+      getSlackAgentIdentityService()?.getInstalled(this.config.orchestratorSession)?.botUserId ??
+      (await this.slackService.getBotUserId().catch(() => null));
+    return renderSlackThreadContext(ctx, { botUserId });
+  }
+
+  /**
+   * The token that can actually read this message's files.
+   *
+   * A file lives in the channel it was posted to, and Slack only serves it
+   * to an app that is in that channel. When an agent's own Slack app is the
+   * one that was invited — which is how a private channel usually works,
+   * since the owner invites the agent they want, not the workspace bot —
+   * the workspace token gets a flat 403 on the download while the event
+   * itself arrives perfectly well through the agent's app. The result was a
+   * message the agent could read but an image it could not
+   * (2026-09-20, #steamfun-portal: "Download failed with status 403").
+   *
+   * `agentSession` is only set for a DM to an agent's own bot. A channel
+   * message has none, so it fell straight through to the workspace token —
+   * and in a private channel the workspace bot is not a member, so
+   * `files.info` answered `file_not_found` and the download took a 403. The
+   * agent got the text with no sign that an image had been attached, and
+   * answered about the previous topic (2026-09-21, #daily-info). An agent
+   * the message @-mentions is in that channel by definition, so its token
+   * can read the file.
+   *
+   * @param message - The inbound message
+   * @returns Tokens to try, in order: the agent the DM was for, @-mentioned
+   *   agents, the agents in the channel's room, then the workspace token
+   */
+  private fileTokenCandidates(message: SlackIncomingMessage): string[] {
+    const workspaceToken = this.slackService.getBotToken() ?? undefined;
+    const tokens: Array<string | undefined> = [];
+    const identities = getSlackAgentIdentityService();
+    const tokenOf = (session: string | null | undefined): string | undefined =>
+      session ? identities?.getInstalled(session)?.botToken ?? undefined : undefined;
+    if (identities) {
+      if (message.agentSession) tokens.push(tokenOf(message.agentSession));
+      for (const botUserId of mentionedBotUserIds(message.text)) {
+        tokens.push(tokenOf(identities.findByBotUserId(botUserId)));
+      }
+      // No @: the agents Crewly put in this channel's room are members of
+      // it. A voice clip posted to #content-team with no mention went to
+      // the workspace bot — not in that private channel — and 403'd, so
+      // two of three agents answered "I can't open your recording"
+      // (2026-09-25).
+      if (message.channelId) {
+        for (const session of getSlackTeamChannelService()?.rosterSessions(message.channelId) ?? []) {
+          tokens.push(tokenOf(session));
+        }
+      }
+    }
+    tokens.push(workspaceToken);
+    return [...new Set(tokens.filter((t): t is string => !!t))];
+  }
+
+  /**
+   * Pick the first token that can read these files (via `files.info`) and
+   * refresh their URLs with it.
+   *
+   * @param message - The inbound message
+   * @param files - Files to read (URLs mutated in place)
+   * @returns The token to download with, or null when downloads can't proceed
+   */
+  private async resolveFileToken(message: SlackIncomingMessage, files: SlackFile[]): Promise<string | null> {
+    const candidates = this.fileTokenCandidates(message);
+    if (candidates.length === 0) return null;
+    if (files.length === 0) return candidates[0];
+    for (const token of candidates.slice(0, -1)) {
+      try {
+        await this.slackService.getFileInfo(files[0].id, token);
+        return (await this.refreshFileUrls(files, token)) ? token : null;
+      } catch {
+        // Not in the channel / no scope with this token — try the next.
+      }
+    }
+    const last = candidates[candidates.length - 1];
+    return (await this.refreshFileUrls(files, last)) ? last : null;
+  }
+
+  /**
+   * Refresh file download URLs via the Slack files.info API.
+   * The event payload URLs may not work with just the bot token — the
+   * files.info API returns authenticated URLs and validates scope.
+   *
+   * @param files - Slack file objects to refresh URLs for (mutated in place)
+   * @param botToken - Token with access to these files; see {@link resolveFileToken}
+   * @returns true if downloads can proceed, false if scope is missing
+   */
+  private async refreshFileUrls(files: SlackFile[], botToken?: string): Promise<boolean> {
+    for (const file of files) {
+      try {
+        const freshInfo = await this.slackService.getFileInfo(file.id, botToken);
+        if (freshInfo.url_private_download) {
+          file.url_private_download = freshInfo.url_private_download;
+        }
+        if (freshInfo.url_private) {
+          file.url_private = freshInfo.url_private;
+        }
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg.includes('missing_scope') || errMsg.includes('not_allowed_token_type')) {
+          this.logger.error('Bot token lacks files:read scope — cannot download files. Add the "files:read" scope to your Slack app.');
+          return false;
+        }
+        this.logger.warn('Could not refresh URL via files.info', { fileName: file.name, error: errMsg });
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Download image files from a Slack message using SlackImageService.
+   * Populates `message.images` with successfully downloaded image info.
+   * Downloads are batched with a concurrency limit of MAX_CONCURRENT_DOWNLOADS.
+   *
+   * @param message - Incoming message to attach downloaded images to
+   * @param imageFiles - Pre-filtered list of image files to download
+   */
+  private async downloadMessageImages(message: SlackIncomingMessage, imageFiles: SlackFile[]): Promise<void> {
+    if (imageFiles.length === 0) {
+      return;
+    }
+    const botToken = await this.resolveFileToken(message, imageFiles);
+    if (!botToken) {
+      this.logger.warn('Cannot download images: no bot token can read them');
+      return;
+    }
+
+    const slackImageService = getSlackImageService();
+    const files = imageFiles;
+    const downloadedImages: SlackImageInfo[] = [];
+    const maxConcurrent = SLACK_IMAGE_CONSTANTS.MAX_CONCURRENT_DOWNLOADS;
+    const rejectionMessages: string[] = [];
+
+
+    for (let i = 0; i < files.length; i += maxConcurrent) {
+      const batch = files.slice(i, i + maxConcurrent);
+      const results = await Promise.allSettled(
+        batch.map((file) => slackImageService.downloadImage(file, botToken)),
+      );
+
+      for (let j = 0; j < results.length; j++) {
+        const result = results[j];
+        if (result.status === 'fulfilled') {
+          downloadedImages.push(result.value);
+        } else {
+          const fileName = batch[j].name;
+          const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+          this.logger.warn('Failed to download image', { fileName, reason });
+          // Track files rejected due to validation (size/type) to warn the Slack user.
+          // These match the error prefixes from SlackImageService.downloadImage().
+          if (reason.startsWith('File too large:') || reason.startsWith('Unsupported image type:')) {
+            rejectionMessages.push(`${fileName}: ${reason}`);
+          }
+        }
+      }
+    }
+
+    if (downloadedImages.length > 0) {
+      message.images = downloadedImages;
+    }
+
+    // Rejections are told to the agent (enrichTextWithFiles), not posted into the
+    // owner's thread: no system warning lines there.
+    if (rejectionMessages.length > 0) {
+      message.fileFailures = [
+        ...(message.fileFailures ?? []),
+        ...rejectionMessages.map((m) => {
+          const i = m.indexOf(': ');
+          return { name: m.slice(0, i), reason: m.slice(i + 2) };
+        }),
+      ];
+    }
+  }
+
+  /**
+   * Download non-image file attachments from a Slack message.
+   * Uses authenticated fetch (same pattern as SlackImageService) to download
+   * files to a temp directory. Populates `message.attachments` with results.
+   * Skips magic-byte validation since these are generic files.
+   *
+   * @param message - Incoming message to populate with downloaded file info
+   * @param nonImageFiles - Non-image SlackFile objects to download
+   */
+  private async downloadMessageFiles(message: SlackIncomingMessage, nonImageFiles: SlackFile[]): Promise<void> {
+    const botToken = await this.resolveFileToken(message, nonImageFiles);
+    if (!botToken) {
+      this.logger.warn('Cannot download files: no bot token can read them');
+      return;
+    }
+
+    const crewlyHome = path.join(os.homedir(), '.crewly');
+    const tempDir = path.join(crewlyHome, SLACK_FILE_DOWNLOAD_CONSTANTS.TEMP_DIR);
+    await fs.mkdir(tempDir, { recursive: true });
+
+    const downloadedFiles: SlackFileInfo[] = [];
+    const rejectionMessages: string[] = [];
+    const maxConcurrent = SLACK_FILE_DOWNLOAD_CONSTANTS.MAX_CONCURRENT_DOWNLOADS;
+
+
+    for (let i = 0; i < nonImageFiles.length; i += maxConcurrent) {
+      const batch = nonImageFiles.slice(i, i + maxConcurrent);
+      const results = await Promise.allSettled(
+        batch.map(async (file) => {
+          // Size check
+          if (file.size > SLACK_FILE_DOWNLOAD_CONSTANTS.MAX_FILE_SIZE) {
+            const maxMB = Math.round(SLACK_FILE_DOWNLOAD_CONSTANTS.MAX_FILE_SIZE / (1024 * 1024));
+            throw new Error(`File too large: ${file.size} bytes (max ${maxMB} MB)`);
+          }
+
+          // Never fill the disk: keep the low-disk threshold free after the download.
+          const free = await readFreeBytes(tempDir);
+          if (free !== null && free - file.size < WORKTREE_JANITOR_CONSTANTS.LOW_DISK_BYTES) {
+            throw new Error(
+              `Not enough disk space: ${file.size} bytes needed, ${free} bytes free ` +
+              `(at least ${WORKTREE_JANITOR_CONSTANTS.LOW_DISK_BYTES} bytes must stay free)`,
+            );
+          }
+
+          const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+          const localPath = path.join(tempDir, `${file.id}-${safeName}`);
+          const downloadUrl = file.url_private_download || file.url_private;
+
+          // Authenticated fetch with manual redirect handling, timeout, and resource cleanup
+          const maxRedirects = SLACK_FILE_DOWNLOAD_CONSTANTS.MAX_DOWNLOAD_REDIRECTS;
+          const timeoutMs = SLACK_FILE_DOWNLOAD_CONSTANTS.DOWNLOAD_TIMEOUT_MS;
+          const controller = new AbortController();
+          // The timeout is an idle timeout: reset on every received chunk so a large
+          // file can take as long as it needs while a stalled connection still aborts.
+          let timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+          const resetTimeout = (): void => {
+            clearTimeout(timeoutId);
+            timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+          };
+          let currentUrl = downloadUrl;
+          let response: Response | null = null;
+
+          try {
+            let exhaustedRedirects = true;
+            for (let r = 0; r <= maxRedirects; r++) {
+              response = await fetch(currentUrl, {
+                headers: { 'Authorization': `Bearer ${botToken}` },
+                redirect: 'manual',
+                signal: controller.signal,
+              });
+              if (response.status >= 300 && response.status < 400) {
+                const location = response.headers.get('location');
+                if (!location) throw new Error(`Redirect without Location header`);
+                // Drain response body to free the socket before following redirect
+                await response.body?.cancel();
+                currentUrl = location;
+                continue;
+              }
+              exhaustedRedirects = false;
+              break;
+            }
+
+            if (exhaustedRedirects) {
+              throw new Error(`Too many redirects (${maxRedirects}) while downloading file from Slack`);
+            }
+
+            if (!response || !response.ok) {
+              throw new Error(`Download failed with status ${response?.status || 'unknown'}`);
+            }
+            if (!response.body) {
+              throw new Error('Empty response body from Slack');
+            }
+
+            const fileStream = createWriteStream(localPath);
+            const nodeStream = Readable.fromWeb(response.body as import('stream/web').ReadableStream);
+            nodeStream.on('data', resetTimeout);
+            await pipeline(nodeStream, fileStream, { signal: controller.signal });
+          } catch (downloadErr) {
+            // Clean up partial file on failure
+            try { await fs.unlink(localPath); } catch { /* ignore if file doesn't exist */ }
+            throw downloadErr;
+          } finally {
+            clearTimeout(timeoutId);
+          }
+
+          // Extract text from PDFs after download
+          let extractedText: string | undefined;
+          if (SLACK_FILE_DOWNLOAD_CONSTANTS.EXTRACTABLE_MIMES.includes(file.mimetype)) {
+            extractedText = await this.extractPdfText(localPath, file.name);
+          }
+
+          return {
+            id: file.id,
+            name: file.name,
+            mimetype: file.mimetype,
+            localPath,
+            size: file.size,
+            permalink: file.permalink,
+            extractedText,
+          } satisfies SlackFileInfo;
+        }),
+      );
+
+      for (let j = 0; j < results.length; j++) {
+        const result = results[j];
+        if (result.status === 'fulfilled') {
+          downloadedFiles.push(result.value);
+        } else {
+          const fileName = batch[j].name;
+          const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+          this.logger.warn('Failed to download file', { fileName, reason });
+          if (reason.startsWith('File too large:') || reason.startsWith('Not enough disk space:')) {
+            rejectionMessages.push(`${fileName}: ${reason}`);
+          }
+        }
+      }
+    }
+
+    if (downloadedFiles.length > 0) {
+      message.attachments = downloadedFiles;
+    }
+
+    // Told to the agent (enrichTextWithFiles), never posted into the owner's thread.
+    if (rejectionMessages.length > 0) {
+      message.fileFailures = [
+        ...(message.fileFailures ?? []),
+        ...rejectionMessages.map((m) => {
+          const i = m.indexOf(': ');
+          return { name: m.slice(0, i), reason: m.slice(i + 2) };
+        }),
+      ];
+    }
+  }
+
+  /**
+   * Fetch Slack files linked in a message's text, like attachments.
+   *
+   * Ella posted `longform-en.md` in #pro-crewly-marketing and handed it to
+   * Rex on another machine by link; Rex's bot was not in that channel and
+   * he asked her to paste the text (2026-10-08). The link is now fetched
+   * here — local bots first, then Cloud, which holds every bot of the
+   * account — so the hand-off carries the file. Best effort and capped:
+   * file links only (message links are left to `slack-file get`), at most
+   * {@link SLACK_FILE_FETCH_CONSTANTS.MAX_LINKED_PER_MESSAGE}, each under
+   * {@link SLACK_FILE_FETCH_CONSTANTS.MAX_LINKED_BYTES}. Never throws.
+   *
+   * @param message - Inbound message; `linkedFiles` / `linkedFileFailures` are set on it
+   */
+  async fetchLinkedFiles(message: SlackIncomingMessage): Promise<void> {
+    try {
+      const { findSlackFileLinks, parseSlackFileRef } = await import('./slack-file-ref.js');
+      const attachedIds = new Set((message.files ?? []).map((f) => f.id));
+      const links = findSlackFileLinks(message.text || '')
+        .filter((link) => {
+          const ref = parseSlackFileRef(link);
+          return !!ref?.fileId && !attachedIds.has(ref.fileId);
+        })
+        .slice(0, SLACK_FILE_FETCH_CONSTANTS.MAX_LINKED_PER_MESSAGE);
+      if (links.length === 0) return;
+      const { getSlackFileFetchService } = await import('./slack-file-fetch.service.js');
+      const service = await getSlackFileFetchService();
+      const fetched: SlackFileInfo[] = [];
+      const failures: Array<{ link: string; reason: string }> = [];
+      for (const link of links) {
+        try {
+          const { meta, localPath } = await service.get(link, {
+            ...(message.agentSession ? { requesterAgent: message.agentSession } : {}),
+            maxBytes: SLACK_FILE_FETCH_CONSTANTS.MAX_LINKED_BYTES,
+          });
+          let extractedText: string | undefined;
+          if (meta.isText) {
+            const text = await fs.readFile(localPath, 'utf8').catch(() => '');
+            const max = SLACK_FILE_DOWNLOAD_CONSTANTS.MAX_EXTRACTED_TEXT_LENGTH;
+            extractedText = text.length > max ? `${text.slice(0, max)}\n[... truncated — read the whole file at ${localPath}]` : text;
+          } else if (SLACK_FILE_DOWNLOAD_CONSTANTS.EXTRACTABLE_MIMES.includes(meta.mimetype)) {
+            extractedText = await this.extractPdfText(localPath, meta.name);
+          }
+          fetched.push({
+            id: meta.id,
+            name: meta.name,
+            mimetype: meta.mimetype,
+            localPath,
+            size: meta.size,
+            permalink: meta.permalink ?? link,
+            ...(extractedText ? { extractedText } : {}),
+          });
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          this.logger.info('Linked Slack file not fetched', { reason });
+          failures.push({ link, reason });
+        }
+      }
+      if (fetched.length > 0) message.linkedFiles = fetched;
+      if (failures.length > 0) message.linkedFileFailures = failures;
+    } catch (err) {
+      this.logger.warn('Linked Slack files skipped', { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /**
+   * Enrich message text with file path references so agents
+   * can read them via their file-reading tools (Claude Code Read, Gemini @file).
+   * Includes both images and non-image file attachments.
+   *
+   * @param message - Message with optional downloaded images and files
+   * @returns Enriched text with file references appended
+   */
+  private enrichTextWithFiles(message: SlackIncomingMessage): string {
+    let text = message.text || '';
+
+    if (message.images && message.images.length > 0) {
+      for (const img of message.images) {
+        const dims = img.width && img.height ? ` (${img.width}x${img.height})` : '';
+        text += `\n[Slack Image: ${img.localPath}${dims}, ${img.mimetype}]`;
+      }
+    }
+
+    if (message.attachments && message.attachments.length > 0) {
+      for (const file of message.attachments) {
+        const sizeStr = file.size < 1024 ? `${file.size}B` : `${Math.round(file.size / 1024)}KB`;
+        text += `\n[Slack File: ${file.localPath} (${file.name}, ${file.mimetype}, ${sizeStr})]`;
+        if (file.extractedText) {
+          text += `\n--- Extracted content from ${file.name} ---\n${file.extractedText}\n--- End of ${file.name} ---`;
+        }
+        // Name the skill that reads this kind of file (voice messages →
+        // transcribe-audio, PDFs the inline extract could not cover → pdf-tools).
+        const hint = inboundFileHint(file);
+        if (hint) text += `\n${hint}`;
+      }
+    }
+
+    for (const file of message.linkedFiles ?? []) {
+      const sizeStr = file.size < 1024 ? `${file.size}B` : `${Math.round(file.size / 1024)}KB`;
+      text += `\n[Slack File (linked): ${file.localPath} (${file.name}, ${file.mimetype}, ${sizeStr})]`;
+      if (file.extractedText) {
+        text += `\n--- Content of ${file.name} ---\n${file.extractedText}\n--- End of ${file.name} ---`;
+      }
+    }
+    for (const f of message.linkedFileFailures ?? []) {
+      text += `\n[Slack: the linked file ${f.link} could not be fetched automatically (${f.reason}). Try \`slack-file get ${f.link}\` before asking anyone to paste it.]`;
+    }
+
+    // A download that failed left no trace in the text at all, so the agent
+    // saw "have a look at this" with nothing to look at and answered about
+    // the previous topic instead of saying it could not see the attachment
+    // (2026-09-21, #daily-info). Name what is missing.
+    const explained = new Set<string>();
+    for (const f of message.fileFailures ?? []) {
+      if (explained.has(f.name)) continue;
+      explained.add(f.name);
+      const tooBig = f.reason.startsWith('File too large:') || f.reason.startsWith('Not enough disk space:');
+      text += `\n[Slack: the attachment ${f.name} could not be downloaded (${f.reason}).` +
+        (tooBig
+          ? ' Do not ask the owner to compress it or use Drive. Use the `request-file` skill to send the owner an upload link, and explain it in your own words.'
+          : '') +
+        ']';
+    }
+    const delivered = (message.images?.length ?? 0) + (message.attachments?.length ?? 0);
+    const attached = message.files?.length ?? 0;
+    if (attached > delivered + explained.size) {
+      const undelivered = (message.files ?? [])
+        .filter((f) => {
+          const name = f.name ?? '';
+          return (
+            !explained.has(name) &&
+            !(message.images ?? []).some((i) => i.name === name) &&
+            !(message.attachments ?? []).some((a) => a.name === name)
+          );
+        })
+        .map((f) => f.name || 'unnamed')
+        .join(', ');
+      text += `\n[Slack: ${attached - delivered - explained.size} attachment(s) could not be read${undelivered ? ` — ${undelivered}` : ''}. Say so rather than guessing what they contained; the owner may need to invite your Slack app to this channel.]`;
+    }
+
+    return text;
+  }
+
+  /**
+   * Extract text content from a downloaded PDF file.
+   * Returns undefined if extraction fails or produces no text.
+   *
+   * @param filePath - Absolute path to the downloaded PDF
+   * @param fileName - Original file name (for logging)
+   * @returns Extracted text (possibly truncated) or undefined
+   */
+  async extractPdfText(filePath: string, fileName: string): Promise<string | undefined> {
+    try {
+      const fileBuffer = await fs.readFile(filePath);
+      const parser = new PDFParse({ data: fileBuffer });
+      const pdfData = await parser.getText();
+      const rawText = typeof pdfData === 'string' ? pdfData : pdfData?.text;
+      if (rawText && rawText.trim().length > 0) {
+        const maxLen = SLACK_FILE_DOWNLOAD_CONSTANTS.MAX_EXTRACTED_TEXT_LENGTH;
+        return rawText.trim().length > maxLen
+          ? rawText.trim().substring(0, maxLen) + '\n... [truncated]'
+          : rawText.trim();
+      }
+      return undefined;
+    } catch (extractErr) {
+      this.logger.warn('Failed to extract text from PDF', {
+        fileName,
+        error: extractErr instanceof Error ? extractErr.message : String(extractErr),
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * Add typing indicator to message
+   *
+   * @param message - Message to add indicator to
+   */
+  private async addTypingIndicator(message: SlackIncomingMessage): Promise<void> {
+    try {
+      await this.slackService.addReaction(message.channelId, message.ts, 'eyes');
+    } catch (error) {
+      // Non-critical - reactions require 'reactions:write' scope which is optional
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (errorMessage.includes('missing_scope')) {
+        // Only log once about missing scope, not on every message
+        if (!this.loggedMissingScope) {
+          this.logger.warn('Reactions disabled - add reactions:write scope to Slack app for typing indicators');
+          this.loggedMissingScope = true;
+        }
+      } else {
+        this.logger.warn('Could not add typing indicator', { error: errorMessage });
+      }
+    }
+  }
+
+  /**
+   * Mark message as complete
+   *
+   * @param message - Message to mark complete
+   */
+  private async markComplete(message: SlackIncomingMessage): Promise<void> {
+    try {
+      await this.slackService.addReaction(message.channelId, message.ts, 'white_check_mark');
+    } catch (error) {
+      // Non-critical - reactions require 'reactions:write' scope which is optional
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (!errorMessage.includes('missing_scope')) {
+        this.logger.warn('Could not add completion indicator', { error: errorMessage });
+      }
+      // Silent fail for missing_scope since we already logged about it
+    }
+  }
+
+  /**
+   * Add a completion reaction (✅) to a message that was previously
+   * stored as a pending reaction. Consumes the pending reaction.
+   *
+   * @param channelId - Slack channel ID
+   * @param threadTs - Thread timestamp (key for lookup)
+   */
+  public async addCompletionReaction(channelId: string, threadTs: string): Promise<void> {
+    const key = `${channelId}:${threadTs}`;
+    const messageTs = this.pendingReactions.get(key);
+
+    if (messageTs) {
+      // Consume the pending reaction
+      this.pendingReactions.delete(key);
+
+      try {
+        await this.slackService.addReaction(channelId, messageTs, 'white_check_mark');
+      } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        // Suppress "already_reacted" errors as they are common and non-fatal
+        if (errMsg.includes('already_reacted')) {
+          return;
+        }
+        // Suppress "missing_scope" since we already log/warn about that elsewhere
+        if (!errMsg.includes('missing_scope')) {
+          this.logger.warn('Failed to add completion reaction', { channelId, messageTs, error: errMsg });
+        }
+      }
+    }
+  }
+
+  /**
+   * Record response to thread store. Slack delivery is handled exclusively
+   * by the reply-slack skill via the API — no terminal output fallback needed.
+   *
+   * The `fromOrcReply` flag gates the V3 SLA auto-resolve hook
+   * (`markResolvedByThread`). Only real orc replies (delivered via the
+   * orc's reply-slack skill → `slackResolve` callback) may auto-resolve
+   * the SLA tracker. Placeholder / timeout / offline / fallback responses
+   * must NOT trigger the cascade — doing so closes the parent Request to
+   * `done` even though the orc never actually replied (Steve 2026-04-30
+   * incident: false-done Request, paired with Bug 1 silent-drop in
+   * agent-registration.service.ts).
+   *
+   * Default `fromOrcReply = true` preserves the legacy behaviour for the
+   * mention-routing call site (line ~327) which currently has no
+   * placeholder semantics — its `sendToAgent` path delivers a direct
+   * agent reply when reachable. If that path later grows a timeout
+   * fallback, the call site should pass `false` explicitly.
+   *
+   * @param originalMessage - Original incoming message
+   * @param response        - Response content (real reply or placeholder)
+   * @param fromOrcReply    - `true` only when the response came from a
+   *   real agent/orc reply path. `false` for any timeout / fallback /
+   *   offline acknowledgement. Drives whether the SLA tracker is
+   *   auto-resolved for the matching Slack thread.
+   */
+  private async sendSlackResponse(
+    originalMessage: SlackIncomingMessage,
+    response: string,
+    fromOrcReply: boolean = true,
+  ): Promise<void> {
+    await this.recordThreadReply(originalMessage, response);
+
+    // INBOUND-1.4: notify the RequestSlaSubscriber that the orc replied to
+    // this Slack thread so any tracked respond_to_user WorkItem can
+    // auto-transition and the SLA timers no-op. Lazy import breaks the
+    // static cycle (subscriber boot wires this bridge).
+    if (!fromOrcReply) {
+      this.logger.debug('Skipping SLA auto-resolve — response is not a real orc reply', {
+        threadTs: originalMessage.ts,
+        responsePreview: response.slice(0, 60),
+      });
+      return;
+    }
+
+    try {
+      const { getRequestSlaSubscriber } = await import('../v3/request-sla.subscriber.js');
+      const sub = getRequestSlaSubscriber();
+      if (sub) {
+        // sourceConversationItemId for slack messages is `slack-${channelId}-${ts}`
+        // (see line ~372 above); the threadTs we index on is the original
+        // user message ts. originalMessage.ts is exactly that.
+        await sub.markResolvedByThread(originalMessage.ts);
+      }
+    } catch (err) {
+      this.logger.debug('SLA auto-resolve hook failed (non-critical)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Send error response
+   *
+   * @param message - Original message
+   * @param error - Error that occurred
+   */
+  private async sendErrorResponse(
+    message: SlackIncomingMessage,
+    error: Error
+  ): Promise<void> {
+    await this.slackService.sendMessage({
+      channelId: message.channelId,
+      text: `:warning: Sorry, I encountered an error: ${error.message}`,
+      threadTs: message.threadTs || message.ts,
+    });
+  }
+
+  /**
+   * Format response for Slack
+   *
+   * Converts markdown to Slack-compatible formatting.
+   *
+   * @param text - Text to format
+   * @returns Formatted text
+   */
+  formatForSlack(text: string): string {
+    // Markdown → mrkdwn (bold, headings, bullets, links, literal "\n").
+    let formatted = toSlackMrkdwn(text);
+
+    // Slack already supports backtick code formatting
+    // Convert code blocks (simplified)
+    formatted = formatted.replace(/```[\w]*\n([\s\S]*?)```/g, '```$1```');
+
+    return formatted;
+  }
+
+  /**
+   * Persist Slack reply content to the thread store when available.
+   */
+  private async recordThreadReply(
+    originalMessage: SlackIncomingMessage,
+    content: string
+  ): Promise<void> {
+    if (!this.threadStore) return;
+    const trimmed = content?.trim();
+    if (!trimmed) return;
+
+    const threadTs = originalMessage.threadTs || originalMessage.ts;
+    if (!threadTs) return;
+
+    try {
+      await this.threadStore.appendOrchestratorReply(originalMessage.channelId, threadTs, trimmed);
+    } catch (err) {
+      this.logger.warn('Failed to store thread reply', { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /**
+   * Send proactive notification to Slack
+   *
+   * @param notification - Notification to send
+   * @returns True when it was delivered (false: notifications off, or no channel)
+   */
+  async sendNotification(notification: SlackNotification): Promise<boolean> {
+    if (!this.config.enableNotifications) return false;
+    return this.slackService.sendNotification(notification);
+  }
+
+  /**
+   * Send a content approval notification to Slack with Block Kit buttons.
+   *
+   * Posts a rich message with content preview and approve/reject buttons.
+   * Links the Slack message back to the approval record so interactive
+   * button clicks can resolve the approval.
+   *
+   * @param approvalId - The content approval ID
+   * @param channelId - Slack channel ID
+   * @param threadTs - Optional thread timestamp
+   * @returns The Slack message timestamp, or null if failed
+   */
+  async sendContentApproval(approvalId: string, channelId?: string, threadTs?: string): Promise<string | null> {
+    if (!channelId) return null;
+    try {
+      const approval = ContentApprovalService.getInstance().get(approvalId);
+      const fallbackText = `Content approval requested (ID: ${approvalId.slice(0, 8)}). Use the buttons to approve/reject.`;
+
+      const blocks: SlackBlock[] = [
+        {
+          type: 'header',
+          text: { type: 'plain_text', text: '\ud83d\udccb Content Approval Required', emoji: true },
+        },
+        {
+          type: 'section',
+          fields: [
+            { type: 'mrkdwn', text: `*Platform:*\n${approval?.platform ?? 'N/A'}` },
+            { type: 'mrkdwn', text: `*Type:*\n${approval?.contentType ?? 'N/A'}` },
+            { type: 'mrkdwn', text: `*Submitted by:*\n${approval?.submittedBy ?? 'Unknown'}` },
+            { type: 'mrkdwn', text: `*ID:*\n${approvalId.slice(0, 8)}` },
+          ],
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*Content Preview:*\n${(approval?.content ?? '').slice(0, 300)}${(approval?.content ?? '').length > 300 ? '...' : ''}`,
+          },
+        },
+      ];
+
+      // Add hashtags and scheduled time if present
+      const metaFields: SlackTextObject[] = [];
+      if (approval?.hashtags && approval.hashtags.length > 0) {
+        metaFields.push({ type: 'mrkdwn', text: `*Hashtags:*\n${approval.hashtags.join(' ')}` });
+      }
+      if (approval?.scheduledTime) {
+        metaFields.push({ type: 'mrkdwn', text: `*Scheduled:*\n${approval.scheduledTime}` });
+      }
+      if (metaFields.length > 0) {
+        blocks.push({ type: 'section', fields: metaFields });
+      }
+
+      blocks.push({ type: 'divider' });
+
+      // Actions block with approve/reject buttons
+      blocks.push({
+        type: 'actions',
+        block_id: `content_approval_${approvalId}`,
+        elements: [
+          {
+            type: 'button',
+            action_id: 'content_approval_approve',
+            text: { type: 'plain_text', text: '\u2705 Approve', emoji: true },
+            value: approvalId,
+            style: 'primary',
+          } as SlackElement,
+          {
+            type: 'button',
+            action_id: 'content_approval_reject',
+            text: { type: 'plain_text', text: '\u274c Reject', emoji: true },
+            value: approvalId,
+            style: 'danger',
+          } as SlackElement,
+        ],
+      });
+
+      const messageTs = await this.slackService.sendMessage({
+        channelId,
+        text: fallbackText,
+        threadTs,
+        blocks,
+      });
+
+      // Link the Slack message to the approval for tracking
+      if (messageTs) {
+        ContentApprovalService.getInstance().linkSlackMessage(approvalId, channelId, messageTs);
+      }
+
+      return messageTs ?? null;
+    } catch (err) {
+      this.logger.warn('Failed to send content approval to Slack', {
+        approvalId: approvalId.slice(0, 8),
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Notify about task completion
+   *
+   * @param taskTitle - Title of completed task
+   * @param agentName - Name of agent that completed the task
+   * @param projectName - Name of the project
+   */
+  async notifyTaskCompleted(
+    taskTitle: string,
+    agentName: string,
+    projectName: string
+  ): Promise<void> {
+    await this.sendNotification({
+      type: 'task_completed',
+      title: 'Task Completed',
+      message: `*${taskTitle}*\n\nCompleted by ${agentName} on project ${projectName}`,
+      urgency: 'normal',
+      timestamp: new Date().toISOString(),
+      metadata: { projectId: projectName },
+    });
+  }
+
+  /**
+   * Notify about agent needing assistance
+   *
+   * @param agentName - Name of agent with question
+   * @param question - The question from the agent
+   * @param projectName - Name of the project
+   */
+  async notifyAgentQuestion(
+    agentName: string,
+    question: string,
+    projectName: string
+  ): Promise<void> {
+    await this.sendNotification({
+      type: 'agent_question',
+      title: 'Agent Needs Input',
+      message: `*${agentName}* has a question:\n\n_${question}_`,
+      urgency: 'high',
+      timestamp: new Date().toISOString(),
+      metadata: { agentId: agentName, projectId: projectName },
+    });
+  }
+
+  /**
+   * Notify about errors
+   *
+   * @param errorMessage - Error message
+   * @param agentName - Optional agent name
+   * @param projectName - Optional project name
+   */
+  async notifyError(
+    errorMessage: string,
+    agentName?: string,
+    projectName?: string
+  ): Promise<void> {
+    await this.sendNotification({
+      type: 'agent_error',
+      title: 'Error Occurred',
+      message: errorMessage,
+      urgency: 'critical',
+      timestamp: new Date().toISOString(),
+      metadata: { agentId: agentName, projectId: projectName },
+    });
+  }
+
+  /**
+   * Notify about daily summary
+   *
+   * @param summary - Summary content
+   */
+  async notifyDailySummary(summary: string): Promise<void> {
+    await this.sendNotification({
+      type: 'daily_summary',
+      title: 'Daily Summary',
+      message: summary,
+      urgency: 'low',
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Resolve @mention in message text to an agent session (#177).
+   *
+   * Matches patterns: @assistant, @auditor, @sam, @leo, etc.
+   * Looks up the agent name in team configs to find the session name.
+   *
+   * @param text - Message text to scan for @mentions
+   * @returns Target agent info, or null if no mention found
+   */
+  private async resolveMentionTarget(text: string): Promise<{ name: string; sessionName: string } | null> {
+    // Match @name at the start of the message
+    const mentionMatch = text.match(/^@(\w+)\s/i);
+    if (!mentionMatch) return null;
+
+    const mentionedName = mentionMatch[1].toLowerCase();
+
+    // Built-in aliases
+    const aliases: Record<string, string> = {
+      assistant: 'crewly-orc-assistant',
+      auditor: 'crewly-auditor',
+      orc: 'crewly-orc',
+      orchestrator: 'crewly-orc',
+    };
+
+    if (aliases[mentionedName]) {
+      return { name: mentionedName, sessionName: aliases[mentionedName] };
+    }
+
+    // Look up in team configs
+    try {
+      const StorageService = (await import('../core/storage.service.js')).StorageService;
+      const storage = StorageService.getInstance();
+      const teams = await storage.getTeams();
+      for (const team of teams) {
+        for (const member of (team.members || [])) {
+          // Match by name (case-insensitive) or session name fragment
+          const memberName = member.name?.toLowerCase() || '';
+          const sessionParts = (member.sessionName || '').split('-');
+          const shortName = sessionParts.length >= 3 ? sessionParts[2] : '';
+
+          if (memberName === mentionedName || shortName === mentionedName) {
+            return { name: mentionedName, sessionName: member.sessionName };
+          }
+        }
+      }
+    } catch (err) {
+      this.logger.warn('Failed to look up mention target', {
+        mention: mentionedName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    return null;
+  }
+
+  /**
+   * Send a message to a specific agent session via terminal deliver (#177).
+   *
+   * @param sessionName - Target agent session
+   * @param message - Message to send (what the person wrote; this is what
+   *   chat-v2 stores)
+   * @param context - Slack context for response routing
+   * @param authorAgentSession - Set when an agent wrote the Slack message
+   * @param slackContextBlock - Slack thread context for the delivered copy
+   * @param ticket - The message's ticket, if any. Its line is added to the
+   *   delivered copy only.
+   * @returns OrcResponse envelope — `fromOrcReply` is `true` ONLY when the
+   *   reply came from the agent's `slackResolve` callback (a real reply
+   *   via the reply-slack skill). Timeout / direct-delivery / error
+   *   placeholders return `fromOrcReply: false` so callers can gate the
+   *   SLA cascade. Issue #394.
+   */
+  private async sendToAgent(
+    sessionName: string,
+    message: string,
+    context?: SlackConversationContext,
+    authorAgentSession?: string,
+    slackContextBlock?: string,
+    ticket: TicketRef = null,
+  ): Promise<OrcResponse> {
+    try {
+      // Enrich with Slack context for reply routing. The ticket line goes on
+      // the delivered copy only (never persisted).
+      let enrichedMessage = message;
+      let deliveredMessage = withContextBlock(appendTicketLine(message, ticket), slackContextBlock);
+      if (context) {
+        const header = `[SLACK_CONTEXT:channelId=${context.channelId},threadTs=${context.threadTs || ''}]`;
+        enrichedMessage = `${header}\n${message}`;
+        deliveredMessage = `${header}\n${deliveredMessage}`;
+      }
+
+      // Use message queue for agents that support it, or deliver directly
+      if (this.messageQueueService) {
+        const chatResult = {
+          conversation: {
+            id: this.persistSlackInbound({
+              content: enrichedMessage,
+              conversationId: context?.conversationId,
+              agentSession: sessionName,
+              channelId: context?.channelId,
+              threadTs: context?.threadTs,
+              userId: context?.userId,
+              authorAgentSession,
+              ...persistIdsOf(context),
+            }).conversationId,
+          },
+        };
+        this.watchOwnerMessage(context, authorAgentSession, message, chatResult.conversation.id, sessionName);
+
+        return new Promise<OrcResponse>((resolve) => {
+          let resolved = false;
+          const timeoutId = setTimeout(() => {
+            if (!resolved) {
+              resolved = true;
+              // Timeout placeholder — explicitly NOT a real reply.
+              resolve({
+                response: 'Agent is processing your message. Check back shortly.',
+                fromOrcReply: false,
+              });
+            }
+          }, this.config.responseTimeoutMs);
+
+          this.messageQueueService!.enqueue({
+            content: deliveredMessage,
+            conversationId: chatResult.conversation.id,
+            source: 'slack',
+            targetSession: sessionName,
+            sourceMetadata: {
+              // Whom the turn acts for (issue #968): this message's human sender, or
+              // the agent that wrote it — never the agent's bot user id.
+              ...slackActingForMetadata(context, authorAgentSession),
+              slackResolve: (resp: string) => {
+                if (!resolved) {
+                  resolved = true;
+                  clearTimeout(timeoutId);
+                  // Real agent reply path. Empty `resp` is the
+                  // QueueProcessor fire-and-forget delivery ack — treat
+                  // it as a non-reply too (mirrors the orchestrator
+                  // path's empty-string gate in sendToOrchestrator).
+                  resolve({ response: resp, fromOrcReply: resp.length > 0 });
+                }
+              },
+              channelId: context?.channelId,
+              threadTs: context?.threadTs,
+            },
+          });
+        });
+      }
+
+      // Fallback: direct terminal delivery — the agent acknowledges the
+      // write, but the actual reply hasn't been generated yet. Return a
+      // placeholder with fromOrcReply=false so the SLA cascade does NOT
+      // close on this.
+      // The owner's message still waits for an answer from this agent: record
+      // it in chat-v2 (the watchdog looks for the reply there) and hand it to
+      // the unanswered-owner watchdog, as the queue path above does.
+      let fallbackConversationId: string;
+      try {
+        fallbackConversationId = this.persistSlackInbound({
+          content: enrichedMessage,
+          conversationId: context?.conversationId,
+          agentSession: sessionName,
+          channelId: context?.channelId,
+          threadTs: context?.threadTs,
+          userId: context?.userId,
+          authorAgentSession,
+          ...persistIdsOf(context),
+        }).conversationId;
+      } catch {
+        fallbackConversationId =
+          context?.conversationId ??
+          synthesizeSlackConversationId(context?.channelId ?? 'unknown', context?.threadTs || context?.messageTs || String(Date.now()));
+      }
+      this.watchOwnerMessage(context, authorAgentSession, message, fallbackConversationId, sessionName);
+
+      // In process (#1024): the HTTP deliver route refuses callers without a
+      // credential, and this bridge is already in the backend.
+      const delivery = await deliverForcedMessage(sessionName, deliveredMessage);
+      if (delivery.status !== 'delivered' && delivery.status !== 'queued') {
+        throw new Error(delivery.error);
+      }
+      return {
+        response: 'Message delivered to agent. Response will arrive shortly.',
+        fromOrcReply: false,
+      };
+    } catch (err) {
+      this.logger.error('Failed to send to agent', {
+        session: sessionName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return {
+        response: `Failed to reach agent. Error: ${err instanceof Error ? err.message : String(err)}`,
+        fromOrcReply: false,
+      };
+    }
+  }
+
+  /**
+   * The owner's Slack message now waits for an answer from `responsible`:
+   * hand it to the unanswered-owner-message watchdog
+   * (specs/2026-09-30-owner-message-guarantee.md). Agent-authored messages
+   * and other people's messages are not watched. Never throws.
+   *
+   * @param context - Slack ids of the message
+   * @param authorAgentSession - Set when an agent wrote it
+   * @param text - What the owner wrote
+   * @param conversationId - chat-v2 conversation it was recorded in
+   * @param responsible - Who must answer
+   */
+  private watchOwnerMessage(
+    context: SlackConversationContext | undefined,
+    authorAgentSession: string | undefined,
+    text: string,
+    conversationId: string,
+    responsible: string,
+  ): void {
+    try {
+      if (!context?.channelId || !context.messageTs) return;
+      if (!isOwnerAuthored({ userId: context.messageUserId, authorAgentSession }, this.slackService.getOwnerUserId?.() ?? null)) return;
+      getOwnerMessageWatchdog()?.track({
+        surface: 'slack',
+        slackChannelId: context.channelId,
+        threadTs: context.threadTs || context.messageTs,
+        sourceTs: context.messageTs,
+        chatChannelId: conversationId,
+        responsible,
+        recipients: [responsible],
+        required: true,
+        text,
+        ...(Number.isFinite(parseFloat(context.messageTs)) ? { receivedAt: Math.floor(parseFloat(context.messageTs) * 1000) } : {}),
+      });
+    } catch (err) {
+      this.logger.debug('Owner message watchdog track failed', { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /**
+   * Persist a Slack inbound user message to chat-v2 and return the
+   * `(conversationId, messageId)` pair callers thread downstream
+   * into `MessageQueueService.enqueue` and `ThreadStatusQueueService.trackInbound`.
+   *
+   * Phase 6c of unified-chat-message-store spec: replaces the
+   * legacy `chatService.sendMessage` call sites on this bridge.
+   * Synthesizes a stable conversationId from Slack channel + thread
+   * ts when the caller didn't supply one, so re-enqueue paths
+   * (offline replay, recovery) reuse the same channel.
+   *
+   * @param args - Persistence inputs (content + slack context + recipient agent)
+   * @returns The chat-v2 channelId and the freshly persisted messageId
+   */
+  private persistSlackInbound(args: {
+    content: string;
+    conversationId?: string;
+    agentSession: string;
+    channelId?: string;
+    threadTs?: string;
+    userId?: string;
+    /** Crewly agent that wrote the Slack message (cross-machine colleague), if any. */
+    authorAgentSession?: string;
+    /** Slack ts of the message (G5). */
+    messageTs?: string;
+    /** Slack user id of the author (G5). */
+    slackUserId?: string;
+    /** Slack workspace id (G5). */
+    slackTeamId?: string;
+  }): { conversationId: string; messageId: string } {
+    const cid =
+      args.conversationId ??
+      synthesizeSlackConversationId(
+        args.channelId ?? 'unknown',
+        args.threadTs ?? String(Date.now()),
+      );
+    const channel = this.chatV2.ensureChannelForLegacyConversation({
+      conversationId: cid,
+      agentSession: args.agentSession,
+      // Name the thread by its first message so the consolidated chat shows a
+      // readable title (e.g. "Slack: ship the v2 launch…") instead of N
+      // identical synthesized ids. ensure… only sets the name on create, so
+      // this stamps the thread's opening message. Falls back to the id.
+      name: deriveSlackThreadName(args.content),
+    });
+    const { message } = this.chatV2.recordTurn({
+      channelId: channel.id,
+      senderType: 'user',
+      senderId: args.userId ?? 'slack-user',
+      content: args.content,
+      metadata: {
+        source: 'slack',
+        slackChannelId: args.channelId,
+        slackThreadTs: args.threadTs,
+        ...(args.messageTs ? { slackTs: args.messageTs } : {}),
+        ...(args.slackUserId ? { slackUserId: args.slackUserId } : {}),
+        ...(args.slackTeamId ? { slackTeamId: args.slackTeamId } : {}),
+        // An agent's Slack post is stored as a user turn so it is delivered
+        // like a colleague's, but it is NOT the owner: tag it so the
+        // commitment-approval gate never reads it as owner approval (#730).
+        ...(args.authorAgentSession ? { [OWNER_EVIDENCE_METADATA.AUTHOR_AGENT_SESSION]: args.authorAgentSession } : {}),
+      },
+    });
+    return { conversationId: channel.id, messageId: message.id };
+  }
+}
+
+/**
+ * Get bridge singleton
+ *
+ * @returns SlackOrchestratorBridge instance
+ */
+export function getSlackOrchestratorBridge(): SlackOrchestratorBridge {
+  if (!bridgeInstance) {
+    bridgeInstance = new SlackOrchestratorBridge();
+  }
+  return bridgeInstance;
+}
+
+/**
+ * Reset bridge (for testing)
+ */
+export function resetSlackOrchestratorBridge(): void {
+  bridgeInstance = null;
+}
+
+/**
+ * The per-message Slack ids the conversation log keeps for an inbound turn
+ * (specs/unified-conversations-cloud-store.md §A.3 G5): the message ts, its
+ * author and the workspace. Absent fields are left out.
+ *
+ * @param context - The bridge's copy of the conversation context, if any
+ * @returns Fields to spread into `persistSlackInbound`
+ */
+export function persistIdsOf(
+  context: SlackConversationContext | undefined,
+): { messageTs?: string; slackUserId?: string; slackTeamId?: string } {
+  if (!context) return {};
+  const slackUserId = context.messageUserId ?? context.userId;
+  return {
+    ...(context.messageTs ? { messageTs: context.messageTs } : {}),
+    ...(slackUserId ? { slackUserId } : {}),
+    ...(context.slackTeamId ? { slackTeamId: context.slackTeamId } : {}),
+  };
+}

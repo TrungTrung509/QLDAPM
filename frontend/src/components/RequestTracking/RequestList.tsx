@@ -1,0 +1,288 @@
+/**
+ * Request List Component
+ *
+ * Fetches and renders the list of requests from the V3 Request API.
+ * Maps backend Request entities to the frontend RequestItem type.
+ *
+ * @module components/RequestTracking/RequestList
+ */
+
+import React, { useMemo, useEffect, useState, useCallback } from 'react';
+import { Inbox } from 'lucide-react';
+import type {
+  RequestItem,
+  RequestPrimaryFilter,
+  RequestSecondaryFilter,
+  RequestStatistics,
+  RequestStatus,
+  RequestPriority,
+} from './request-tracking.types';
+import { computeRequestStats } from './request-tracking.types';
+import { RequestRow } from './RequestRow';
+import { SkeletonRows } from '@crewly/ui/SkeletonRows';
+import { Button } from '@crewly/ui/Button';
+import { apiService } from '../../services/api.service';
+
+// =============================================================================
+// Props
+// =============================================================================
+
+interface RequestListProps {
+  /** Active primary status filter */
+  activeFilter: RequestPrimaryFilter;
+  /** Active secondary filters (toggle set) */
+  secondaryFilters?: Set<RequestSecondaryFilter>;
+  /** Current search query string */
+  searchQuery: string;
+  /** Callback to report computed stats to parent */
+  onStatsLoaded: (stats: RequestStatistics) => void;
+}
+
+// =============================================================================
+// Mapping helpers
+// =============================================================================
+
+/**
+ * Maps a backend Request status to the frontend RequestStatus enum.
+ *
+ * Backend statuses (`types/v2/request.types.ts:RequestStatus`):
+ *   `open` | `ready` | `running` | `blocked` | `waiting_confirmation` |
+ *   `awaiting_followup` | `done` | `cancelled`
+ *
+ * `awaiting_followup` (the agent still owes the owner a promised deliverable
+ * or an answer to its question) renders as Active: the work is not over.
+ *
+ * The previous version used a stale literal `'in_progress'` (the V1 status
+ * name) and silently fell through `ready` / `running` to the `default →
+ * 'active'` branch. That hid a real bug class — when the backend added a
+ * new live status it would render as "Active" without any compile-time
+ * signal. Listing every backend status explicitly makes future drift fail
+ * fast (the exhaustiveness assertion at the bottom is the guard).
+ *
+ * @param backendStatus - Status string from the API
+ * @returns Mapped RequestStatus
+ */
+function mapRequestStatus(backendStatus: string): RequestStatus {
+  switch (backendStatus) {
+    case 'open':
+    case 'ready':
+    case 'running':
+    case 'awaiting_followup':
+      return 'active';
+    case 'blocked':
+      return 'blocked';
+    case 'waiting_confirmation':
+      return 'waiting_confirmation';
+    case 'done':
+    case 'cancelled':
+      return 'done';
+    default:
+      // Unknown backend status — render as Active so it does not silently
+      // collapse to a terminal-looking pill in the UI. Logged via console
+      // so a follow-up sweep can update this mapper alongside any new
+      // backend status. (Logged at debug level via console.warn to surface
+      // during dev without crashing prod renders.)
+      if (typeof console !== 'undefined' && backendStatus) {
+        // eslint-disable-next-line no-console
+        console.warn('[RequestList] Unknown backend Request status:', backendStatus);
+      }
+      return 'active';
+  }
+}
+
+/**
+ * Maps a backend Request priority to the frontend RequestPriority.
+ *
+ * @param backendPriority - Priority string from the API
+ * @returns Mapped RequestPriority
+ */
+function mapRequestPriority(backendPriority: string): RequestPriority {
+  switch (backendPriority) {
+    case 'high':
+      return 'high';
+    case 'low':
+      return 'low';
+    default:
+      return 'medium';
+  }
+}
+
+/** Open-item statuses that still hold a request open (mirrors the backend). */
+const ACTIVE_OPEN_ITEM_STATUSES = new Set(['open', 'waiting_owner', 'ready', 'overdue']);
+
+/**
+ * Number of open items the agent still owes on a request.
+ *
+ * @param raw - `openItems` from the API (unknown shape)
+ * @returns Count (0 when none)
+ */
+export function countActiveOpenItems(raw: unknown): number {
+  if (!Array.isArray(raw)) return 0;
+  return raw.filter((i) => i && typeof i === 'object' && ACTIVE_OPEN_ITEM_STATUSES.has(String((i as { status?: unknown }).status))).length;
+}
+
+/**
+ * Converts raw API response objects into typed RequestItem objects.
+ *
+ * @param rawRequests - Raw request objects from the API
+ * @returns Array of RequestItem objects sorted newest first
+ */
+export function apiToRequestItems(rawRequests: Record<string, unknown>[]): RequestItem[] {
+  return rawRequests
+    .map((r): RequestItem => {
+      const workItemIds = Array.isArray(r.workItemIds) ? (r.workItemIds as string[]) : [];
+      const rawCategory = r.intentCategory as string | undefined;
+      return {
+        id: (r.id as string) || '',
+        title: (r.title as string) || 'Untitled Request',
+        status: mapRequestStatus((r.status as string) || ''),
+        priority: mapRequestPriority((r.priority as string) || ''),
+        source: ((r.tags as string[]) || []).includes('slack') ? 'slack' : 'api',
+        requester: 'user',
+        category: rawCategory && rawCategory.length > 0 ? rawCategory : undefined,
+        workItemCount: workItemIds.length,
+        updatedAt: (r.updatedAt as string) || (r.createdAt as string) || new Date().toISOString(),
+        missionLink: r.missionId ? `Mission: ${(r.missionId as string).slice(0, 8)}` : undefined,
+        totalInputTokens: (r.totalInputTokens as number) || 0,
+        totalOutputTokens: (r.totalOutputTokens as number) || 0,
+        totalCost: (r.totalCost as number) || 0,
+        ownerAgent: (r.ownerAgent as string) || undefined,
+        openItemCount: countActiveOpenItems(r.openItems),
+      };
+    })
+    .sort(
+      (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+    );
+}
+
+// =============================================================================
+// Component
+// =============================================================================
+
+/**
+ * Renders the filtered and searched list of request rows.
+ * Fetches real data from GET /api/requests.
+ *
+ * @param props - Filter state and stats callback
+ * @returns Request list JSX element
+ */
+/** Priority values considered "urgent" for the secondary filter */
+const URGENT_PRIORITIES: Set<RequestPriority> = new Set(['critical', 'high']);
+
+export const RequestList: React.FC<RequestListProps> = ({
+  activeFilter,
+  secondaryFilters,
+  searchQuery,
+  onStatsLoaded,
+}) => {
+  const [requests, setRequests] = useState<RequestItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  /** Fetch requests from the V3 Request API */
+  const loadRequests = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const rawRequests = await apiService.getRequests();
+      if (!Array.isArray(rawRequests)) {
+        console.warn('[RequestList] getRequests returned non-array:', typeof rawRequests, rawRequests);
+        setRequests([]);
+        return;
+      }
+      const converted = apiToRequestItems(rawRequests as Record<string, unknown>[]);
+      setRequests(converted);
+    } catch (err) {
+      console.warn('[RequestList] loadRequests error:', err);
+      setError(err instanceof Error ? err.message : 'Failed to load requests');
+      setRequests([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadRequests();
+  }, [loadRequests]);
+
+  // Compute stats from all requests
+  const stats = useMemo(() => computeRequestStats(requests), [requests]);
+
+  // Report stats to parent
+  useEffect(() => {
+    onStatsLoaded(stats);
+  }, [stats, onStatsLoaded]);
+
+  // Apply filters
+  const filtered = useMemo(() => {
+    let result = requests;
+
+    // Status filter
+    if (activeFilter !== 'all') {
+      result = result.filter((r) => r.status === activeFilter);
+    }
+
+    // Secondary filters (additive — each enabled filter narrows results)
+    if (secondaryFilters && secondaryFilters.size > 0) {
+      if (secondaryFilters.has('urgent')) {
+        result = result.filter((r) => URGENT_PRIORITIES.has(r.priority));
+      }
+      if (secondaryFilters.has('assigned_to_me')) {
+        result = result.filter((r) => r.requester === 'user');
+      }
+    }
+
+    // Search filter
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      result = result.filter(
+        (r) =>
+          r.title.toLowerCase().includes(q) ||
+          r.requester.toLowerCase().includes(q) ||
+          r.missionLink?.toLowerCase().includes(q)
+      );
+    }
+
+    return result;
+  }, [requests, activeFilter, secondaryFilters, searchQuery]);
+
+  if (loading) {
+    return (
+      <div data-testid="request-list-loading">
+        <SkeletonRows count={4} />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-3 py-16 text-text-secondary-dark" data-testid="request-list-error">
+        <span className="text-sm text-red-400">{error}</span>
+        <Button variant="link" onClick={loadRequests}>
+          Retry
+        </Button>
+      </div>
+    );
+  }
+
+  if (filtered.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-3 py-16 text-text-secondary-dark" data-testid="request-list-empty">
+        <Inbox className="h-10 w-10 opacity-40" />
+        <span className="text-sm">
+          {requests.length === 0
+            ? 'No requests found. Requests will appear here when user messages are processed.'
+            : 'No requests match the current filters.'}
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2" data-testid="request-list">
+      {filtered.map((request) => (
+        <RequestRow key={request.id} request={request} />
+      ))}
+    </div>
+  );
+};

@@ -1,0 +1,169 @@
+/**
+ * Connector access — who may use a connected account.
+ *
+ * `GET /api/connectors/access` and `PUT /api/connectors/access/:id` back the
+ * "which agents may use this" control on each connector card, and
+ * {@link requireConnectorAccess} is the middleware the Google / Canva data
+ * routes sit behind.
+ *
+ * @module controllers/connector/connector.controller
+ */
+
+import type { Request, Response, NextFunction } from 'express';
+import { LoggerService } from '../../services/core/logger.service.js';
+import { ConnectorAccessService, GATED_CONNECTORS } from '../../services/connector/connector-access.service.js';
+import { RemoteMcpService, remoteMcpConnectorId } from '../../services/connector/remote-mcp.service.js';
+import { readAgentSessionHeader, resolveAgentCaller } from '../../utils/agent-caller.utils.js';
+import { isOwnerCaller, rejectNonOwner, sendOwnerAuthRequired } from '../../middleware/caller-identity.middleware.js';
+import { getActingFor, runAsActor, type Actor } from '../../services/people/acting-for.service.js';
+import { actorFromRequest, recordActivity, summarizeChange, type ActivityActor } from '../../services/activity/activity-log.service.js';
+import { getConnectorUseAudit } from '../../services/connector/connector-use-audit.service.js';
+import { getPrivateSourceTracker } from '../../services/people/private-source.service.js';
+
+const logger = LoggerService.getInstance().createComponentLogger('ConnectorController');
+
+/**
+ * The person a connector request acts for (issue #968): the owner for the
+ * dashboard, else the person the calling agent's session acts for. Never
+ * taken from anything the agent sends.
+ *
+ * @param session - Calling agent session, if any
+ * @returns Actor (the owner when it cannot be read)
+ */
+function actorOf(session: string | undefined): Actor {
+  try {
+    return getActingFor().actorFor(session);
+  } catch {
+    return { id: 'owner', role: 'owner', name: 'the owner' };
+  }
+}
+
+/**
+ * Express middleware refusing an agent whose role is not on the
+ * connector's allowlist. The owner (an owner credential — #999, no longer
+ * "no `X-Agent-Session`") always passes, and a connector with no allowlist
+ * is open to every agent. A caller that is neither the owner nor a named
+ * agent gets 401: it must never run with the owner's person.
+ *
+ * The rest of the request runs as the person the call acts for
+ * ({@link runAsActor}), so every credential request to Cloud carries that
+ * person and Cloud can refuse a grant that is not shared with them.
+ *
+ * @param connectorId - Connector this route belongs to
+ * @returns The middleware
+ */
+export function requireConnectorAccess(connectorId: string) {
+  return async function connectorAccessGate(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const caller = await resolveAgentCaller(req);
+      if (!caller.session && !isOwnerCaller(req)) {
+        logger.warn('Connector call without an owner credential or an agent identity refused', { connectorId, path: req.path });
+        sendOwnerAuthRequired(res, req);
+        return;
+      }
+      const person = actorOf(caller.session);
+      // Issue #969: the audit names the same agent the role decision was made for.
+      const fromRequest = actorFromRequest(req);
+      const actor: ActivityActor = caller.session ? { ...fromRequest, type: 'agent', id: caller.session } : fromRequest;
+      if (await ConnectorAccessService.getInstance().isAllowed(connectorId, caller.role)) {
+        // Who used which connection, acting for whom (once an hour per trio).
+        getConnectorUseAudit().allowed({ connectorId, actor, actingFor: person, what: req.path });
+        // What this session reads now is that person's data: wiki pages it
+        // writes inside the window are visible to that person only (#969).
+        getPrivateSourceTracker().note(caller.session, person.id, connectorId);
+        runAsActor(person, () => next());
+        return;
+      }
+      const allowed = await ConnectorAccessService.getInstance().allowedRoles(connectorId);
+      logger.warn('Connector access refused', { connectorId, session: caller.session, role: caller.role, allowed });
+      getConnectorUseAudit().refused({ connectorId, actor, actingFor: person, reason: 'role_not_allowed', allowedRoles: allowed, what: req.path });
+      res.status(403).json({
+        success: false,
+        error: 'connector_forbidden',
+        message: `Your role (${caller.role}) may not use the ${connectorId} connection.`,
+        hint: `The owner limited it to: ${allowed.join(', ')}. Ask them to add your role in Connections, or ask a colleague with one of those roles.`,
+      });
+    } catch (err) {
+      // A bookkeeping failure must not lock the owner out of their own data.
+      logger.error('Connector access check failed — allowing the call', {
+        connectorId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Still as the caller's person: a failed role check must not skip Cloud's per-person check.
+      let session: string | undefined;
+      try {
+        session = readAgentSessionHeader(req);
+      } catch {
+        session = undefined;
+      }
+      if (!session && !isOwnerCaller(req)) {
+        sendOwnerAuthRequired(res, req);
+        return;
+      }
+      runAsActor(actorOf(session), () => next());
+    }
+  };
+}
+
+/**
+ * GET /api/connectors/access — every connector's allowlist.
+ *
+ * @param _req - Request
+ * @param res - `{ success, data: { <id>: { allowedRoles } } }` with an entry per gated connector
+ *   and per remote MCP server (`mcp:<id>`)
+ */
+export async function getConnectorAccess(_req: Request, res: Response): Promise<void> {
+  try {
+    const stored = await ConnectorAccessService.getInstance().list();
+    const data: Record<string, { allowedRoles: string[] }> = {};
+    for (const id of GATED_CONNECTORS) data[id] = { allowedRoles: stored[id]?.allowedRoles ?? [] };
+    // Each remote MCP server is gated as `mcp:<id>`, open until the owner picks roles.
+    for (const server of await RemoteMcpService.getInstance().list().catch(() => [])) {
+      const id = remoteMcpConnectorId(server.id);
+      data[id] = { allowedRoles: stored[id]?.allowedRoles ?? [] };
+    }
+    for (const [id, rule] of Object.entries(stored)) data[id] = rule;
+    res.json({ success: true, data });
+  } catch (err) {
+    logger.error('Failed to read connector access', { error: err instanceof Error ? err.message : String(err) });
+    res.status(500).json({ success: false, error: 'internal', message: 'Could not read connector access' });
+  }
+}
+
+/**
+ * PUT /api/connectors/access/:connectorId — body `{ allowedRoles: string[] }`
+ * (empty array = every agent).
+ *
+ * @param req - Request
+ * @param res - `{ success, data: { connectorId, allowedRoles } }`
+ */
+export async function updateConnectorAccess(req: Request, res: Response): Promise<void> {
+  // Owner only (#999: this had no caller check — an agent could widen its own access).
+  if (rejectNonOwner(req, res, { success: false, error: 'owner_only', message: 'Only the owner can change which agents may use a connection (Connections).' })) return;
+  try {
+    const connectorId = String(req.params.connectorId ?? '').trim();
+    if (!connectorId) {
+      res.status(400).json({ success: false, error: 'validation', message: 'connectorId is required' });
+      return;
+    }
+    const body = (req.body ?? {}) as { allowedRoles?: unknown };
+    if (!Array.isArray(body.allowedRoles)) {
+      res.status(400).json({ success: false, error: 'validation', message: 'allowedRoles must be an array of role names (empty = every agent)' });
+      return;
+    }
+    const service = ConnectorAccessService.getInstance();
+    const previous = ((await service.list().catch(() => ({}))) as Record<string, { allowedRoles?: string[] } | undefined>)[connectorId]?.allowedRoles ?? [];
+    const rule = await service.setAllowedRoles(connectorId, body.allowedRoles.map((r) => String(r)));
+    // Who widened or narrowed which agents may use this connection (#881).
+    recordActivity({
+      actor: actorFromRequest(req),
+      action: 'connector.access.updated',
+      target: { type: 'connector', id: connectorId },
+      ...summarizeChange({ allowedRoles: previous }, { allowedRoles: rule.allowedRoles }),
+    });
+    res.json({ success: true, data: { connectorId, ...rule } });
+  } catch (err) {
+    logger.error('Failed to update connector access', { error: err instanceof Error ? err.message : String(err) });
+    res.status(500).json({ success: false, error: 'internal', message: 'Could not update connector access' });
+  }
+}

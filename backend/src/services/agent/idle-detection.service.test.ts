@@ -1,0 +1,938 @@
+/**
+ * Tests for IdleDetectionService
+ *
+ * @module services/agent/idle-detection.service.test
+ */
+
+import { AGENT_SUSPEND_CONSTANTS } from '../../constants.js';
+
+// Mock LoggerService
+// Memory is tight by default, so the stop paths below run; the tests at the
+// end flip it to show an idle agent is left alone when memory is fine.
+const mockMemoryStats = jest.fn(() => ({ usedPercent: 95, freeMB: 200, totalMB: 16384 }));
+jest.mock('../core/system-health.util.js', () => ({
+	getMemoryStats: () => mockMemoryStats(),
+	isUnderMemoryPressure: () => false,
+}));
+
+jest.mock('../core/logger.service.js', () => ({
+	LoggerService: {
+		getInstance: () => ({
+			createComponentLogger: () => ({
+				info: jest.fn(),
+				debug: jest.fn(),
+				warn: jest.fn(),
+				error: jest.fn(),
+			}),
+		}),
+	},
+}));
+
+// Mock settings service
+const mockGetSettings = jest.fn().mockResolvedValue({
+	general: { agentIdleTimeoutMinutes: 30 },
+});
+
+jest.mock('../settings/index.js', () => ({
+	getSettingsService: () => ({
+		getSettings: mockGetSettings,
+	}),
+}));
+
+// Mock storage service
+const mockGetTeams = jest.fn();
+const mockUpdateAgentStatus = jest.fn().mockResolvedValue(undefined);
+jest.mock('../core/storage.service.js', () => ({
+	StorageService: {
+		getInstance: () => ({
+			getTeams: mockGetTeams,
+			updateAgentStatus: mockUpdateAgentStatus,
+		}),
+	},
+}));
+
+// Mock AgentSuspendService
+const mockSuspendAgent = jest.fn().mockResolvedValue(true);
+const mockIsSuspended = jest.fn().mockReturnValue(false);
+const mockIsRehydrating = jest.fn().mockReturnValue(false);
+
+jest.mock('./agent-suspend.service.js', () => ({
+	AgentSuspendService: {
+		getInstance: () => ({
+			suspendAgent: mockSuspendAgent,
+			isSuspended: mockIsSuspended,
+			isRehydrating: mockIsRehydrating,
+		}),
+		resetInstance: jest.fn(),
+	},
+}));
+
+// Mock PtyActivityTrackerService
+const mockIsIdleFor = jest.fn();
+const mockClearSession = jest.fn();
+
+jest.mock('./pty-activity-tracker.service.js', () => ({
+	PtyActivityTrackerService: {
+		getInstance: () => ({
+			isIdleFor: mockIsIdleFor,
+			clearSession: mockClearSession,
+		}),
+		resetInstance: jest.fn(),
+	},
+}));
+
+// Mock session backend
+const mockKillSession = jest.fn().mockResolvedValue(undefined);
+const mockSessionExists = jest.fn().mockReturnValue(true);
+jest.mock('../session/index.js', () => ({
+	getSessionBackendSync: () => ({
+		killSession: mockKillSession,
+		sessionExists: mockSessionExists,
+	}),
+}));
+
+// Mock ActivityMonitorService
+const mockGetWorkingStatus = jest.fn().mockResolvedValue('idle');
+jest.mock('../monitoring/activity-monitor.service.js', () => ({
+	ActivityMonitorService: {
+		getInstance: () => ({
+			getWorkingStatusForSession: mockGetWorkingStatus,
+		}),
+	},
+}));
+
+// Mock CronTaskService (cron keep-alive, 2026-09-16)
+const mockCronList = jest.fn().mockResolvedValue([]);
+jest.mock('../workflow/cron-task.service.js', () => ({
+	CronTaskService: {
+		getInstance: () => ({
+			list: mockCronList,
+		}),
+	},
+}));
+
+// Import after mocks
+import { IdleDetectionService, PENDING_WORK_STATUSES } from './idle-detection.service.js';
+import { setOwnerThreadSentinel } from '../messaging/owner-thread-sentinel.service.js';
+
+describe('IdleDetectionService', () => {
+	beforeEach(() => {
+		IdleDetectionService.resetInstance();
+		jest.clearAllMocks();
+		mockGetSettings.mockResolvedValue({ general: { agentIdleTimeoutMinutes: 30 } });
+		mockIsSuspended.mockReturnValue(false);
+		mockIsRehydrating.mockReturnValue(false);
+		mockGetWorkingStatus.mockResolvedValue('idle');
+		jest.useFakeTimers();
+	});
+
+	afterEach(() => {
+		IdleDetectionService.resetInstance();
+		jest.useRealTimers();
+	});
+
+	describe('getInstance', () => {
+		it('should return a singleton instance', () => {
+			const a = IdleDetectionService.getInstance();
+			const b = IdleDetectionService.getInstance();
+			expect(a).toBe(b);
+		});
+	});
+
+	describe('start/stop', () => {
+		it('should start the check cycle', () => {
+			const service = IdleDetectionService.getInstance();
+			service.start();
+			expect(service.isRunning()).toBe(true);
+			service.stop();
+		});
+
+		it('should stop the check cycle', () => {
+			const service = IdleDetectionService.getInstance();
+			service.start();
+			service.stop();
+			expect(service.isRunning()).toBe(false);
+		});
+
+		it('should not start twice', () => {
+			const service = IdleDetectionService.getInstance();
+			service.start();
+			service.start();
+			expect(service.isRunning()).toBe(true);
+			service.stop();
+		});
+	});
+
+	describe('performCheck', () => {
+		it('should skip when timeout is 0 (disabled)', async () => {
+			mockGetSettings.mockResolvedValueOnce({ general: { agentIdleTimeoutMinutes: 0 } });
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			expect(mockGetTeams).not.toHaveBeenCalled();
+		});
+
+		it('should skip orchestrator role agents', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'orc1', sessionName: 'crewly-orc', role: 'orchestrator', agentStatus: 'active' }],
+			}]);
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			expect(mockSuspendAgent).not.toHaveBeenCalled();
+			expect(mockIsIdleFor).not.toHaveBeenCalled();
+		});
+
+		it('should skip auditor role agents (always-on)', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'aud1', sessionName: 'crewly-auditor', role: 'auditor', agentStatus: 'active' }],
+			}]);
+			mockIsIdleFor.mockReturnValue(true);
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			expect(mockSuspendAgent).not.toHaveBeenCalled();
+		});
+
+		it('should skip non-active agents', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'dev1', sessionName: 'agent-dev', role: 'developer', agentStatus: 'inactive' }],
+			}]);
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			expect(mockIsIdleFor).not.toHaveBeenCalled();
+		});
+
+		it('should stop idle agents when registration service is set', async () => {
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'dev1', sessionName: 'agent-dev', role: 'developer', agentStatus: 'active' }],
+			}]);
+			mockIsIdleFor.mockReturnValue(true);
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+			await service.performCheck();
+			expect(mockTerminate).toHaveBeenCalledWith('agent-dev', 'developer');
+			expect(mockUpdateAgentStatus).toHaveBeenCalledWith('agent-dev', 'inactive', 'idle_exit');
+		});
+
+		it('should fall back to suspend when registration service not set', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'dev1', sessionName: 'agent-dev', role: 'developer', agentStatus: 'active' }],
+			}]);
+			mockIsIdleFor.mockReturnValue(true);
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			expect(mockSuspendAgent).toHaveBeenCalledWith('agent-dev', 'team1', 'dev1', 'developer');
+		});
+
+		it('should not suspend non-idle agents', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'dev1', sessionName: 'agent-dev', role: 'developer', agentStatus: 'active' }],
+			}]);
+			mockIsIdleFor.mockReturnValue(false);
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			expect(mockSuspendAgent).not.toHaveBeenCalled();
+		});
+
+		it('should skip already suspended agents', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'dev1', sessionName: 'agent-dev', role: 'developer', agentStatus: 'active' }],
+			}]);
+			mockIsSuspended.mockReturnValue(true);
+			mockIsIdleFor.mockReturnValue(true);
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			expect(mockSuspendAgent).not.toHaveBeenCalled();
+		});
+
+		it('should handle getTeams failure gracefully', async () => {
+			mockGetTeams.mockRejectedValue(new Error('Storage error'));
+			const service = IdleDetectionService.getInstance();
+			await expect(service.performCheck()).resolves.not.toThrow();
+		});
+
+		it('should mark stuck started agents as inactive instead of suspended', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'dev1', sessionName: 'agent-dev', role: 'developer', agentStatus: 'started' }],
+			}]);
+			mockIsIdleFor.mockReturnValue(true);
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			expect(mockIsIdleFor).toHaveBeenCalledWith(
+				'agent-dev',
+				AGENT_SUSPEND_CONSTANTS.STARTED_AGENT_IDLE_TIMEOUT_MINUTES * 60 * 1000
+			);
+			expect(mockSuspendAgent).not.toHaveBeenCalled();
+			expect(mockKillSession).toHaveBeenCalledWith('agent-dev');
+			expect(mockClearSession).toHaveBeenCalledWith('agent-dev');
+			expect(mockUpdateAgentStatus).toHaveBeenCalledWith('agent-dev', 'inactive');
+		});
+
+		it('should not check agents with activating status', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'dev1', sessionName: 'agent-dev', role: 'developer', agentStatus: 'activating' }],
+			}]);
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			expect(mockIsIdleFor).not.toHaveBeenCalled();
+		});
+
+		it('should use default timeout (30min) when settings read fails', async () => {
+			mockGetSettings.mockRejectedValueOnce(new Error('Settings error'));
+			mockGetTeams.mockResolvedValueOnce([{
+				id: 'team1',
+				members: [{ id: 'dev1', sessionName: 'agent-dev', role: 'developer', agentStatus: 'active' }],
+			}]);
+			mockIsIdleFor.mockReturnValueOnce(true);
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			// Default is 30 minutes = 1,800,000ms
+			expect(mockIsIdleFor).toHaveBeenCalledWith('agent-dev', 1_800_000);
+			expect(mockSuspendAgent).toHaveBeenCalled();
+		});
+	});
+
+	// ===== New: crewly-agent timestamp-based idle detection =====
+
+	// 2026-09-16 token-burn fix: a 15-minute cron under a 10-minute idle
+	// timeout paid a full cold start (init prompt + registration + recall)
+	// on every single run.
+	describe('stopping idle agents only when memory is tight (owner, 2026-09-22)', () => {
+		const idleDev = () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'dev1', sessionName: 'agent-dev', role: 'developer', agentStatus: 'active' }],
+			}]);
+			mockIsIdleFor.mockReturnValue(true);
+		};
+
+		afterEach(() => {
+			mockMemoryStats.mockImplementation(() => ({ usedPercent: 95, freeMB: 200, totalMB: 16384 }));
+		});
+
+		it('leaves an idle agent running when the machine has memory to spare', async () => {
+			// An idle agent spends no tokens; stopping it costs a cold start and a
+			// rebuilt context the next time anyone speaks to it.
+			idleDev();
+			mockMemoryStats.mockImplementation(() => ({ usedPercent: 60, freeMB: 6000, totalMB: 16384 }));
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+
+			await service.performCheck();
+
+			expect(mockTerminate).not.toHaveBeenCalled();
+		});
+
+		it('stops it when too much of the RAM is in use', async () => {
+			idleDev();
+			mockMemoryStats.mockImplementation(() => ({ usedPercent: 88, freeMB: 2000, totalMB: 16384 }));
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+
+			await service.performCheck();
+
+			expect(mockTerminate).toHaveBeenCalledWith('agent-dev', 'developer');
+		});
+
+		it('does not stop it for a full swap file alone while memory is otherwise fine (healthy Mac, 2026-10-26)', async () => {
+			// macOS keeps swap full for hours after the pressure is gone: 93 %
+			// swap with 6 GB free and a calm kernel put a 16 GB Mac in pressure
+			// mode 11 times in a day. (The 2026-09-23 crawl — 4 GB "available",
+			// swap 89 %, load 117 — is caught by the OS pressure flag and the
+			// CPU-load rule of pressure mode, not by swap on its own.)
+			idleDev();
+			mockMemoryStats.mockImplementation(() => ({ usedPercent: 62, freeMB: 6223, totalMB: 16384, swapUsedPercent: 93, pressureElevated: false }));
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+
+			await service.performCheck();
+
+			expect(mockTerminate).not.toHaveBeenCalled();
+		});
+
+		it('stops it when the machine is swapping and free memory is short', async () => {
+			idleDev();
+			mockMemoryStats.mockImplementation(() => ({ usedPercent: 74, freeMB: 1500, totalMB: 16384, swapUsedPercent: 89 }));
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+
+			await service.performCheck();
+
+			expect(mockTerminate).toHaveBeenCalled();
+		});
+
+		it('stops it when the OS reports memory pressure', async () => {
+			idleDev();
+			mockMemoryStats.mockImplementation(() => ({ usedPercent: 70, freeMB: 3000, totalMB: 16384, swapUsedPercent: 10, pressureElevated: true }));
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+
+			await service.performCheck();
+
+			expect(mockTerminate).toHaveBeenCalled();
+		});
+
+		it('stops it when free memory drops under the floor', async () => {
+			idleDev();
+			mockMemoryStats.mockImplementation(() => ({ usedPercent: 70, freeMB: 500, totalMB: 16384 }));
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+
+			await service.performCheck();
+
+			expect(mockTerminate).toHaveBeenCalled();
+		});
+	});
+
+	describe('owner conversation keep-alive (crewly#1344)', () => {
+		const idleDev = () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'dev1', sessionName: 'agent-dev', role: 'developer', agentStatus: 'active' }],
+			}]);
+		};
+		afterEach(() => setOwnerThreadSentinel(null));
+
+		it('a member the owner spoke to in the last two hours waits 30 minutes before an idle stop, whatever the configured timeout', async () => {
+			idleDev();
+			setOwnerThreadSentinel({ ownerActiveRecently: (s: string) => s === 'agent-dev' } as never);
+			mockGetSettings.mockResolvedValue({ general: { agentIdleTimeoutMinutes: 10 } });
+			// Idle for 10 minutes but not for 30: kept.
+			mockIsIdleFor.mockImplementation((_s: string, ms: number) => ms <= 10 * 60_000);
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+
+			await service.performCheck();
+			expect(mockIsIdleFor).toHaveBeenCalledWith('agent-dev', AGENT_SUSPEND_CONSTANTS.OWNER_THREAD_IDLE_TIMEOUT_MINUTES * 60_000);
+			expect(mockTerminate).not.toHaveBeenCalled();
+
+			// Idle for 30 minutes: stopped as before (memory is tight in this file).
+			mockIsIdleFor.mockReturnValue(true);
+			await service.performCheck();
+			expect(mockTerminate).toHaveBeenCalledWith('agent-dev', 'developer');
+		});
+
+		it('an agent the owner has not spoken to keeps the configured timeout', async () => {
+			idleDev();
+			setOwnerThreadSentinel({ ownerActiveRecently: () => false } as never);
+			mockGetSettings.mockResolvedValue({ general: { agentIdleTimeoutMinutes: 10 } });
+			mockIsIdleFor.mockReturnValue(true);
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: jest.fn().mockResolvedValue({ success: true }) } as any);
+			await service.performCheck();
+			expect(mockIsIdleFor).toHaveBeenCalledWith('agent-dev', 10 * 60_000);
+		});
+	});
+
+	describe('cron keep-alive', () => {
+		const idleDev = () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'dev1', sessionName: 'agent-dev', role: 'developer', agentStatus: 'active' }],
+			}]);
+			mockIsIdleFor.mockReturnValue(true);
+		};
+
+		afterEach(() => {
+			mockCronList.mockResolvedValue([]);
+		});
+
+		it('keeps an idle agent alive when a cron run for it is due within the window', async () => {
+			idleDev();
+			const inTenMinutes = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+			mockCronList.mockResolvedValue([{ id: 'c1', targetAgent: 'agent-dev', enabled: true, nextRunAt: inTenMinutes }]);
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+
+			await service.performCheck();
+
+			expect(mockCronList).toHaveBeenCalledWith({ targetAgent: 'agent-dev', enabled: true });
+			expect(mockTerminate).not.toHaveBeenCalled();
+			expect(mockSuspendAgent).not.toHaveBeenCalled();
+		});
+
+		it('treats an overdue cron (about to fire) as imminent', async () => {
+			idleDev();
+			const oneMinuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
+			mockCronList.mockResolvedValue([{ id: 'c1', targetAgent: 'agent-dev', enabled: true, nextRunAt: oneMinuteAgo }]);
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+
+			await service.performCheck();
+			expect(mockTerminate).not.toHaveBeenCalled();
+		});
+
+		it('still stops the agent when the next cron run is far away', async () => {
+			idleDev();
+			const inThreeHours = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+			mockCronList.mockResolvedValue([{ id: 'c1', targetAgent: 'agent-dev', enabled: true, nextRunAt: inThreeHours }]);
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+
+			await service.performCheck();
+			expect(mockTerminate).toHaveBeenCalledWith('agent-dev', 'developer');
+		});
+
+		it('falls back to the normal idle stop when the cron lookup fails', async () => {
+			idleDev();
+			mockCronList.mockRejectedValue(new Error('store unreadable'));
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+
+			await service.performCheck();
+			expect(mockTerminate).toHaveBeenCalledWith('agent-dev', 'developer');
+		});
+	});
+
+	describe('queued work keep-alive', () => {
+		const idleDev = () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'nova', sessionName: 'ce-nova', role: 'content-strategist', agentStatus: 'active' }],
+			}]);
+			mockIsIdleFor.mockReturnValue(true);
+		};
+
+		it('does not stop an agent that has work queued for it (a ticket it was just started for)', async () => {
+			idleDev();
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+			const check = jest.fn(async (s: string) => s === 'ce-nova');
+			service.setPendingWorkCheck(check);
+
+			await service.performCheck();
+			expect(check).toHaveBeenCalledWith('ce-nova');
+			expect(mockTerminate).not.toHaveBeenCalled();
+		});
+
+		it('stops it as before when nothing is queued, or the check fails', async () => {
+			idleDev();
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+			service.setPendingWorkCheck(async () => {
+				throw new Error('pool unreadable');
+			});
+			await service.performCheck();
+			expect(mockTerminate).toHaveBeenCalledWith('ce-nova', 'content-strategist');
+		});
+
+		it('counts waiting work and a running item (2026-10-10: a running item protected nothing)', () => {
+			expect([...PENDING_WORK_STATUSES].sort()).toEqual(['accepted', 'proposed', 'queued', 'running']);
+		});
+
+		it('a reason string from the check is logged and keeps the agent alive', async () => {
+			idleDev();
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+			service.setPendingWorkCheck(async () => 'ticket');
+			await service.performCheck();
+			expect(mockTerminate).not.toHaveBeenCalled();
+		});
+
+		it('under memory pressure it stops an agent that owes work, after putting its work back in the queue', async () => {
+			idleDev();
+			const { ResourceModeService } = jest.requireActual('./resource-mode.service.js') as typeof import('./resource-mode.service.js');
+			const mode = jest.spyOn(ResourceModeService.getInstance(), 'getMode').mockReturnValue('pressure');
+			const order: string[] = [];
+			const mockTerminate = jest.fn(async () => {
+				order.push('terminate');
+				return { success: true };
+			});
+			const releaser = jest.fn(async () => {
+				order.push('release');
+			});
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+			service.setPendingWorkCheck(async () => 'work_item');
+			service.setWorkReleaser(releaser);
+			await service.performCheck();
+			mode.mockRestore();
+			expect(releaser).toHaveBeenCalledWith('ce-nova', expect.stringContaining('pressure'));
+			expect(order).toEqual(['release', 'terminate']);
+		});
+
+		it('under memory pressure it still keeps an agent that made a promise minutes ago', async () => {
+			idleDev();
+			const { ResourceModeService } = jest.requireActual('./resource-mode.service.js') as typeof import('./resource-mode.service.js');
+			const mode = jest.spyOn(ResourceModeService.getInstance(), 'getMode').mockReturnValue('pressure');
+			const mockTerminate = jest.fn(async () => ({ success: true }));
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+			service.setPendingWorkCheck(async () => 'fresh_promise');
+			await service.performCheck();
+			mode.mockRestore();
+			expect(mockTerminate).not.toHaveBeenCalled();
+		});
+
+		it('after stopping an agent that owed work it runs the re-dispatch hook once', async () => {
+			idleDev();
+			const { ResourceModeService } = jest.requireActual('./resource-mode.service.js') as typeof import('./resource-mode.service.js');
+			const mode = jest.spyOn(ResourceModeService.getInstance(), 'getMode').mockReturnValue('pressure');
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: jest.fn(async () => ({ success: true })) } as any);
+			service.setPendingWorkCheck(async () => 'promise');
+			service.setWorkReleaser(async () => undefined);
+			const hook = jest.fn();
+			service.setOwedStopHook(hook);
+			await service.performCheck();
+			mode.mockRestore();
+			service.setOwedStopHook(null);
+			expect(hook).toHaveBeenCalledTimes(1);
+			expect(hook).toHaveBeenCalledWith('ce-nova');
+		});
+
+		it('the emergency stop also puts the work back in the queue first', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'nova', sessionName: 'ce-nova', role: 'content-strategist', agentStatus: 'active', workingStatus: 'idle' }],
+			}]);
+			const releaser = jest.fn().mockResolvedValue(undefined);
+			const service = IdleDetectionService.getInstance();
+			service.setWorkReleaser(releaser);
+			await service.forceStopIdleAgents();
+			expect(releaser).toHaveBeenCalledWith('ce-nova', expect.stringContaining('emergency'));
+		});
+	});
+
+	describe('crewly-agent idle detection', () => {
+		it('should suspend crewly-agent after 30min idle via updatedAt timestamp', async () => {
+			const thirtyOneMinAgo = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{
+					id: 'dev1', sessionName: 'crewly-agent-dev', role: 'developer',
+					agentStatus: 'active', runtimeType: 'crewly-agent', updatedAt: thirtyOneMinAgo,
+				}],
+			}]);
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			expect(mockIsIdleFor).not.toHaveBeenCalled();
+			expect(mockSuspendAgent).toHaveBeenCalledWith('crewly-agent-dev', 'team1', 'dev1', 'developer');
+		});
+
+		it('should NOT suspend crewly-agent when updatedAt is recent', async () => {
+			const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{
+					id: 'dev1', sessionName: 'crewly-agent-dev', role: 'developer',
+					agentStatus: 'active', runtimeType: 'crewly-agent', updatedAt: fiveMinAgo,
+				}],
+			}]);
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			expect(mockSuspendAgent).not.toHaveBeenCalled();
+			expect(mockIsIdleFor).not.toHaveBeenCalled();
+		});
+
+		it('should use readyAt over updatedAt when both exist for crewly-agent', async () => {
+			const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+			const thirtyOneMinAgo = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{
+					id: 'dev1', sessionName: 'crewly-agent-dev', role: 'developer',
+					agentStatus: 'active', runtimeType: 'crewly-agent',
+					readyAt: fiveMinAgo, updatedAt: thirtyOneMinAgo,
+				}],
+			}]);
+			const service = IdleDetectionService.getInstance();
+			await service.performCheck();
+			expect(mockSuspendAgent).not.toHaveBeenCalled();
+		});
+	});
+
+	// ===== forceStopIdleAgents (memory pressure emergency stop) =====
+
+	describe('Drive mode keep-warm (specs/2026-10-09-drive-mode-v3.md §5)', () => {
+		afterEach(async () => {
+			const { DriveKeepWarm, setDriveKeepWarm } = await import('../drive/drive-keep-warm.js');
+			setDriveKeepWarm(new DriveKeepWarm());
+		});
+
+		it('the idle stop leaves an agent kept warm alone; the emergency memory-pressure stop still wins', async () => {
+			const { DriveKeepWarm, setDriveKeepWarm } = await import('../drive/drive-keep-warm.js');
+			const warm = new DriveKeepWarm();
+			warm.set('drv_abcdefghijkl', ['ce-nova'], Date.now() + 60_000);
+			setDriveKeepWarm(warm);
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [{ id: 'nova', sessionName: 'ce-nova', role: 'content-strategist', agentStatus: 'active', workingStatus: 'idle' }],
+			}]);
+			mockIsIdleFor.mockReturnValue(true);
+			mockSessionExists.mockReturnValue(true);
+			const mockTerminate = jest.fn().mockResolvedValue({ success: true });
+			const service = IdleDetectionService.getInstance();
+			service.setAgentRegistrationService({ terminateAgentSession: mockTerminate } as any);
+			await service.performCheck();
+			expect(mockTerminate).not.toHaveBeenCalled();
+			expect(await service.forceStopIdleAgents()).toBe(1);
+			expect(mockKillSession).toHaveBeenCalledWith('ce-nova');
+		});
+	});
+
+	describe('forceStopIdleAgents', () => {
+		it('should stop idle agents but skip orchestrator', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [
+					{
+						id: 'orc1',
+						sessionName: 'crewly-orc',
+						role: 'orchestrator',
+						agentStatus: 'active',
+						workingStatus: 'idle',
+					},
+					{
+						id: 'dev1',
+						sessionName: 'agent-dev1',
+						role: 'developer',
+						agentStatus: 'active',
+						workingStatus: 'idle',
+					},
+					{
+						id: 'dev2',
+						sessionName: 'agent-dev2',
+						role: 'developer',
+						agentStatus: 'active',
+						workingStatus: 'in_progress',
+					},
+				],
+			}]);
+			mockSessionExists.mockReturnValue(true);
+
+			const service = IdleDetectionService.getInstance();
+			const stoppedCount = await service.forceStopIdleAgents();
+
+			// Only the idle non-orchestrator agent should be stopped
+			expect(stoppedCount).toBe(1);
+
+			// agent-dev1 (idle) should be killed and marked inactive
+			expect(mockKillSession).toHaveBeenCalledWith('agent-dev1');
+			expect(mockClearSession).toHaveBeenCalledWith('agent-dev1');
+			expect(mockUpdateAgentStatus).toHaveBeenCalledWith('agent-dev1', 'inactive', 'idle_exit_pressure');
+
+			// orchestrator should NOT be stopped
+			expect(mockKillSession).not.toHaveBeenCalledWith('crewly-orc');
+
+			// agent-dev2 (in_progress) should NOT be stopped
+			expect(mockKillSession).not.toHaveBeenCalledWith('agent-dev2');
+		});
+
+		it('should skip inactive agents', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [
+					{
+						id: 'dev1',
+						sessionName: 'agent-dev1',
+						role: 'developer',
+						agentStatus: 'inactive',
+						workingStatus: 'idle',
+					},
+				],
+			}]);
+
+			const service = IdleDetectionService.getInstance();
+			const stoppedCount = await service.forceStopIdleAgents();
+
+			expect(stoppedCount).toBe(0);
+			expect(mockKillSession).not.toHaveBeenCalled();
+		});
+
+		it('should stop started agents that are idle', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [
+					{
+						id: 'dev1',
+						sessionName: 'agent-dev1',
+						role: 'developer',
+						agentStatus: 'started',
+						workingStatus: 'idle',
+					},
+				],
+			}]);
+			mockSessionExists.mockReturnValue(true);
+
+			const service = IdleDetectionService.getInstance();
+			const stoppedCount = await service.forceStopIdleAgents();
+
+			expect(stoppedCount).toBe(1);
+			expect(mockKillSession).toHaveBeenCalledWith('agent-dev1');
+		});
+
+		it('should return 0 when getTeams fails', async () => {
+			mockGetTeams.mockRejectedValue(new Error('Storage error'));
+
+			const service = IdleDetectionService.getInstance();
+			const stoppedCount = await service.forceStopIdleAgents();
+
+			expect(stoppedCount).toBe(0);
+		});
+
+		it('should handle killSession failure gracefully and continue', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [
+					{
+						id: 'dev1',
+						sessionName: 'agent-dev1',
+						role: 'developer',
+						agentStatus: 'active',
+						workingStatus: 'idle',
+					},
+					{
+						id: 'dev2',
+						sessionName: 'agent-dev2',
+						role: 'developer',
+						agentStatus: 'active',
+						workingStatus: 'idle',
+					},
+				],
+			}]);
+			mockSessionExists.mockReturnValue(true);
+			// First call fails, second succeeds
+			mockKillSession.mockRejectedValueOnce(new Error('Kill failed'));
+			mockKillSession.mockResolvedValueOnce(undefined);
+
+			const service = IdleDetectionService.getInstance();
+			const stoppedCount = await service.forceStopIdleAgents();
+
+			// The second agent should still be stopped even though first failed
+			expect(stoppedCount).toBe(1);
+		});
+
+		it('should skip auditor role agents (always-on)', async () => {
+			mockGetTeams.mockResolvedValue([{
+				id: 'team1',
+				members: [
+					{
+						id: 'aud1',
+						sessionName: 'crewly-auditor',
+						role: 'auditor',
+						agentStatus: 'active',
+						workingStatus: 'idle',
+					},
+				],
+			}]);
+
+			const service = IdleDetectionService.getInstance();
+			const stoppedCount = await service.forceStopIdleAgents();
+
+			expect(stoppedCount).toBe(0);
+			expect(mockKillSession).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('tick observability (re-entrancy guard + heartbeat)', () => {
+		it('should expose initial stats including new forcedResetCount field', () => {
+			const service = IdleDetectionService.getInstance();
+			expect(service.getStats()).toEqual({
+				isRunning: false,
+				isChecking: false,
+				lastTickStartedAt: null,
+				lastTickCompletedAt: null,
+				lastTickDurationMs: null,
+				consecutiveSkippedTicks: 0,
+				forcedResetCount: 0,
+			});
+		});
+
+		it('should skip overlapping ticks via re-entrancy guard (real exercise)', () => {
+			// Make performCheck hang so the first tick stays in flight.
+			let releaseHang: () => void = () => {};
+			mockGetTeams.mockReturnValue(
+				new Promise<unknown[]>(resolve => {
+					releaseHang = () => resolve([]);
+				}),
+			);
+
+			const service = IdleDetectionService.getInstance();
+			const runTick = (service as any).runTick.bind(service) as () => void;
+
+			// First call: starts a real tick, isChecking flips to true,
+			// and the hang holds it there.
+			runTick();
+			expect(service.getStats().isChecking).toBe(true);
+			expect(service.getStats().consecutiveSkippedTicks).toBe(0);
+
+			// Second call within the stuck-threshold: must short-circuit
+			// (not increment further into a new tick) AND must increment
+			// the skipped-tick counter — this is the assertion the
+			// previous test missed.
+			runTick();
+			expect(service.getStats().consecutiveSkippedTicks).toBe(1);
+			expect(service.getStats().isChecking).toBe(true);
+
+			// Third call still within threshold: counter keeps climbing.
+			runTick();
+			expect(service.getStats().consecutiveSkippedTicks).toBe(2);
+
+			// Cleanup so we don't leak the pending promise.
+			releaseHang();
+		});
+
+		it('should force-reset isChecking when a tick has been hung past the stuck threshold', () => {
+			// Hang the first tick indefinitely.
+			let releaseHang: () => void = () => {};
+			mockGetTeams.mockReturnValue(
+				new Promise<unknown[]>(resolve => {
+					releaseHang = () => resolve([]);
+				}),
+			);
+
+			const service = IdleDetectionService.getInstance();
+			const runTick = (service as any).runTick.bind(service) as () => void;
+
+			runTick();
+			expect(service.getStats().isChecking).toBe(true);
+
+			// Fast-forward perceived clock past 3× interval. We can't
+			// move `Date.now()` via fake timers without `modern` mode;
+			// instead we backdate `lastTickStartedAt` to simulate
+			// elapsed time.
+			const oldStart = service.getStats().lastTickStartedAt!;
+			const stuckBy = AGENT_SUSPEND_CONSTANTS.IDLE_CHECK_INTERVAL_MS * 3 + 1000;
+			(service as any).lastTickStartedAt = oldStart - stuckBy;
+
+			runTick();
+			// Watchdog fired: isChecking flipped to false (and a fresh
+			// tick was scheduled, which then re-set isChecking to true).
+			expect(service.getStats().forcedResetCount).toBe(1);
+
+			releaseHang();
+		});
+
+		it('should never let a thrown error in performCheck stop the timer', async () => {
+			mockGetTeams.mockRejectedValueOnce(new Error('boom'));
+			const service = IdleDetectionService.getInstance();
+
+			// performCheck swallows storage errors internally (returns void).
+			// The tick wrapper additionally catches anything that escapes.
+			await expect(service.performCheck()).resolves.toBeUndefined();
+		});
+	});
+});

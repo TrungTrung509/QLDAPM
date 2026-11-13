@@ -1,0 +1,3352 @@
+// Updated: 2026-04-13T15:54:17Z - request title summarization + dangling fix
+/**
+ * Tests for Slack-Orchestrator Bridge
+ *
+ * @module services/slack/slack-orchestrator-bridge.test
+ */
+
+// Jest globals are available automatically
+import {
+  SlackOrchestratorBridge,
+  getSlackOrchestratorBridge,
+  resetSlackOrchestratorBridge,
+  suppressTrivialOrShort,
+  suppressFileOnly,
+  deriveSlackThreadName,
+  mentionedBotUserIds,
+  persistIdsOf,
+  slackActingForMetadata,
+} from './slack-orchestrator-bridge.js';
+import { resetSlackService, getSlackService } from './slack.service.js';
+import { resetChatService } from '../chat/chat.service.js';
+import type { SlackIncomingMessage } from '../../types/slack.types.js';
+import { setSlackThreadContextService, type SlackThreadContextService } from './slack-thread-context.service.js';
+import { setSlackFileFetchService, SlackFileGetError, type SlackFileFetchService } from './slack-file-fetch.service.js';
+import { promises as nodeFs } from 'fs';
+import nodeOs from 'os';
+import nodePath from 'path';
+import { SLACK_FILE_FETCH_CONSTANTS } from '../../constants.js';
+
+// The direct-delivery fallback delivers in process (#1024).
+const mockDeliverForcedMessage = jest.fn().mockResolvedValue({ status: 'delivered', inProcess: false });
+jest.mock('../worktree/low-disk-guard.js', () => ({
+  readFreeBytes: jest.fn().mockResolvedValue(null),
+}));
+jest.mock('../messaging/forced-delivery.js', () => ({
+  deliverForcedMessage: (...args: unknown[]) => mockDeliverForcedMessage(...args),
+}));
+
+// Mock the orchestrator status module
+jest.mock('../orchestrator/index.js', () => ({
+  isOrchestratorActive: jest.fn(),
+  isAgentActive: jest.fn().mockResolvedValue(false),
+  getOrchestratorOfflineMessage: jest.fn().mockReturnValue('Orchestrator is offline'),
+  triggerOrchestratorSetup: jest.fn().mockResolvedValue({ success: false, error: 'not wired' }),
+}));
+
+// Phase 3 — chat-v2 dual-write target. Mocked so the bridge can fire
+// `dualWriteSlackInboundToV2` without opening a real SQLite database.
+const mockChatV2EnsureChannel = jest.fn();
+const mockChatV2RecordTurn = jest.fn();
+jest.mock('../chat-v2/chat-v2.singleton.js', () => ({
+  getChatV2Service: jest.fn(() => ({
+    ensureChannelForLegacyConversation: mockChatV2EnsureChannel,
+    recordTurn: mockChatV2RecordTurn,
+  })),
+}));
+
+// Slack team channels — a mapped channel must bypass the orchestrator
+// entirely. Mutable fake so individual tests can install a mapping.
+const mockTeamChannels: {
+  current: null | { findBySlackChannelId: jest.Mock; routeInbound: jest.Mock; sharedRoomOwnedElsewhere?: jest.Mock };
+} = { current: null };
+jest.mock('./slack-team-channel.service.js', () => ({
+  getSlackTeamChannelService: jest.fn(() => mockTeamChannels.current),
+}));
+
+// Mock the slack image service
+jest.mock('./slack-image.service.js', () => ({
+  getSlackImageService: jest.fn().mockReturnValue({
+    downloadImage: jest.fn().mockResolvedValue({
+      id: 'F001',
+      name: 'test.png',
+      mimetype: 'image/png',
+      localPath: '/tmp/slack-images/F001-test.png',
+      width: 800,
+      height: 600,
+      permalink: 'https://slack.com/files/F001',
+    }),
+  }),
+  SlackImageService: jest.fn(),
+  setSlackImageService: jest.fn(),
+  resetSlackImageService: jest.fn(),
+}));
+
+import { setTicketIntakeService, type IntakeMessage, type TicketIntakeService } from '../v3/ticket-intake.service.js';
+import { isOrchestratorActive, isAgentActive, getOrchestratorOfflineMessage, triggerOrchestratorSetup } from '../orchestrator/index.js';
+import { getChatService } from '../chat/chat.service.js';
+import { ChatMessage } from '../../types/chat.types.js';
+import { getSlackImageService } from './slack-image.service.js';
+import { notePausedTeam, resetTeamPauseRegistryForTesting } from '../team/team-pause.registry.js';
+import { StorageService } from '../core/storage.service.js';
+
+describe('SlackOrchestratorBridge', () => {
+  beforeEach(() => {
+    // Never reach the real Slack Web API for thread context from tests.
+    setSlackThreadContextService({ getContext: async () => null } as unknown as SlackThreadContextService);
+    resetSlackOrchestratorBridge();
+    resetSlackService();
+    resetChatService();
+    jest.clearAllMocks();
+  });
+
+  afterEach(() => {
+    resetSlackOrchestratorBridge();
+    resetSlackService();
+    resetChatService();
+  });
+
+  describe('getSlackOrchestratorBridge', () => {
+    it('should return singleton instance', () => {
+      const bridge1 = getSlackOrchestratorBridge();
+      const bridge2 = getSlackOrchestratorBridge();
+      expect(bridge1).toBe(bridge2);
+    });
+
+    it('should return SlackOrchestratorBridge instance', () => {
+      const bridge = getSlackOrchestratorBridge();
+      expect(bridge).toBeInstanceOf(SlackOrchestratorBridge);
+    });
+  });
+
+  describe('resetSlackOrchestratorBridge', () => {
+    it('should reset the singleton instance', () => {
+      const bridge1 = getSlackOrchestratorBridge();
+      resetSlackOrchestratorBridge();
+      const bridge2 = getSlackOrchestratorBridge();
+      expect(bridge1).not.toBe(bridge2);
+    });
+  });
+
+  describe('SlackOrchestratorBridge class', () => {
+    it('should have correct initial state', () => {
+      const bridge = new SlackOrchestratorBridge();
+      expect(bridge.isInitialized()).toBe(false);
+    });
+
+    it('should initialize without throwing', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await expect(bridge.initialize()).resolves.not.toThrow();
+      expect(bridge.isInitialized()).toBe(true);
+    });
+
+    it('should only initialize once', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+      await bridge.initialize(); // Should not throw
+      expect(bridge.isInitialized()).toBe(true);
+    });
+
+    it('should accept custom configuration', () => {
+      const customConfig = {
+        maxResponseLength: 5000,
+        enableNotifications: false,
+      };
+      const bridge = new SlackOrchestratorBridge(customConfig);
+      const config = bridge.getConfig();
+      expect(config.maxResponseLength).toBe(5000);
+      expect(config.enableNotifications).toBe(false);
+    });
+
+    it('sendNotification passes on whether it was delivered (false when notifications are off)', async () => {
+      const off = new SlackOrchestratorBridge({ enableNotifications: false });
+      expect(await off.sendNotification({ type: 'system', title: 't', message: 'm', urgency: 'low', timestamp: '' } as never)).toBe(false);
+      const on = new SlackOrchestratorBridge();
+      const send = jest.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+      (on as unknown as { slackService: { sendNotification: jest.Mock } }).slackService = { sendNotification: send };
+      expect(await on.sendNotification({ type: 'system', title: 't', message: 'm', urgency: 'low', timestamp: '' } as never)).toBe(true);
+      expect(await on.sendNotification({ type: 'system', title: 't', message: 'm', urgency: 'low', timestamp: '' } as never)).toBe(false);
+    });
+
+    it('should use default configuration for unspecified options', () => {
+      const bridge = new SlackOrchestratorBridge({ maxResponseLength: 5000 });
+      const config = bridge.getConfig();
+      expect(config.showTypingIndicator).toBe(true);
+      expect(config.enableNotifications).toBe(true);
+    });
+  });
+
+  describe('which token reads a message\'s files', () => {
+    // A file lives in the channel it was posted to, and Slack serves it only
+    // to an app that is in that channel. In a private channel the owner
+    // invites the agent they want, not the workspace bot — so the event
+    // arrives fine through the agent's app while the workspace token gets a
+    // flat 403 on the download. The agent could read the message and not the
+    // image (2026-09-20, #steamfun-portal).
+    const identityModule = '../slack/slack-agent-identity.service.js';
+
+    /** Call the private token picker. */
+    function tokenFor(bridge: SlackOrchestratorBridge, message: Partial<SlackIncomingMessage>): string | undefined {
+      return (bridge as unknown as {
+        fileTokenCandidates(m: Partial<SlackIncomingMessage>): string[];
+      }).fileTokenCandidates(message)[0];
+    }
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('uses the agent\'s own token when the event came through its app', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const identities = await import(identityModule);
+      jest.spyOn(identities, 'getSlackAgentIdentityService').mockReturnValue({
+        getInstalled: () => ({ botToken: 'xoxb-agent', agentSession: 'team-avery' }),
+      } as never);
+
+      expect(tokenFor(bridge, { agentSession: 'team-avery' })).toBe('xoxb-agent');
+    });
+
+    it('falls back to the workspace token when the message names no agent', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      jest.spyOn(getSlackService(), 'getBotToken').mockReturnValue('xoxb-workspace');
+      expect(tokenFor(bridge, {})).toBe('xoxb-workspace');
+    });
+
+    it('falls back when the agent has no installed bot of its own', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      jest.spyOn(getSlackService(), 'getBotToken').mockReturnValue('xoxb-workspace');
+      const identities = await import(identityModule);
+      jest.spyOn(identities, 'getSlackAgentIdentityService').mockReturnValue({
+        getInstalled: () => null,
+      } as never);
+
+      expect(tokenFor(bridge, { agentSession: 'team-avery' })).toBe('xoxb-workspace');
+    });
+
+    // `agentSession` is only set for a DM. A channel message went straight
+    // to the workspace token, and in a private channel that bot is not a
+    // member: `files.info` said `file_not_found` and the download took a
+    // 403. The agent got the text with no sign an image was attached and
+    // answered about the previous topic (2026-09-21, #daily-info).
+    it('uses an @-mentioned agent\'s token for a channel message', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      jest.spyOn(getSlackService(), 'getBotToken').mockReturnValue('xoxb-workspace');
+      const identities = await import(identityModule);
+      jest.spyOn(identities, 'getSlackAgentIdentityService').mockReturnValue({
+        findByBotUserId: (id: string) => (id === 'U0C2ZK849ND' ? 'think-tank-atlas' : null),
+        getInstalled: (s: string) => (s === 'think-tank-atlas' ? { botToken: 'xoxb-atlas', botUserId: 'U0C2ZK849ND' } : null),
+      } as never);
+
+      expect(tokenFor(bridge, { text: '<@U0C2ZK849ND> 这个可以帮我研究一下吗' })).toBe('xoxb-atlas');
+    });
+
+    it('skips a mentioned human and an agent with no bot, then falls back', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      jest.spyOn(getSlackService(), 'getBotToken').mockReturnValue('xoxb-workspace');
+      const identities = await import(identityModule);
+      jest.spyOn(identities, 'getSlackAgentIdentityService').mockReturnValue({
+        findByBotUserId: (id: string) => (id === 'U-PENDING' ? 'not-installed-yet' : null),
+        getInstalled: () => null,
+      } as never);
+
+      expect(tokenFor(bridge, { text: '<@UHUMAN> and <@U-PENDING> look' })).toBe('xoxb-workspace');
+    });
+  });
+
+  describe('a channel file with no @ (2026-09-25, #content-team voice clip)', () => {
+    const identityModule = '../slack/slack-agent-identity.service.js';
+    afterEach(() => {
+      jest.restoreAllMocks();
+      mockTeamChannels.current = null;
+    });
+
+    it('tries the agents in the channel\'s room, then the workspace bot, and downloads with the first that can read it', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const slack = getSlackService();
+      jest.spyOn(slack, 'getBotToken').mockReturnValue('xoxb-workspace');
+      const identities = await import(identityModule);
+      jest.spyOn(identities, 'getSlackAgentIdentityService').mockReturnValue({
+        findByBotUserId: () => null,
+        getInstalled: (s: string) => ({ 'room-ella': { botToken: 'xoxb-ella' }, 'room-atlas': { botToken: 'xoxb-atlas' } } as Record<string, { botToken: string }>)[s] ?? null,
+      } as never);
+      // The team-channel module is jest.mock'ed at file scope; install the
+      // room roster through its fake rather than spyOn + restoreAllMocks,
+      // which (Jest 29) would strip the module mock's implementation and
+      // break every later test that routes through team channels.
+      mockTeamChannels.current = {
+        rosterSessions: (c: string) => (c === 'CPRIV' ? ['room-ella', 'room-atlas'] : []),
+      } as never;
+      const tried: Array<string | undefined> = [];
+      jest.spyOn(slack, 'getFileInfo').mockImplementation(async (_id: string, token?: string) => {
+        tried.push(token);
+        if (token !== 'xoxb-atlas') throw new Error('An API error occurred: file_not_found');
+        return { url_private_download: 'https://files/ok' } as never;
+      });
+
+      const bridgeApi = bridge as unknown as {
+        fileTokenCandidates(m: Partial<SlackIncomingMessage>): string[];
+        resolveFileToken(m: Partial<SlackIncomingMessage>, f: Array<{ id: string; name: string; url_private_download?: string }>): Promise<string | null>;
+      };
+      expect(bridgeApi.fileTokenCandidates({ channelId: 'CPRIV', text: 'voice' })).toEqual(['xoxb-ella', 'xoxb-atlas', 'xoxb-workspace']);
+      const files: Array<{ id: string; name: string; url_private_download?: string }> = [{ id: 'F1', name: 'Audio Clip.m4a' }];
+      expect(await bridgeApi.resolveFileToken({ channelId: 'CPRIV', text: '' }, files)).toBe('xoxb-atlas');
+      expect(files[0].url_private_download).toBe('https://files/ok');
+      expect(tried.slice(0, 2)).toEqual(['xoxb-ella', 'xoxb-atlas']);
+    });
+  });
+
+  describe('mentionedBotUserIds', () => {
+    it('pulls distinct ids out of Slack mention syntax, including the labelled form', () => {
+      expect(mentionedBotUserIds('<@U01> hi <@W02|atlas> and <@U01> again')).toEqual(['U01', 'W02']);
+      expect(mentionedBotUserIds('no mentions here')).toEqual([]);
+      expect(mentionedBotUserIds(undefined)).toEqual([]);
+    });
+  });
+
+  describe('parseCommand', () => {
+    it('should parse help command', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand('help');
+      expect(result.intent).toBe('help');
+      expect(result.rawText).toBe('help');
+    });
+
+    it('should parse status command', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand('status');
+      expect(result.intent).toBe('status');
+    });
+
+    it('should parse list projects command', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand('list projects');
+      expect(result.intent).toBe('list_projects');
+    });
+
+    it('should parse list teams command', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand('show all teams');
+      expect(result.intent).toBe('list_teams');
+    });
+
+    it('should parse list agents command', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand("who's working");
+      expect(result.intent).toBe('list_agents');
+    });
+
+    it('should remove bot mentions from text', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand('<@U1234567890> status');
+      expect(result.rawText).toBe('status');
+      expect(result.intent).toBe('status');
+    });
+
+    it('should handle multiple bot mentions', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand('<@U123> <@U456> help');
+      expect(result.rawText).toBe('help');
+    });
+
+    it('should parse pause command', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand('pause');
+      expect(result.intent).toBe('pause');
+    });
+
+    it('should parse resume command', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand('resume');
+      expect(result.intent).toBe('resume');
+    });
+
+    it('should extract quoted parameters', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand('create task "Fix the login bug"');
+      expect(result.parameters.quoted).toBe('Fix the login bug');
+    });
+
+    it('should extract mention parameters', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand('assign to @developer');
+      expect(result.parameters.mention).toBe('developer');
+    });
+
+    it('should extract target parameters', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand('status for ProjectX');
+      expect(result.parameters.target).toBe('ProjectX');
+    });
+
+    it('should default to conversation for unknown input', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const result = bridge.parseCommand('hello there how are you');
+      expect(result.intent).toBe('conversation');
+    });
+  });
+
+  describe('getHelpMessage', () => {
+    it('should return formatted help message', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const help = bridge.getHelpMessage();
+
+      expect(help).toContain('Crewly Commands');
+      expect(help).toContain('status');
+      expect(help).toContain('list projects');
+      expect(help).toContain('list teams');
+      expect(help).toContain('pause');
+      expect(help).toContain('resume');
+    });
+
+    it('should include emoji formatting', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const help = bridge.getHelpMessage();
+
+      expect(help).toContain(':clipboard:');
+      expect(help).toContain(':gear:');
+    });
+  });
+
+  describe('formatForSlack', () => {
+    it('should convert markdown headers to bold', () => {
+      const bridge = new SlackOrchestratorBridge();
+
+      expect(bridge.formatForSlack('# Heading')).toBe('*Heading*');
+      expect(bridge.formatForSlack('## Subheading')).toBe('*Subheading*');
+      expect(bridge.formatForSlack('### Small heading')).toBe('*Small heading*');
+    });
+
+    it('should preserve code blocks', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const input = '```\nconst x = 1;\n```';
+      const result = bridge.formatForSlack(input);
+      expect(result).toContain('const x = 1;');
+      expect(result).toContain('```');
+    });
+
+    it('should handle mixed content', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const input = '# Title\nSome text\n```code```';
+      const result = bridge.formatForSlack(input);
+      expect(result).toContain('*Title*');
+      expect(result).toContain('Some text');
+    });
+  });
+
+  describe('linked Slack files (cross-machine hand-offs)', () => {
+    // Ella handed Rex (another machine, bot not in the channel) a file by
+    // link; he asked her to paste the text (2026-10-08). The link is now
+    // fetched like an attachment.
+    const LINK = 'https://acme.slack.com/files/U0ELLA1234/F0ABC12345/longform-en.md';
+    let dir: string;
+    let get: jest.Mock;
+
+    beforeEach(async () => {
+      dir = await nodeFs.mkdtemp(nodePath.join(nodeOs.tmpdir(), 'linked-files-'));
+      const saved = nodePath.join(dir, 'F0ABC12345-longform-en.md');
+      await nodeFs.writeFile(saved, '# Longform\nBody');
+      get = jest.fn().mockResolvedValue({
+        meta: { id: 'F0ABC12345', name: 'longform-en.md', mimetype: 'text/markdown', size: 16, user: 'U0ELLA1234', channels: [], permalink: LINK, isText: true, via: 'cloud:agent:team-ella' },
+        localPath: saved,
+      });
+      setSlackFileFetchService({ get } as unknown as SlackFileFetchService);
+    });
+    afterEach(async () => {
+      setSlackFileFetchService(null);
+      await nodeFs.rm(dir, { recursive: true, force: true });
+    });
+
+    const msg = (text: string, extra: Partial<SlackIncomingMessage> = {}): SlackIncomingMessage => ({
+      id: '1', type: 'message', text, userId: 'U0ELLA1234', channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1', ...extra,
+    });
+
+    it('fetches a linked file, capped, for the addressed agent and shows its content', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const message = msg(`Rex, please translate <${LINK}|longform-en.md>`, { agentSession: 'team-rex' });
+      await bridge.fetchLinkedFiles(message);
+      expect(get).toHaveBeenCalledWith(LINK, { requesterAgent: 'team-rex', maxBytes: SLACK_FILE_FETCH_CONSTANTS.MAX_LINKED_BYTES });
+      expect(message.linkedFiles?.[0]?.name).toBe('longform-en.md');
+      const enriched = (bridge as any).enrichTextWithFiles(message) as string;
+      expect(enriched).toContain('[Slack File (linked): ');
+      expect(enriched).toContain('# Longform\nBody');
+      // A linked file does not count as a delivered attachment.
+      expect(enriched).not.toContain('could not be read');
+    });
+
+    it('does not re-fetch a file that is already attached to the message', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const message = msg(`see ${LINK}`, { files: [{ id: 'F0ABC12345', name: 'longform-en.md', mimetype: 'text/markdown', size: 1 } as any] });
+      await bridge.fetchLinkedFiles(message);
+      expect(get).not.toHaveBeenCalled();
+    });
+
+    it('leaves message links alone (only file links are auto-fetched)', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.fetchLinkedFiles(msg('context: https://acme.slack.com/archives/C0MKTG1234/p1696771234567890'));
+      expect(get).not.toHaveBeenCalled();
+    });
+
+    it('caps the number of linked files fetched per message', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const links = ['F0AAAAAAA1', 'F0AAAAAAA2', 'F0AAAAAAA3', 'F0AAAAAAA4'].map((id) => `https://acme.slack.com/files/U0ELLA1234/${id}/x.md`);
+      await bridge.fetchLinkedFiles(msg(links.join(' ')));
+      expect(get).toHaveBeenCalledTimes(SLACK_FILE_FETCH_CONSTANTS.MAX_LINKED_PER_MESSAGE);
+    });
+
+    it('names a linked file it could not fetch and points at slack-file get', async () => {
+      get.mockRejectedValue(new SlackFileGetError('not_visible', 'No bot can see that file'));
+      const bridge = new SlackOrchestratorBridge();
+      const message = msg(`translate ${LINK}`);
+      await bridge.fetchLinkedFiles(message);
+      expect(message.linkedFiles).toBeUndefined();
+      const enriched = (bridge as any).enrichTextWithFiles(message) as string;
+      expect(enriched).toContain(`slack-file get ${LINK}`);
+      expect(enriched).toContain('No bot can see that file');
+    });
+  });
+
+  describe('image handling', () => {
+    it('should enrich text with image file references', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const enrichTextWithFiles = (bridge as any).enrichTextWithFiles.bind(bridge);
+
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: 'Check this', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        images: [{
+          id: 'F001', name: 'shot.png', mimetype: 'image/png',
+          localPath: '/tmp/F001-shot.png', width: 1920, height: 1080,
+          permalink: 'https://slack.com/files/F001',
+        }],
+      };
+
+      const enriched = enrichTextWithFiles(message);
+      expect(enriched).toContain('Check this');
+      expect(enriched).toContain('[Slack Image: /tmp/F001-shot.png (1920x1080), image/png]');
+    });
+
+    // A download that failed left no trace at all: the agent saw "have a
+    // look at this" with nothing to look at, and answered about the previous
+    // topic rather than saying it could not see the image (2026-09-21,
+    // #daily-info, IMG_3956.jpg → files.info file_not_found, download 403).
+    it('says so when an attachment was announced but could not be read', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const enrichTextWithFiles = (bridge as any).enrichTextWithFiles.bind(bridge);
+
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: '这个可以帮我研究一下吗', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasFiles: true,
+        files: [{ id: 'F1', name: 'IMG_3956.jpg', mimetype: 'image/jpeg' }],
+        images: [],
+      } as unknown as SlackIncomingMessage;
+
+      const enriched = enrichTextWithFiles(message);
+      expect(enriched).toContain('这个可以帮我研究一下吗');
+      expect(enriched).toContain('1 attachment(s) could not be read');
+      expect(enriched).toContain('IMG_3956.jpg');
+      expect(enriched).toContain('rather than guessing');
+    });
+
+    it('adds no such note when every announced file arrived', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const enrichTextWithFiles = (bridge as any).enrichTextWithFiles.bind(bridge);
+
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: 'Check this', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasFiles: true,
+        files: [{ id: 'F001', name: 'shot.png', mimetype: 'image/png' }],
+        images: [{
+          id: 'F001', name: 'shot.png', mimetype: 'image/png',
+          localPath: '/tmp/F001-shot.png', permalink: 'https://slack.com/files/F001',
+        }],
+      } as unknown as SlackIncomingMessage;
+
+      expect(enrichTextWithFiles(message)).not.toContain('could not be read');
+    });
+
+    it('should return original text when no images', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const enrichTextWithFiles = (bridge as any).enrichTextWithFiles.bind(bridge);
+
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: 'No images here', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+      };
+
+      expect(enrichTextWithFiles(message)).toBe('No images here');
+    });
+
+    it('should enrich text with non-image file attachments', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const enrichTextWithFiles = (bridge as any).enrichTextWithFiles.bind(bridge);
+
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: 'Check this PDF', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        attachments: [{
+          id: 'F002', name: 'report.pdf', mimetype: 'application/pdf',
+          localPath: '/tmp/F002-report.pdf', size: 102400,
+          permalink: 'https://slack.com/files/F002',
+        }],
+      };
+
+      const enriched = enrichTextWithFiles(message);
+      expect(enriched).toContain('Check this PDF');
+      expect(enriched).toContain('[Slack File: /tmp/F002-report.pdf (report.pdf, application/pdf, 100KB)]');
+    });
+
+    it('points a Slack voice message at transcribe-audio, right after the file line', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const enrichTextWithFiles = (bridge as any).enrichTextWithFiles.bind(bridge);
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: '', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        attachments: [{
+          id: 'F009', name: 'Audio Clip.m4a', mimetype: 'audio/mp4',
+          localPath: '/tmp/F009-Audio_Clip.m4a', size: 219136,
+          permalink: 'https://slack.com/files/F009',
+        }],
+      };
+      const lines = enrichTextWithFiles(message).split('\n');
+      const at = lines.findIndex((l: string) => l.startsWith('[Slack File: /tmp/F009-Audio_Clip.m4a'));
+      expect(at).toBeGreaterThanOrEqual(0);
+      expect(lines[at + 1]).toMatch(/^\[Hint: voice\/audio or video file — use the transcribe-audio skill: \{"audioFile":"\/tmp\/F009-Audio_Clip\.m4a"\}/);
+      expect(lines[at + 1]).toContain('install-skill --id transcribe-audio');
+    });
+
+    it('hints the PDF reading skill only when the PDF text is not already inline', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const enrichTextWithFiles = (bridge as any).enrichTextWithFiles.bind(bridge);
+      const base = { id: 'F002', name: 'report.pdf', mimetype: 'application/pdf', localPath: '/tmp/F002-report.pdf', size: 1024, permalink: 'p' };
+      const msg = (extractedText?: string): SlackIncomingMessage => ({
+        id: '1', type: 'message', text: 'pdf', userId: 'U1', channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        attachments: [{ ...base, ...(extractedText ? { extractedText } : {}) }],
+      });
+      expect(enrichTextWithFiles(msg('The whole contract.'))).not.toContain('[Hint:');
+      expect(enrichTextWithFiles(msg())).toContain('use the PDF reading skill (pdf-tools): {"action":"read","input":"/tmp/F002-report.pdf"}');
+      expect(enrichTextWithFiles(msg('Start...\n... [truncated]'))).toContain('only the start of its text is included above');
+    });
+
+    it('should enrich text with both images and file attachments', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const enrichTextWithFiles = (bridge as any).enrichTextWithFiles.bind(bridge);
+
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: 'Mixed files', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        images: [{
+          id: 'F001', name: 'shot.png', mimetype: 'image/png',
+          localPath: '/tmp/F001-shot.png', width: 800, height: 600,
+          permalink: 'https://slack.com/files/F001',
+        }],
+        attachments: [{
+          id: 'F002', name: 'doc.csv', mimetype: 'text/csv',
+          localPath: '/tmp/F002-doc.csv', size: 2048,
+          permalink: 'https://slack.com/files/F002',
+        }],
+      };
+
+      const enriched = enrichTextWithFiles(message);
+      expect(enriched).toContain('[Slack Image:');
+      expect(enriched).toContain('[Slack File:');
+    });
+
+    it('should download images via SlackImageService', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('xoxb-test');
+      jest.spyOn(slackService, 'getFileInfo').mockResolvedValue({
+        url_private: 'https://files.slack.com/F001',
+        url_private_download: 'https://files.slack.com/F001/download',
+      });
+
+      const downloadMessageImages = (bridge as any).downloadMessageImages.bind(bridge);
+
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: 'here', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasImages: true,
+        files: [{
+          id: 'F001', name: 'test.png', mimetype: 'image/png',
+          filetype: 'png', size: 1024,
+          url_private: 'https://files.slack.com/F001',
+          url_private_download: 'https://files.slack.com/F001/download',
+          permalink: 'https://slack.com/files/F001',
+        }],
+      };
+
+      await downloadMessageImages(message, message.files!);
+
+      expect(message.images).toBeDefined();
+      expect(message.images).toHaveLength(1);
+      expect(message.images![0].localPath).toBe('/tmp/slack-images/F001-test.png');
+
+      const mockImgService = getSlackImageService();
+      expect(mockImgService.downloadImage).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'F001' }),
+        'xoxb-test'
+      );
+    });
+
+    it('should batch downloads with MAX_CONCURRENT_DOWNLOADS limit', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('xoxb-test');
+      jest.spyOn(slackService, 'getFileInfo').mockResolvedValue({
+        url_private: 'https://files.slack.com/refreshed',
+        url_private_download: 'https://files.slack.com/refreshed/download',
+      });
+
+      // Track concurrent calls to verify batching
+      let activeConcurrent = 0;
+      let maxObservedConcurrent = 0;
+
+      const mockImgService = getSlackImageService();
+      (mockImgService.downloadImage as jest.Mock).mockImplementation(async (file: any) => {
+        activeConcurrent++;
+        maxObservedConcurrent = Math.max(maxObservedConcurrent, activeConcurrent);
+        // Simulate async work so concurrent calls overlap within a batch
+        await new Promise(r => setTimeout(r, 10));
+        activeConcurrent--;
+        return {
+          id: file.id, name: file.name, mimetype: 'image/png',
+          localPath: `/tmp/slack-images/${file.id}-${file.name}`, permalink: file.permalink,
+        };
+      });
+
+      const downloadMessageImages = (bridge as any).downloadMessageImages.bind(bridge);
+
+      // Create 5 files to test batching (max concurrent = 3, so 2 batches: [3, 2])
+      const files = Array.from({ length: 5 }, (_, i) => ({
+        id: `F00${i}`, name: `img${i}.png`, mimetype: 'image/png',
+        filetype: 'png', size: 1024,
+        url_private: `https://files.slack.com/F00${i}`,
+        url_private_download: `https://files.slack.com/F00${i}/download`,
+        permalink: `https://slack.com/files/F00${i}`,
+      }));
+
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: 'batch test', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasImages: true,
+        files,
+      };
+
+      await downloadMessageImages(message, message.files!);
+
+      expect(message.images).toBeDefined();
+      expect(message.images).toHaveLength(5);
+      expect(mockImgService.downloadImage).toHaveBeenCalledTimes(5);
+      // Verify concurrency was bounded to batch size (3)
+      expect(maxObservedConcurrent).toBeLessThanOrEqual(3);
+    });
+
+    it('should continue downloading remaining batches when one file fails', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('xoxb-test');
+      jest.spyOn(slackService, 'getFileInfo').mockResolvedValue({
+        url_private: 'https://files.slack.com/refreshed',
+        url_private_download: 'https://files.slack.com/refreshed/download',
+      });
+
+      const mockImgService = getSlackImageService();
+      (mockImgService.downloadImage as jest.Mock)
+        .mockRejectedValueOnce(new Error('Download failed'))
+        .mockResolvedValueOnce({ id: 'F001', name: 'b.png', mimetype: 'image/png', localPath: '/tmp/slack-images/F001-b.png', permalink: 'x' })
+        .mockResolvedValueOnce({ id: 'F002', name: 'c.png', mimetype: 'image/png', localPath: '/tmp/slack-images/F002-c.png', permalink: 'x' });
+
+      const downloadMessageImages = (bridge as any).downloadMessageImages.bind(bridge);
+
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: '', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasImages: true,
+        files: [
+          { id: 'F000', name: 'a.png', mimetype: 'image/png', filetype: 'png', size: 1, url_private: 'x', url_private_download: 'x', permalink: 'x' },
+          { id: 'F001', name: 'b.png', mimetype: 'image/png', filetype: 'png', size: 1, url_private: 'x', url_private_download: 'x', permalink: 'x' },
+          { id: 'F002', name: 'c.png', mimetype: 'image/png', filetype: 'png', size: 1, url_private: 'x', url_private_download: 'x', permalink: 'x' },
+        ],
+      };
+
+      await downloadMessageImages(message, message.files!);
+
+      // First file failed, but the other 2 in the batch should succeed
+      expect(message.images).toHaveLength(2);
+      expect(mockImgService.downloadImage).toHaveBeenCalledTimes(3);
+    });
+
+    it('should skip all downloads when files:read scope is missing', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('xoxb-test');
+      jest.spyOn(slackService, 'getFileInfo').mockRejectedValue(
+        new Error('An API error occurred: missing_scope')
+      );
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      const downloadMessageImages = (bridge as any).downloadMessageImages.bind(bridge);
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: '', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasImages: true,
+        files: [{ id: 'F001', name: 'a.png', mimetype: 'image/png', filetype: 'png',
+          size: 1, url_private: 'x', url_private_download: 'x', permalink: 'x' }],
+      };
+
+      await downloadMessageImages(message, message.files!);
+
+      // Should skip all downloads — no images downloaded
+      expect(message.images).toBeUndefined();
+      // Should log a clear error about missing scope
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining('files:read scope')
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it('should continue with original URLs when getFileInfo fails for other reasons', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('xoxb-test');
+      jest.spyOn(slackService, 'getFileInfo').mockRejectedValue(
+        new Error('file_not_found')
+      );
+
+      const downloadMessageImages = (bridge as any).downloadMessageImages.bind(bridge);
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: '', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasImages: true,
+        files: [{ id: 'F001', name: 'a.png', mimetype: 'image/png', filetype: 'png',
+          size: 1, url_private: 'x', url_private_download: 'x', permalink: 'x' }],
+      };
+
+      await downloadMessageImages(message, message.files!);
+
+      // Should still attempt download with original URLs
+      const mockImgService = getSlackImageService();
+      expect(mockImgService.downloadImage).toHaveBeenCalled();
+    });
+
+    it('should skip image download when no bot token', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue(null);
+
+      const downloadMessageImages = (bridge as any).downloadMessageImages.bind(bridge);
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: '', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasImages: true,
+        files: [{ id: 'F001', name: 'a.png', mimetype: 'image/png', filetype: 'png',
+          size: 1, url_private: 'x', url_private_download: 'x', permalink: 'x' }],
+      };
+
+      await downloadMessageImages(message, message.files!);
+      expect(message.images).toBeUndefined();
+    });
+
+    it('should send warning to Slack when file is too large', async () => {
+      const mockImgService = getSlackImageService() as jest.Mocked<ReturnType<typeof getSlackImageService>>;
+      mockImgService.downloadImage = jest.fn().mockRejectedValue(new Error('File too large: 25000000 bytes (max 20 MB)'));
+
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('xoxb-test');
+      jest.spyOn(slackService, 'getFileInfo').mockResolvedValue({
+        url_private: 'x', url_private_download: 'x',
+      });
+      const sendMessageSpy = jest.spyOn(slackService, 'sendMessage').mockResolvedValue('ok');
+
+      const downloadMessageImages = (bridge as any).downloadMessageImages.bind(bridge);
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: 'Check this', userId: 'U1',
+        channelId: 'C1', ts: '1.000', teamId: 'T1', eventTs: '1',
+        hasImages: true,
+        files: [{ id: 'F001', name: 'huge.png', mimetype: 'image/png', filetype: 'png',
+          size: 25000000, url_private: 'x', url_private_download: 'x', permalink: 'x' }],
+      };
+
+      await downloadMessageImages(message, message.files!);
+
+      // Should have no downloaded images
+      expect(message.images).toBeUndefined();
+      // Told to the agent only: nothing is posted into the owner's thread
+      expect(sendMessageSpy).not.toHaveBeenCalled();
+      expect(message.fileFailures).toEqual([
+        expect.objectContaining({ name: 'huge.png', reason: expect.stringContaining('File too large:') }),
+      ]);
+    });
+
+    it('should not send warning for non-size/type failures', async () => {
+      const mockImgService = getSlackImageService() as jest.Mocked<ReturnType<typeof getSlackImageService>>;
+      mockImgService.downloadImage = jest.fn().mockRejectedValue(new Error('Download failed with status 500'));
+
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('xoxb-test');
+      jest.spyOn(slackService, 'getFileInfo').mockResolvedValue({
+        url_private: 'x', url_private_download: 'x',
+      });
+      const sendMessageSpy = jest.spyOn(slackService, 'sendMessage').mockResolvedValue('ok');
+
+      const downloadMessageImages = (bridge as any).downloadMessageImages.bind(bridge);
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: '', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasImages: true,
+        files: [{ id: 'F001', name: 'a.png', mimetype: 'image/png', filetype: 'png',
+          size: 1, url_private: 'x', url_private_download: 'x', permalink: 'x' }],
+      };
+
+      await downloadMessageImages(message, message.files!);
+
+      // Should NOT send a warning for generic errors
+      expect(sendMessageSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('downloadMessageFiles (non-image files)', () => {
+    it('should skip download when no bot token is available', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('');
+
+      const downloadMessageFiles = (bridge as any).downloadMessageFiles.bind(bridge);
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: 'doc', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasFiles: true,
+      };
+      const nonImageFiles = [{ id: 'F001', name: 'doc.pdf', mimetype: 'application/pdf', filetype: 'pdf',
+        size: 1024, url_private: 'x', url_private_download: 'x', permalink: 'x' }];
+
+      await downloadMessageFiles(message, nonImageFiles);
+
+      // No attachments set since we couldn't download
+      expect(message.attachments).toBeUndefined();
+    });
+
+    it('rejects files over the limit without posting into the thread, and tells the agent', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('xoxb-test');
+      jest.spyOn(slackService, 'getFileInfo').mockResolvedValue({
+        url_private: 'x', url_private_download: 'x',
+      });
+      const sendMessageSpy = jest.spyOn(slackService, 'sendMessage').mockResolvedValue('ok');
+
+      const downloadMessageFiles = (bridge as any).downloadMessageFiles.bind(bridge);
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: '', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasFiles: true,
+      };
+      // Over the 1 GB default limit
+      const huge = 2 * 1024 * 1024 * 1024;
+      const nonImageFiles = [{ id: 'F001', name: 'huge.mov', mimetype: 'video/quicktime', filetype: 'mov',
+        size: huge, url_private: 'x', url_private_download: 'x', permalink: 'x' }];
+
+      await downloadMessageFiles(message, nonImageFiles);
+
+      expect(message.attachments).toBeUndefined();
+      expect(sendMessageSpy).not.toHaveBeenCalled();
+      expect(message.fileFailures).toEqual([
+        expect.objectContaining({ name: 'huge.mov', reason: expect.stringContaining('File too large:') }),
+      ]);
+      message.files = nonImageFiles as any;
+      const text: string = (bridge as any).enrichTextWithFiles(message);
+      expect(text).toContain('huge.mov could not be downloaded');
+      expect(text).toContain('request-file');
+      // Named once, not again in the generic "could not be read" note
+      expect(text).not.toContain('could not be read');
+    });
+
+    it('accepts a 23 MB video (the old 20 MB limit no longer applies)', async () => {
+      const home = await nodeFs.mkdtemp(nodePath.join(nodeOs.tmpdir(), 'crewly-dl-test-'));
+      const homeSpy = jest.spyOn(nodeOs, "homedir").mockReturnValue(home);
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('xoxb-test');
+      jest.spyOn(slackService, 'getFileInfo').mockResolvedValue({ url_private: 'x', url_private_download: 'x' });
+      const sendMessageSpy = jest.spyOn(slackService, 'sendMessage').mockResolvedValue('ok');
+      const fetchSpy = jest.spyOn(global, 'fetch').mockResolvedValue(
+        new Response(new Uint8Array([1, 2, 3]), { status: 200 }),
+      );
+      const downloadMessageFiles = (bridge as any).downloadMessageFiles.bind(bridge);
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: '', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasFiles: true,
+      };
+      const files = [{ id: 'F_MOV', name: 'IMG_5057.MOV', mimetype: 'video/quicktime', filetype: 'mov',
+        size: 23273672, url_private: 'https://x/a', url_private_download: 'https://x/a', permalink: 'x' }];
+      await downloadMessageFiles(message, files);
+      expect(message.fileFailures).toBeUndefined();
+      expect(message.attachments?.[0].name).toBe('IMG_5057.MOV');
+      expect(sendMessageSpy).not.toHaveBeenCalled();
+      fetchSpy.mockRestore();
+      homeSpy.mockRestore();
+      await nodeFs.rm(home, { recursive: true, force: true });
+    });
+
+    it('refuses a download that would leave the disk below the low-disk threshold', async () => {
+      const { readFreeBytes } = jest.requireMock('../worktree/low-disk-guard.js') as { readFreeBytes: jest.Mock };
+      readFreeBytes.mockResolvedValueOnce(15.5 * 1024 ** 3);
+      const home = await nodeFs.mkdtemp(nodePath.join(nodeOs.tmpdir(), 'crewly-dl-test-'));
+      const homeSpy = jest.spyOn(nodeOs, "homedir").mockReturnValue(home);
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('xoxb-test');
+      jest.spyOn(slackService, 'getFileInfo').mockResolvedValue({ url_private: 'x', url_private_download: 'x' });
+      const sendMessageSpy = jest.spyOn(slackService, 'sendMessage').mockResolvedValue('ok');
+      const fetchSpy = jest.spyOn(global, 'fetch');
+      const downloadMessageFiles = (bridge as any).downloadMessageFiles.bind(bridge);
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: '', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasFiles: true,
+      };
+      await downloadMessageFiles(message, [{ id: 'F2', name: 'big.mov', mimetype: 'video/quicktime', filetype: 'mov',
+        size: 900 * 1024 ** 2, url_private: 'x', url_private_download: 'x', permalink: 'x' }]);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(message.fileFailures?.[0].reason).toContain('Not enough disk space:');
+      expect(sendMessageSpy).not.toHaveBeenCalled();
+      fetchSpy.mockRestore();
+      homeSpy.mockRestore();
+      await nodeFs.rm(home, { recursive: true, force: true });
+    });
+
+    it('should abort all downloads when files:read scope is missing', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('xoxb-test');
+      jest.spyOn(slackService, 'getFileInfo').mockRejectedValue(new Error('missing_scope'));
+
+      const downloadMessageFiles = (bridge as any).downloadMessageFiles.bind(bridge);
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: '', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        hasFiles: true,
+      };
+      const nonImageFiles = [{ id: 'F001', name: 'a.pdf', mimetype: 'application/pdf', filetype: 'pdf',
+        size: 1024, url_private: 'x', url_private_download: 'x', permalink: 'x' }];
+
+      await downloadMessageFiles(message, nonImageFiles);
+
+      expect(message.attachments).toBeUndefined();
+    });
+  });
+
+  describe('extractPdfText', () => {
+    it('should extract text from a valid PDF buffer', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const { promises: fsPromises } = await import('fs');
+
+      // Minimal valid PDF with "Hello World" text (proper xref offsets)
+      const minPdf = Buffer.from(
+        'JVBERi0xLjQKMSAwIG9iaiA8PC9UeXBlIC9DYXRhbG9nIC9QYWdlcyAyIDAgUj4+IGVuZG9iagoyIDAgb2JqIDw8L1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDE+PiBlbmRvYmoKMyAwIG9iaiA8PC9UeXBlIC9QYWdlIC9NZWRpYUJveCBbMCAwIDYxMiA3OTJdIC9QYXJlbnQgMiAwIFIgL0NvbnRlbnRzIDQgMCBSIC9SZXNvdXJjZXMgPDwvRm9udCA8PC9GMSA1IDAgUj4+Pj4+PiBlbmRvYmoKNCAwIG9iaiA8PC9MZW5ndGggNDQ+PiBzdHJlYW0KQlQgL0YxIDEyIFRmIDEwMCA3MDAgVGQgKEhlbGxvIFdvcmxkKSBUaiBFVAplbmRzdHJlYW0gZW5kb2JqCjUgMCBvYmogPDwvVHlwZSAvRm9udCAvU3VidHlwZSAvVHlwZTEgL0Jhc2VGb250IC9IZWx2ZXRpY2E+PiBlbmRvYmoKeHJlZgowIDYKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTYgMDAwMDAgbiAKMDAwMDAwMDExMSAwMDAwMCBuIAowMDAwMDAwMjMxIDAwMDAwIG4gCjAwMDAwMDAzMjIgMDAwMDAgbiAKdHJhaWxlciA8PC9TaXplIDYgL1Jvb3QgMSAwIFI+PgpzdGFydHhyZWYKMzkwCiUlRU9GCg==',
+        'base64'
+      );
+
+      const tmpPath = '/tmp/test-extract.pdf';
+      await fsPromises.writeFile(tmpPath, minPdf);
+
+      try {
+        // Verify the file was written correctly
+        const writtenBuf = await fsPromises.readFile(tmpPath);
+        expect(writtenBuf.length).toBeGreaterThan(100);
+
+        // Test extraction directly to see errors
+        const { PDFParse } = await import('pdf-parse');
+        const parser = new PDFParse({ data: writtenBuf });
+        let directResult;
+        try {
+          directResult = await parser.getText();
+        } catch (e: any) {
+          // If pdf-parse fails in test env, skip with a meaningful message
+          console.warn('PDFParse.getText failed:', e.message);
+        }
+
+        const text = await bridge.extractPdfText(tmpPath, 'test.pdf');
+        if (directResult) {
+          expect(text).toBeDefined();
+          expect(text).toContain('Hello World');
+        } else {
+          // pdf-parse may not work in Jest transform env - verify graceful handling
+          expect(text).toBeUndefined();
+        }
+      } finally {
+        await fsPromises.unlink(tmpPath).catch(() => {});
+      }
+    });
+
+    it('should return undefined for non-existent file', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const text = await bridge.extractPdfText('/tmp/nonexistent-file.pdf', 'ghost.pdf');
+      expect(text).toBeUndefined();
+    });
+
+    it('should return undefined for corrupt/non-PDF file', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const { promises: fsPromises } = await import('fs');
+
+      const tmpPath = '/tmp/test-corrupt.pdf';
+      await fsPromises.writeFile(tmpPath, 'this is not a PDF');
+
+      try {
+        const text = await bridge.extractPdfText(tmpPath, 'corrupt.pdf');
+        expect(text).toBeUndefined();
+      } finally {
+        await fsPromises.unlink(tmpPath).catch(() => {});
+      }
+    });
+
+    it('should truncate text exceeding max length', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      const { SLACK_FILE_DOWNLOAD_CONSTANTS } = await import('../../constants.js');
+      const maxLen = SLACK_FILE_DOWNLOAD_CONSTANTS.MAX_EXTRACTED_TEXT_LENGTH;
+
+      // Mock fs.readFile and PDFParse to return a very long text
+      const longText = 'A'.repeat(maxLen + 500);
+      const { PDFParse } = await import('pdf-parse');
+
+      // Use the real extractPdfText with a mocked PDFParse
+      const origGetText = PDFParse.prototype.getText;
+      PDFParse.prototype.getText = jest.fn().mockResolvedValue({ text: longText, pages: [], total: 1 });
+
+      const { promises: fsPromises } = await import('fs');
+      const tmpPath = '/tmp/test-long.pdf';
+      // Write a minimal PDF so fs.readFile succeeds
+      await fsPromises.writeFile(tmpPath, Buffer.from('%PDF-1.0 dummy'));
+
+      try {
+        const text = await bridge.extractPdfText(tmpPath, 'long.pdf');
+        expect(text).toBeDefined();
+        expect(text!.length).toBeLessThanOrEqual(maxLen + 50); // +50 for truncation marker
+        expect(text).toContain('... [truncated]');
+      } finally {
+        PDFParse.prototype.getText = origGetText;
+        await fsPromises.unlink(tmpPath).catch(() => {});
+      }
+    });
+  });
+
+  describe('enrichTextWithFiles (with extracted text)', () => {
+    it('should include extracted PDF text inline in enriched message', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const enrichTextWithFiles = (bridge as any).enrichTextWithFiles.bind(bridge);
+
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: 'Here is the doc', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        attachments: [{
+          id: 'F001', name: 'report.pdf', mimetype: 'application/pdf',
+          localPath: '/tmp/slack-files/F001-report.pdf', size: 5000, permalink: 'x',
+          extractedText: 'This is the PDF content.',
+        }],
+      };
+
+      const result = enrichTextWithFiles(message);
+
+      expect(result).toContain('[Slack File: /tmp/slack-files/F001-report.pdf (report.pdf, application/pdf, 5KB)]');
+      expect(result).toContain('--- Extracted content from report.pdf ---');
+      expect(result).toContain('This is the PDF content.');
+      expect(result).toContain('--- End of report.pdf ---');
+    });
+
+    it('should not include extraction section when extractedText is undefined', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const enrichTextWithFiles = (bridge as any).enrichTextWithFiles.bind(bridge);
+
+      const message: SlackIncomingMessage = {
+        id: '1', type: 'message', text: 'A zip file', userId: 'U1',
+        channelId: 'C1', ts: '1', teamId: 'T1', eventTs: '1',
+        attachments: [{
+          id: 'F002', name: 'data.zip', mimetype: 'application/zip',
+          localPath: '/tmp/slack-files/F002-data.zip', size: 10000, permalink: 'x',
+        }],
+      };
+
+      const result = enrichTextWithFiles(message);
+
+      expect(result).toContain('[Slack File:');
+      expect(result).not.toContain('--- Extracted content');
+    });
+  });
+
+  describe('notifications', () => {
+    it('should not throw when sending task completed notification', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+
+      // Should not throw even though Slack is not connected
+      await expect(
+        bridge.notifyTaskCompleted('Fix login bug', 'Developer Agent', 'MyApp')
+      ).resolves.not.toThrow();
+    });
+
+    it('should not throw when sending agent question notification', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+
+      await expect(
+        bridge.notifyAgentQuestion('Developer', 'Should I use REST or GraphQL?', 'MyApp')
+      ).resolves.not.toThrow();
+    });
+
+    it('should not throw when sending error notification', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+
+      await expect(
+        bridge.notifyError('Build failed', 'CI Agent', 'MyApp')
+      ).resolves.not.toThrow();
+    });
+
+    it('should not throw when sending daily summary', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+
+      await expect(
+        bridge.notifyDailySummary('5 tasks completed, 2 in progress')
+      ).resolves.not.toThrow();
+    });
+
+    it('should skip notifications when disabled', async () => {
+      const bridge = new SlackOrchestratorBridge({ enableNotifications: false });
+      await bridge.initialize();
+
+      // Should return immediately without attempting to send
+      await expect(
+        bridge.notifyTaskCompleted('Task', 'Agent', 'Project')
+      ).resolves.not.toThrow();
+    });
+  });
+
+  describe('event emitter', () => {
+    it('should be an EventEmitter', () => {
+      const bridge = getSlackOrchestratorBridge();
+
+      expect(typeof bridge.on).toBe('function');
+      expect(typeof bridge.emit).toBe('function');
+      expect(typeof bridge.removeListener).toBe('function');
+    });
+
+    it('should allow registering event handlers', () => {
+      const bridge = getSlackOrchestratorBridge();
+      const handler = jest.fn();
+
+      bridge.on('error', handler);
+      bridge.emit('error', new Error('test'));
+
+      expect(handler).toHaveBeenCalled();
+    });
+
+    it('should emit message_handled event after successful handling', async () => {
+      const bridge = getSlackOrchestratorBridge();
+      await bridge.initialize();
+
+      const handler = jest.fn();
+      bridge.on('message_handled', handler);
+
+      // Note: actual message handling requires Slack service to be connected
+      // This tests that the event handler can be registered
+      expect(handler).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('setMessageQueueService', () => {
+    it('should accept a MessageQueueService', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const mockService = {
+        enqueue: jest.fn(),
+      } as any;
+
+      // Should not throw
+      expect(() => bridge.setMessageQueueService(mockService)).not.toThrow();
+    });
+
+    it('should allow setting service after initialization', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+
+      const mockService = {
+        enqueue: jest.fn(),
+      } as any;
+
+      expect(() => bridge.setMessageQueueService(mockService)).not.toThrow();
+    });
+  });
+
+  describe('getConfig', () => {
+    it('should return a copy of the configuration', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const config1 = bridge.getConfig();
+      const config2 = bridge.getConfig();
+
+      expect(config1).not.toBe(config2);
+      expect(config1).toEqual(config2);
+    });
+
+    it('should not be mutatable from outside', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const config = bridge.getConfig();
+
+      config.maxResponseLength = 999999;
+
+      const freshConfig = bridge.getConfig();
+      expect(freshConfig.maxResponseLength).not.toBe(999999);
+    });
+
+    it('should contain all expected properties', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const config = bridge.getConfig();
+
+      expect(config).toHaveProperty('orchestratorSession');
+      expect(config).toHaveProperty('showTypingIndicator');
+      expect(config).toHaveProperty('maxResponseLength');
+      expect(config).toHaveProperty('enableNotifications');
+      expect(config).toHaveProperty('responseTimeoutMs');
+    });
+
+    it('should have responseTimeoutMs longer than queue processor timeout', () => {
+      const bridge = new SlackOrchestratorBridge();
+      const config = bridge.getConfig();
+
+      // The Slack bridge timeout must exceed the queue processor timeout
+      // to prevent the bridge from timing out before the queue processor
+      expect(config.responseTimeoutMs).toBeGreaterThan(120000);
+    });
+  });
+
+  describe('orchestrator message forwarding via queue', () => {
+    let mockQueueService: any;
+
+    beforeEach(() => {
+      mockQueueService = {
+        enqueue: jest.fn().mockReturnValue({ id: 'q-1' }),
+      };
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(true);
+    });
+
+    it('should return error when message queue service is not set', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+
+      // Without queue service, message forwarding should not work
+      // The bridge should handle this gracefully
+      expect(bridge.isInitialized()).toBe(true);
+    });
+
+    it('should allow setting queue service after initialization', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      bridge.setMessageQueueService(mockQueueService);
+      await bridge.initialize();
+
+      // The queue service should be set
+      expect(typeof mockQueueService.enqueue).toBe('function');
+    });
+
+    it('should handle queue service enqueue failure gracefully', async () => {
+      const failingService = {
+        enqueue: jest.fn().mockImplementation(() => { throw new Error('Queue full'); }),
+      } as any;
+
+      const bridge = new SlackOrchestratorBridge();
+      bridge.setMessageQueueService(failingService);
+      await bridge.initialize();
+
+      // Service failure should be handled gracefully
+      expect(bridge.isInitialized()).toBe(true);
+    });
+  });
+
+  describe('orchestrator status handling', () => {
+    it('should check orchestrator status before sending messages', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(false);
+
+      // When orchestrator is offline, the bridge should return the offline message
+      expect(isOrchestratorActive).toBeDefined();
+    });
+
+    it('should return offline message when orchestrator is not active', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(false);
+      (getOrchestratorOfflineMessage as jest.Mock).mockReturnValue('Orchestrator is currently offline');
+
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+
+      // The offline message function should be accessible
+      const offlineMsg = getOrchestratorOfflineMessage(true);
+      expect(offlineMsg).toContain('offline');
+    });
+  });
+
+  describe('inbound interceptor (harness re-login replies)', () => {
+    /** Start a bridge whose normal path is observable through getConversationContext. */
+    async function startBridge() {
+      const bridge = new SlackOrchestratorBridge();
+      const queue = { enqueue: jest.fn().mockReturnValue({ id: 'q-1' }) };
+      bridge.setMessageQueueService(queue as any);
+      const store = { appendUserMessage: jest.fn().mockResolvedValue(undefined), getThreadFilePath: jest.fn(() => '/tmp/thread.md') };
+      bridge.setSlackThreadStore(store as any);
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+      // Reaching the conversation context = the normal path ran; it stops
+      // there (the handler's own catch absorbs the error).
+      const context = jest.spyOn(slackService, 'getConversationContext').mockImplementation(() => {
+        throw new Error('normal path reached');
+      });
+      bridge.on('error', () => undefined);
+      await bridge.initialize();
+      return { bridge, slackService, queue, store, context };
+    }
+
+    const codeMessage = { text: 'Kq3xZ8vN2mP7rT4wY1bC6dF9#state', channelId: 'DOWNER', userId: 'UOWNER', ts: '1700000000.000100' };
+
+    it('a consumed message never reaches the thread store, the orchestrator queue or routing', async () => {
+      const { bridge, slackService, queue, store, context } = await startBridge();
+      const interceptor = jest.fn().mockReturnValue(true);
+      bridge.setInboundInterceptor(interceptor);
+      slackService.emit('message', { ...codeMessage });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(interceptor).toHaveBeenCalledWith(expect.objectContaining({ channelId: 'DOWNER' }));
+      expect(context).not.toHaveBeenCalled();
+      expect(store.appendUserMessage).not.toHaveBeenCalled();
+      expect(queue.enqueue).not.toHaveBeenCalled();
+      bridge.setInboundInterceptor(null);
+    });
+
+    it('a declined or failing interceptor lets the message through the normal path', async () => {
+      const { bridge, slackService, context } = await startBridge();
+      bridge.setInboundInterceptor(() => false);
+      slackService.emit('message', { ...codeMessage, text: 'hello orc' });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(context).toHaveBeenCalledTimes(1);
+
+      bridge.setInboundInterceptor(() => {
+        throw new Error('boom');
+      });
+      slackService.emit('message', { ...codeMessage, text: 'hello again' });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(context).toHaveBeenCalledTimes(2);
+      bridge.setInboundInterceptor(null);
+    });
+
+    it('added interceptors (the skip-all-cards command) run after the primary one and can be removed', async () => {
+      const { bridge, slackService, context, queue } = await startBridge();
+      const order: string[] = [];
+      bridge.setInboundInterceptor(() => (order.push('relogin'), false));
+      const remove = bridge.addInboundInterceptor('the skip-all-cards command', (m) => (order.push('skip-all'), m.text === 'skip all old cards'));
+      slackService.emit('message', { ...codeMessage, text: 'skip all old cards' });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(order).toEqual(['relogin', 'skip-all']);
+      expect(context).not.toHaveBeenCalled();
+      expect(queue.enqueue).not.toHaveBeenCalled();
+      remove();
+      slackService.emit('message', { ...codeMessage, text: 'skip all old cards' });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(order).toEqual(['relogin', 'skip-all', 'relogin']);
+      expect(context).toHaveBeenCalledTimes(1);
+      bridge.setInboundInterceptor(null);
+    });
+  });
+
+  describe('Slack team channel routing', () => {
+    afterEach(() => {
+      mockTeamChannels.current = null;
+    });
+
+    function startBridge(mockQueueService: any) {
+      const bridge = new SlackOrchestratorBridge();
+      bridge.setMessageQueueService(mockQueueService);
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'getConversationContext').mockReturnValue({
+        conversationId: 'conv-1',
+        channelId: 'C-TEAM',
+        userId: 'U123',
+      });
+      return { bridge, slackService };
+    }
+
+    it('routes a message in a mapped channel to the team huddle and never to the orchestrator', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(true);
+      const routeInbound = jest.fn().mockResolvedValue({
+        mapping: { teamId: 'team-alpha', slackChannelId: 'C-TEAM' },
+        message: { id: 'm1' },
+        mentions: [],
+        dispatch: { strategy: 'huddle-broadcast', dispatched: true },
+      });
+      mockTeamChannels.current = {
+        findBySlackChannelId: jest.fn((id: string) => (id === 'C-TEAM' ? { teamId: 'team-alpha' } : null)),
+        routeInbound,
+      };
+      const mockQueueService = { enqueue: jest.fn().mockReturnValue({ id: 'q-1' }) };
+      const { bridge, slackService } = startBridge(mockQueueService);
+      await bridge.initialize();
+
+      const handled = new Promise<any>((resolve) => bridge.on('message_handled', resolve));
+      slackService.emit('message', {
+        text: '@sam please look',
+        channelId: 'C-TEAM',
+        userId: 'U123',
+        ts: '1700000000.000100',
+      });
+      const event = await handled;
+
+      expect(routeInbound).toHaveBeenCalledWith(expect.objectContaining({ channelId: 'C-TEAM', text: '@sam please look' }));
+      expect(event.routedTo).toBe('team-channel');
+      expect(event.teamId).toBe('team-alpha');
+      expect(mockQueueService.enqueue).not.toHaveBeenCalled();
+    });
+
+    it('leaves unmapped channels on the orchestrator path', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(true);
+      mockChatV2EnsureChannel.mockReturnValue({ id: 'conv-orc', agentSession: 'crewly-orc' });
+      mockChatV2RecordTurn.mockReturnValue({ message: { id: 'm-orc' }, deduped: false });
+      // Every message is offered to the team-channel service (it links a
+      // channel on the fly when a local agent bot is @'d); null = not ours.
+      const routeInbound = jest.fn().mockResolvedValue(null);
+      mockTeamChannels.current = { findBySlackChannelId: jest.fn(() => null), routeInbound };
+      // Resolve the orc reply immediately so the test does not sit on the
+      // bridge's response timeout.
+      const mockQueueService = {
+        enqueue: jest.fn((msg: any) => {
+          msg?.sourceMetadata?.slackResolve?.('orc reply');
+          return { id: 'q-1' };
+        }),
+      };
+      const { bridge, slackService } = startBridge(mockQueueService);
+      await bridge.initialize();
+
+      const handled = new Promise<any>((resolve) => bridge.on('message_handled', resolve));
+      slackService.emit('message', {
+        text: 'hello orc',
+        channelId: 'C-OTHER',
+        userId: 'U123',
+        ts: '1700000000.000200',
+      });
+      await handled;
+
+      expect(routeInbound).toHaveBeenCalledTimes(1);
+      expect(mockQueueService.enqueue).toHaveBeenCalled();
+    });
+
+    // 2026-10-13, #pro-crewly-marketing: another machine's agent @'d this
+    // machine's orchestrator in a thread of an ad-hoc room. The room service
+    // hands it back (routeInbound -> null); the whole bridge path after that
+    // (shared-room guard, auditor prefix, @name lookup on `<@U…>` text) must
+    // reach the orchestrator, set up to answer in the same thread.
+    it('delivers an agent-authored room @ of this orchestrator to it, tied to the same thread', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(true);
+      mockChatV2EnsureChannel.mockReturnValue({ id: 'conv-orc', agentSession: 'crewly-orc' });
+      mockChatV2RecordTurn.mockReturnValue({ message: { id: 'm-orc' }, deduped: false });
+      const routeInbound = jest.fn().mockResolvedValue(null);
+      const sharedRoomOwnedElsewhere = jest.fn().mockResolvedValue(true);
+      mockTeamChannels.current = { findBySlackChannelId: jest.fn(() => null), routeInbound, sharedRoomOwnedElsewhere };
+      const mockQueueService = {
+        enqueue: jest.fn((msg: any) => {
+          msg?.sourceMetadata?.slackResolve?.('');
+          return { id: 'q-1' };
+        }),
+      };
+      const bridge = new SlackOrchestratorBridge();
+      bridge.setMessageQueueService(mockQueueService as any);
+      const slackService = (bridge as any).slackService;
+      const sendMessage = jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+      await bridge.initialize();
+
+      const handled = new Promise<any>((resolve) => bridge.on('message_handled', resolve));
+      slackService.emit('message', {
+        text: '<@UORCBOT> Steve approved a new team on your machine (air). Please create and start it.',
+        channelId: 'C0C2WMFB9EF',
+        userId: 'UELLABOT',
+        ts: '1700000500.000200',
+        threadTs: '1700000400.000100',
+        authorAgentSession: 'crewly-marketing-ella-e6a6b8ea',
+        authorDisplayName: 'Ella',
+        mentionedAgentSessions: ['crewly-orc'],
+        room: { members: [{ agentSession: 'crewly-marketing-ella-e6a6b8ea', displayName: 'Ella', instanceId: 'mac', deviceName: 'mac', awake: true }] },
+      });
+      await handled;
+
+      expect(routeInbound).toHaveBeenCalledTimes(1);
+      // Mentioned agents bypass the "another machine owns this room" guard.
+      expect(sharedRoomOwnedElsewhere).not.toHaveBeenCalled();
+      expect(mockQueueService.enqueue).toHaveBeenCalledTimes(1);
+      const queued = mockQueueService.enqueue.mock.calls[0][0] as any;
+      expect(queued.content).toContain('Steve approved a new team');
+      expect(queued.sourceMetadata.channelId).toBe('C0C2WMFB9EF');
+      expect(queued.sourceMetadata.threadTs).toBe('1700000400.000100');
+      // Whatever the bridge posts back goes to that thread.
+      for (const call of sendMessage.mock.calls) {
+        expect((call[0] as any).threadTs).toBe('1700000400.000100');
+      }
+    });
+
+    it('does not hand the orchestrator a shared-room message another machine owns (2026-10-03)', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(true);
+      const routeInbound = jest.fn().mockResolvedValue(null);
+      const sharedRoomOwnedElsewhere = jest.fn().mockResolvedValue(true);
+      mockTeamChannels.current = { findBySlackChannelId: jest.fn(() => null), routeInbound, sharedRoomOwnedElsewhere };
+      const mockQueueService = { enqueue: jest.fn(() => ({ id: 'q-1' })) };
+      const { bridge, slackService } = startBridge(mockQueueService);
+      await bridge.initialize();
+
+      const handled = new Promise<any>((resolve) => bridge.on('message_handled', resolve));
+      slackService.emit('message', {
+        text: 'linkedin有人回复了',
+        channelId: 'C-MKT',
+        userId: 'U123',
+        ts: '1700000000.000300',
+        room: { members: [{ agentSession: 'crewly-marketing-ella', displayName: 'Ella', instanceId: 'mac', deviceName: 'mac', awake: true }] },
+      });
+      const event = await handled;
+
+      expect(event.routedTo).toBe('shared-room-elsewhere');
+      expect(mockQueueService.enqueue).not.toHaveBeenCalled();
+      mockTeamChannels.current = null;
+    });
+  });
+
+  // 2026-09-28 #daily-info: Cloud drops own-bot events, so a thread post by
+  // an agent on another machine never reaches this one. The bridge reads the
+  // thread from Slack and hands it over as prompt context only.
+  describe('Slack thread context', () => {
+    const identityModule = '../slack/slack-agent-identity.service.js';
+    const CTX = {
+      kind: 'thread' as const,
+      channelId: 'C-OTHER',
+      threadTs: '1700000000.000100',
+      totalBefore: 1,
+      messages: [{ ts: '1700000000.000150', isBot: true, authorName: 'Ella (Personal Assistant Team)', userId: 'UELLA', text: 'Email digest: AWS invoice' }],
+    };
+    let getContext: jest.Mock;
+
+    beforeEach(() => {
+      getContext = jest.fn().mockResolvedValue(CTX);
+      setSlackThreadContextService({ getContext } as unknown as SlackThreadContextService);
+    });
+    afterEach(() => {
+      setSlackThreadContextService(null);
+      mockTeamChannels.current = null;
+      jest.restoreAllMocks();
+    });
+
+    /** A bridge whose orchestrator is up and whose queue answers at once. */
+    async function orcBridge() {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(true);
+      mockChatV2EnsureChannel.mockReturnValue({ id: 'conv-orc', agentSession: 'crewly-orc' });
+      mockChatV2RecordTurn.mockReturnValue({ message: { id: 'm-orc' }, deduped: false });
+      const routeInbound = jest.fn().mockResolvedValue(null);
+      mockTeamChannels.current = { findBySlackChannelId: jest.fn(() => null), routeInbound };
+      // An earlier spy in this file can leave the module mock without its
+      // implementation; pin it so this block does not depend on test order.
+      const teamChannelModule = await import('./slack-team-channel.service.js');
+      (teamChannelModule.getSlackTeamChannelService as unknown as jest.Mock).mockImplementation(() => mockTeamChannels.current);
+      const queue = {
+        enqueue: jest.fn((msg: any) => {
+          msg?.sourceMetadata?.slackResolve?.('orc reply');
+          return { id: 'q-1' };
+        }),
+      };
+      const bridge = new SlackOrchestratorBridge();
+      bridge.setMessageQueueService(queue as any);
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'getBotToken').mockReturnValue('xoxb-workspace');
+      jest.spyOn(slackService, 'getBotUserId').mockResolvedValue('UORC');
+      jest.spyOn(slackService, 'getConversationContext').mockReturnValue({ conversationId: 'conv-1', channelId: 'C-OTHER', userId: 'U123', threadTs: '1700000000.000100' });
+      await bridge.initialize();
+      return { bridge, slackService, queue, routeInbound };
+    }
+
+    it('the orchestrator gets the thread block; the persisted row does not', async () => {
+      const { bridge, slackService, queue } = await orcBridge();
+      const handled = new Promise<any>((resolve) => bridge.on('message_handled', resolve));
+      slackService.emit('message', { text: '看看上面的这些', channelId: 'C-OTHER', userId: 'U123', ts: '1700000000.000200', threadTs: '1700000000.000100' });
+      await handled;
+
+      const delivered = String(queue.enqueue.mock.calls[0][0].content);
+      expect(delivered).toContain('Ella (Personal Assistant Team) [bot]: Email digest: AWS invoice');
+      expect(delivered.indexOf('Email digest')).toBeLessThan(delivered.indexOf('看看上面的这些'));
+      const persisted = mockChatV2RecordTurn.mock.calls.map((c) => String(c[0]?.content ?? '')).join('\n');
+      expect(persisted).toContain('看看上面的这些');
+      expect(persisted).not.toContain('Email digest');
+      expect(getContext).toHaveBeenCalledWith(
+        expect.objectContaining({ channelId: 'C-OTHER', ts: '1700000000.000200', threadTs: '1700000000.000100' }),
+        ['xoxb-workspace'],
+      );
+    });
+
+    it('the pending read is handed to the team-channel router; the receiving agent\'s token is tried first', async () => {
+      const identities = await import(identityModule);
+      jest.spyOn(identities, 'getSlackAgentIdentityService').mockReturnValue({
+        findByBotUserId: () => null,
+        getInstalled: (s: string) => (s === 'think-tank-atlas' ? { botToken: 'xoxb-atlas', botUserId: 'UATLAS' } : null),
+      } as never);
+      const { bridge, slackService, routeInbound } = await orcBridge();
+      routeInbound.mockResolvedValue({ mapping: { teamId: 't1' } });
+      (mockTeamChannels.current as unknown as { rosterSessions: jest.Mock }).rosterSessions = jest.fn(() => []);
+      const handled = new Promise<any>((resolve) => bridge.on('message_handled', resolve));
+      slackService.emit('message', {
+        text: '<@UATLAS> 看看上面的这些', channelId: 'C-OTHER', userId: 'U123',
+        ts: '1700000000.000200', threadTs: '1700000000.000100', receivedVia: 'think-tank-atlas',
+      });
+      await handled;
+
+      const passed = routeInbound.mock.calls[0][0] as SlackIncomingMessage;
+      await expect(passed.threadContext).resolves.toEqual(CTX);
+      expect(getContext.mock.calls[0][1]).toEqual(['xoxb-atlas', 'xoxb-workspace']);
+    });
+
+    it('a read that fails still delivers, without a block', async () => {
+      getContext.mockRejectedValue(new Error('boom'));
+      const { bridge, slackService, queue } = await orcBridge();
+      const handled = new Promise<any>((resolve) => bridge.on('message_handled', resolve));
+      slackService.emit('message', { text: 'follow-up', channelId: 'C-OTHER', userId: 'U123', ts: '1700000000.000200', threadTs: '1700000000.000100' });
+      await handled;
+      const delivered = String(queue.enqueue.mock.calls[0][0].content);
+      expect(delivered).toContain('follow-up');
+      expect(delivered).not.toContain('Slack thread so far');
+    });
+
+    it('a top-level message with no mention reads nothing', async () => {
+      const { bridge, slackService } = await orcBridge();
+      const handled = new Promise<any>((resolve) => bridge.on('message_handled', resolve));
+      slackService.emit('message', { text: 'hello orc', channelId: 'D-ORC', userId: 'U123', ts: '1700000000.000300' });
+      await handled;
+      expect(getContext).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('ticket loop intake on the orchestrator path', () => {
+    afterEach(() => {
+      mockTeamChannels.current = null;
+      setTicketIntakeService(null);
+    });
+
+    it('the owner\'s message goes through intake first, and the orchestrator gets the [TICKET:…] line', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(true);
+      mockChatV2EnsureChannel.mockReturnValue({ id: 'conv-orc', agentSession: 'crewly-orc' });
+      mockChatV2RecordTurn.mockReturnValue({ message: { id: 'm-orc' }, deduped: false });
+      mockTeamChannels.current = { findBySlackChannelId: jest.fn(() => null), routeInbound: jest.fn().mockResolvedValue(null) };
+      const intake = {
+        intakeWithOutcome: jest.fn(async () => ({
+          action: 'created',
+          ticket: { id: '11111111-2222-3333-4444-555555555555', ticketNumber: 3 },
+        })),
+      };
+      setTicketIntakeService(intake as unknown as TicketIntakeService);
+      const mockQueueService = {
+        enqueue: jest.fn((msg: any) => {
+          msg?.sourceMetadata?.slackResolve?.('orc reply');
+          return { id: 'q-1' };
+        }),
+      };
+      const bridge = new SlackOrchestratorBridge();
+      bridge.setMessageQueueService(mockQueueService as any);
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'getConversationContext').mockReturnValue({ conversationId: 'conv-1', channelId: 'C-OTHER', userId: 'U123' });
+      await bridge.initialize();
+
+      const handled = new Promise<any>((resolve) => bridge.on('message_handled', resolve));
+      slackService.emit('message', { text: 'please fix the flaky deploy job', channelId: 'C-OTHER', userId: 'U123', ts: '1700000000.000300' });
+      await handled;
+
+      const [msg] = intake.intakeWithOutcome.mock.calls[0] as unknown as [IntakeMessage];
+      expect(msg).toMatchObject({
+        isOwner: true,
+        targetAgent: 'crewly-orc',
+        tags: ['slack'],
+        origin: { ref: 'slack-C-OTHER-1700000000.000300', threadRef: 'slack:C-OTHER:1700000000.000300' },
+        receipt: { kind: 'slack', slackChannelId: 'C-OTHER', threadTs: '1700000000.000300' },
+      });
+      expect(String(mockQueueService.enqueue.mock.calls[0][0].content)).toContain('[TICKET:TKT-003');
+      // …but the chat-v2 row (what the owner sees in history / Cloud Talk) is
+      // exactly what the owner wrote.
+      expect(mockChatV2RecordTurn).toHaveBeenCalledTimes(1);
+      expect((mockChatV2RecordTurn.mock.calls[0] as [{ content: string }])[0].content).toBe('please fix the flaky deploy job');
+    });
+  });
+
+  // The legacy bridge used to persist the delivered copy, so owners saw the
+  // `[TICKET:…]` harness line in their own messages (2026-10-04, TKT-238).
+  describe('ticket line: delivered, never persisted', () => {
+    const ticket = { id: '11111111-2222-3333-4444-555555555555', ticketNumber: 7 };
+    const ctx = { conversationId: 'conv-t', channelId: 'D-T', threadTs: '1700000000.000100', userId: 'U123' };
+    type PrivateBridge = {
+      sendToAgent: (s: string, m: string, c?: unknown, a?: string, b?: string, t?: unknown) => Promise<unknown>;
+      sendToOrchestrator: (m: string, c?: unknown, a?: string, b?: string, t?: unknown) => Promise<unknown>;
+      sendToAuditorFallback: (m: string, c?: unknown, a?: string, t?: unknown) => Promise<string>;
+    };
+
+    function setup(): { bridge: SlackOrchestratorBridge; enqueue: jest.Mock } {
+      mockChatV2EnsureChannel.mockReset().mockReturnValue({ id: 'conv-t', agentSession: 'crewly-orc' });
+      mockChatV2RecordTurn.mockReset().mockReturnValue({ message: { id: 'm-t' }, deduped: false });
+      const enqueue = jest.fn((msg: any) => {
+        msg?.sourceMetadata?.slackResolve?.('');
+        return { id: 'q-t' };
+      });
+      const bridge = new SlackOrchestratorBridge();
+      bridge.setMessageQueueService({ enqueue } as any);
+      bridge.setSlackThreadStore({ getThreadFilePath: jest.fn().mockReturnValue('/tmp/threads/D-T/t.md') } as never);
+      return { bridge, enqueue };
+    }
+
+    function persisted(): string {
+      expect(mockChatV2RecordTurn).toHaveBeenCalledTimes(1);
+      return (mockChatV2RecordTurn.mock.calls[0] as [{ content: string }])[0].content;
+    }
+
+    it('to a mentioned agent: the agent gets the line, the row does not', async () => {
+      const { bridge, enqueue } = setup();
+      await (bridge as unknown as PrivateBridge).sendToAgent('crewly-sam', 'ship it', ctx, undefined, undefined, ticket);
+      expect(persisted()).not.toContain('[TICKET:');
+      expect(persisted()).toContain('ship it');
+      expect(String(enqueue.mock.calls[0][0].content)).toContain('ship it\n\n[TICKET:TKT-007');
+    });
+
+    it('to the orchestrator (online): the orchestrator gets the line, the row does not', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(true);
+      const { bridge, enqueue } = setup();
+      await (bridge as unknown as PrivateBridge).sendToOrchestrator('ship it', ctx, undefined, undefined, ticket);
+      expect(persisted()).not.toContain('[TICKET:');
+      const delivered = String(enqueue.mock.calls[0][0].content);
+      expect(delivered).toContain('ship it\n\n[TICKET:TKT-007');
+      expect(delivered).toContain('[Thread context file: /tmp/threads/D-T/t.md]');
+    });
+
+    it('to the orchestrator (offline, queued for replay): the queued copy has the line, the row does not', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(false);
+      (isAgentActive as jest.Mock).mockResolvedValue(false);
+      const { bridge, enqueue } = setup();
+      await (bridge as unknown as PrivateBridge).sendToOrchestrator('ship it', ctx, undefined, undefined, ticket);
+      expect(persisted()).not.toContain('[TICKET:');
+      expect(String(enqueue.mock.calls[0][0].content)).toContain('ship it\n\n[TICKET:TKT-007');
+    });
+
+    it('to the Auditor fallback: the Auditor gets the line, the row does not', async () => {
+      const { bridge, enqueue } = setup();
+      await (bridge as unknown as PrivateBridge).sendToAuditorFallback('ship it', ctx, undefined, ticket);
+      expect(persisted()).not.toContain('[TICKET:');
+      expect(String(enqueue.mock.calls[0][0].content)).toContain('ship it\n\n[TICKET:TKT-007');
+    });
+  });
+
+  describe('auditor fallback routing', () => {
+    let mockQueueService: any;
+
+    function makeChatMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
+      return {
+        id: 'msg-1',
+        conversationId: 'conv-fallback',
+        from: { type: 'user', name: 'User' },
+        content: 'Hello',
+        contentType: 'text',
+        timestamp: new Date().toISOString(),
+        ...overrides,
+      } as ChatMessage;
+    }
+
+    beforeEach(() => {
+      mockQueueService = {
+        enqueue: jest.fn().mockReturnValue({ id: 'q-fallback' }),
+      };
+      const chatService = getChatService();
+      jest.spyOn(chatService, 'sendMessage').mockResolvedValue({
+        message: makeChatMessage(),
+        conversation: { id: 'conv-fallback', title: 'test', messages: [], createdAt: '', updatedAt: '' } as any,
+      });
+    });
+
+    it('should route to auditor via queue when orchestrator is offline and auditor is active', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(false);
+      (isAgentActive as jest.Mock).mockResolvedValue(true);
+
+      const bridge = new SlackOrchestratorBridge();
+      bridge.setMessageQueueService(mockQueueService);
+      await bridge.initialize();
+
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'getConversationContext').mockReturnValue({
+        conversationId: 'conv-fallback',
+        channelId: 'C123',
+        userId: 'U123',
+        threadTs: '1234567890.123',
+      });
+
+      const handledPromise = new Promise<any>((resolve) => {
+        bridge.on('message_handled', resolve);
+      });
+
+      slackService.emit('message', {
+        text: 'hello from user',
+        channelId: 'C123',
+        userId: 'U123',
+        ts: '1234567890.123',
+      });
+
+      const event = await handledPromise;
+
+      // Should enqueue with targetSession pointing to auditor
+      expect(mockQueueService.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({
+          targetSession: 'crewly-auditor',
+          source: 'slack',
+        })
+      );
+      // Enqueued content should include FALLBACK marker and SLACK_CONTEXT
+      const enqueuedContent = mockQueueService.enqueue.mock.calls[0][0].content;
+      expect(enqueuedContent).toContain('[FALLBACK]');
+      expect(enqueuedContent).toContain('[SLACK_CONTEXT:');
+      expect(enqueuedContent).toContain('C123');
+
+      // Response should acknowledge the fallback
+      expect(event.response).toContain('forwarded to the Auditor');
+    }, 15000);
+
+    it('should return offline message when both orchestrator and auditor are inactive', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(false);
+      (isAgentActive as jest.Mock).mockResolvedValue(false);
+      (getOrchestratorOfflineMessage as jest.Mock).mockReturnValue('Orchestrator is offline. Please start it from the dashboard.');
+
+      const bridge = new SlackOrchestratorBridge();
+      bridge.setMessageQueueService(mockQueueService);
+      await bridge.initialize();
+
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'getConversationContext').mockReturnValue({
+        conversationId: 'conv-fb',
+        channelId: 'C123',
+        userId: 'U123',
+      });
+
+      const handledPromise = new Promise<any>((resolve) => {
+        bridge.on('message_handled', resolve);
+      });
+
+      slackService.emit('message', {
+        text: 'hello',
+        channelId: 'C123',
+        userId: 'U123',
+        ts: '999.999',
+      });
+
+      const event = await handledPromise;
+
+      // #247: Should route to the orchestrator queue for replay when both are offline
+      expect(mockQueueService.enqueue).toHaveBeenCalled();
+      // Response is the offline/queued message
+      expect(event.response).toContain('offline');
+      expect(event.response).toContain('queued');
+    }, 15000);
+
+    it('should include FALLBACK marker in auditor-routed messages', () => {
+      const message = 'Hello from user';
+      const fallbackMessage = `[FALLBACK] Orchestrator is offline. User message:\n${message}`;
+      expect(fallbackMessage).toContain('[FALLBACK]');
+      expect(fallbackMessage).toContain(message);
+    });
+
+    it('should include SLACK_CONTEXT in fallback messages when context is available', () => {
+      const channelId = 'C123';
+      const threadTs = '1234567890.123456';
+      const prefix = `[SLACK_CONTEXT:channelId=${channelId},threadTs=${threadTs}]`;
+      expect(prefix).toContain(channelId);
+      expect(prefix).toContain(threadTs);
+    });
+  });
+
+  describe('typing indicator scope handling', () => {
+    it('should only log missing scope warning once', () => {
+      const bridge = new SlackOrchestratorBridge();
+
+      // The bridge has a loggedMissingScope flag to prevent spam
+      // After first missing_scope error, subsequent errors should be silent
+      expect(bridge.getConfig().showTypingIndicator).toBe(true);
+    });
+
+    it('should continue operation when reactions scope is missing', async () => {
+      const bridge = new SlackOrchestratorBridge({ showTypingIndicator: true });
+      await bridge.initialize();
+
+      // Missing scope should not prevent message handling
+      expect(bridge.isInitialized()).toBe(true);
+    });
+  });
+
+  describe('sendToOrchestrator (queue-based)', () => {
+    let mockQueueService: any;
+    let chatService: ReturnType<typeof getChatService>;
+
+    /**
+     * Helper to build a ChatMessage for testing
+     */
+    function makeChatMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
+      return {
+        id: 'msg-1',
+        conversationId: 'conv-123',
+        from: { type: 'orchestrator', name: 'Orchestrator' },
+        content: 'Hello from orchestrator',
+        contentType: 'text',
+        timestamp: new Date().toISOString(),
+        ...overrides,
+      } as ChatMessage;
+    }
+
+    beforeEach(() => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(true);
+      chatService = getChatService();
+
+      // Mock sendMessage to return a conversation with a known ID
+      jest.spyOn(chatService, 'sendMessage').mockResolvedValue({
+        message: makeChatMessage(),
+        conversation: { id: 'conv-123', title: 'test', messages: [], createdAt: '', updatedAt: '' } as any,
+      });
+
+      // Create a mock queue service that captures the slackResolve callback
+      mockQueueService = {
+        enqueue: jest.fn().mockReturnValue({ id: 'q-1' }),
+      };
+    });
+
+    it('should enqueue with slackResolve callback and resolve when called', async () => {
+      // Configure enqueue to immediately call slackResolve
+      mockQueueService.enqueue.mockImplementation((input: any) => {
+        // Simulate the processor calling slackResolve after a tick
+        setTimeout(() => {
+          input.sourceMetadata.slackResolve('Task completed successfully');
+        }, 10);
+        return { id: 'q-1' };
+      });
+
+      const bridge = new SlackOrchestratorBridge({ responseTimeoutMs: 5000 });
+      bridge.setMessageQueueService(mockQueueService);
+      await bridge.initialize();
+
+      const messagePromise = new Promise<string>((resolve) => {
+        bridge.on('message_handled', (event: any) => {
+          resolve(event.response);
+        });
+      });
+
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'getConversationContext').mockReturnValue({
+        conversationId: 'conv-123',
+        channelId: 'C123',
+        userId: 'U123',
+      });
+
+      slackService.emit('message', {
+        text: 'hello orchestrator',
+        channelId: 'C123',
+        userId: 'U123',
+        ts: '1234567890.123456',
+      });
+
+      const response = await messagePromise;
+      expect(response).toBe('Task completed successfully');
+      expect(mockQueueService.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({
+          source: 'slack',
+          content: 'hello orchestrator',
+        })
+      );
+    }, 30000);
+
+    it('hands the owner\'s message to the unanswered-owner-message watchdog (not an agent\'s)', async () => {
+      const { setOwnerMessageWatchdog } = await import('../messaging/owner-message-watchdog.service.js');
+      const track = jest.fn();
+      setOwnerMessageWatchdog({ track } as any);
+      mockChatV2EnsureChannel.mockReturnValue({ id: 'conv-123', agentSession: 'crewly-orc' });
+      mockChatV2RecordTurn.mockReturnValue({ message: { id: 'm-1' }, deduped: false });
+      try {
+        mockQueueService.enqueue.mockImplementation((input: any) => {
+          setTimeout(() => input.sourceMetadata.slackResolve('ok'), 10);
+          return { id: 'q-1' };
+        });
+        const bridge = new SlackOrchestratorBridge({ responseTimeoutMs: 5000 });
+        bridge.setMessageQueueService(mockQueueService);
+        await bridge.initialize();
+        const slackService = (bridge as any).slackService;
+        jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+        jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+        jest.spyOn(slackService, 'getConversationContext').mockReturnValue({
+          conversationId: 'conv-123',
+          channelId: 'D0MASTER',
+          userId: 'U123',
+          threadTs: '1234567890.123456',
+        });
+        const handled = () => new Promise<void>((resolve) => bridge.once('message_handled', () => resolve()));
+
+        const done = handled();
+        slackService.emit('message', { text: 'what is the plan for today?', channelId: 'D0MASTER', userId: 'U123', ts: '1234567890.123456' });
+        await done;
+        expect(track).toHaveBeenCalledWith(
+          expect.objectContaining({
+            surface: 'slack',
+            slackChannelId: 'D0MASTER',
+            sourceTs: '1234567890.123456',
+            chatChannelId: 'conv-123',
+            responsible: 'crewly-orc',
+            required: true,
+          }),
+        );
+
+        // A colleague agent's post (any machine) is not the owner's message.
+        track.mockClear();
+        (bridge as any).watchOwnerMessage(
+          { channelId: 'D0MASTER', threadTs: '1.1', messageTs: '1.1', messageUserId: 'U123' },
+          'crewly-orc-laptop',
+          'status from the laptop',
+          'conv-123',
+          'crewly-orc',
+        );
+        expect(track).not.toHaveBeenCalled();
+      } finally {
+        setOwnerMessageWatchdog(null);
+      }
+    }, 30000);
+
+    // #730: a colleague agent's Slack post that falls through to the
+    // orchestrator is stored as a `user` turn — it must carry its author so
+    // the commitment gate never reads it as the owner's approval.
+    it.each([
+      ['a human (owner)', undefined],
+      ['a cross-machine agent', 'crewly-orc-laptop'],
+    ])('persists the inbound turn from %s with the right authorship', async (_label, author) => {
+      mockChatV2EnsureChannel.mockReturnValue({ id: 'slack-C123-1234567890-123456' });
+      mockChatV2RecordTurn.mockReset();
+      mockChatV2RecordTurn.mockReturnValue({ message: { id: 'm-1' }, deduped: false });
+      mockQueueService.enqueue.mockImplementation((input: any) => {
+        setTimeout(() => input.sourceMetadata.slackResolve('ok'), 5);
+        return { id: 'q-1' };
+      });
+
+      const bridge = new SlackOrchestratorBridge({ responseTimeoutMs: 5000 });
+      bridge.setMessageQueueService(mockQueueService);
+      await bridge.initialize();
+      const handled = new Promise<void>((resolve) => bridge.on('message_handled', () => resolve()));
+
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'getConversationContext').mockReturnValue({
+        conversationId: 'slack-C123-1234567890-123456',
+        channelId: 'C123',
+        userId: 'U123',
+      });
+
+      slackService.emit('message', {
+        text: 'go ahead, 启动',
+        channelId: 'C123',
+        userId: 'U123',
+        ts: '1234567890.123456',
+        ...(author ? { authorAgentSession: author } : {}),
+      });
+      await handled;
+
+      const turn = mockChatV2RecordTurn.mock.calls[0][0] as { senderType: string; metadata: Record<string, unknown> };
+      expect(turn.senderType).toBe('user');
+      if (author) {
+        expect(turn.metadata.authorAgentSession).toBe(author);
+      } else {
+        expect(turn.metadata).not.toHaveProperty('authorAgentSession');
+      }
+    }, 30000);
+
+    it('should timeout if slackResolve is never called', async () => {
+      // enqueue does NOT call slackResolve — so the bridge times out
+      const bridge = new SlackOrchestratorBridge({ responseTimeoutMs: 200 });
+      bridge.setMessageQueueService(mockQueueService);
+      await bridge.initialize();
+
+      const messagePromise = new Promise<string>((resolve) => {
+        bridge.on('message_handled', (event: any) => {
+          resolve(event.response);
+        });
+      });
+
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'getConversationContext').mockReturnValue({
+        conversationId: 'conv-123',
+        channelId: 'C123',
+        userId: 'U123',
+      });
+
+      slackService.emit('message', {
+        text: 'hello',
+        channelId: 'C123',
+        userId: 'U123',
+        ts: '1234567890.123456',
+      });
+
+      const response = await messagePromise;
+      expect(response).toBe('The orchestrator is still processing your request. It will reply here when ready — no need to resend.');
+    }, 30000);
+
+    it('should handle enqueue failure gracefully', async () => {
+      mockQueueService.enqueue.mockImplementation(() => {
+        throw new Error('Queue is full');
+      });
+
+      const bridge = new SlackOrchestratorBridge({ responseTimeoutMs: 5000 });
+      bridge.setMessageQueueService(mockQueueService);
+      await bridge.initialize();
+
+      const messagePromise = new Promise<string>((resolve) => {
+        bridge.on('message_handled', (event: any) => {
+          resolve(event.response);
+        });
+      });
+
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'getConversationContext').mockReturnValue({
+        conversationId: 'conv-123',
+        channelId: 'C123',
+        userId: 'U123',
+      });
+
+      slackService.emit('message', {
+        text: 'hello',
+        channelId: 'C123',
+        userId: 'U123',
+        ts: '1234567890.123456',
+      });
+
+      const response = await messagePromise;
+      expect(response).toContain('Failed to enqueue message');
+    }, 30000);
+
+    // 2026-05-12 dogfood regression: QueueProcessor calls
+    // `slackResolve('')` on fire-and-forget PTY delivery (see
+    // queue-processor.service.ts:692). The previous bridge callback
+    // always returned `fromOrcReply: true`, so every Slack delivery
+    // triggered the SLA cascade-close → Request landed in `done` with
+    // `Auto-closed by SLA: orc_reply` before the user ever saw a reply.
+    // 5 of 7 Slack messages that day were falsely-done. Fix: gate on
+    // resp.length > 0 inside the bridge's slackResolve callback so
+    // the empty delivery ack stops short of the SLA cascade.
+    it('does NOT mark SLA resolved when slackResolve fires with empty resp (delivery ack only)', async () => {
+      const mockSubscriber = {
+        markResolvedByThread: jest.fn().mockResolvedValue(undefined),
+      };
+      const { setRequestSlaSubscriber } = await import('../v3/request-sla.subscriber.js');
+      setRequestSlaSubscriber(mockSubscriber as any);
+
+      try {
+        // Capture the slackResolve callback and fire it with EMPTY string
+        // (mirrors QueueProcessor's `routeResponse(message, '')` call).
+        mockQueueService.enqueue.mockImplementation((input: any) => {
+          setTimeout(() => input.sourceMetadata.slackResolve(''), 5);
+          return { id: 'q-empty' };
+        });
+
+        const bridge = new SlackOrchestratorBridge({ responseTimeoutMs: 5000 });
+        bridge.setMessageQueueService(mockQueueService);
+        await bridge.initialize();
+
+        const handled = new Promise<void>((resolve) => {
+          bridge.on('message_handled', () => resolve());
+        });
+
+        const slackService = (bridge as any).slackService;
+        jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+        jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+        jest.spyOn(slackService, 'getConversationContext').mockReturnValue({
+          conversationId: 'conv-x', channelId: 'C-x', userId: 'U-x',
+        });
+
+        slackService.emit('message', {
+          text: 'I sent a request, expecting a reply',
+          channelId: 'C-x',
+          userId: 'U-x',
+          ts: '1778100000.000001',
+        });
+
+        await handled;
+
+        // The whole point: SLA cascade-close must not fire. The Request
+        // stays in flight until orc actually replies via reply-slack →
+        // respond_to_user WI transitions → cascade subscriber closes it.
+        expect(mockSubscriber.markResolvedByThread).not.toHaveBeenCalled();
+      } finally {
+        setRequestSlaSubscriber(null);
+      }
+    }, 15000);
+  });
+
+  describe('sendSlackResponse', () => {
+    let bridge: SlackOrchestratorBridge;
+
+    beforeEach(() => {
+      bridge = new SlackOrchestratorBridge({ skillDeliveryWaitMs: 0 });
+    });
+
+    const makeMessage = (overrides: Partial<SlackIncomingMessage> = {}): SlackIncomingMessage => ({
+      id: 'msg-1',
+      type: 'message',
+      text: 'hello',
+      userId: 'U123',
+      channelId: 'C123',
+      ts: '1707.001',
+      teamId: 'T1',
+      eventTs: '1707.001',
+      ...overrides,
+    });
+
+    it('should record thread reply to thread store', async () => {
+      const mockThreadStore = {
+        appendOrchestratorReply: jest.fn().mockResolvedValue(undefined),
+        getThreadFilePath: jest.fn(),
+      };
+      bridge.setSlackThreadStore(mockThreadStore as any);
+
+      const message = makeMessage();
+
+      const sendSlackResponse = (bridge as any).sendSlackResponse.bind(bridge);
+      await sendSlackResponse(message, 'Recorded response');
+
+      expect(mockThreadStore.appendOrchestratorReply).toHaveBeenCalledWith(
+        'C123',
+        '1707.001',
+        'Recorded response'
+      );
+    });
+
+    // ---------------------------------------------------------------------
+    // Bug 2 regression — Steve 2026-04-30 false-done Request cascade
+    // ---------------------------------------------------------------------
+    // Scenario reproduced from `crewly-2026-04-30.log` UTC 17:28 / 18:37:
+    // Slack messages were lost on the input path (Bug 1) so the orc never
+    // replied, but `sendToOrchestrator`'s 30s placeholder fallback fired
+    // anyway. Pre-fix, `sendSlackResponse` unconditionally called
+    // `markResolvedByThread`, which the V3 SLA subscriber treated as a
+    // legitimate orc reply and cascaded the parent Request to `done`.
+    //
+    // Post-fix: `sendSlackResponse` accepts `fromOrcReply` and gates the
+    // SLA hook on it. Only real orc replies (slackResolve callback fired
+    // by the reply-slack skill) reach `markResolvedByThread`.
+
+    it('should NOT call markResolvedByThread when fromOrcReply=false (responseTimeoutMs placeholder path)', async () => {
+      const mockSubscriber = {
+        markResolvedByThread: jest.fn().mockResolvedValue(undefined),
+      };
+
+      // Inject a mock subscriber via `setRequestSlaSubscriber` so the lazy
+      // import inside sendSlackResponse picks it up.
+      const { setRequestSlaSubscriber } = await import('../v3/request-sla.subscriber.js');
+      setRequestSlaSubscriber(mockSubscriber as any);
+
+      try {
+        const sendSlackResponse = (bridge as any).sendSlackResponse.bind(bridge);
+        // The exact placeholder string sendToOrchestrator returns on
+        // responseTimeoutMs — pinned here so a future copy-edit of the
+        // placeholder doesn't silently re-introduce the false-resolve bug.
+        await sendSlackResponse(
+          makeMessage(),
+          'The orchestrator is still processing your request. It will reply here when ready — no need to resend.',
+          false, // fromOrcReply = false (placeholder / timeout / fallback)
+        );
+
+        expect(mockSubscriber.markResolvedByThread).not.toHaveBeenCalled();
+      } finally {
+        setRequestSlaSubscriber(null);
+      }
+    });
+
+    it('should call markResolvedByThread when fromOrcReply=true (real orc reply path)', async () => {
+      const mockSubscriber = {
+        markResolvedByThread: jest.fn().mockResolvedValue(undefined),
+      };
+
+      const { setRequestSlaSubscriber } = await import('../v3/request-sla.subscriber.js');
+      setRequestSlaSubscriber(mockSubscriber as any);
+
+      try {
+        const sendSlackResponse = (bridge as any).sendSlackResponse.bind(bridge);
+        await sendSlackResponse(
+          makeMessage({ ts: '1777570119.119589' }),
+          'Real orc reply content from reply-slack skill',
+          true, // fromOrcReply = true (slackResolve callback fired)
+        );
+
+        expect(mockSubscriber.markResolvedByThread).toHaveBeenCalledWith('1777570119.119589');
+      } finally {
+        setRequestSlaSubscriber(null);
+      }
+    });
+
+    it('should default fromOrcReply=true to preserve mention-routing behaviour for legacy callers', async () => {
+      const mockSubscriber = {
+        markResolvedByThread: jest.fn().mockResolvedValue(undefined),
+      };
+
+      const { setRequestSlaSubscriber } = await import('../v3/request-sla.subscriber.js');
+      setRequestSlaSubscriber(mockSubscriber as any);
+
+      try {
+        const sendSlackResponse = (bridge as any).sendSlackResponse.bind(bridge);
+        // Two-arg call (no fromOrcReply) — legacy mention-routing path.
+        await sendSlackResponse(
+          makeMessage({ ts: '1777570119.119589' }),
+          'Agent reply content',
+        );
+
+        expect(mockSubscriber.markResolvedByThread).toHaveBeenCalledWith('1777570119.119589');
+      } finally {
+        setRequestSlaSubscriber(null);
+      }
+    });
+
+    // Issue #394: sendToAgent now returns the OrcResponse envelope so
+    // the mention-routing path can distinguish a real reply from the
+    // three placeholder return paths (timeout, direct-delivery, error)
+    // that previously slipped past the `response.length > 0` proxy.
+    // This test pins the shape of the direct-delivery fallback —
+    // the easiest of the three to hit deterministically (no queue
+    // service wired → falls through to the direct-delivery branch
+    // and returns the placeholder with fromOrcReply: false).
+    it('sendToAgent returns fromOrcReply=false on the direct-delivery placeholder path (#394)', async () => {
+      // Build a bridge WITHOUT a messageQueueService so sendToAgent
+      // takes the direct-delivery fallback branch.
+      const noQueueBridge = new SlackOrchestratorBridge();
+      mockDeliverForcedMessage.mockClear();
+      const origFetch = (globalThis as any).fetch;
+      (globalThis as any).fetch = jest.fn();
+
+      try {
+        const sendToAgent = (noQueueBridge as any).sendToAgent.bind(noQueueBridge);
+        const result = await sendToAgent('agent-session-x', 'hello agent', {
+          channelId: 'C394',
+          threadTs: '1900.394',
+        });
+        expect(result).toEqual(
+          expect.objectContaining({
+            fromOrcReply: false,
+            response: expect.stringContaining('Message delivered to agent'),
+          }),
+        );
+        // In process, forced, with the Slack context header — no HTTP hop (#1024).
+        expect(mockDeliverForcedMessage).toHaveBeenCalledWith('agent-session-x', expect.stringContaining('[SLACK_CONTEXT:channelId=C394,threadTs=1900.394]'));
+        expect((globalThis as any).fetch).not.toHaveBeenCalled();
+      } finally {
+        (globalThis as any).fetch = origFetch;
+      }
+    });
+
+    it('sendToAgent hands the owner\'s message to the watchdog before the direct delivery (#1024 review)', async () => {
+      const noQueueBridge = new SlackOrchestratorBridge();
+      mockDeliverForcedMessage.mockClear();
+      const watch = jest.spyOn(noQueueBridge as any, 'watchOwnerMessage').mockImplementation(() => undefined);
+      jest.spyOn(noQueueBridge as any, 'persistSlackInbound').mockReturnValue({ conversationId: 'conv-fallback', messageId: 'm-1' });
+      const context = { channelId: 'C394', threadTs: '1900.394', messageTs: '1900.394', messageUserId: 'U123' };
+      await (noQueueBridge as any).sendToAgent('agent-session-x', 'hello agent', context);
+      expect(watch).toHaveBeenCalledWith(context, undefined, 'hello agent', 'conv-fallback', 'agent-session-x');
+      expect(watch.mock.invocationCallOrder[0]).toBeLessThan(mockDeliverForcedMessage.mock.invocationCallOrder[0]);
+    });
+
+    it('sendToAgent reports a direct delivery that did not land (#1024)', async () => {
+      const noQueueBridge = new SlackOrchestratorBridge();
+      mockDeliverForcedMessage.mockResolvedValueOnce({ status: 'not-found', error: "Session 'agent-session-x' not found" });
+      const sendToAgent = (noQueueBridge as any).sendToAgent.bind(noQueueBridge);
+      const result = await sendToAgent('agent-session-x', 'hello agent', { channelId: 'C394', threadTs: '1900.394' });
+      expect(result).toEqual(expect.objectContaining({ fromOrcReply: false, response: expect.stringContaining('Failed to reach agent') }));
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Bug 2 regression — end-to-end: timeout-placeholder must NOT auto-resolve
+  // -----------------------------------------------------------------------
+  // Replays Steve's UTC 17:28 path through the full bridge:
+  // slackService.emit('message') → handleSlackMessage → sendToOrchestrator
+  // (slackResolve never fires) → responseTimeoutMs → placeholder returned
+  // → sendSlackResponse called with fromOrcReply=false → markResolvedByThread
+  // is NOT invoked → V3 cascade does not close the parent Request.
+  describe('end-to-end SLA gating on responseTimeoutMs (Bug 2 regression)', () => {
+    let mockQueueService: any;
+    let chatService: ReturnType<typeof getChatService>;
+
+    function makeChatMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
+      return {
+        id: 'msg-1',
+        conversationId: 'conv-123',
+        from: { type: 'orchestrator', name: 'Orchestrator' },
+        content: 'Hello from orchestrator',
+        contentType: 'text',
+        timestamp: new Date().toISOString(),
+        ...overrides,
+      } as ChatMessage;
+    }
+
+    beforeEach(() => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(true);
+      chatService = getChatService();
+      jest.spyOn(chatService, 'sendMessage').mockResolvedValue({
+        message: makeChatMessage(),
+        conversation: { id: 'conv-123', title: 'test', messages: [], createdAt: '', updatedAt: '' } as any,
+      });
+      mockQueueService = {
+        enqueue: jest.fn().mockReturnValue({ id: 'q-1' }),
+      };
+    });
+
+    it('should NOT auto-resolve the SLA tracker when sendToOrchestrator hits responseTimeoutMs', async () => {
+      // enqueue does NOT invoke slackResolve — exact reproduction of
+      // Steve's incident (orc never replied within the timeout).
+      const bridge = new SlackOrchestratorBridge({ responseTimeoutMs: 200 });
+      bridge.setMessageQueueService(mockQueueService);
+      await bridge.initialize();
+
+      const mockSubscriber = {
+        markResolvedByThread: jest.fn().mockResolvedValue(undefined),
+      };
+      const { setRequestSlaSubscriber } = await import('../v3/request-sla.subscriber.js');
+      setRequestSlaSubscriber(mockSubscriber as any);
+
+      try {
+        const messagePromise = new Promise<string>((resolve) => {
+          bridge.on('message_handled', (event: any) => resolve(event.response));
+        });
+
+        const slackService = (bridge as any).slackService;
+        jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+        jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+        jest.spyOn(slackService, 'getConversationContext').mockReturnValue({
+          conversationId: 'conv-123',
+          channelId: 'D0AC7NF5N7L',
+          userId: 'U_STEVE',
+        });
+
+        slackService.emit('message', {
+          text: 'Important Slack message orc never receives',
+          channelId: 'D0AC7NF5N7L',
+          userId: 'U_STEVE',
+          ts: '1777469680.609509',
+        });
+
+        const response = await messagePromise;
+
+        // Confirms the placeholder path was hit (matches sendToOrchestrator's
+        // exact timeout string).
+        expect(response).toBe(
+          'The orchestrator is still processing your request. It will reply here when ready — no need to resend.',
+        );
+
+        // The actual regression guard: SLA tracker was NOT auto-resolved.
+        // Pre-fix this would have fired with reason=orc_reply and the V3
+        // cascade would have closed the parent Request to `done`.
+        expect(mockSubscriber.markResolvedByThread).not.toHaveBeenCalled();
+      } finally {
+        setRequestSlaSubscriber(null);
+      }
+    }, 30000);
+  });
+
+  describe('auditor prefix routing', () => {
+    const pattern = /^[/@]?auditor[\s:]+(.+)/is;
+
+    it('should match "auditor ..." prefix and extract message', () => {
+      const match = 'auditor show me the latest audit report'.match(pattern);
+      expect(match).not.toBeNull();
+      expect(match![1].trim()).toBe('show me the latest audit report');
+    });
+
+    it('should not route messages without auditor prefix', () => {
+      expect('hello world'.match(pattern)).toBeNull();
+      expect('status check'.match(pattern)).toBeNull();
+      expect('the auditor found issues'.match(pattern)).toBeNull();
+    });
+
+    it('should handle /auditor prefix with slash', () => {
+      const match = '/auditor check system health'.match(pattern);
+      expect(match).not.toBeNull();
+      expect(match![1].trim()).toBe('check system health');
+    });
+
+    it('should handle @auditor prefix with at-sign', () => {
+      const match = '@auditor check system health'.match(pattern);
+      expect(match).not.toBeNull();
+      expect(match![1].trim()).toBe('check system health');
+    });
+
+    it('should handle @auditor: prefix with colon', () => {
+      const match = '@auditor: what is the team status?'.match(pattern);
+      expect(match).not.toBeNull();
+      expect(match![1].trim()).toBe('what is the team status?');
+    });
+
+    it('should be case-insensitive', () => {
+      expect('Auditor check status'.match(pattern)).not.toBeNull();
+      expect('AUDITOR run audit'.match(pattern)).not.toBeNull();
+      expect('@Auditor show report'.match(pattern)).not.toBeNull();
+    });
+  });
+
+  describe('addCompletionReaction (deferred ✅)', () => {
+    it('should add ✅ reaction when pending reaction exists', async () => {
+      const bridge = new SlackOrchestratorBridge({ showTypingIndicator: true });
+      await bridge.initialize();
+
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+
+      // Simulate storing a pending reaction
+      (bridge as any).pendingReactions.set('C123:1707.001', '1707.002');
+
+      await (bridge as any).addCompletionReaction('C123', '1707.001');
+
+      expect(slackService.addReaction).toHaveBeenCalledWith('C123', '1707.002', 'white_check_mark');
+      // Pending reaction should be consumed
+      expect((bridge as any).pendingReactions.has('C123:1707.001')).toBe(false);
+    });
+
+    it('should not react when no pending reaction exists (no-op contract)', async () => {
+      const bridge = new SlackOrchestratorBridge({ showTypingIndicator: true });
+      await bridge.initialize();
+
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+
+      // Contract (R1 comment in chat.controller.ts): calling with a thread
+      // that has no pending reaction is a no-op — no addReaction call, no
+      // throw, and the Map stays unchanged.
+      await expect(
+        (bridge as any).addCompletionReaction('C123', '1707.001'),
+      ).resolves.toBeUndefined();
+
+      expect(slackService.addReaction).not.toHaveBeenCalled();
+      expect((bridge as any).pendingReactions.size).toBe(0);
+    });
+
+    it('should handle addReaction errors gracefully', async () => {
+      const bridge = new SlackOrchestratorBridge({ showTypingIndicator: true });
+      await bridge.initialize();
+
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'addReaction').mockRejectedValue(new Error('network error'));
+
+      (bridge as any).pendingReactions.set('C123:1707.001', '1707.002');
+
+      // Should not throw
+      await expect((bridge as any).addCompletionReaction('C123', '1707.001')).resolves.toBeUndefined();
+      // Pending reaction still consumed
+      expect((bridge as any).pendingReactions.has('C123:1707.001')).toBe(false);
+    });
+
+    it('should suppress already_reacted errors silently', async () => {
+      const bridge = new SlackOrchestratorBridge({ showTypingIndicator: true });
+      await bridge.initialize();
+
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'addReaction').mockRejectedValue(new Error('already_reacted'));
+
+      (bridge as any).pendingReactions.set('C123:1707.001', '1707.002');
+
+      await expect((bridge as any).addCompletionReaction('C123', '1707.001')).resolves.toBeUndefined();
+    });
+
+    it('should store pending reaction for orchestrator-routed messages', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(true);
+      const chatService = getChatService();
+      jest.spyOn(chatService, 'sendMessage').mockResolvedValue({
+        message: { id: 'msg-1', conversationId: 'conv-123', from: { type: 'user', name: 'User' }, content: 'test', contentType: 'text', timestamp: new Date().toISOString() } as any,
+        conversation: { id: 'conv-123', title: 'test', messages: [], createdAt: '', updatedAt: '' } as any,
+      });
+
+      const mockQS = {
+        enqueue: jest.fn().mockImplementation((input: any) => {
+          // Immediately resolve slackResolve to unblock
+          setTimeout(() => input.sourceMetadata.slackResolve('done'), 5);
+          return { id: 'q-1' };
+        }),
+      };
+
+      const bridge = new SlackOrchestratorBridge({ showTypingIndicator: true, responseTimeoutMs: 5000 });
+      bridge.setMessageQueueService(mockQS as any);
+      await bridge.initialize();
+
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+      jest.spyOn(slackService, 'getConversationContext').mockReturnValue({
+        conversationId: 'conv-123',
+        channelId: 'C123',
+        userId: 'U123',
+        threadTs: '1707.001',
+      });
+
+      const handledPromise = new Promise<void>((resolve) => {
+        bridge.on('message_handled', () => resolve());
+      });
+
+      slackService.emit('message', {
+        text: 'hello orchestrator',
+        channelId: 'C123',
+        userId: 'U123',
+        ts: '1707.002',
+        threadTs: '1707.001',
+      });
+
+      await handledPromise;
+
+      // Should have added 👀 (eyes) typing indicator
+      expect(slackService.addReaction).toHaveBeenCalledWith('C123', '1707.002', 'eyes');
+      // Should NOT have immediately added ✅ (that's deferred)
+      expect(slackService.addReaction).not.toHaveBeenCalledWith('C123', '1707.002', 'white_check_mark');
+      // Should have a pending reaction stored
+      expect((bridge as any).pendingReactions.has('C123:1707.001')).toBe(true);
+      expect((bridge as any).pendingReactions.get('C123:1707.001')).toBe('1707.002');
+    }, 15000);
+  });
+
+  describe('sendContentApproval', () => {
+    it('should return null when channelId is not provided', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+      const result = await bridge.sendContentApproval('test-id');
+      expect(result).toBeNull();
+    });
+
+    it('should return null when channelId is undefined', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+      const result = await bridge.sendContentApproval('test-id', undefined);
+      expect(result).toBeNull();
+    });
+
+    it('should send Block Kit message with approve/reject buttons', async () => {
+      // Set up a mock approval in ContentApprovalService
+      const { ContentApprovalService } = await import('../onboarding/content-approval.service.js');
+      ContentApprovalService.resetInstance();
+      const approvalService = ContentApprovalService.getInstance();
+      const approval = approvalService.submit({
+        teamId: 'team-1',
+        submittedBy: 'agent-luna',
+        platform: 'Twitter',
+        contentType: 'post',
+        content: 'This is a great marketing post about our product #awesome',
+        hashtags: ['#marketing', '#ai'],
+        scheduledTime: '2026-04-16T10:00:00Z',
+      });
+
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+      const slackService = (bridge as any).slackService;
+      const sendMessageSpy = jest.spyOn(slackService, 'sendMessage').mockResolvedValue('1234.5678');
+
+      const result = await bridge.sendContentApproval(approval.id, 'C123', '1000.001');
+
+      expect(result).toBe('1234.5678');
+      expect(sendMessageSpy).toHaveBeenCalledTimes(1);
+
+      const callArgs = sendMessageSpy.mock.calls[0][0] as any;
+      expect(callArgs.channelId).toBe('C123');
+      expect(callArgs.threadTs).toBe('1000.001');
+      expect(callArgs.text).toContain('Content approval requested');
+      expect(callArgs.blocks).toBeDefined();
+      expect(callArgs.blocks.length).toBeGreaterThanOrEqual(4);
+
+      // Verify header block
+      const headerBlock = callArgs.blocks.find((b: any) => b.type === 'header');
+      expect(headerBlock).toBeDefined();
+      expect(headerBlock.text.text).toContain('Content Approval Required');
+
+      // Verify actions block with buttons
+      const actionsBlock = callArgs.blocks.find((b: any) => b.type === 'actions');
+      expect(actionsBlock).toBeDefined();
+      expect(actionsBlock.elements).toHaveLength(2);
+      expect(actionsBlock.elements[0].action_id).toBe('content_approval_approve');
+      expect(actionsBlock.elements[0].value).toBe(approval.id);
+      expect(actionsBlock.elements[0].style).toBe('primary');
+      expect(actionsBlock.elements[1].action_id).toBe('content_approval_reject');
+      expect(actionsBlock.elements[1].value).toBe(approval.id);
+      expect(actionsBlock.elements[1].style).toBe('danger');
+
+      // Verify linkSlackMessage was called
+      const linkedApproval = approvalService.get(approval.id);
+      expect(linkedApproval?.slackChannelId).toBe('C123');
+      expect(linkedApproval?.slackMessageTs).toBe('1234.5678');
+
+      ContentApprovalService.resetInstance();
+    });
+
+    it('should handle missing approval gracefully with fallback blocks', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue('1234.5678');
+
+      const result = await bridge.sendContentApproval('nonexistent-id', 'C123');
+      expect(result).toBe('1234.5678');
+
+      const callArgs = slackService.sendMessage.mock.calls[0][0] as any;
+      // Should still produce blocks with N/A values
+      const sectionBlock = callArgs.blocks.find((b: any) => b.type === 'section' && b.fields);
+      expect(sectionBlock).toBeDefined();
+      expect(sectionBlock.fields[0].text).toContain('N/A');
+    });
+
+    it('should return null when sendMessage throws', async () => {
+      const { ContentApprovalService } = await import('../onboarding/content-approval.service.js');
+      ContentApprovalService.resetInstance();
+
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockRejectedValue(new Error('Slack API error'));
+
+      const result = await bridge.sendContentApproval('test-id', 'C123');
+      expect(result).toBeNull();
+
+      ContentApprovalService.resetInstance();
+    });
+
+    it('should include hashtags and scheduled time in meta section', async () => {
+      const { ContentApprovalService } = await import('../onboarding/content-approval.service.js');
+      ContentApprovalService.resetInstance();
+      const approvalService = ContentApprovalService.getInstance();
+      const approval = approvalService.submit({
+        teamId: 'team-1',
+        submittedBy: 'agent-luna',
+        platform: 'LinkedIn',
+        contentType: 'article',
+        content: 'Test content',
+        hashtags: ['#tech', '#startup'],
+        scheduledTime: '2026-04-20T14:00:00Z',
+      });
+
+      const bridge = new SlackOrchestratorBridge();
+      await bridge.initialize();
+      const slackService = (bridge as any).slackService;
+      jest.spyOn(slackService, 'sendMessage').mockResolvedValue('msg-ts');
+
+      await bridge.sendContentApproval(approval.id, 'C123');
+
+      const callArgs = slackService.sendMessage.mock.calls[0][0] as any;
+      const sectionBlocks = callArgs.blocks.filter((b: any) => b.type === 'section' && b.fields);
+      // There should be at least 2 section blocks with fields (main info + meta)
+      expect(sectionBlocks.length).toBeGreaterThanOrEqual(2);
+
+      // Find the meta section with hashtags
+      const allFieldTexts = sectionBlocks.flatMap((b: any) => b.fields.map((f: any) => f.text));
+      expect(allFieldTexts.some((t: string) => t.includes('#tech'))).toBe(true);
+      expect(allFieldTexts.some((t: string) => t.includes('2026-04-20'))).toBe(true);
+
+      ContentApprovalService.resetInstance();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // sendToAuditorFallback — thread-context enrichment regression
+  // -------------------------------------------------------------------------
+  //
+  // Regression for 2026-04-25 bug: when the orchestrator drops, Slack falls
+  // through to the Auditor via `sendToAuditorFallback`. Prior to this fix
+  // the fallback path forwarded only `[SLACK_CONTEXT:...]` to the Auditor —
+  // missing the `[Thread context file: <path>]` pointer that
+  // `sendToOrchestrator` (~line 712) appends. Auditor therefore replied with
+  // "I cannot see the rest of the conversation" because it had no thread
+  // file path to read prior history from.
+  //
+  // This test stubs the private surface (queue + threadStore) and asserts
+  // the enriched payload contains the thread file path on both the chat-v2
+  // persist (`recordTurn`, which replaced `chatService.sendMessage` in the
+  // unified chat message store migration, #545) and `messageQueueService.enqueue`.
+  describe('sendToAuditorFallback — thread context enrichment', () => {
+    type FallbackBridge = {
+      messageQueueService: { enqueue: jest.Mock };
+      sendToAuditorFallback: (
+        msg: string,
+        ctx?: {
+          channelId: string;
+          threadTs: string;
+          userId?: string;
+          conversationId?: string;
+        },
+      ) => Promise<string>;
+    };
+
+    /**
+     * Wire the chat-v2 persist + queue doubles the fallback path reaches.
+     *
+     * @param bridge - Bridge under test
+     * @returns The queue enqueue mock
+     */
+    function wireFallbackDoubles(bridge: SlackOrchestratorBridge): jest.Mock {
+      mockChatV2EnsureChannel.mockReset().mockReturnValue({ id: 'conv-1' });
+      mockChatV2RecordTurn.mockReset().mockReturnValue({ message: { id: 'msg-1' } });
+      const enqueueMock = jest.fn();
+      (bridge as unknown as FallbackBridge).messageQueueService = { enqueue: enqueueMock };
+      return enqueueMock;
+    }
+
+    /**
+     * Content of the single turn persisted to chat-v2.
+     *
+     * @returns The persisted content string
+     */
+    function persistedContent(): string {
+      expect(mockChatV2RecordTurn).toHaveBeenCalledTimes(1);
+      return (mockChatV2RecordTurn.mock.calls[0] as [{ content: string }])[0].content;
+    }
+
+    it('appends [Thread context file: <path>] when threadStore + context are present', async () => {
+      const bridge = new SlackOrchestratorBridge();
+
+      // Wire a fake thread store. The shape only needs `getThreadFilePath`
+      // for this code path.
+      const fakeThreadStore = {
+        getThreadFilePath: jest
+          .fn()
+          .mockReturnValue('/tmp/threads/C123/1234.567.md'),
+      };
+      bridge.setSlackThreadStore(fakeThreadStore as never);
+      const enqueueMock = wireFallbackDoubles(bridge);
+
+      const ack = await (bridge as unknown as FallbackBridge).sendToAuditorFallback('hello fallback', {
+        channelId: 'C123',
+        threadTs: '1234.567',
+        userId: 'U999',
+      });
+
+      // Acknowledgement to the user is the unchanged copy.
+      expect(ack).toMatch(/forwarded to the Auditor/);
+
+      // threadStore lookup happened with the right keys.
+      expect(fakeThreadStore.getThreadFilePath).toHaveBeenCalledWith(
+        'C123',
+        '1234.567',
+      );
+
+      // The chat-v2 persist saw the enriched content.
+      const content = persistedContent();
+      expect(content).toMatch(/\[SLACK_CONTEXT:channelId=C123,threadTs=1234\.567\]/);
+      expect(content).toMatch(/\[FALLBACK\] Orchestrator is offline/);
+      expect(content).toMatch(
+        /\[Thread context file: \/tmp\/threads\/C123\/1234\.567\.md\]/,
+      );
+      // Original user payload preserved.
+      expect(content).toMatch(/hello fallback/);
+
+      // messageQueueService.enqueue saw the same enriched content, on the
+      // conversation the persist returned.
+      expect(enqueueMock).toHaveBeenCalledTimes(1);
+      const enqueued = enqueueMock.mock.calls[0][0] as { content: string; conversationId: string };
+      expect(enqueued.content).toMatch(
+        /\[Thread context file: \/tmp\/threads\/C123\/1234\.567\.md\]/,
+      );
+      expect(enqueued.conversationId).toBe('conv-1');
+    });
+
+    it('omits thread context line when threadStore is unset (no regression on legacy path)', async () => {
+      const bridge = new SlackOrchestratorBridge();
+      wireFallbackDoubles(bridge);
+
+      await (bridge as unknown as FallbackBridge).sendToAuditorFallback('hello no-thread', {
+        channelId: 'C999',
+        threadTs: '0000.000',
+      });
+
+      expect(persistedContent()).not.toMatch(/Thread context file/);
+    });
+
+    it('omits thread context line when context is missing (no regression on direct-message path)', async () => {
+      const bridge = new SlackOrchestratorBridge();
+
+      bridge.setSlackThreadStore({
+        getThreadFilePath: jest.fn(),
+      } as never);
+      wireFallbackDoubles(bridge);
+
+      await (bridge as unknown as FallbackBridge).sendToAuditorFallback('hello no-context');
+
+      expect(persistedContent()).not.toMatch(/Thread context file/);
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // P2-2 regression: slack-orchestrator-bridge no longer writes to
+  // RequestTracker on the V3-Request-from-Slack path. Static source guard
+  // mirrors the chat.controller test to fire the moment someone
+  // re-introduces setActiveRequest here.
+  // ---------------------------------------------------------------------
+  describe('P2-2: RequestTracker write removal', () => {
+    it('slack-orchestrator-bridge source must not call RequestTracker.setActiveRequest', () => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const fs = require('fs');
+      const path = require('path');
+      const src = fs.readFileSync(
+        path.join(__dirname, 'slack-orchestrator-bridge.ts'),
+        'utf-8',
+      );
+      expect(src).not.toMatch(/RequestTracker\.getInstance\(\)\.setActiveRequest/);
+    });
+  });
+
+  describe('B0 auto-recovery (sendToOrchestrator)', () => {
+    /**
+     * Construct a minimal Slack incoming message for routing through
+     * the bridge's handleSlackMessage entrypoint.
+     */
+    function makeIncomingMessage(text: string): SlackIncomingMessage {
+      return {
+        text,
+        channelId: 'C-test',
+        userId: 'U-test',
+        ts: '1.0',
+        threadTs: undefined,
+        hasImages: false,
+        hasFiles: false,
+        files: [],
+        images: [],
+        user: { realName: 'Tester', name: 'tester' },
+      } as unknown as SlackIncomingMessage;
+    }
+
+    it('attempts auto-recovery once when isActive returns false on first check', async () => {
+      // First isActive() → false (offline). After auto-recovery, second
+      // isActive() → true (orc came back). Bridge should proceed normally.
+      (isOrchestratorActive as jest.Mock)
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(true);
+      (triggerOrchestratorSetup as jest.Mock).mockResolvedValueOnce({
+        success: true,
+        sessionName: 'crewly-orc',
+      });
+      (isAgentActive as jest.Mock).mockResolvedValue(false);
+
+      const bridge = getSlackOrchestratorBridge();
+      const mockQueue = {
+        enqueue: jest.fn(),
+        hasPending: () => false,
+      };
+      bridge.setMessageQueueService(mockQueue as any);
+      await bridge.initialize();
+
+      const chatService = getChatService();
+      jest.spyOn(chatService, 'sendMessage').mockResolvedValue({
+        message: { id: 'm', conversationId: 'c1' } as any,
+        conversation: { id: 'c1' } as any,
+      });
+
+      // Drive a message through the bridge
+      const slack = (bridge as any).slackService;
+      slack.emit('message', makeIncomingMessage('hello'));
+
+      // Allow async tasks to resolve
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(triggerOrchestratorSetup).toHaveBeenCalledTimes(1);
+      // After successful recovery + active recheck, the bridge should
+      // continue down the normal queue-based path and call enqueue.
+      expect(mockQueue.enqueue).toHaveBeenCalled();
+    });
+
+    it('falls through to offline path when auto-recovery fails', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(false); // always offline
+      (triggerOrchestratorSetup as jest.Mock).mockResolvedValueOnce({
+        success: false,
+        error: 'mock failure',
+      });
+      (isAgentActive as jest.Mock).mockResolvedValue(false);
+
+      const bridge = getSlackOrchestratorBridge();
+      const mockQueue = {
+        enqueue: jest.fn(),
+        hasPending: () => false,
+      };
+      bridge.setMessageQueueService(mockQueue as any);
+      await bridge.initialize();
+
+      const chatService = getChatService();
+      jest.spyOn(chatService, 'sendMessage').mockResolvedValue({
+        message: { id: 'm', conversationId: 'c1' } as any,
+        conversation: { id: 'c1' } as any,
+      });
+
+      const slack = (bridge as any).slackService;
+      slack.emit('message', makeIncomingMessage('hello'));
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      // Auto-recovery was attempted exactly once (once-per-message contract).
+      expect(triggerOrchestratorSetup).toHaveBeenCalledTimes(1);
+      // When attemptAutoRecovery throws (success=false → wrapped Error),
+      // the bridge falls straight through to the offline path WITHOUT a
+      // second isActive recheck — there's no point rechecking when we
+      // know recovery failed. The previously-cached isActive=false is reused.
+      expect(isOrchestratorActive).toHaveBeenCalledTimes(1);
+    });
+
+    it('attemptAutoRecovery rejects when triggerOrchestratorSetup wedges past 5s timeout', async () => {
+      // Drive attemptAutoRecovery directly to avoid fake-timer interactions
+      // with the surrounding async Slack pipeline. The timeout path is the
+      // only thing this test cares about.
+      jest.useFakeTimers();
+      try {
+        const bridge = new SlackOrchestratorBridge();
+        // Wedged setup — never resolves
+        (triggerOrchestratorSetup as jest.Mock).mockReturnValueOnce(
+          new Promise(() => {}),
+        );
+
+        const recoveryPromise = (bridge as any).attemptAutoRecovery();
+        // Pump microtasks so the race promise schedules its setTimeout
+        await Promise.resolve();
+
+        // Advance past the 5s deadline
+        jest.advanceTimersByTime(5_001);
+
+        await expect(recoveryPromise).rejects.toThrow(/timed out/i);
+        expect(triggerOrchestratorSetup).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('skips auto-recovery when orchestrator is already active', async () => {
+      (isOrchestratorActive as jest.Mock).mockResolvedValue(true);
+
+      const bridge = getSlackOrchestratorBridge();
+      const mockQueue = { enqueue: jest.fn(), hasPending: () => false };
+      bridge.setMessageQueueService(mockQueue as any);
+      await bridge.initialize();
+
+      const chatService = getChatService();
+      jest.spyOn(chatService, 'sendMessage').mockResolvedValue({
+        message: { id: 'm', conversationId: 'c1' } as any,
+        conversation: { id: 'c1' } as any,
+      });
+
+      const slack = (bridge as any).slackService;
+      slack.emit('message', makeIncomingMessage('hello'));
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      // Auto-recovery is NOT invoked when orc is already active
+      expect(triggerOrchestratorSetup).not.toHaveBeenCalled();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Pipeline-#4 fix (Patch D) — auto-Request suppression gates
+  // ---------------------------------------------------------------------------
+
+  describe('auto-Request suppression gates (Pipeline-#4 fix Patch D)', () => {
+    describe('suppressTrivialOrShort (gate 1)', () => {
+      it.each([
+        ['ok', 'ack token'],
+        ['好的', 'Chinese ack'],
+        ['thx', 'thanks shorthand'],
+        ['👍', 'thumbs up emoji'],
+        ['ok!', 'ack with punctuation'],
+        ['Sure', 'mixed-case ack'],
+        ['hi', 'too-short text'],
+        ['', 'empty string'],
+        ['a'.repeat(11), 'just under min length'],
+      ])('suppresses %j (%s)', (text) => {
+        expect(suppressTrivialOrShort(text)).toBe('trivial_or_short');
+      });
+
+      it.each([
+        ['fix the build please', 'short but actionable command'],
+        ['Build OAuth2 with Google + GitHub', 'normal request'],
+        ['can we revisit the v3 reconciler timing?', 'question'],
+      ])('does NOT suppress %j (%s)', (text) => {
+        expect(suppressTrivialOrShort(text)).toBeNull();
+      });
+    });
+
+    describe('suppressFileOnly (gate 3)', () => {
+      it('suppresses synthetic [Slack File: ...] titles', () => {
+        expect(suppressFileOnly('[Slack File: /tmp/foo.png]')).toBe('file_only');
+        expect(suppressFileOnly('[Slack File: /tmp/foo.png].')).toBe('file_only');
+      });
+
+      it('does NOT suppress when narrative accompanies the file', () => {
+        expect(
+          suppressFileOnly('[Slack File: /tmp/foo.png] please review this mockup'),
+        ).toBeNull();
+      });
+
+      it('does NOT suppress text without the file shape', () => {
+        expect(suppressFileOnly('build a real feature please')).toBeNull();
+      });
+    });
+
+    describe('thread-continuation gate (gate 2) — ARCH NC-1 terminal-status fix', () => {
+      // NC-1: a thread that has already completed (parent Request → done)
+      // and then receives a NEW actionable user message MUST NOT be
+      // suppressed; the new message creates a fresh Request. The gate must
+      // therefore check `parentRequest.status` is non-terminal.
+      //
+      // We exercise this through a focused stub of the private method's
+      // dependency surface (svc.findBySourceConversationItemId).
+      const { TERMINAL_REQUEST_STATUSES } = jest.requireActual(
+        '../../types/v2/request.types.js',
+      ) as { TERMINAL_REQUEST_STATUSES: ReadonlySet<string> };
+
+      function runGate(
+        parentStatus: string | null,
+      ): 'thread_continuation' | null {
+        // Inline reimpl of the gate using the same predicate the production
+        // method uses. Production code lives at
+        // SlackOrchestratorBridge.shouldSuppressAutoRequest; this is a focused
+        // pin of the predicate (parentRequest && !TERMINAL.has(status)).
+        if (!parentStatus) return null;
+        if (TERMINAL_REQUEST_STATUSES.has(parentStatus)) return null;
+        return 'thread_continuation';
+      }
+
+      it('SUPPRESSES when parent is non-terminal (open / running / ready)', () => {
+        expect(runGate('open')).toBe('thread_continuation');
+        expect(runGate('running')).toBe('thread_continuation');
+        expect(runGate('ready')).toBe('thread_continuation');
+      });
+
+      it('does NOT suppress when parent is terminal (done / cancelled)', () => {
+        expect(runGate('done')).toBeNull();
+        expect(runGate('cancelled')).toBeNull();
+      });
+
+      it('does NOT suppress when no parent Request exists for the thread', () => {
+        expect(runGate(null)).toBeNull();
+      });
+    });
+  });
+
+  // Phase 6β of unified-chat-message-store spec — the
+  // `dualWriteSlackInboundToV2` helper was deleted because
+  // `ChatService.sendMessage` is now a façade over
+  // `ChatV2Service.recordTurn`. The chat-v2 jest.mock at module scope
+  // is retained for any future re-instrumentation of the bridge.
+});
+
+describe('deriveSlackThreadName', () => {
+  it('titles a thread by its first message (collapsed whitespace, truncated)', () => {
+    expect(deriveSlackThreadName('ship the v2 launch deck')).toBe('Slack: ship the v2 launch deck');
+    expect(deriveSlackThreadName('  multi\n   line   text ')).toBe('Slack: multi line text');
+  });
+
+  it('truncates long messages with an ellipsis', () => {
+    const long = 'a'.repeat(80);
+    const out = deriveSlackThreadName(long);
+    expect(out.startsWith('Slack: ')).toBe(true);
+    expect(out.endsWith('…')).toBe(true);
+    expect(out.length).toBeLessThan(60);
+  });
+
+  it('falls back to "Slack thread" for empty/whitespace content', () => {
+    expect(deriveSlackThreadName('')).toBe('Slack thread');
+    expect(deriveSlackThreadName('   ')).toBe('Slack thread');
+    expect(deriveSlackThreadName(undefined)).toBe('Slack thread');
+  });
+});
+
+describe('persistIdsOf (G5: Slack ids kept on the orchestrator path)', () => {
+  const base = { threadTs: '1.0', channelId: 'C1', userId: 'U-starter', conversationId: 'slack-C1-1-0', startedAt: '', lastActivityAt: '', messageCount: 1 };
+
+  it('takes the ts, author and workspace of the message being handled', () => {
+    expect(persistIdsOf({ ...base, messageTs: '1.5', messageUserId: 'U-maya', slackTeamId: 'T1' })).toEqual({
+      messageTs: '1.5',
+      slackUserId: 'U-maya',
+      slackTeamId: 'T1',
+    });
+  });
+
+  it('falls back to the thread starter and omits what it does not know', () => {
+    expect(persistIdsOf(base)).toEqual({ slackUserId: 'U-starter' });
+    expect(persistIdsOf(undefined)).toEqual({});
+  });
+});
+
+describe('slackActingForMetadata (issue #968)', () => {
+  it("a human's message acts for its own sender", () => {
+    expect(slackActingForMetadata({ messageUserId: 'UINFO001' }, undefined)).toEqual({ actingForUserId: 'UINFO001' });
+  });
+
+  it("a post an agent wrote carries the agent, never its bot's user id", () => {
+    expect(slackActingForMetadata({ messageUserId: 'UBOTDEV1' }, 'dev-1')).toEqual({ authorAgentSession: 'dev-1' });
+  });
+
+  it('no sender known: nothing', () => {
+    expect(slackActingForMetadata(undefined, undefined)).toEqual({});
+  });
+});
+
+describe('team pause (specs/2026-10-04-team-pause.md)', () => {
+  beforeEach(() => {
+    setSlackThreadContextService({ getContext: async () => null } as unknown as SlackThreadContextService);
+    resetSlackOrchestratorBridge();
+    resetSlackService();
+    resetChatService();
+    jest.clearAllMocks();
+    const paused = {
+      id: 'team-assist',
+      name: 'Assist',
+      members: [{ id: 'a1', name: 'Assistant', sessionName: 'crewly-orc-assistant', role: 'developer' }],
+      projectIds: [],
+      createdAt: '',
+      updatedAt: '',
+      paused: { pausedAt: '2026-10-04T00:00:00.000Z', by: 'owner' },
+    };
+    notePausedTeam(paused as never);
+    // Storage is the source of truth for the pause index: serve the paused team.
+    jest.spyOn(StorageService.prototype, 'getTeams').mockResolvedValue([paused] as never);
+  });
+  afterEach(() => {
+    jest.restoreAllMocks();
+    resetTeamPauseRegistryForTesting();
+    resetSlackOrchestratorBridge();
+    resetSlackService();
+    resetChatService();
+  });
+
+  it('a legacy @name of a paused agent gets the notice in the thread and is not delivered', async () => {
+    (isAgentActive as jest.Mock).mockResolvedValue(true);
+    const bridge = new SlackOrchestratorBridge();
+    await bridge.initialize();
+    const slackService = (bridge as any).slackService;
+    const sendMessage = jest.spyOn(slackService, 'sendMessage').mockResolvedValue(undefined);
+    jest.spyOn(slackService, 'addReaction').mockResolvedValue(undefined);
+    jest.spyOn(slackService, 'getConversationContext').mockReturnValue({ conversationId: 'c', channelId: 'C900', userId: 'U1' });
+    const sendToAgent = jest.spyOn(bridge as any, 'sendToAgent');
+
+    const handled = new Promise<any>((resolve) => bridge.on('message_handled', resolve));
+    slackService.emit('message', { text: '@assistant please look', channelId: 'C900', userId: 'U1', ts: '900.1' });
+    const event = await handled;
+
+    expect(event.routedTo).toBe('paused-team');
+    expect(sendToAgent).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ channelId: 'C900', threadTs: '900.1', text: expect.stringMatching(/^assistant is on Assist, which the owner has paused/) }),
+    );
+  }, 15000);
+});

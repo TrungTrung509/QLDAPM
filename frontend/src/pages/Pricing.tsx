@@ -1,0 +1,292 @@
+/**
+ * Pricing Page
+ *
+ * Displays subscription plans (Starter, Pro, Max) with a
+ * monthly/yearly billing toggle. The currently active plan is indicated
+ * and upgrade buttons redirect to the payment checkout flow.
+ *
+ * @module pages/Pricing
+ */
+
+import { useState } from 'react';
+import { Check } from 'lucide-react';
+import { Button, SegmentedControl } from '@crewly/ui';
+import { useAuth } from '../contexts/AuthContext';
+import { apiService } from '../services/api.service';
+import type { BillingInterval } from '../types/payment-wall.types';
+import { getYearlySavingsPercent } from '../types/payment-wall.types';
+
+// ---------------------------------------------------------------------------
+// Plan definitions
+// ---------------------------------------------------------------------------
+
+/** Shape of a single pricing plan card */
+interface PricingPlan {
+  /** Unique plan identifier — matches Stripe plan IDs */
+  id: string;
+  /** Display name */
+  name: string;
+  /** Monthly price in USD */
+  monthly: number;
+  /** Yearly price per month in USD */
+  yearly: number;
+  /** Feature bullet points */
+  features: string[];
+  /** Call-to-action button label */
+  cta: string;
+  /** Whether this card gets the highlighted border */
+  highlighted: boolean;
+  /** Optional badge text (e.g. "Popular") */
+  badge?: string;
+}
+
+/** Static plan data shown in the pricing grid */
+const PRICING_PLANS: PricingPlan[] = [
+  {
+    id: 'starter',
+    name: 'Starter',
+    monthly: 49,
+    yearly: 39,
+    features: [
+      '3 teams',
+      '5 agents per team',
+      '5 projects',
+      '1 Cloud Relay session',
+      '10 marketplace templates',
+      '20 scheduled check-ins',
+      'Community support',
+    ],
+    cta: 'Get Started',
+    highlighted: false,
+  },
+  {
+    id: 'pro',
+    name: 'Pro',
+    monthly: 99,
+    yearly: 79,
+    features: [
+      '10 teams',
+      '10 agents per team',
+      '20 projects',
+      '5 Cloud Relay sessions',
+      'Full marketplace access',
+      'Unlimited schedules',
+      'Cloud Portal with 1-click deploy',
+      'Priority support',
+    ],
+    cta: 'Upgrade to Pro',
+    highlighted: true,
+    badge: 'Popular',
+  },
+  {
+    id: 'max',
+    name: 'Max',
+    monthly: 299,
+    yearly: 239,
+    features: [
+      'Everything in Pro',
+      'Unlimited teams & agents',
+      'Unlimited projects',
+      'Unlimited Cloud Relay',
+      'Shared team memory',
+      'Slack deep integration',
+      'Team analytics',
+      'Thread-based chat portal',
+      'Dedicated support',
+    ],
+    cta: 'Upgrade to Max',
+    highlighted: false,
+    badge: 'Best Value',
+  },
+];
+
+/** Map from license plan value to pricing plan id */
+const LICENSE_TO_PLAN_ID: Record<string, string> = {
+  free: 'free',
+  starter: 'starter',
+  pro: 'pro',
+  max: 'max',
+};
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
+/**
+ * Pricing page component.
+ *
+ * Renders the three main plan cards plus an Enterprise CTA section.
+ * Reads the current user plan from AuthContext to mark the active plan.
+ *
+ * @returns The pricing page element
+ */
+export const Pricing: React.FC = () => {
+  const [billingInterval, setBillingInterval] = useState<BillingInterval>('monthly');
+  const { license } = useAuth();
+
+  const currentPlanId = license ? LICENSE_TO_PLAN_ID[license.plan] ?? 'free' : 'free';
+  const savingsPercent = getYearlySavingsPercent('pro');
+
+  const [upgrading, setUpgrading] = useState<string | null>(null);
+
+  /**
+   * Handle upgrade button click for a given plan.
+   * Creates a Stripe Checkout session and redirects to it.
+   *
+   * @param planId - The plan to upgrade to
+   */
+  const handleUpgrade = async (planId: string) => {
+    try {
+      setUpgrading(planId);
+      const interval = billingInterval === 'monthly' ? 'month' : 'year';
+      const result = await apiService.createCheckoutSession(
+        planId,
+        interval as 'month' | 'year',
+        `${window.location.origin}/cloud?upgraded=true`,
+        window.location.href
+      );
+      window.location.href = result.checkoutUrl;
+    } catch {
+      setUpgrading(null);
+    }
+  };
+
+  /**
+   * Return the displayed price for a plan based on the current billing interval.
+   *
+   * @param plan - The pricing plan
+   * @returns Formatted price string
+   */
+  const getPrice = (plan: PricingPlan): string => {
+    const amount = billingInterval === 'monthly' ? plan.monthly : plan.yearly;
+    return amount === 0 ? '$0' : `$${amount}`;
+  };
+
+  /**
+   * Determine if a plan is the user's current plan.
+   *
+   * @param planId - Plan identifier to check
+   * @returns True when planId matches the user's active plan
+   */
+  const isCurrentPlan = (planId: string): boolean => planId === currentPlanId;
+
+  return (
+    <div className="min-h-screen bg-background-dark px-4 py-12 sm:px-6 lg:px-8">
+      {/* Header */}
+      <div className="mx-auto max-w-4xl text-center">
+        <h1 className="text-3xl font-bold text-text-primary-dark sm:text-4xl">
+          Choose Your Plan
+        </h1>
+        <p className="mt-3 text-lg text-text-secondary-dark">
+          Start with Starter, upgrade as you grow.
+        </p>
+      </div>
+
+      {/* Billing toggle */}
+      <div className="mt-8 flex items-center justify-center gap-3">
+        <SegmentedControl<BillingInterval>
+          aria-label="Billing interval"
+          value={billingInterval}
+          onChange={setBillingInterval}
+          options={[
+            { value: 'monthly', label: 'Monthly', 'data-testid': 'billing-monthly' },
+            { value: 'yearly', label: `Yearly — Save ${savingsPercent}%`, 'data-testid': 'billing-yearly' },
+          ]}
+        />
+      </div>
+
+      {/* Plan cards */}
+      <div className="mx-auto mt-10 grid max-w-6xl grid-cols-1 gap-6 md:grid-cols-3">
+        {PRICING_PLANS.map((plan) => {
+          const isCurrent = isCurrentPlan(plan.id);
+          return (
+            <div
+              key={plan.id}
+              data-testid={`plan-card-${plan.id}`}
+              className={`relative flex flex-col rounded-xl border bg-surface-dark p-6 ${
+                plan.highlighted
+                  ? 'border-primary ring-2 ring-primary/30'
+                  : 'border-border-dark'
+              }`}
+            >
+              {/* Badge */}
+              {plan.badge && (
+                <span className="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full bg-primary px-3 py-0.5 text-xs font-semibold text-white">
+                  {plan.badge}
+                </span>
+              )}
+
+              {/* Plan name */}
+              <h2 className="text-xl font-semibold text-text-primary-dark">{plan.name}</h2>
+
+              {/* Price */}
+              <div className="mt-4 flex items-baseline gap-1">
+                <span className="text-4xl font-bold text-text-primary-dark" data-testid={`price-${plan.id}`}>
+                  {getPrice(plan)}
+                </span>
+                <span className="text-text-secondary-dark">/mo</span>
+              </div>
+
+              {billingInterval === 'yearly' && plan.yearly > 0 && (
+                <p className="mt-1 text-xs text-text-secondary-dark">
+                  Billed annually at ${plan.yearly * 12}/yr
+                </p>
+              )}
+
+              {/* Features */}
+              <ul className="mt-6 flex-1 space-y-3">
+                {plan.features.map((feature) => (
+                  <li key={feature} className="flex items-start gap-2 text-sm text-text-secondary-dark">
+                    <Check className="mt-0.5 h-4 w-4 flex-shrink-0 text-emerald-400" />
+                    <span>{feature}</span>
+                  </li>
+                ))}
+              </ul>
+
+              {/* CTA */}
+              <div className="mt-8">
+                {isCurrent ? (
+                  <Button variant="secondary" className="w-full" disabled data-testid={`cta-${plan.id}`}>
+                    Current Plan
+                  </Button>
+                ) : (
+                  <Button
+                    variant="primary"
+                    className="w-full"
+                    onClick={() => handleUpgrade(plan.id)}
+                    loading={upgrading === plan.id}
+                    data-testid={`cta-${plan.id}`}
+                  >
+                    {plan.cta}
+                  </Button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Enterprise section */}
+      <div
+        className="mx-auto mt-10 max-w-6xl rounded-xl border border-border-dark bg-surface-dark p-8"
+        data-testid="enterprise-section"
+      >
+        <div className="flex flex-col items-center justify-between gap-4 sm:flex-row">
+          <div>
+            <h2 className="text-xl font-semibold text-text-primary-dark">Enterprise</h2>
+            <p className="mt-1 text-text-secondary-dark">
+              Custom pricing &middot; Unlimited seats &middot; VPC deploy &middot; SSO &middot; 24/7 support
+            </p>
+          </div>
+          <a href="mailto:sales@crewlyai.com">
+            <Button variant="ghost" data-testid="contact-sales-btn">
+              Contact Sales
+            </Button>
+          </a>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default Pricing;

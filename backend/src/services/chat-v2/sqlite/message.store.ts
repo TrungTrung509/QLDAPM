@@ -1,0 +1,1189 @@
+/**
+ * MessageStore — CRUD for `chat_messages` plus the server-side
+ * sequence assigner described in tech-spec §4.
+ *
+ * Key properties:
+ * - Every insert assigns `seq = MAX(seq)+1` for the channel inside a
+ *   transaction that also bumps `chat_channels.last_message_at`.
+ * - Concurrent writes serialize through the SQLite write lock; the
+ *   `UNIQUE(channel_id, seq)` constraint is a belt-and-braces guard.
+ * - `clientMessageId` is an optional idempotency key stored in
+ *   `metadata.clientMessageId`; duplicate inserts surface the
+ *   persisted row instead of erroring.
+ *
+ * @module services/chat-v2/sqlite/message.store
+ */
+
+import { randomUUID } from 'crypto';
+import {
+  CHAT_ERROR_CODES,
+  ChatError,
+  type ChatChannelType,
+  type ChatContentType,
+  type ChatMessageCursorPayload,
+  type ChatMessageRow,
+  type ChatSenderType,
+} from '../types.js';
+import type { ChatDatabase } from './chat-db.js';
+import { deriveUnifiedColumns, type OwnerIdentity } from './unified-log.js';
+
+// ---------------------------------------------------------------------------
+// Constants — shared SELECT column list, single source of truth
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical column list for `chat_messages` SELECTs. Including all Phase A
+ * columns (mentions / thread_id) here keeps every read path in this store
+ * mapping to a fully-populated `ChatMessageRow`.
+ */
+const MESSAGE_SELECT_COLUMNS = `
+  id, channel_id, seq, sender_type, sender_id, content, content_type,
+  created_at, metadata, mentions, thread_id
+`;
+
+// ---------------------------------------------------------------------------
+// Cursor helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Encode a pagination cursor to an opaque base64url string.
+ *
+ * @param payload - Cursor fields
+ * @returns Opaque base64url-encoded JSON string
+ */
+export function encodeCursor(payload: ChatMessageCursorPayload): string {
+  const json = JSON.stringify(payload);
+  return Buffer.from(json, 'utf-8').toString('base64url');
+}
+
+/**
+ * Decode an opaque pagination cursor.
+ *
+ * @param cursor - The cursor string (or null/undefined)
+ * @returns The decoded payload, or null if input is missing
+ * @throws {ChatError} `invalid_cursor` (400) if the cursor fails to parse or
+ *   doesn't contain the expected fields.
+ */
+export function decodeCursor(cursor: string | null | undefined): ChatMessageCursorPayload | null {
+  if (!cursor) return null;
+  try {
+    const json = Buffer.from(cursor, 'base64url').toString('utf-8');
+    const parsed = JSON.parse(json) as Partial<ChatMessageCursorPayload>;
+    if (
+      typeof parsed.seq !== 'number' ||
+      !Number.isFinite(parsed.seq) ||
+      typeof parsed.channelId !== 'string' ||
+      parsed.channelId.length === 0
+    ) {
+      throw new Error('missing required fields');
+    }
+    return { seq: parsed.seq, channelId: parsed.channelId };
+  } catch (err) {
+    throw new ChatError(
+      CHAT_ERROR_CODES.INVALID_CURSOR,
+      400,
+      `Cursor failed to parse: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Input shapes
+// ---------------------------------------------------------------------------
+
+/** Options for inserting a message. */
+export interface MessageInsertInput {
+  channelId: string;
+  senderType: ChatSenderType;
+  senderId: string;
+  content: string;
+  contentType?: ChatContentType;
+  /** Optional metadata object. Will be JSON-stringified. */
+  metadata?: Record<string, unknown>;
+  /** Stable client id for idempotent retries; folded into metadata. */
+  clientMessageId?: string;
+  /**
+   * Phase A (SEALED §3.2) — array of mention IDs (member or team)
+   * referenced inline in `content`. Stored as a JSON-encoded string in
+   * the `mentions` column. Empty array or omitted → null in storage.
+   */
+  mentions?: string[];
+  /**
+   * Phase A (SEALED §3.2) — Slack-style thread root. When set, this
+   * message is a reply within the thread rooted at `threadId`. Omitted
+   * for top-level channel messages.
+   */
+  threadId?: string;
+  /** Override the insert clock (tests). */
+  nowMs?: number;
+  /** Override the generated id (tests / deterministic callers). */
+  id?: string;
+}
+
+/** A timeline row: the message, its unified-log columns, and its channel. */
+export interface AgentTimelineRow extends ChatMessageRow {
+  /** SQLite rowid — the tie-breaker for rows created in the same ms. */
+  rowid: number;
+  source: string | null;
+  direction: string | null;
+  sender_kind: string | null;
+  agent_session: string | null;
+  ext_ref: string | null;
+  channel_name: string;
+  channel_type: ChatChannelType;
+}
+
+/** One hit of {@link MessageStore.searchForAgent}. */
+export interface ChatSearchRow {
+  id: string;
+  channel_id: string;
+  channel_name: string;
+  channel_type: ChatChannelType;
+  sender_type: string;
+  sender_id: string;
+  content: string;
+  created_at: number;
+  thread_id: string | null;
+}
+
+/** Keywords and filters of a chat search. */
+export interface ChatSearchOptions {
+  /** Keywords, all required (case-insensitive substring) */
+  terms: string[];
+  /** Channel id, or name (with or without `#`) */
+  channel?: string;
+  /** Only messages created at or after this (epoch ms) */
+  fromMs?: number;
+  /** Only messages created before this (epoch ms) */
+  toMs?: number;
+  /** Most hits */
+  limit: number;
+}
+
+/** Escape LIKE wildcards. */
+function likeEscape(term: string): string {
+  return term.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
+/** Result of inserting a message — includes whether this was a dedupe hit. */
+export interface MessageInsertResult {
+  row: ChatMessageRow;
+  /** True when the returned row pre-existed under the given clientMessageId. */
+  deduped: boolean;
+}
+
+/** Options for listing messages with cursor pagination. */
+export interface MessageListOptions {
+  cursor?: string | null;
+  /** 1..100, default 50. */
+  limit?: number;
+  /** `backward` (default) loads older; `forward` loads newer. */
+  direction?: 'backward' | 'forward';
+}
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+
+/** SQLite-backed store for chat messages. */
+export class MessageStore {
+  /** Cap on a single page size. */
+  static readonly MAX_LIMIT = 100;
+  /** Default page size when caller didn't specify. */
+  static readonly DEFAULT_LIMIT = 50;
+
+  /** Who the owner is (Slack user / workspace) — feeds `sender_kind` and `ext_ref`. */
+  private ownerIdentity: () => OwnerIdentity | null = () => null;
+
+  constructor(private readonly db: ChatDatabase) {}
+
+  /**
+   * Wire the owner-identity lookup used when deriving the unified-log
+   * columns. Called post-construction because Slack is configured after the
+   * chat store opens.
+   *
+   * @param provider - Returns the owner's identity, or null when unknown
+   */
+  setOwnerIdentityProvider(provider: () => OwnerIdentity | null): void {
+    this.ownerIdentity = provider;
+  }
+
+  /**
+   * Resolve the owner identity without letting a faulty provider break a write.
+   *
+   * @returns The identity, or null
+   */
+  private safeOwnerIdentity(): OwnerIdentity | null {
+    try {
+      return this.ownerIdentity();
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Insert a message into the channel.
+   *
+   * Performs sequence assignment (`MAX(seq)+1`) and idempotency dedupe in a
+   * single transaction. If a row with the same `(channel_id, clientMessageId)`
+   * already exists, returns it with `deduped=true` instead of inserting.
+   *
+   * Also updates the parent channel's `last_message_at`.
+   *
+   * @param input - Insert payload
+   * @returns The persisted row plus a dedupe flag
+   * @throws {ChatError} `channel_not_found` (404) if the channel is missing
+   *   (or archived and we want to refuse).
+   */
+  insert(input: MessageInsertInput): MessageInsertResult {
+    const id = input.id ?? randomUUID();
+    const createdAt = input.nowMs ?? Date.now();
+    const contentType: ChatContentType = input.contentType ?? 'markdown';
+    const metadataObj = {
+      ...(input.metadata ?? {}),
+      ...(input.clientMessageId ? { clientMessageId: input.clientMessageId } : {}),
+    };
+    const metadataHasKeys = Object.keys(metadataObj).length > 0;
+    const metadataJson = metadataHasKeys ? JSON.stringify(metadataObj) : null;
+
+    // Phase A: serialize mentions to JSON. Treat null/empty as DB-null so
+    // legacy rows and "no mentions" share a representation; the read-side
+    // mapper translates DB-null back to [].
+    const mentionsJson =
+      input.mentions && input.mentions.length > 0 ? JSON.stringify(input.mentions) : null;
+    const threadId = input.threadId ?? null;
+
+    const txn = this.db.transaction((): MessageInsertResult => {
+      // Dedupe check — same clientMessageId + channel → return existing row.
+      if (input.clientMessageId) {
+        const existing = this.db
+          .prepare(
+            `SELECT ${MESSAGE_SELECT_COLUMNS}
+             FROM chat_messages
+             WHERE channel_id = ?
+               AND json_extract(metadata, '$.clientMessageId') = ?
+             LIMIT 1`,
+          )
+          .get(input.channelId, input.clientMessageId) as ChatMessageRow | undefined;
+        if (existing) {
+          return { row: existing, deduped: true };
+        }
+      }
+
+      // Channel existence check — FK catches it too but we want a typed error
+      // with a sensible status code.
+      const channel = this.db
+        .prepare('SELECT id, archived_at, type, agent_session FROM chat_channels WHERE id = ?')
+        .get(input.channelId) as
+        | { id: string; archived_at: number | null; type: ChatChannelType; agent_session: string }
+        | undefined;
+      if (!channel) {
+        throw new ChatError(
+          CHAT_ERROR_CODES.CHANNEL_NOT_FOUND,
+          404,
+          `Channel ${input.channelId} not found`,
+        );
+      }
+      if (channel.archived_at) {
+        throw new ChatError(
+          CHAT_ERROR_CODES.CHANNEL_ARCHIVED,
+          404,
+          `Channel ${input.channelId} is archived`,
+        );
+      }
+
+      // Sequence assignment + insert.
+      const seqRow = this.db
+        .prepare(
+          `SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
+           FROM chat_messages
+           WHERE channel_id = ?`,
+        )
+        .get(input.channelId) as { next_seq: number };
+
+      // Unified conversation log columns (spec §A.4). An agent's reply
+      // takes the surface of the latest inbound turn it answers.
+      const latestInboundSource =
+        input.senderType === 'agent'
+          ? ((this.db
+              .prepare(
+                `SELECT source FROM chat_messages
+                 WHERE channel_id = ? AND sender_type = 'user' AND source IS NOT NULL
+                 ORDER BY seq DESC LIMIT 1`,
+              )
+              .get(input.channelId) as { source: string } | undefined)?.source ?? null)
+          : null;
+      const unified = deriveUnifiedColumns({
+        senderType: input.senderType,
+        senderId: input.senderId,
+        metadata: metadataObj,
+        mentions: input.mentions ?? [],
+        channel: { id: channel.id, type: channel.type ?? 'dm', agentSession: channel.agent_session ?? '' },
+        latestInboundSource,
+        owner: this.safeOwnerIdentity(),
+      });
+
+      this.db
+        .prepare(
+          `INSERT INTO chat_messages
+             (id, channel_id, seq, sender_type, sender_id, content, content_type,
+              created_at, metadata, mentions, thread_id,
+              source, direction, sender_kind, agent_session, ext_ref, cloud_sync)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          input.channelId,
+          seqRow.next_seq,
+          input.senderType,
+          input.senderId,
+          input.content,
+          contentType,
+          createdAt,
+          metadataJson,
+          mentionsJson,
+          threadId,
+          unified.source,
+          unified.direction,
+          unified.senderKind,
+          unified.agentSession,
+          unified.extRef ? JSON.stringify(unified.extRef) : null,
+          unified.cloudSync,
+        );
+
+      // Touch last_message_at on the parent channel.
+      this.db
+        .prepare(
+          `UPDATE chat_channels
+           SET last_message_at = ?
+           WHERE id = ?
+             AND (last_message_at IS NULL OR last_message_at < ?)`,
+        )
+        .run(createdAt, input.channelId, createdAt);
+
+      const row = this.db
+        .prepare(
+          `SELECT ${MESSAGE_SELECT_COLUMNS}
+           FROM chat_messages
+           WHERE id = ?`,
+        )
+        .get(id) as ChatMessageRow;
+      return { row, deduped: false };
+    });
+
+    return txn();
+  }
+
+  /**
+   * Look up a message by its id.
+   *
+   * @param id - The message id
+   * @returns The row, or null
+   */
+  getById(id: string): ChatMessageRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT ${MESSAGE_SELECT_COLUMNS}
+         FROM chat_messages
+         WHERE id = ?`,
+      )
+      .get(id) as ChatMessageRow | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * List messages for a channel with cursor pagination.
+   *
+   * @param channelId - The channel id to read
+   * @param options - Listing options (cursor, limit, direction)
+   * @returns An ordered array of rows and cursors for next/prev pages
+   */
+  listByChannel(
+    channelId: string,
+    options?: MessageListOptions,
+  ): {
+    rows: ChatMessageRow[];
+    nextCursor: string | null;
+    prevCursor: string | null;
+  } {
+    const direction = options?.direction ?? 'backward';
+    const rawLimit = options?.limit ?? MessageStore.DEFAULT_LIMIT;
+    const limit = Math.max(1, Math.min(rawLimit, MessageStore.MAX_LIMIT));
+
+    const decoded = decodeCursor(options?.cursor);
+    if (decoded && decoded.channelId !== channelId) {
+      throw new ChatError(
+        CHAT_ERROR_CODES.INVALID_CURSOR,
+        400,
+        'Cursor belongs to a different channel',
+      );
+    }
+
+    const rows = this.queryPage(channelId, decoded?.seq ?? null, direction, limit);
+
+    const cursors = this.buildCursors(channelId, rows, direction, limit);
+    return { rows, ...cursors };
+  }
+
+  /** Execute the paginated SELECT for one page of messages. */
+  private queryPage(
+    channelId: string,
+    fromSeq: number | null,
+    direction: 'backward' | 'forward',
+    limit: number,
+  ): ChatMessageRow[] {
+    const cols = MESSAGE_SELECT_COLUMNS;
+
+    if (direction === 'backward') {
+      // Loading older: newest-first, seq < cursor.
+      if (fromSeq === null) {
+        return this.db
+          .prepare(
+            `SELECT ${cols} FROM chat_messages
+             WHERE channel_id = ?
+             ORDER BY seq DESC
+             LIMIT ?`,
+          )
+          .all(channelId, limit) as ChatMessageRow[];
+      }
+      return this.db
+        .prepare(
+          `SELECT ${cols} FROM chat_messages
+           WHERE channel_id = ? AND seq < ?
+           ORDER BY seq DESC
+           LIMIT ?`,
+        )
+        .all(channelId, fromSeq, limit) as ChatMessageRow[];
+    }
+
+    // Forward: oldest-first, seq > cursor.
+    if (fromSeq === null) {
+      return this.db
+        .prepare(
+          `SELECT ${cols} FROM chat_messages
+           WHERE channel_id = ?
+           ORDER BY seq ASC
+           LIMIT ?`,
+        )
+        .all(channelId, limit) as ChatMessageRow[];
+    }
+    return this.db
+      .prepare(
+        `SELECT ${cols} FROM chat_messages
+         WHERE channel_id = ? AND seq > ?
+         ORDER BY seq ASC
+         LIMIT ?`,
+      )
+      .all(channelId, fromSeq, limit) as ChatMessageRow[];
+  }
+
+  /** Compute next/prev cursors based on the page result. */
+  private buildCursors(
+    channelId: string,
+    rows: ChatMessageRow[],
+    direction: 'backward' | 'forward',
+    limit: number,
+  ): { nextCursor: string | null; prevCursor: string | null } {
+    // `nextCursor` continues in the current direction; `prevCursor` goes back.
+    if (rows.length === 0) {
+      return { nextCursor: null, prevCursor: null };
+    }
+    const isLastPage = rows.length < limit;
+
+    if (direction === 'backward') {
+      // rows ordered newest → oldest; the last element has the smallest seq.
+      const oldest = rows[rows.length - 1];
+      const newest = rows[0];
+      return {
+        nextCursor: isLastPage
+          ? null
+          : encodeCursor({ seq: oldest.seq, channelId }),
+        prevCursor: encodeCursor({ seq: newest.seq, channelId }),
+      };
+    }
+
+    // forward: rows ordered oldest → newest; the last element has the largest seq.
+    const newest = rows[rows.length - 1];
+    const oldest = rows[0];
+    return {
+      nextCursor: isLastPage ? null : encodeCursor({ seq: newest.seq, channelId }),
+      prevCursor: encodeCursor({ seq: oldest.seq, channelId }),
+    };
+  }
+
+  /**
+   * Aggregate Slack-style thread reply counts for a channel in a single
+   * query.
+   *
+   * Replies carry `thread_id = <root message id>`; root messages have
+   * `thread_id IS NULL`. This groups every reply by its root and returns
+   * one entry per thread with the reply count and the timestamp (ms) of
+   * the most recent reply. The caller attaches these to the matching
+   * root-message DTOs.
+   *
+   * Kept as ONE aggregate query per page (O(rows-with-threads)) rather
+   * than a per-message lookup, so a page render stays a fixed two-query
+   * cost regardless of page size.
+   *
+   * @param channelId - The channel id to aggregate over
+   * @returns Map of `rootMessageId` to `{ replyCount, lastReplyAtMs }`
+   */
+  threadReplySummary(
+    channelId: string,
+  ): Map<string, { replyCount: number; lastReplyAtMs: number }> {
+    const rows = this.db
+      .prepare(
+        `SELECT thread_id AS rootId, COUNT(*) AS cnt, MAX(created_at) AS last
+         FROM chat_messages
+         WHERE channel_id = ? AND thread_id IS NOT NULL
+         GROUP BY thread_id`,
+      )
+      .all(channelId) as Array<{ rootId: string; cnt: number; last: number }>;
+    const out = new Map<string, { replyCount: number; lastReplyAtMs: number }>();
+    for (const r of rows) {
+      out.set(r.rootId, { replyCount: r.cnt, lastReplyAtMs: r.last });
+    }
+    return out;
+  }
+
+  /**
+   * The most recent messages of a channel, or of one thread within it.
+   *
+   * Used to show an agent what was said before the message it is being woken
+   * for. Without it an agent @-mentioned into a channel sees exactly one
+   * line and nothing else, so it cannot tell whether a colleague already
+   * answered, and cannot check its own account of what it was told.
+   *
+   * Ordered oldest-first, which is the order it will be read in.
+   *
+   * @param channelId - The channel id
+   * @param rootId - Thread root to scope to, or undefined for the channel
+   * @param limit - Maximum messages to return
+   * @returns Rows oldest first, newest last
+   */
+  recentTurns(
+    channelId: string,
+    rootId: string | undefined,
+    limit: number,
+  ): Array<{ senderType: string; senderId: string; content: string; createdAt: number; threadId: string | null }> {
+    const scoped = rootId
+      ? `AND (id = ? OR thread_id = ?)`
+      : '';
+    const params: Array<string | number> = rootId ? [channelId, rootId, rootId, limit] : [channelId, limit];
+    const rows = this.db
+      .prepare(
+        `SELECT sender_type, sender_id, content, created_at, thread_id
+         FROM chat_messages
+         WHERE channel_id = ? ${scoped}
+         ORDER BY seq DESC
+         LIMIT ?`,
+      )
+      .all(...params) as Array<{
+      sender_type: string;
+      sender_id: string;
+      content: string;
+      created_at: number;
+      thread_id: string | null;
+    }>;
+
+    // Query is newest-first so LIMIT takes the newest; hand back the order
+    // a person would read.
+    return rows.reverse().map((r) => ({
+      senderType: r.sender_type,
+      senderId: r.sender_id,
+      content: r.content,
+      createdAt: r.created_at,
+      threadId: r.thread_id,
+    }));
+  }
+
+  /**
+   * Agents already engaged in a thread: every agent that posted in it
+   * (root or reply) plus every session @-mentioned anywhere in it. A
+   * human's follow-up in that thread goes to these agents without another
+   * @, which is what makes a Slack thread feel like a conversation.
+   *
+   * @param channelId - The channel id
+   * @param rootId - The thread root message id
+   * @returns Distinct session names, in first-seen order
+   */
+  threadParticipants(channelId: string, rootId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT sender_type, sender_id, mentions
+         FROM chat_messages
+         WHERE channel_id = ? AND (id = ? OR thread_id = ?)
+         ORDER BY seq ASC`,
+      )
+      .all(channelId, rootId, rootId) as Array<{ sender_type: string; sender_id: string; mentions: string | null }>;
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const add = (s: string) => {
+      if (s && !seen.has(s)) {
+        seen.add(s);
+        out.push(s);
+      }
+    };
+    for (const r of rows) {
+      if (r.sender_type === 'agent') add(r.sender_id);
+      if (r.mentions) {
+        try {
+          const parsed = JSON.parse(r.mentions) as unknown;
+          if (Array.isArray(parsed)) for (const m of parsed) if (typeof m === 'string') add(m);
+        } catch {
+          // malformed mentions column — ignore
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Every message of a thread (the root and its replies), oldest first.
+   * Read by the open-items backfill (specs/2026-10-01-reply-open-items.md).
+   *
+   * @param channelId - The channel id
+   * @param rootId - The thread root message id
+   * @param limit - Max rows (newest kept when over)
+   * @returns Rows in seq order
+   */
+  listThread(channelId: string, rootId: string, limit = 500): ChatMessageRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM (
+           SELECT * FROM chat_messages
+           WHERE channel_id = ? AND (id = ? OR thread_id = ?)
+           ORDER BY seq DESC
+           LIMIT ?
+         ) ORDER BY seq ASC`,
+      )
+      .all(channelId, rootId, rootId, limit) as ChatMessageRow[];
+    return rows;
+  }
+
+  /**
+   * The agent that spoke last in a thread.
+   *
+   * A bare follow-up in a thread addresses whoever just spoke, the way it
+   * does between people. Treating every engaged agent as required meant an
+   * agent answered — and acted on — a line meant for a colleague: the owner
+   * wrote "那要不算了？" to one agent and a second one rolled back its own
+   * unrelated config (2026-09-21, #daily-info).
+   *
+   * @param channelId - The channel id
+   * @param rootId - The thread root message id
+   * @returns The last agent sender, or null when no agent has posted
+   */
+  lastThreadSpeaker(channelId: string, rootId: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT sender_id
+         FROM chat_messages
+         WHERE channel_id = ? AND (id = ? OR thread_id = ?) AND sender_type = 'agent'
+         ORDER BY seq DESC
+         LIMIT 1`,
+      )
+      .get(channelId, rootId, rootId) as { sender_id: string } | undefined;
+    return row?.sender_id ?? null;
+  }
+
+  /**
+   * Return the current `MAX(seq)` for a channel, or 0 when empty.
+   *
+   * @param channelId - The channel id
+   * @returns The largest seq, or 0
+   */
+  getLastSeq(channelId: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(seq), 0) AS last_seq
+         FROM chat_messages
+         WHERE channel_id = ?`,
+      )
+      .get(channelId) as { last_seq: number };
+    return row.last_seq;
+  }
+
+  /** Count messages for a channel. Used by tests and metrics. */
+  count(channelId: string): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS n FROM chat_messages WHERE channel_id = ?')
+      .get(channelId) as { n: number };
+    return row.n;
+  }
+
+  /**
+   * Count all messages across every channel in the database.
+   *
+   * Onboarding v3 (B1) — used by the cold-start detector to decide whether
+   * a fresh OSS install should auto-launch onboarding. The "any chat at all
+   * means user has been here before" semantics is intentional: the detector
+   * combines this with the per-project `firstLaunchedAt` marker to defend
+   * against the case where chat-v2 is wiped accidentally on an existing
+   * install (a non-zero count short-circuits onboarding before the marker
+   * is even consulted).
+   *
+   * Single COUNT(*) over the index — O(rows) in the worst case but
+   * negligible at install time when the table is empty (the only time the
+   * caller actually cares about the result).
+   *
+   * @returns Total number of persisted chat messages
+   */
+  countAll(): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS n FROM chat_messages')
+      .get() as { n: number };
+    return row.n;
+  }
+
+  /**
+   * Count messages created after `sinceMs` that a PERSON wrote. Agent rows
+   * are excluded on purpose: an agent's own status echo ("[DONE] Agent orc:
+   * Task complete") or a cron post lands in chat as an agent row, and
+   * counting it would let the orchestrator re-arm its own reflect nudge.
+   * System rows (dispatches, nudges) are not conversation either.
+   *
+   * Used by the wiki reflect trigger to decide whether there is anything new
+   * to sweep before it wakes the orchestrator (2026-09-17): a reflect nudge
+   * that follows no conversation costs a full model turn and always ends in
+   * "nothing this period".
+   *
+   * @param sinceMs - Epoch ms; rows with `created_at > sinceMs` count
+   * @returns Number of user/agent messages newer than `sinceMs`
+   */
+  countConversationSince(sinceMs: number): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM chat_messages
+         WHERE created_at > ? AND sender_type = 'user'`,
+      )
+      .get(sinceMs) as { n: number };
+    return row.n;
+  }
+
+  /**
+   * Phase 6.0b — delete every message in a channel while leaving the
+   * channel row in place. Used by the legacy `clearConversation`
+   * controller route. Not transactional with channel state; callers
+   * that need atomicity should wrap in their own transaction.
+   *
+   * @param channelId - The channel whose messages to remove
+   * @returns Number of rows deleted
+   */
+  deleteAllByChannel(channelId: string): number {
+    const result = this.db
+      .prepare(`DELETE FROM chat_messages WHERE channel_id = ?`)
+      .run(channelId);
+    return result.changes;
+  }
+
+  /**
+   * Replace a message's content in place. Used for server-authored rows that
+   * change state after they are posted (a ticket receipt turning into
+   * "is no longer tracked"); user and agent turns are never edited.
+   *
+   * @param id - Message id
+   * @param content - New content
+   * @returns The updated row, or null when no such message exists
+   */
+  updateContent(id: string, content: string): ChatMessageRow | null {
+    const result = this.db.prepare('UPDATE chat_messages SET content = ? WHERE id = ?').run(content, id);
+    if (result.changes === 0) return null;
+    return this.getById(id);
+  }
+
+  /**
+   * Merge a JSON patch into an existing message's metadata column.
+   * Implementation of Phase 6.0 of the unified-chat-message-store spec
+   * — replaces the legacy `ChatService.updateMessageMetadata` so all
+   * mutation flows through the canonical store. SQLite's `json_patch`
+   * built-in handles the merge atomically.
+   *
+   * @param id - Message id to update
+   * @param patch - Partial metadata object to merge in (shallow merge)
+   * @returns The post-update row, or null if the message doesn't exist
+   */
+  updateMetadata(id: string, patch: Record<string, unknown>): ChatMessageRow | null {
+    const patchJson = JSON.stringify(patch);
+    const existing = this.db
+      .prepare('SELECT metadata FROM chat_messages WHERE id = ?')
+      .get(id) as { metadata: string | null } | undefined;
+    if (!existing) {
+      return null;
+    }
+    // SQLite's json_patch merges the right operand into the left,
+    // adding missing keys and overwriting existing ones. NULL-safe:
+    // when the current metadata is NULL we feed an empty object so
+    // the patch becomes the final state.
+    const baseExpr = existing.metadata ?? '{}';
+    this.db
+      .prepare(`UPDATE chat_messages SET metadata = json_patch(?, ?) WHERE id = ?`)
+      .run(baseExpr, patchJson, id);
+    return this.getById(id);
+  }
+
+  /**
+   * Find messages with `metadata.slackDeliveryStatus = 'pending'` AND a
+   * non-empty `metadata.slackChannelId`, created within the past
+   * `maxAgeMs`. Used by `NotifyReconciliationService` to retry Slack
+   * deliveries that failed mid-flight.
+   *
+   * The `slackDeliveryStatus` field is set by callers (legacy code and
+   * Phase 3 Slack writes) — this method is the canonical replacement
+   * for `ChatService.getMessagesWithPendingSlackDelivery`.
+   *
+   * @param maxAgeMs - Lookback window in milliseconds
+   * @param nowMs - Optional clock override for tests
+   * @returns Up to `MAX_LIMIT` matching rows, newest first
+   */
+  /**
+   * Find the thread-root message a Slack thread maps to. Slack team channels
+   * persist every inbound root with `metadata.slackThreadTs = <its own ts>`;
+   * a Slack reply carries that ts as `thread_ts`, so this lookup recovers
+   * the chat-v2 root the reply belongs under.
+   *
+   * @param channelId - The chat-v2 channel (huddle) id
+   * @param slackThreadTs - Slack thread timestamp (`1712345678.000100`)
+   * @returns The root row, or null when no message carries that ts
+   */
+  findThreadRootBySlackTs(channelId: string, slackThreadTs: string): ChatMessageRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT ${MESSAGE_SELECT_COLUMNS}
+         FROM chat_messages
+         WHERE channel_id = ?
+           AND thread_id IS NULL
+           AND json_extract(metadata, '$.slackThreadTs') = ?
+         ORDER BY seq DESC
+         LIMIT 1`,
+      )
+      .get(channelId, slackThreadTs) as ChatMessageRow | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * Whether any chat channel recorded the Slack message `slackTs` from Slack
+   * channel `slackChannelId` (`metadata.slackChannelId` + `metadata.slackTs`).
+   * The delivery audit asks this for each owner message Slack has.
+   *
+   * @param slackChannelId - Slack channel id
+   * @param slackTs - The Slack message's own ts
+   * @returns True when a row carries it
+   */
+  hasSlackMessage(slackChannelId: string, slackTs: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS found
+         FROM chat_messages
+         WHERE json_extract(metadata, '$.slackTs') = ?
+           AND json_extract(metadata, '$.slackChannelId') = ?
+         LIMIT 1`,
+      )
+      .get(slackTs, slackChannelId) as { found: number } | undefined;
+    return !!row;
+  }
+
+  /**
+   * The newest user-origin message in a channel that @-mentioned `agentSession`
+   * at or after `sinceMs` — the message that agent was most recently asked in
+   * this channel. Evidence that an agent's reply belongs here, and which thread.
+   *
+   * @param channelId - The chat-v2 channel id
+   * @param agentSession - The agent's session name (as stored in `mentions`)
+   * @param sinceMs - Oldest `created_at` (epoch ms) to consider
+   * @returns The row, or null
+   */
+  findLatestUserMessageMentioning(channelId: string, agentSession: string, sinceMs: number): ChatMessageRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT ${MESSAGE_SELECT_COLUMNS}
+         FROM chat_messages
+         WHERE channel_id = ?
+           AND sender_type = 'user'
+           AND created_at >= ?
+           AND mentions IS NOT NULL
+           AND EXISTS (SELECT 1 FROM json_each(chat_messages.mentions) WHERE json_each.value = ?)
+         ORDER BY seq DESC
+         LIMIT 1`,
+      )
+      .get(channelId, sinceMs, agentSession) as ChatMessageRow | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * The most recent thread-root in a channel that originated from Slack —
+   * an inbound message, not a local agent's own top-level post (those carry
+   * `slackThreadTs` too once mirrored, so replies under them can find them).
+   * Used to tell whether an un-@'d Slack message continues a person-to-person
+   * exchange. It is no longer an outbound fallback: an agent message with no
+   * thread is posted top level (2026-10-03, nightly reports buried in the
+   * owner's latest thread).
+   *
+   * @param channelId - The chat-v2 channel (huddle) id
+   * @returns The latest Slack-origin root row, or null
+   */
+  findLatestSlackRoot(channelId: string): ChatMessageRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT ${MESSAGE_SELECT_COLUMNS}
+         FROM chat_messages
+         WHERE channel_id = ?
+           AND thread_id IS NULL
+           AND sender_type != 'agent'
+           AND json_extract(metadata, '$.slackThreadTs') IS NOT NULL
+         ORDER BY seq DESC
+         LIMIT 1`,
+      )
+      .get(channelId) as ChatMessageRow | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * Epoch ms of the owner's latest turn on a channel (any surface).
+   *
+   * @param channelId - chat-v2 channel id
+   * @returns Epoch ms, or null
+   */
+  latestOwnerTurnAt(channelId: string): number | null {
+    const row = this.db
+      .prepare(
+        `SELECT created_at FROM chat_messages
+         WHERE channel_id = ? AND sender_type = 'user'
+           AND COALESCE(sender_kind, 'owner') = 'owner'
+         ORDER BY seq DESC
+         LIMIT 1`,
+      )
+      .get(channelId) as { created_at: number | string | null } | undefined;
+    if (!row || row.created_at === null || row.created_at === undefined) return null;
+    const n = typeof row.created_at === 'number' ? row.created_at : Date.parse(String(row.created_at));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  /**
+   * Surface of the owner's most recent message in a channel — the Slack
+   * reply-affinity rule (spec §A.3 G6) mirrors an agent's answer to Slack only
+   * when the owner last spoke there.
+   *
+   * Rows an agent wrote as a `user` turn (`sender_kind = 'agent'`) and other
+   * people's rows (`human`) are not the owner and are skipped.
+   *
+   * @param channelId - The chat-v2 channel id
+   * @returns The source column (`slack`, `crewly-chat`, `cloud-talk`, …), or null
+   */
+  latestOwnerTurnSource(channelId: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT source FROM chat_messages
+         WHERE channel_id = ? AND sender_type = 'user'
+           AND COALESCE(sender_kind, 'owner') = 'owner'
+         ORDER BY seq DESC
+         LIMIT 1`,
+      )
+      .get(channelId) as { source: string | null } | undefined;
+    return row?.source ?? null;
+  }
+
+  /**
+   * One page of an agent's merged timeline across every surface: rows whose
+   * `agent_session` is the agent, plus every row of the huddles the agent is
+   * a member of. Newest first (spec §A.5).
+   *
+   * @param agentSession - Agent session name
+   * @param options.before - Only rows strictly older than this (ms), or a
+   *   `{createdAt, rowid}` position from a previous page
+   * @param options.limit - Page size (already clamped by the caller)
+   * @param options.sources - Restrict to these `source` values
+   * @returns Rows (with their channel's name/type and the rowid used for paging)
+   */
+  listAgentTimeline(
+    agentSession: string,
+    options: { before?: { createdAt: number; rowid?: number }; limit: number; sources?: string[] },
+  ): Array<AgentTimelineRow> {
+    const params: Array<string | number> = [agentSession, agentSession];
+    let where = `(m.agent_session = ? OR m.channel_id IN (
+                    SELECT channel_id FROM chat_channel_members WHERE member_session = ?))`;
+    if (options.before) {
+      if (options.before.rowid !== undefined) {
+        where += ' AND (m.created_at < ? OR (m.created_at = ? AND m.rowid < ?))';
+        params.push(options.before.createdAt, options.before.createdAt, options.before.rowid);
+      } else {
+        where += ' AND m.created_at < ?';
+        params.push(options.before.createdAt);
+      }
+    }
+    if (options.sources && options.sources.length > 0) {
+      where += ` AND m.source IN (${options.sources.map(() => '?').join(', ')})`;
+      params.push(...options.sources);
+    }
+    params.push(options.limit);
+    return this.db
+      .prepare(
+        `SELECT m.rowid AS rowid, ${MESSAGE_SELECT_COLUMNS.split(',').map((c) => `m.${c.trim()}`).join(', ')},
+                m.source, m.direction, m.sender_kind, m.agent_session, m.ext_ref,
+                c.name AS channel_name, c.type AS channel_type
+         FROM chat_messages m JOIN chat_channels c ON c.id = m.channel_id
+         WHERE ${where}
+         ORDER BY m.created_at DESC, m.rowid DESC
+         LIMIT ?`,
+      )
+      .all(...params) as AgentTimelineRow[];
+  }
+
+  /**
+   * Search the messages an agent can see — its DMs, the channels and huddles
+   * it is a member of, and any message that @-mentions it — by keywords (all
+   * must appear), optional channel and date range, newest first.
+   *
+   * @param agentSession - The agent whose view is searched
+   * @param opts - Keywords and filters, see {@link ChatSearchOptions}
+   * @returns Hits, newest first
+   */
+  searchForAgent(agentSession: string, opts: ChatSearchOptions): ChatSearchRow[] {
+    const params: Array<string | number> = [
+      agentSession,
+      agentSession,
+      agentSession,
+      `%${likeEscape(JSON.stringify(agentSession))}%`,
+    ];
+    const scope = `(m.agent_session = ? OR c.agent_session = ?
+           OR m.channel_id IN (SELECT channel_id FROM chat_channel_members WHERE member_session = ?)
+           OR m.mentions LIKE ? ESCAPE '\\')`;
+    return this.runSearch(scope, params, opts);
+  }
+
+  /**
+   * Search every conversation on this machine — the owner's view (#1400
+   * cross-conversation search). Same keywords and filters as
+   * {@link searchForAgent}, no membership scope.
+   *
+   * @param opts - Keywords and filters, see {@link ChatSearchOptions}
+   * @returns Hits, newest first
+   */
+  searchAll(opts: ChatSearchOptions): ChatSearchRow[] {
+    return this.runSearch(null, [], opts);
+  }
+
+  /**
+   * Shared body of the two searches: keyword, channel and date clauses on
+   * top of an optional scope clause.
+   *
+   * @param scope - SQL predicate restricting whose messages are seen, or null for all
+   * @param params - Bind values the scope predicate consumes, in order
+   * @param opts - Keywords and filters
+   * @returns Hits, newest first
+   */
+  private runSearch(scope: string | null, params: Array<string | number>, opts: ChatSearchOptions): ChatSearchRow[] {
+    let where = `m.sender_type != 'system'`;
+    if (scope) where += ` AND ${scope}`;
+    for (const term of opts.terms) {
+      where += ` AND m.content LIKE ? ESCAPE '\\'`;
+      params.push(`%${likeEscape(term)}%`);
+    }
+    if (opts.channel) {
+      const name = opts.channel.replace(/^#/, '');
+      where += ` AND (m.channel_id = ? OR lower(replace(c.name, '#', '')) = lower(?))`;
+      params.push(opts.channel, name);
+    }
+    if (opts.fromMs !== undefined) {
+      where += ' AND m.created_at >= ?';
+      params.push(opts.fromMs);
+    }
+    if (opts.toMs !== undefined) {
+      where += ' AND m.created_at < ?';
+      params.push(opts.toMs);
+    }
+    params.push(opts.limit);
+    return this.db
+      .prepare(
+        `SELECT m.id, m.channel_id, c.name AS channel_name, c.type AS channel_type,
+                m.sender_type, m.sender_id, m.content, m.created_at, m.thread_id
+         FROM chat_messages m JOIN chat_channels c ON c.id = m.channel_id
+         WHERE ${where}
+         ORDER BY m.created_at DESC, m.rowid DESC
+         LIMIT ?`,
+      )
+      .all(...params) as ChatSearchRow[];
+  }
+
+  /**
+   * Every message since a time in the owner's live channels (not archived),
+   * oldest first, capped at the newest `limit` — Drive mode recall reads its
+   * window from here (specs/2026-10-08-drive-mode.md §7).
+   *
+   * @param sinceMs - Only messages created at or after this (epoch ms)
+   * @param limit - Most rows returned (newest kept)
+   * @returns Rows with their unified-log columns and channel, oldest first
+   */
+  listOwnerFeedRows(sinceMs: number, limit: number): Array<AgentTimelineRow> {
+    const rows = this.db
+      .prepare(
+        `SELECT m.rowid AS rowid, ${MESSAGE_SELECT_COLUMNS.split(',').map((c) => `m.${c.trim()}`).join(', ')},
+                m.source, m.direction, m.sender_kind, m.agent_session, m.ext_ref,
+                c.name AS channel_name, c.type AS channel_type
+         FROM chat_messages m JOIN chat_channels c ON c.id = m.channel_id
+         WHERE m.created_at >= ? AND c.archived_at IS NULL
+         ORDER BY m.created_at DESC, m.rowid DESC
+         LIMIT ?`,
+      )
+      .all(sinceMs, limit) as AgentTimelineRow[];
+    return rows.reverse();
+  }
+
+  /**
+   * When the owner last spoke in each conversation, all time: per channel
+   * for a DM, per thread (root message id) for a channel or huddle.
+   *
+   * @returns One row per conversation the owner ever wrote in
+   */
+  listOwnerTurnMarks(): Array<{ channelId: string; root: string; lastAt: number }> {
+    return (
+      this.db
+        .prepare(
+          `SELECT m.channel_id AS channelId,
+                  CASE WHEN c.type = 'dm' THEN '' ELSE COALESCE(m.thread_id, m.id) END AS root,
+                  MAX(m.created_at) AS lastAt
+           FROM chat_messages m JOIN chat_channels c ON c.id = m.channel_id
+           WHERE m.sender_type = 'user' AND COALESCE(m.sender_kind, 'owner') = 'owner'
+           GROUP BY m.channel_id, root`,
+        )
+        .all() as Array<{ channelId: string; root: string; lastAt: number }>
+    ).map((r) => ({ channelId: r.channelId, root: r.root, lastAt: Number(r.lastAt) }));
+  }
+
+  /**
+   * Slack channels where an inbound (owner/user) Slack message was stored
+   * since `sinceMs`, most recently active first.
+   *
+   * @param sinceMs - Epoch ms lower bound
+   * @param limit - Most channels returned
+   * @returns Slack channel ids
+   */
+  listSlackInboundChannels(sinceMs: number, limit: number): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT json_extract(ext_ref, '$.slackChannelId') AS ch, MAX(created_at) AS last
+         FROM chat_messages
+         WHERE source = 'slack' AND direction = 'in' AND created_at >= ?
+           AND json_extract(ext_ref, '$.slackChannelId') IS NOT NULL
+         GROUP BY ch ORDER BY last DESC LIMIT ?`,
+      )
+      .all(sinceMs, limit) as Array<{ ch: string }>;
+    return rows.map((r) => r.ch);
+  }
+
+  findPendingSlackDelivery(maxAgeMs: number, nowMs?: number): ChatMessageRow[] {
+    const cutoff = (nowMs ?? Date.now()) - maxAgeMs;
+    const rows = this.db
+      .prepare(
+        `SELECT ${MESSAGE_SELECT_COLUMNS}
+         FROM chat_messages
+         WHERE json_extract(metadata, '$.slackDeliveryStatus') = 'pending'
+           AND json_extract(metadata, '$.slackChannelId') IS NOT NULL
+           AND created_at >= ?
+         ORDER BY created_at DESC
+         LIMIT ${MessageStore.MAX_LIMIT}`,
+      )
+      .all(cutoff) as ChatMessageRow[];
+    return rows;
+  }
+}

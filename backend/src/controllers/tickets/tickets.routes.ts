@@ -1,0 +1,56 @@
+/**
+ * Tickets Routes — mounted at `/api/tickets` (specs/ticket-loop.md §5).
+ *
+ * @module controllers/tickets/tickets.routes
+ */
+
+import { Router } from 'express';
+import {
+  listTickets,
+  getTicket,
+  dismissTicket,
+  verifyTicket,
+  rejectTicket,
+  setTicketAcceptance,
+  selfCheckTicket,
+  splitTicket,
+  patchTicket,
+  cleanupTickets,
+} from './tickets.controller.js';
+
+/**
+ * Create the tickets router.
+ *
+ * Routes:
+ * - GET  /             — board-shaped list
+ * - GET  /:tkt         — one ticket
+ * - POST /:id/dismiss  — "不用记"
+ * - POST /:id/verify   — 验过了
+ * - POST /:id/reject   — 打回 { reason }
+ * - PUT  /:id/acceptance — replace acceptance list
+ * - POST /:id/self-check — agent self-check of one criterion
+ * - POST /:id/split    — split an ask out into its own ticket (#827; agents may call)
+ * - PATCH /:id         — title / priority / kind / assignee
+ * - POST /cleanup      — one-time cleanup of the pile; dry run unless `{ apply: true }`
+ * - POST /:id/acceptance, POST /:id/update — the same two, for the relay
+ *   (portal / phone), which only carries GET and POST
+ *
+ * @returns Express router for /api/tickets
+ */
+export function createTicketsRouter(): Router {
+  const router = Router();
+  router.get('/', listTickets);
+  router.post('/cleanup', (req, res) => cleanupTickets(req, res));
+  router.get('/:tkt', getTicket);
+  router.post('/:id/dismiss', dismissTicket);
+  router.post('/:id/verify', verifyTicket);
+  router.post('/:id/reject', rejectTicket);
+  router.put('/:id/acceptance', setTicketAcceptance);
+  router.post('/:id/self-check', selfCheckTicket);
+  router.post('/:id/split', splitTicket);
+  router.patch('/:id', patchTicket);
+  // POST twins: the relay (portal / phone) only carries GET and POST.
+  router.post('/:id/acceptance', setTicketAcceptance);
+  router.post('/:id/update', patchTicket);
+  return router;
+}

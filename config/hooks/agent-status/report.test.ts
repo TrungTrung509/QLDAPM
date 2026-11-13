@@ -1,0 +1,323 @@
+import { spawn, spawnSync } from 'child_process';
+import { mkdtempSync, rmSync, symlinkSync } from 'fs';
+import { tmpdir } from 'os';
+import { createServer, type IncomingHttpHeaders, type Server } from 'http';
+import type { AddressInfo } from 'net';
+import { join } from 'path';
+
+/**
+ * Tests for the agent-status hook (#815, specs/2026-09-26-agent-waiting-on-human.md).
+ *
+ * Each test runs the real script with a Claude Code hook payload on stdin and
+ * a throwaway HTTP server standing in for the backend, then inspects exactly
+ * what reached the server. The privacy contract: only the event name, the
+ * notification type and the session are ever sent.
+ */
+
+const HOOK = join(__dirname, 'report.sh');
+
+interface Captured {
+	url: string;
+	headers: IncomingHttpHeaders;
+	body: string;
+}
+
+let server: Server;
+let received: Captured[];
+let apiUrl: string;
+/** What the stand-in backend answers. */
+let responseBody = '{}';
+
+beforeEach(async () => {
+	received = [];
+	responseBody = '{}';
+	server = createServer((req, res) => {
+		let body = '';
+		req.on('data', (c) => (body += c));
+		req.on('end', () => {
+			received.push({ url: req.url ?? '', headers: req.headers, body });
+			res.statusCode = 202;
+			res.end(responseBody);
+		});
+	});
+	await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+	apiUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+});
+
+afterEach(async () => {
+	await new Promise<void>((r) => server.close(() => r()));
+});
+
+/**
+ * Run the hook with a payload on stdin (async, so the test server can answer).
+ *
+ * @param payload - Hook JSON (object is serialised; a string is sent as-is)
+ * @param env - Extra environment
+ * @returns Exit status and stdout/stderr
+ */
+function runHook(payload: unknown, env: Record<string, string | undefined> = {}): Promise<{ status: number | null; stdout: string; stderr: string }> {
+	return new Promise((resolve) => {
+		const child = spawn('bash', [HOOK], {
+			env: { ...process.env, CREWLY_API_URL: apiUrl, CREWLY_SESSION_NAME: 'crewly-dev-1', CREWLY_AGENT_AUTHORIZATION: '', ...env },
+		});
+		let stdout = '';
+		let stderr = '';
+		child.stdout.on('data', (c) => (stdout += c));
+		child.stderr.on('data', (c) => (stderr += c));
+		child.on('close', (status) => resolve({ status, stdout, stderr }));
+		child.stdin.end(typeof payload === 'string' ? payload : JSON.stringify(payload));
+	});
+}
+
+const SECRET = 'sk-ant-api03-THISISAFAKEKEYFORTESTING0123456789abcdef';
+
+describe('agent-status hook (report.sh)', () => {
+	it('sends only event, notification type and session for a permission prompt', async () => {
+		const r = await runHook({
+			session_id: 'abc',
+			transcript_path: `/home/user/.claude/projects/x/${SECRET}.jsonl`,
+			cwd: '/home/user/project',
+			hook_event_name: 'Notification',
+			notification_type: 'permission_prompt',
+			message: `Claude needs your permission to use Bash: export ANTHROPIC_API_KEY=${SECRET}`,
+		});
+
+		expect(r.status).toBe(0);
+		expect(received).toHaveLength(1);
+		expect(received[0].url).toBe('/api/agent-hooks');
+		expect(received[0].headers['x-agent-session']).toBe('crewly-dev-1');
+		expect(received[0].headers['user-agent']).toMatch(/^crewly-agent-status-hook\//);
+		const body = JSON.parse(received[0].body);
+		expect(body).toEqual({ event: 'Notification', notificationType: 'permission_prompt' });
+		expect(Object.keys(body).sort()).toEqual(['event', 'notificationType']);
+	});
+
+	it('never forwards tool_input, the transcript or a key-looking string, and prints nothing', async () => {
+		const r = await runHook({
+			hook_event_name: 'PostToolUse',
+			tool_name: 'Bash',
+			tool_input: { command: `curl -H "x-api-key: ${SECRET}" https://api.example.com` },
+			tool_response: { stdout: SECRET },
+			transcript_path: `/tmp/${SECRET}`,
+		});
+
+		expect(r.status).toBe(0);
+		expect(received).toHaveLength(1);
+		const wire = received[0].body + JSON.stringify(received[0].headers);
+		expect(wire).not.toContain(SECRET);
+		expect(wire).not.toContain('sk-ant');
+		expect(wire).not.toContain('tool_input');
+		// The tool NAME is sent (team-lead nudge, crewly#1083); its input never is.
+		expect(JSON.parse(received[0].body)).toEqual({ event: 'PostToolUse', toolName: 'Bash' });
+		expect(r.stdout + r.stderr).toBe('');
+	});
+
+	it('drops a field that is not a plain identifier instead of sending it', async () => {
+		await runHook({ hook_event_name: 'Notification', notification_type: `x","leak":"${SECRET}` });
+		expect(received).toHaveLength(1);
+		expect(JSON.parse(received[0].body)).toEqual({ event: 'Notification' });
+		expect(received[0].body).not.toContain(SECRET);
+	});
+
+	it('sends nothing without a session or an event name, and still exits 0', async () => {
+		expect((await runHook({ hook_event_name: 'Stop' }, { CREWLY_SESSION_NAME: '' })).status).toBe(0);
+		expect((await runHook({ notification_type: 'permission_prompt' })).status).toBe(0);
+		expect((await runHook('not json at all')).status).toBe(0);
+		expect(received).toHaveLength(0);
+	});
+
+	it('exits 0 quickly when the backend is unreachable', async () => {
+		const started = Date.now();
+		const r = await runHook({ hook_event_name: 'Stop' }, { CREWLY_API_URL: 'http://127.0.0.1:9' });
+		expect(r.status).toBe(0);
+		expect(Date.now() - started).toBeLessThan(5000);
+	});
+
+	/**
+	 * Build a PATH directory holding only the given tools (symlinks), so a test
+	 * can prove which parser the script had available.
+	 *
+	 * @param tools - Tool names to expose
+	 * @returns The directory (caller removes it)
+	 */
+	function pathWith(tools: string[]): string {
+		const bin = mkdtempSync(join(tmpdir(), 'hookpath-'));
+		for (const tool of tools) {
+			const found = spawnSync('bash', ['-c', `command -v ${tool}`], { encoding: 'utf-8' }).stdout.trim();
+			if (found) symlinkSync(found, join(bin, tool));
+		}
+		return bin;
+	}
+	const has = (bin: string, tool: string): boolean =>
+		spawnSync(join(bin, 'bash'), ['-c', `command -v ${tool}`], { env: { PATH: bin } }).status === 0;
+	const BASE_TOOLS = ['bash', 'cat', 'grep', 'curl', 'base64', 'tr', 'sed'];
+
+	// A nested "hook_event_name" inside tool_input (e.g. in a command the agent
+	// runs) must not override the real, top-level event.
+	const SPOOF = {
+		hook_event_name: 'PermissionRequest',
+		tool_name: 'Bash',
+		tool_input: { command: 'echo \'{"hook_event_name":"Stop","notification_type":"idle_prompt"}\'', hook_event_name: 'Stop' },
+		zz_trailing: { hook_event_name: 'Stop' },
+	};
+
+	it('jq path: reads the TOP-LEVEL event, not one nested in tool_input', async () => {
+		const bin = pathWith([...BASE_TOOLS, 'jq']);
+		expect(has(bin, 'jq')).toBe(true);
+		await runHook(SPOOF, { PATH: bin });
+		rmSync(bin, { recursive: true, force: true });
+		expect(received).toHaveLength(1);
+		expect(JSON.parse(received[0].body)).toEqual({ event: 'PermissionRequest' });
+	});
+
+	it('no-jq path (node): reads the TOP-LEVEL event, not one nested in tool_input', async () => {
+		const bin = pathWith([...BASE_TOOLS, 'node']);
+		expect(has(bin, 'jq')).toBe(false);
+		expect(has(bin, 'node')).toBe(true);
+		await runHook(SPOOF, { PATH: bin });
+		rmSync(bin, { recursive: true, force: true });
+		expect(received).toHaveLength(1);
+		expect(JSON.parse(received[0].body)).toEqual({ event: 'PermissionRequest' });
+	});
+
+	it('sends the tool-use id for tool events and the subagent id for subagent events (runtime turn state)', async () => {
+		await runHook({ hook_event_name: 'PreToolUse', tool_use_id: 'toolu_01DCgEGybopgPqvXvaCDeSsY', agent_id: 'ignored' });
+		await runHook({ hook_event_name: 'SubagentStart', agent_id: 'a1d4d935dea1c5443', agent_type: 'Explore', tool_use_id: 'ignored' });
+		expect(received.map((r) => JSON.parse(r.body))).toEqual([
+			{ event: 'PreToolUse', toolUseId: 'toolu_01DCgEGybopgPqvXvaCDeSsY' },
+			{ event: 'SubagentStart', agentId: 'a1d4d935dea1c5443' },
+		]);
+	});
+
+	describe('owner board tool input (crewly#1247)', () => {
+		const PRE = {
+			hook_event_name: 'PreToolUse',
+			tool_use_id: 'toolu_1',
+			tool_name: 'Edit',
+			tool_input: { file_path: '/work/app/src/a.ts', old_string: SECRET, new_string: SECRET, command: 'git push', url: 'https://x.io/a?k=1', content: SECRET },
+			transcript_path: `/tmp/${SECRET}`,
+		};
+
+		it('PreToolUse sends the tool name and ONLY file path, command and url from tool_input', async () => {
+			await runHook(PRE);
+			expect(JSON.parse(received[0].body)).toEqual({
+				event: 'PreToolUse',
+				toolUseId: 'toolu_1',
+				toolName: 'Edit',
+				toolInput: { filePath: '/work/app/src/a.ts', command: 'git push', url: 'https://x.io/a?k=1' },
+			});
+			expect(received[0].body).not.toContain(SECRET);
+		});
+
+		it('the node path sends the same', async () => {
+			const bin = pathWith([...BASE_TOOLS, 'node']);
+			await runHook(PRE, { PATH: bin });
+			rmSync(bin, { recursive: true, force: true });
+			expect(JSON.parse(received[0].body).toolInput).toEqual({ filePath: '/work/app/src/a.ts', command: 'git push', url: 'https://x.io/a?k=1' });
+			expect(received[0].body).not.toContain(SECRET);
+		});
+
+		it('sends the search query for WebSearch only', async () => {
+			await runHook({ hook_event_name: 'PreToolUse', tool_name: 'WebSearch', tool_input: { query: 'open swarm rivals', prompt: SECRET } });
+			expect(JSON.parse(received[0].body).toolInput).toEqual({ query: 'open swarm rivals' });
+			expect(received[0].body).not.toContain(SECRET);
+			received.length = 0;
+			await runHook({ hook_event_name: 'PreToolUse', tool_name: 'mcp__db__query', tool_input: { query: `select * from t where k = '${SECRET}'` } });
+			expect(received[0].body).not.toContain('toolInput');
+			expect(received[0].body).not.toContain(SECRET);
+		});
+
+		it('cuts long values to 600 characters and skips non-strings', async () => {
+			await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'a'.repeat(5000), url: 42 } });
+			const body = JSON.parse(received[0].body);
+			expect(body.toolInput.command).toHaveLength(600);
+			expect(body.toolInput.url).toBeUndefined();
+		});
+
+		it('does not read a tool_input nested elsewhere, and sends no toolInput without one', async () => {
+			await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', other: { tool_input: { command: SECRET } } });
+			expect(JSON.parse(received[0].body)).toEqual({ event: 'PreToolUse', toolName: 'Bash' });
+		});
+
+		it('CREWLY_BOARD_PUSH=0 stops the script sending tool input at all', async () => {
+			await runHook(PRE, { CREWLY_BOARD_PUSH: '0' });
+			expect(JSON.parse(received[0].body)).toEqual({ event: 'PreToolUse', toolUseId: 'toolu_1', toolName: 'Edit' });
+		});
+
+		it('other events never carry tool input', async () => {
+			await runHook({ ...PRE, hook_event_name: 'PostToolUse' });
+			await runHook({ ...PRE, hook_event_name: 'Notification' });
+			for (const r of received) expect(r.body).not.toContain('toolInput');
+		});
+	});
+
+	it('sends the SessionStart source', async () => {
+		await runHook({ hook_event_name: 'SessionStart', source: 'resume', transcript_path: `/tmp/${SECRET}` });
+		expect(JSON.parse(received[0].body)).toEqual({ event: 'SessionStart', source: 'resume' });
+		expect(received[0].body).not.toContain(SECRET);
+	});
+
+	describe('team-lead nudge (crewly#1083)', () => {
+		const NUDGE = '[CREWLY-NUDGE] You have edited files 6 times. Delegate with "delegate-task".';
+
+		it.each([
+			['jq', ['jq']],
+			['node', ['node']],
+		])('%s path: prints the backend note as hookSpecificOutput.additionalContext', async (_label, tools) => {
+			responseBody = JSON.stringify({ success: true, recorded: true, additionalContext: NUDGE });
+			const bin = pathWith([...BASE_TOOLS, ...tools]);
+			const r = await runHook({ hook_event_name: 'PostToolUse', tool_name: 'Edit', tool_use_id: 'toolu_1', tool_input: { file_path: SECRET } }, { PATH: bin });
+			rmSync(bin, { recursive: true, force: true });
+			expect(r.status).toBe(0);
+			expect(JSON.parse(received[0].body)).toEqual({ event: 'PostToolUse', toolUseId: 'toolu_1', toolName: 'Edit' });
+			expect(received[0].body).not.toContain(SECRET);
+			expect(JSON.parse(r.stdout)).toEqual({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: NUDGE } });
+		});
+
+		it('prints nothing when the backend has no note, answers junk, or the event is not PostToolUse', async () => {
+			responseBody = JSON.stringify({ success: true, recorded: true });
+			expect((await runHook({ hook_event_name: 'PostToolUse', tool_name: 'Edit' })).stdout).toBe('');
+			responseBody = 'not json';
+			expect((await runHook({ hook_event_name: 'PostToolUse', tool_name: 'Edit' })).stdout).toBe('');
+			responseBody = JSON.stringify({ additionalContext: NUDGE });
+			expect((await runHook({ hook_event_name: 'Stop' })).stdout).toBe('');
+			expect((await runHook({ hook_event_name: 'PreToolUse', tool_name: 'Edit' })).stdout).toBe('');
+		});
+
+		it("sends a subagent's agent_id with PostToolUse, so owner messages go to the main agent only", async () => {
+			await runHook({ hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_use_id: 'toolu_2', agent_id: 'aec1310fcf3b9c9e3', agent_type: 'general-purpose' });
+			expect(JSON.parse(received[0].body)).toEqual({ event: 'PostToolUse', toolUseId: 'toolu_2', agentId: 'aec1310fcf3b9c9e3', toolName: 'Bash' });
+		});
+
+		it('drops a tool name that is not a plain identifier', async () => {
+			await runHook({ hook_event_name: 'PostToolUse', tool_name: `Edit","x":"${SECRET}` });
+			expect(JSON.parse(received[0].body)).toEqual({ event: 'PostToolUse' });
+		});
+	});
+
+	it('drops an id that is not a plain identifier instead of sanitising it', async () => {
+		await runHook({ hook_event_name: 'PostToolUse', tool_use_id: '../../etc/passwd' });
+		await runHook({ hook_event_name: 'SubagentStop', agent_id: 'a"b' });
+		expect(received.map((r) => JSON.parse(r.body))).toEqual([{ event: 'PostToolUse' }, { event: 'SubagentStop' }]);
+	});
+
+	it('no-jq path (node) still sends only identifiers', async () => {
+		const bin = pathWith([...BASE_TOOLS, 'node']);
+		await runHook({ hook_event_name: 'Notification', notification_type: 'permission_prompt', tool_input: { command: SECRET } }, { PATH: bin });
+		rmSync(bin, { recursive: true, force: true });
+		expect(received).toHaveLength(1);
+		expect(JSON.parse(received[0].body)).toEqual({ event: 'Notification', notificationType: 'permission_prompt' });
+		expect(received[0].body).not.toContain(SECRET);
+	});
+
+	it('with neither jq nor node it drops the event (never guesses) and exits 0', async () => {
+		const bin = pathWith(BASE_TOOLS);
+		expect(has(bin, 'jq')).toBe(false);
+		expect(has(bin, 'node')).toBe(false);
+		const r = await runHook(SPOOF, { PATH: bin });
+		rmSync(bin, { recursive: true, force: true });
+		expect(r.status).toBe(0);
+		expect(received).toHaveLength(0);
+	});
+
+});

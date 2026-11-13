@@ -1,0 +1,1114 @@
+/**
+ * Sub-Agent Message Queue Service
+ *
+ * Buffers messages destined for sub-agents that have not yet completed
+ * initialization (agentStatus !== 'active'). Messages are flushed once
+ * the agent registers via the MCP `register_agent_status` tool.
+ *
+ * The orchestrator is excluded from this queue because it already has
+ * its own deferral mechanism via QueueProcessorService.
+ *
+ * @module sub-agent-message-queue
+ */
+
+import * as path from 'path';
+import { randomUUID } from 'crypto';
+import { LoggerService, ComponentLogger } from '../core/logger.service.js';
+import { OWNER_HOOK_MESSAGE_CONSTANTS, SUB_AGENT_QUEUE_CONSTANTS } from '../../constants.js';
+import { mkdirSync, existsSync } from 'fs';
+import { atomicWriteFileSync, quarantineCorruptFileSync, readJsonStoreSync, CorruptJsonFileError } from '../../utils/file-io.utils.js';
+import { getCrewlyHomePath } from '../core/crewly-home.utils.js';
+import { AgentPostLog, currentQueueMeta, type QueueMessageMeta } from './queue-priority.js';
+import { canonicalAgentSession } from '../../utils/orchestrator-alias.utils.js';
+
+/**
+ * A single queued message destined for a sub-agent.
+ */
+/** Why queued messages were dropped undelivered. */
+export type QueueDropReason = 'aged-out' | 'capacity' | 'undeliverable';
+
+/**
+ * Told when undelivered messages are dropped, so someone hears about it.
+ *
+ * @param sessionName - The agent they were for
+ * @param dropped - The dropped messages
+ * @param reason - Why
+ */
+export type QueueDropListener = (sessionName: string, dropped: QueuedAgentMessage[], reason: QueueDropReason) => void;
+
+export interface QueuedAgentMessage {
+	/**
+	 * Stable identity of this queue entry. Flush matches entries by it, never
+	 * by text: two entries can carry identical text (a re-queue by `send`, a
+	 * reminder repeated later) and must stay distinguishable. Entries stored by
+	 * an older version get one when loaded.
+	 */
+	id?: string;
+	/** The raw data string to write to the agent's terminal */
+	data: string;
+	/** Timestamp (ms since epoch) when the message was enqueued */
+	queuedAt: number;
+	/** The target session name */
+	sessionName: string;
+	/** Times a flush found the agent busy and kept this message (log noise is cut after the first) */
+	deferrals?: number;
+	/** The last time a flush kept it because the agent was busy (ms): not stale while this is recent */
+	lastDeferredAt?: number;
+	/** Failed delivery attempts so far (a send that threw or reported failure) */
+	attempts?: number;
+	/** Times it was kept, instead of dropped, because the agent was down */
+	keptWhileDown?: number;
+	/**
+	 * The WorkItem this message hands over (a `/deliver` with `workItemId`
+	 * held by the restart drain): its hand-over — dispatcher dedup, fresh
+	 * conversation — runs when it is finally delivered (crewly#1015 review).
+	 */
+	workItemId?: string;
+	/**
+	 * Who wrote it and where its answer belongs (see queue-priority.ts):
+	 * owner messages go ahead of system traffic, and a message answered in
+	 * its thread, a second copy of an owner message, or a reminder replaced
+	 * by a newer one is dropped at flush time.
+	 */
+	meta?: QueueMessageMeta;
+	/**
+	 * When the owner message was last handed to the busy agent at a tool
+	 * boundary ({@link SubAgentMessageQueue.takeOwnerMessageForHook}). It
+	 * stays queued until the agent posts in its conversation after this.
+	 */
+	surfacedAt?: number;
+	/** How many times it was handed over at a tool boundary */
+	surfaceCount?: number;
+}
+
+/** An owner message handed to a busy agent at a tool boundary. */
+export interface SurfacedOwnerMessage {
+	/** The queued text (it already carries where and how to reply) */
+	data: string;
+	/** When it was queued */
+	queuedAt: number;
+	/** 1 the first time, 2 for the reminder */
+	surfaceCount: number;
+}
+
+/**
+ * Whether a queued message was written by (or carries the answer of) the owner.
+ *
+ * @param m - Queued message
+ * @returns True for owner traffic
+ */
+function isOwnerItem(m: QueuedAgentMessage): boolean {
+	return m.meta?.owner === true;
+}
+
+/**
+ * Owner messages first, each group in its existing order (stable).
+ *
+ * @param list - Queue
+ * @returns The queue in delivery order
+ */
+export function ownerFirst(list: QueuedAgentMessage[]): QueuedAgentMessage[] {
+	const owner = list.filter(isOwnerItem);
+	if (owner.length === 0 || owner.length === list.length) return list;
+	return [...owner, ...list.filter((m) => !isOwnerItem(m))];
+}
+
+/**
+ * Whether a queued message may be handed to a busy agent at a tool boundary:
+ * written by the owner (not a harness reminder carrying the owner's words)
+ * and naming the conversation its answer belongs in — the evidence that it
+ * was answered is a post there.
+ *
+ * @param m - Queued message
+ * @returns True when it may be surfaced
+ */
+function isSurfaceable(m: QueuedAgentMessage): boolean {
+	const where = m.meta?.where;
+	return isOwnerItem(m) && m.meta?.reminder !== true && !!where && !!(where.chatChannelId || where.slackChannelId);
+}
+
+/**
+ * The text an idle delivery writes: an owner message the agent was already
+ * shown at a tool boundary (and has not answered in its conversation) gets
+ * a one-line notice, so an agent that did answer elsewhere does not answer twice.
+ *
+ * @param m - Queued message
+ * @returns Text to deliver
+ */
+export function withSurfacedNotice(m: QueuedAgentMessage): string {
+	if (m.surfacedAt === undefined) return m.data;
+	const at = new Date(m.surfacedAt).toISOString();
+	return `[Crewly: this owner message was already shown to you during your last turn (at ${at}). If you already answered it, do not answer again.]\n${m.data}`;
+}
+
+/** Why a queued message was dropped before delivery as no longer needed. */
+export type QueuePruneReason = 'answered-in-thread' | 'answered-after-surfacing' | 'duplicate-owner-message' | 'superseded' | 'nothing-left-to-announce';
+
+/** A hand-over prepared for a queued WorkItem brief (see {@link SubAgentMessageQueue.setHandOverPreparer}). */
+export interface QueuedHandOver {
+	/** Text to write */
+	message: string;
+	/** Call after a successful write */
+	delivered: () => void;
+	/** Call after a failed write */
+	failed: () => void;
+	/** The WorkItem was already delivered to this session by the dispatcher: drop the brief */
+	alreadyDispatched?: boolean;
+}
+
+/** Prepares the hand-over of a queued WorkItem brief right before it is written. */
+export type QueuedHandOverPreparer = (sessionName: string, workItemId: string, data: string) => Promise<QueuedHandOver>;
+
+/**
+ * Decides whether a queued message has gone stale and must not be delivered.
+ * Wired at boot (the WorkItem dispatcher's check: a `[CREWLY-DISPATCH]`
+ * notice whose WorkItems are all finished). Errors count as "not stale".
+ */
+export type StaleMessageCheck = (data: string, sessionName: string) => Promise<boolean> | boolean;
+
+/**
+ * Brings a queued message up to date right before delivery: returns the text
+ * to send, or null to drop it (see {@link SubAgentMessageQueue.setMessageRefresher}).
+ */
+export type QueuedMessageRefresher = (data: string, sessionName: string) => Promise<string | null> | string | null;
+
+/**
+ * Singleton service that holds pending messages per agent session.
+ *
+ * Messages are enqueued when a `mode: 'message'` write arrives at
+ * the terminal controller for an agent that is not yet active.
+ * They are dequeued and delivered sequentially when the agent
+ * registers (status becomes 'active').
+ */
+export class SubAgentMessageQueue {
+	private static instance: SubAgentMessageQueue | null = null;
+	private pendingMessages = new Map<string, QueuedAgentMessage[]>();
+	/** Tail of each agent's flush chain: one flush per agent at a time. */
+	private flushTails = new Map<string, Promise<unknown>>();
+	private logger: ComponentLogger;
+	private readonly storePath: string;
+	/** Set while the store file is bad and could not be copied aside; saves copy it aside first. */
+	private blockedReason: string | null = null;
+	/** The store file could not be read (EMFILE, EIO…); saves re-read it first. */
+	private unread = false;
+	private staleCheck: StaleMessageCheck | null = null;
+	private refresher: QueuedMessageRefresher | null = null;
+	/** Told when undelivered messages are dropped (never silently: crewly#1014) */
+	private dropListener: QueueDropListener | null = null;
+	/** Whether an agent's session is down (no live session) */
+	private isDown: ((sessionName: string) => boolean) | null = null;
+	/** Prepares queued WorkItem briefs (wired by the terminal controller) */
+	private handOverPreparer: QueuedHandOverPreparer | null = null;
+	/** Told about each message the flush delivered */
+	private deliveredListener: ((sessionName: string, data: string) => void) | null = null;
+	/** Drops that happened before a listener was set (aged out at load) */
+	private unreportedDrops: Array<{ sessionName: string; dropped: QueuedAgentMessage[]; reason: QueueDropReason }> = [];
+
+	private constructor(storePath?: string) {
+		this.logger = LoggerService.getInstance().createComponentLogger('SubAgentMessageQueue');
+		this.storePath = storePath ?? path.join(getCrewlyHomePath(), 'sub-agent-message-queue.json');
+		this.load();
+	}
+
+	/**
+	 * Read back anything that was still undelivered when the process ended.
+	 *
+	 * This queue is the only record that a person's message has not reached
+	 * its agent. Holding it in memory alone meant a restart dropped it with
+	 * no trace: the owner had asked for something, seen "working on it", and
+	 * the request simply ceased to exist (2026-09-21).
+	 */
+	private load(): boolean {
+		type Stored = { queues?: Record<string, QueuedAgentMessage[]> };
+		let stored: Stored | null = null;
+		try {
+			// Missing: start empty. Bad: copied aside (`.corrupt-<ts>`) and
+			// logged before starting empty, so the next save cannot destroy it.
+			const read = readJsonStoreSync<Stored>(this.storePath, {
+				validate: (d) => (d && typeof d === 'object' && !Array.isArray(d) ? null : 'not a JSON object'),
+				logger: this.logger,
+			});
+			this.unread = false;
+			if (read.status !== 'ok') return true;
+			stored = read.data;
+		} catch (err) {
+			if (err instanceof CorruptJsonFileError) {
+				// Bad and the copy failed: the next save copies it aside first.
+				this.unread = false;
+				this.blockedReason = err.reason;
+				return true;
+			}
+			// EMFILE, EIO…: the file may hold undelivered messages. Never write
+			// over it unread: the next save reads it again and merges.
+			if (!this.unread) {
+				this.logger.error('Pending-message store could not be read; it will not be overwritten until it can be', {
+					storePath: this.storePath,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+			this.unread = true;
+			return false;
+		}
+		if (!stored?.queues) return true;
+		let restored = 0;
+		for (const [storedName, messages] of Object.entries(stored.queues)) {
+			// A queue saved under an alias before 1.20.425 joins the session's own.
+			const sessionName = canonicalAgentSession(storedName);
+			const current = this.pendingMessages.get(sessionName) ?? [];
+			const have = new Set(current.map((m) => `${m.queuedAt}|${m.data}`));
+			const valid = (messages ?? [])
+				.filter((m) => m && typeof m.data === 'string' && typeof m.queuedAt === 'number')
+				.map((m) => (typeof m.id === 'string' && m.id ? m : { ...m, id: randomUUID() }));
+			const fresh = valid.filter((m) => Date.now() - m.queuedAt <= SUB_AGENT_QUEUE_CONSTANTS.MAX_AGE_MS);
+			if (fresh.length < valid.length) {
+				this.unreportedDrops.push({ sessionName, dropped: valid.filter((m) => !fresh.includes(m)), reason: 'aged-out' });
+			}
+			// Already in the live queue (a re-read after an unreadable start): not new.
+			const usable = fresh.filter((m) => !have.has(`${m.queuedAt}|${m.data}`));
+			if (usable.length === 0) continue;
+			// Restored messages are older than anything queued since: they go first.
+			this.pendingMessages.set(sessionName, ownerFirst([...usable, ...current]));
+			restored += usable.length;
+		}
+		if (restored > 0) {
+			this.logger.info('Restored undelivered messages from the previous run', {
+				messages: restored,
+				sessions: this.pendingMessages.size,
+			});
+		}
+		return true;
+	}
+
+	/**
+	 * Write the queue out. Best-effort: a failure must never lose the
+	 * in-memory copy, which is still the live one.
+	 */
+	private save(): void {
+		try {
+			// Unreadable at startup: read it again (merging what it holds) and
+			// never write over it unread.
+			if (this.unread && !this.load()) {
+				this.logger.warn('Pending-message queue not saved: its file still cannot be read');
+				return;
+			}
+			const queues: Record<string, QueuedAgentMessage[]> = {};
+			for (const [k, v] of this.pendingMessages) if (v.length > 0) queues[k] = v;
+			if (this.blockedReason !== null) {
+				if (existsSync(this.storePath)) quarantineCorruptFileSync(this.storePath, this.blockedReason, this.logger);
+				this.blockedReason = null;
+			}
+			mkdirSync(path.dirname(this.storePath), { recursive: true });
+			// Temp + fsync + rename: a crash or a full disk mid-write must not
+			// leave a truncated file that the next boot reads as "nothing was pending".
+			atomicWriteFileSync(this.storePath, JSON.stringify({ queues, savedAt: new Date().toISOString() }, null, 2));
+		} catch (err) {
+			this.logger.warn('Could not persist the pending-message queue', {
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	/**
+	 * Get the singleton instance.
+	 *
+	 * @returns The SubAgentMessageQueue singleton
+	 */
+	static getInstance(storePath?: string): SubAgentMessageQueue {
+		if (!SubAgentMessageQueue.instance) {
+			SubAgentMessageQueue.instance = new SubAgentMessageQueue(storePath);
+		}
+		return SubAgentMessageQueue.instance;
+	}
+
+	/**
+	 * Reset the singleton instance (for testing only).
+	 */
+	static resetInstance(): void {
+		SubAgentMessageQueue.instance = null;
+	}
+
+	/**
+	 * Whether this exact message is already queued for the agent.
+	 *
+	 * @param sessionName - The agent
+	 * @param data - The message
+	 * @returns True when queued
+	 */
+	contains(sessionName: string, data: string): boolean {
+		return (this.pendingMessages.get(sessionName) ?? []).some((m) => m.data === data);
+	}
+
+	/**
+	 * Remove a queued message that reached the agent another way (our Enter
+	 * submitted a paste of it that had been sitting in the box), so a held
+	 * retry does not deliver it twice.
+	 *
+	 * Also takes back a message held while its agent was being started, once
+	 * it is about to be sent directly.
+	 *
+	 * @param sessionName - The agent
+	 * @param data - The message
+	 * @param why - Why it is removed (logged)
+	 * @returns True when a queued copy was removed
+	 */
+	remove(sessionName: string, data: string, why = 'delivered from the input box'): boolean {
+		const queue = this.pendingMessages.get(sessionName);
+		if (!queue) return false;
+		const i = queue.findIndex((m) => m.data === data);
+		if (i < 0) return false;
+		queue.splice(i, 1);
+		this.save();
+		this.logger.info('Removed a queued message', { sessionName, why });
+		return true;
+	}
+
+	/**
+	 * Install the listener told about messages dropped undelivered (aged out
+	 * at load, or the oldest at capacity). Drops from before it was set are
+	 * reported right away.
+	 *
+	 * @param listener - The listener, or null
+	 */
+	/**
+	 * Install the check for an agent whose session is down. Messages that ran
+	 * out of attempts because the agent was not running are kept for its next
+	 * start (the queued-wake sweep starts it) instead of dropped: 10-16 Pia and
+	 * Atlas each lost owner work that way (2026-10-22 audit).
+	 *
+	 * @param check - Whether a session is down, or null to always drop
+	 */
+	setDownCheck(check: ((sessionName: string) => boolean) | null): void {
+		this.isDown = check;
+	}
+
+	setDropListener(listener: QueueDropListener | null): void {
+		this.dropListener = listener;
+		if (!listener) return;
+		const pending = this.unreportedDrops;
+		this.unreportedDrops = [];
+		for (const d of pending) this.reportDrop(d.sessionName, d.dropped, d.reason);
+	}
+
+	/**
+	 * Tell the listener about a drop (or keep it until one is set).
+	 *
+	 * @param sessionName - The agent
+	 * @param dropped - The dropped messages
+	 * @param reason - Why
+	 */
+	private reportDrop(sessionName: string, dropped: QueuedAgentMessage[], reason: QueueDropReason): void {
+		if (!this.dropListener) {
+			this.unreportedDrops.push({ sessionName, dropped, reason });
+			return;
+		}
+		try {
+			this.dropListener(sessionName, dropped, reason);
+		} catch (err) {
+			this.logger.warn('Queue drop listener failed', { sessionName, error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	/**
+	 * Install the check that drops stale messages before delivery.
+	 *
+	 * The queue is persisted and replayed after a restart, so a notice queued
+	 * hours earlier ("WorkItem X queued for you") reached the agent after X was
+	 * already verified, and each stale notice cost a turn re-checking the pool
+	 * (#836). The queue cannot judge staleness itself; the dispatcher can.
+	 *
+	 * @param check - The stale check, or null to deliver everything
+	 */
+	setStaleMessageCheck(check: StaleMessageCheck | null): void {
+		this.staleCheck = check;
+	}
+
+	/**
+	 * Install what brings a queued message up to date right before it is
+	 * delivered (CREW-266: a batch reminder that waited on the queue listed
+	 * WorkItems the agent had finished meanwhile). A failing refresher
+	 * delivers the message as queued.
+	 *
+	 * @param refresher - The refresher, or null
+	 */
+	setMessageRefresher(refresher: QueuedMessageRefresher | null): void {
+		this.refresher = refresher;
+	}
+
+	/**
+	 * The text to deliver for a queued message, per the installed refresher.
+	 *
+	 * @param data - Queued text
+	 * @param sessionName - Target session
+	 * @returns Text to send, or null to drop it
+	 */
+	private async refreshed(data: string, sessionName: string): Promise<string | null> {
+		if (!this.refresher) return data;
+		try {
+			return await this.refresher(data, sessionName);
+		} catch (err) {
+			this.logger.debug('Queued-message refresh failed; delivering the message as queued', {
+				sessionName,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return data;
+		}
+	}
+
+	/**
+	 * Where a queued message stands in its session's queue: 1 is next.
+	 * Owner messages go ahead of the rest, so this is the delivery order,
+	 * not the order of arrival.
+	 *
+	 * @param sessionName - The agent session
+	 * @param data - The queued message
+	 * @returns 1-based position of its last copy, or null when it is not queued
+	 */
+	positionOf(sessionName: string, data: string): number | null {
+		const queue = this.pendingMessages.get(sessionName) ?? [];
+		for (let i = queue.length - 1; i >= 0; i--) {
+			if (queue[i].data === data) return i + 1;
+		}
+		return null;
+	}
+
+	/**
+	 * The messages waiting for a session, oldest first (read only).
+	 *
+	 * @param sessionName - The agent session
+	 * @returns A copy of its queue
+	 */
+	peek(sessionName: string): readonly QueuedAgentMessage[] {
+		return [...(this.pendingMessages.get(sessionName) ?? [])];
+	}
+
+	/**
+	 * Install the listener told about every message the flush delivered (the
+	 * dispatcher marks a delivered dispatch notice's WorkItems as delivered,
+	 * so a held brief for the same WorkItem is then dropped — crewly#1015
+	 * follow-up re-review).
+	 *
+	 * @param listener - The listener, or null
+	 */
+	setDeliveredListener(listener: ((sessionName: string, data: string) => void) | null): void {
+		this.deliveredListener = listener;
+	}
+
+	private notifyDelivered(sessionName: string, data: string): void {
+		try {
+			this.deliveredListener?.(sessionName, data);
+		} catch (err) {
+			this.logger.warn('Delivered listener failed', { sessionName, error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	/**
+	 * Install what prepares a queued WorkItem brief's hand-over right before
+	 * it is written (the terminal controller's `prepareWorkItemHandOver`).
+	 *
+	 * @param preparer - The preparer, or null
+	 */
+	setHandOverPreparer(preparer: QueuedHandOverPreparer | null): void {
+		this.handOverPreparer = preparer;
+	}
+
+	/**
+	 * Whether a queued message is stale per the installed check.
+	 *
+	 * @param data - Message text
+	 * @param sessionName - Target session
+	 * @returns True when the message must be dropped
+	 */
+	private async isStale(data: string, sessionName: string): Promise<boolean> {
+		if (!this.staleCheck) return false;
+		try {
+			return (await this.staleCheck(data, sessionName)) === true;
+		} catch (err) {
+			this.logger.debug('Stale-message check failed; delivering the message', {
+				sessionName,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Drop every stale message from every queue. Run once at boot, so an agent
+	 * whose only pending messages are stale notices is not restored for them.
+	 *
+	 * @returns How many messages were examined and how many were dropped
+	 */
+	async pruneStale(): Promise<{ examined: number; skippedStale: number }> {
+		let examined = 0;
+		let skippedStale = 0;
+		if (!this.staleCheck) return { examined, skippedStale };
+		for (const [sessionName, queue] of [...this.pendingMessages.entries()]) {
+			const kept: QueuedAgentMessage[] = [];
+			for (const message of queue) {
+				examined += 1;
+				if (await this.isStale(message.data, sessionName)) skippedStale += 1;
+				else kept.push(message);
+			}
+			if (kept.length === queue.length) continue;
+			// Messages may have been added while the checks ran: keep those too.
+			const current = this.pendingMessages.get(sessionName) ?? [];
+			const added = current.filter((m) => !queue.includes(m));
+			const next = [...kept, ...added];
+			if (next.length > 0) this.pendingMessages.set(sessionName, next);
+			else this.pendingMessages.delete(sessionName);
+		}
+		if (skippedStale > 0) this.save();
+		this.logger.info('Checked the restored message queue for stale notices', { examined, skippedStale });
+		return { examined, skippedStale };
+	}
+
+	/**
+	 * Enqueue a message for a session that is not yet active.
+	 * If the queue exceeds MAX_QUEUE_SIZE, the oldest non-owner message is
+	 * dropped (the oldest message when all are the owner's).
+	 *
+	 * A message identical to one already waiting for the same session is not
+	 * added again: the reconciler re-sends the same reminder while an agent
+	 * is stopped (daily token cap, busy), and each copy would cost the agent
+	 * a turn once delivered. The waiting copy keeps its place. Neither is a
+	 * second copy of the same owner message (same `ref`).
+	 *
+	 * Owner messages (see {@link QueueMessageMeta}, taken from `meta.queueMeta`
+	 * or the delivery running now — {@link withQueueMeta}) go to the front,
+	 * behind owner messages already waiting; everything else goes to the back.
+	 *
+	 * @param sessionName - The target agent session name
+	 * @param data - The raw data string to deliver later
+	 * @param meta - `workItemId` when the message hands over a WorkItem; `queueMeta` to override the context
+	 */
+	enqueue(queuedFor: string, data: string, meta: { workItemId?: string; queueMeta?: QueueMessageMeta } = {}): void {
+		// A message held for "Orchestrator" (its display name) would wait for a
+		// session that never goes idle: the queue is keyed by session (D-952).
+		const sessionName = canonicalAgentSession(queuedFor);
+		const queueMeta = meta.queueMeta ?? currentQueueMeta(sessionName, data);
+		let queue = this.pendingMessages.get(sessionName);
+		if (!queue) {
+			queue = [];
+			this.pendingMessages.set(sessionName, queue);
+		}
+
+		if (queue.some((m) => m.data === data)) {
+			this.logger.debug('Identical message already queued for sub-agent — not added again', {
+				sessionName,
+				queueSize: queue.length,
+				dataLength: data.length,
+			});
+			return;
+		}
+		if (queueMeta?.ref && queue.some((m) => m.meta?.ref === queueMeta.ref)) {
+			this.logger.info('Same owner message already queued for the agent — not added again', {
+				sessionName,
+				ref: queueMeta.ref,
+				queueSize: queue.length,
+			});
+			return;
+		}
+
+		// Drop the oldest non-owner message if at capacity (the owner's last).
+		if (queue.length >= SUB_AGENT_QUEUE_CONSTANTS.MAX_QUEUE_SIZE) {
+			const victim = queue.findIndex((m) => !isOwnerItem(m));
+			const dropped = queue.splice(victim >= 0 ? victim : 0, 1)[0];
+			this.logger.warn('Queue at capacity, dropping oldest message', {
+				sessionName,
+				droppedAt: dropped?.queuedAt,
+				queueSize: queue.length,
+			});
+			if (dropped) this.reportDrop(sessionName, [dropped], 'capacity');
+		}
+
+		const item: QueuedAgentMessage = {
+			id: randomUUID(),
+			data,
+			queuedAt: Date.now(),
+			sessionName,
+			...(meta.workItemId ? { workItemId: meta.workItemId } : {}),
+			...(queueMeta && Object.keys(queueMeta).length > 0 ? { meta: { ...queueMeta } } : {}),
+		};
+		// The owner's messages go ahead of system traffic, in the order they came.
+		let position = queue.length;
+		if (isOwnerItem(item)) {
+			const firstOther = queue.findIndex((m) => !isOwnerItem(m));
+			if (firstOther >= 0) position = firstOther;
+		}
+		queue.splice(position, 0, item);
+
+		this.save();
+
+		this.logger.info('Message queued for sub-agent', {
+			sessionName,
+			queueSize: queue.length,
+			position: position + 1,
+			...(isOwnerItem(item) ? { owner: true } : {}),
+			dataLength: data.length,
+		});
+	}
+
+	/**
+	 * Dequeue all pending messages for a session (FIFO order).
+	 * The queue is cleared after dequeuing.
+	 *
+	 * @param sessionName - The agent session name
+	 * @returns Array of queued messages in insertion order, or empty array
+	 */
+	dequeueAll(sessionName: string): QueuedAgentMessage[] {
+		const queue = this.pendingMessages.get(sessionName);
+		if (!queue || queue.length === 0) {
+			return [];
+		}
+
+		const messages = [...queue];
+		this.pendingMessages.delete(sessionName);
+		this.save();
+
+		this.logger.info('Dequeued all messages for sub-agent', {
+			sessionName,
+			count: messages.length,
+		});
+
+		return messages;
+	}
+
+	/**
+	 * Remove the copy a `send` inside {@link flush} put back on the queue.
+	 * Only entries that were not queued before the send (their ids are not in
+	 * `knownIds`) are candidates, so an identical message queued earlier or by
+	 * someone else is never taken by mistake.
+	 *
+	 * @param sessionName - The agent session
+	 * @param data - The message text the send re-queued
+	 * @param knownIds - Ids of the entries queued before the send
+	 */
+	private removeRequeuedCopy(sessionName: string, data: string, knownIds: ReadonlySet<string | undefined>): void {
+		const queue = this.pendingMessages.get(sessionName);
+		if (!queue) return;
+		for (let i = queue.length - 1; i >= 0; i--) {
+			if (queue[i].data === data && !knownIds.has(queue[i].id)) {
+				queue.splice(i, 1);
+				return;
+			}
+		}
+	}
+
+	/**
+	 * Hand every queued message to `send`, one at a time.
+	 *
+	 * `sendMessageToAgent` answers `{ success: true, queued: true }` when it
+	 * finds the agent busy and puts the message back — so a caller that only
+	 * checked for a thrown error logged "Delivered" in the same millisecond
+	 * as the re-queue, and reading the log pointed at the agent when the
+	 * message had never reached it. Both call sites had their own copy of
+	 * this loop; this is the shared one, and it distinguishes the two
+	 * outcomes (2026-09-21, Ella).
+	 *
+	 * @param sessionName - The agent session name
+	 * @param send - Delivers one message; `queued` means it went back on the queue
+	 * @param gapMs - Pause between messages so the agent can process each
+	 * Messages the stale check rejects (see {@link setStaleMessageCheck}) are
+	 * dropped instead of sent.
+	 *
+	 * @returns How many were delivered, deferred again, failed, and dropped as stale
+	 */
+	async flush(
+		sessionName: string,
+		send: (data: string) => Promise<{ queued?: boolean; success?: boolean; error?: string }>,
+		gapMs = 0,
+	): Promise<{ delivered: number; deferred: number; failed: number; skippedStale: number }> {
+		// One flush per agent at a time: a second one (idle hook + register +
+		// timer) waits its turn, then sees only what is left. Two overlapping
+		// flushes would both dequeue, deliver out of order and re-queue each
+		// other's messages.
+		const previous = this.flushTails.get(sessionName) ?? Promise.resolve();
+		const run = previous.then(() => this.flushLocked(sessionName, send, gapMs));
+		const tail = run.catch(() => undefined);
+		this.flushTails.set(sessionName, tail);
+		try {
+			return await run;
+		} finally {
+			if (this.flushTails.get(sessionName) === tail) this.flushTails.delete(sessionName);
+		}
+	}
+
+	/** The body of {@link flush}; callers go through the per-agent lock. */
+	private async flushLocked(
+		sessionName: string,
+		send: (data: string) => Promise<{ queued?: boolean; success?: boolean; error?: string }>,
+		gapMs: number,
+	): Promise<{ delivered: number; deferred: number; failed: number; skippedStale: number }> {
+		const out = { delivered: 0, deferred: 0, failed: 0, skippedStale: 0 };
+		const pending = this.pruneNoLongerNeeded(sessionName, this.dequeueAll(sessionName), out);
+		// A send that failed ("Session does not exist", "Runtime has exited")
+		// or threw is not a delivery: the message goes back on the queue, up
+		// to MAX_DELIVERY_ATTEMPTS, then the drop is reported (crewly#1014).
+		const maxAttempts = SUB_AGENT_QUEUE_CONSTANTS.MAX_DELIVERY_ATTEMPTS ?? 5;
+		const failedAgain: QueuedAgentMessage[] = [];
+		const undeliverable: QueuedAgentMessage[] = [];
+		// Messages held again (the agent is still busy or its box is blocked)
+		// keep their place: the held one and everything after it go back to
+		// the front, in order. Sending the later ones now would deliver them
+		// first — "cancel that" before the message it cancels (#1022 review:
+		// M12 held, M17 delivered before it).
+		let heldAgain: QueuedAgentMessage[] = [];
+		const noteFailure = (queued: QueuedAgentMessage, error: string): void => {
+			out.failed += 1;
+			const attempts = (queued.attempts ?? 0) + 1;
+			if (attempts >= maxAttempts) {
+				undeliverable.push({ ...queued, attempts });
+				this.logger.error('Queued message could not be delivered — giving up and reporting it', { sessionName, attempts, error });
+			} else {
+				failedAgain.push({ ...queued, attempts });
+				this.logger.warn('Queued message not delivered — kept for the next attempt', { sessionName, attempts, error });
+			}
+		};
+		for (const [i, original] of pending.entries()) {
+			let queued = original;
+			if (this.answeredInThread(queued)) {
+				out.skippedStale += 1;
+				this.logPrune(sessionName, queued, 'answered-in-thread');
+				continue;
+			}
+			if (this.answeredAfterSurfacing(queued)) {
+				out.skippedStale += 1;
+				this.logPrune(sessionName, queued, 'answered-after-surfacing');
+				continue;
+			}
+			if (await this.isStale(queued.data, sessionName)) {
+				out.skippedStale += 1;
+				continue;
+			}
+			// A batch reminder drops the items finished while it waited (CREW-266).
+			const freshData = await this.refreshed(queued.data, sessionName);
+			if (freshData === null) {
+				out.skippedStale += 1;
+				this.logPrune(sessionName, queued, 'nothing-left-to-announce');
+				continue;
+			}
+			if (freshData !== queued.data) queued = { ...queued, data: freshData };
+			let handOver: QueuedHandOver | null = null;
+			try {
+				// A WorkItem brief gets its hand-over now, as a direct /deliver would.
+				handOver =
+					queued.workItemId && this.handOverPreparer
+						? await this.handOverPreparer(sessionName, queued.workItemId, queued.data).catch(() => null)
+						: null;
+				// The dispatcher delivered this WorkItem meanwhile (the startup
+				// backfill, the grace timer): the held brief would arrive twice.
+				if (handOver?.alreadyDispatched) {
+					out.skippedStale += 1;
+					this.logger.info('Held WorkItem brief dropped — the dispatcher already delivered that WorkItem', {
+						sessionName,
+						workItemId: queued.workItemId,
+					});
+					continue;
+				}
+				const sentText = handOver ? handOver.message : withSurfacedNotice(queued);
+				const knownIds = new Set((this.pendingMessages.get(sessionName) ?? []).map((m) => m.id));
+				const result = await send(sentText);
+				if (handOver) {
+					// Held again or failed: not delivered (the hand-over runs again next time).
+					if (result && (result.queued || result.success === false)) handOver.failed();
+					else handOver.delivered();
+				}
+				if (result && result.success === false && !result.queued) {
+					noteFailure(queued, result.error ?? 'delivery failed');
+				} else if (result?.queued) {
+					// `send` re-queued it at the back; take that copy out — it goes
+					// back at its original place, with its original queuedAt.
+					this.removeRequeuedCopy(sessionName, sentText, knownIds);
+					queued.deferrals = (queued.deferrals ?? 0) + 1;
+					queued.lastDeferredAt = Date.now();
+					pending[i] = queued;
+					heldAgain = pending.slice(i);
+					out.deferred += heldAgain.length;
+					// Every 30 s while the agent is busy: say it once, then every tenth time (657 lines on 2026-10-22, crewly#1431).
+					this.logger[queued.deferrals === 1 || queued.deferrals % 10 === 0 ? 'info' : 'debug']('Queued message deferred again — agent still busy; it and the messages after it keep their order', {
+						sessionName,
+						queuedAt: new Date(queued.queuedAt).toISOString(),
+						keptBehindIt: heldAgain.length - 1,
+						deferrals: queued.deferrals,
+					});
+					break;
+				} else {
+					out.delivered += 1;
+					this.notifyDelivered(sessionName, sentText);
+					this.logger.info('Queued message delivered', {
+						sessionName,
+						queuedAt: new Date(queued.queuedAt).toISOString(),
+					});
+				}
+			} catch (err) {
+				// A thrown send is not a delivery: give the dispatcher's key back.
+				handOver?.failed();
+				noteFailure(queued, err instanceof Error ? err.message : String(err));
+			}
+			if (gapMs > 0 && i < pending.length - 1) {
+				await new Promise((r) => setTimeout(r, gapMs));
+			}
+		}
+		if (failedAgain.length > 0 || heldAgain.length > 0) {
+			// Back at the front, in their original order, ahead of anything
+			// queued meanwhile (failed ones came before the held one).
+			const queue = (this.pendingMessages.get(sessionName) ?? []).filter(
+				(m) => m.id === undefined || (!heldAgain.some((h) => h.id === m.id) && !failedAgain.some((f) => f.id === m.id)),
+			);
+			this.pendingMessages.set(sessionName, ownerFirst([...failedAgain, ...heldAgain, ...queue]));
+			this.save();
+		}
+		if (undeliverable.length > 0) {
+			let down = false;
+			try {
+				down = this.isDown?.(sessionName) ?? false;
+			} catch {
+				down = false;
+			}
+			const maxKeeps = SUB_AGENT_QUEUE_CONSTANTS.MAX_KEEPS_WHILE_DOWN;
+			const keep = down ? undeliverable.filter((m) => (m.keptWhileDown ?? 0) < maxKeeps) : [];
+			const drop = undeliverable.filter((m) => !keep.includes(m));
+			if (keep.length > 0) {
+				const rest = this.pendingMessages.get(sessionName) ?? [];
+				this.pendingMessages.set(sessionName, ownerFirst([...keep.map((m) => ({ ...m, attempts: 0, keptWhileDown: (m.keptWhileDown ?? 0) + 1 })), ...rest]));
+				this.save();
+				this.logger.warn('Queued messages kept for the next start: the agent is down', { sessionName, kept: keep.length });
+			}
+			if (drop.length > 0) this.reportDrop(sessionName, drop, 'undeliverable');
+		}
+		if (out.skippedStale > 0) {
+			this.logger.info('Dropped stale queued messages instead of delivering them', {
+				sessionName,
+				examined: pending.length,
+				skippedStale: out.skippedStale,
+			});
+		}
+		return out;
+	}
+
+	/**
+	 * Drop queued messages that are no longer needed, before delivery:
+	 * a later copy of an owner message already queued (same `ref`), and a
+	 * reminder replaced by a newer one (same `supersedeKey`; the newest is
+	 * kept). Each drop is logged. Messages without metadata are untouched.
+	 *
+	 * @param sessionName - The agent
+	 * @param pending - Its queue, in delivery order
+	 * @param out - Counters (`skippedStale` is incremented per drop)
+	 * @returns The messages still to deliver, in order
+	 */
+	private pruneNoLongerNeeded(
+		sessionName: string,
+		pending: QueuedAgentMessage[],
+		out: { skippedStale: number },
+	): QueuedAgentMessage[] {
+		const newestBySupersede = new Map<string, QueuedAgentMessage>();
+		for (const m of pending) {
+			const key = m.meta?.supersedeKey;
+			if (!key) continue;
+			const cur = newestBySupersede.get(key);
+			if (!cur || m.queuedAt >= cur.queuedAt) newestBySupersede.set(key, m);
+		}
+		const seenRefs = new Set<string>();
+		const kept: QueuedAgentMessage[] = [];
+		for (const m of pending) {
+			const key = m.meta?.supersedeKey;
+			if (key && newestBySupersede.get(key) !== m) {
+				out.skippedStale += 1;
+				this.logPrune(sessionName, m, 'superseded');
+				continue;
+			}
+			const ref = m.meta?.ref;
+			if (ref) {
+				if (seenRefs.has(ref)) {
+					out.skippedStale += 1;
+					this.logPrune(sessionName, m, 'duplicate-owner-message');
+					continue;
+				}
+				seenRefs.add(ref);
+			}
+			kept.push(m);
+		}
+		if (kept.length < pending.length) this.save();
+		return kept;
+	}
+
+	/**
+	 * Hand the next owner message waiting for a busy agent to its PostToolUse
+	 * hook, so it reaches the agent at the next tool boundary instead of at
+	 * the end of the turn. At most one per call.
+	 *
+	 * The message is NOT removed: it is marked surfaced (time and count) and
+	 * stays queued until the agent posts in its conversation after that time
+	 * (then it is dropped here or at the flush). Unanswered after
+	 * {@link OWNER_HOOK_MESSAGE_CONSTANTS.RESURFACE_AFTER_MS} it is shown once
+	 * more; after {@link OWNER_HOOK_MESSAGE_CONSTANTS.MAX_SURFACES} only the
+	 * normal idle delivery remains. Nothing is lost; at worst it arrives twice.
+	 *
+	 * Only the owner's own messages (and the owner's decision answers) that
+	 * name a conversation — not harness reminders, not other traffic.
+	 *
+	 * @param sessionName - The agent whose hook is asking
+	 * @param now - Clock
+	 * @returns The message to show, or null
+	 */
+	takeOwnerMessageForHook(sessionName: string, now: number = Date.now()): SurfacedOwnerMessage | null {
+		const queue = this.pendingMessages.get(sessionName);
+		if (!queue || queue.length === 0) return null;
+		const C = OWNER_HOOK_MESSAGE_CONSTANTS;
+		// Answered since it was shown: done with it.
+		const answered = queue.filter((m) => this.answeredAfterSurfacing(m));
+		if (answered.length > 0) {
+			for (const m of answered) this.logPrune(sessionName, m, 'answered-after-surfacing');
+			const rest = queue.filter((m) => !answered.includes(m));
+			if (rest.length > 0) this.pendingMessages.set(sessionName, rest);
+			else this.pendingMessages.delete(sessionName);
+		}
+		const current = this.pendingMessages.get(sessionName) ?? [];
+		const next = current.find(
+			(m) =>
+				isSurfaceable(m) &&
+				(m.surfaceCount ?? 0) < C.MAX_SURFACES &&
+				(m.surfacedAt === undefined || now - m.surfacedAt >= C.RESURFACE_AFTER_MS),
+		);
+		if (!next) {
+			if (answered.length > 0) this.save();
+			return null;
+		}
+		next.surfacedAt = now;
+		next.surfaceCount = (next.surfaceCount ?? 0) + 1;
+		this.save();
+		this.logger.info('Owner message handed to the busy agent at a tool boundary', {
+			sessionName,
+			surfaceCount: next.surfaceCount,
+			queuedAt: new Date(next.queuedAt).toISOString(),
+			...(next.meta?.ref ? { ref: next.meta.ref } : {}),
+		});
+		return { data: next.data, queuedAt: next.queuedAt, surfaceCount: next.surfaceCount };
+	}
+
+	/**
+	 * Whether a surfaced owner message was answered: the agent posted in its
+	 * conversation after it was shown it.
+	 *
+	 * @param m - Queued message
+	 * @returns True when it was answered
+	 */
+	/**
+	 * Conversations of owner messages shown to the agent at a tool boundary
+	 * that it has not answered yet (the reply resolver will not guess while
+	 * one of these is open in another conversation).
+	 *
+	 * @param sessionName - Agent
+	 * @returns chat-v2 conversation ids, deduplicated
+	 */
+	surfacedUnansweredConversations(sessionName: string): string[] {
+		const queue = this.pendingMessages.get(sessionName) ?? [];
+		const ids = queue
+			.filter((m) => m.surfacedAt !== undefined && isOwnerItem(m) && !this.answeredAfterSurfacing(m))
+			.map((m) => m.meta?.where?.chatChannelId)
+			.filter((id): id is string => !!id);
+		return [...new Set(ids)];
+	}
+
+	private answeredAfterSurfacing(m: QueuedAgentMessage): boolean {
+		if (m.surfacedAt === undefined || !m.meta?.where) return false;
+		return AgentPostLog.getInstance().answeredSince(m.sessionName, m.meta.where, m.surfacedAt);
+	}
+
+	/**
+	 * Whether the agent has already posted in the thread a queued message
+	 * belongs to, after it was queued — it was answered (the agent read the
+	 * thread). Only messages that name a thread are judged this way.
+	 *
+	 * Never an owner's own message (or the owner's decision answer): the owner
+	 * may ask a follow-up in the same thread while the agent is still
+	 * answering the first question, and that post must not make the follow-up
+	 * look answered. Owner messages are dropped only as exact duplicates.
+	 * Harness reminders carrying the owner's words (`reminder`) are judged.
+	 *
+	 * @param m - Queued message
+	 * @returns True when it was answered
+	 */
+	private answeredInThread(m: QueuedAgentMessage): boolean {
+		const where = m.meta?.where;
+		if (!where) return false;
+		if (m.meta?.owner && !m.meta.reminder) return false;
+		return AgentPostLog.getInstance().postedSince(m.sessionName, where, m.queuedAt);
+	}
+
+	private logPrune(sessionName: string, m: QueuedAgentMessage, reason: QueuePruneReason): void {
+		this.logger.info('Queued message dropped before delivery — no longer needed', {
+			sessionName,
+			reason,
+			queuedAt: new Date(m.queuedAt).toISOString(),
+			...(m.meta?.owner ? { owner: true } : {}),
+			...(m.meta?.ref ? { ref: m.meta.ref } : {}),
+			...(m.meta?.supersedeKey ? { supersedeKey: m.meta.supersedeKey } : {}),
+			preview: m.data.slice(0, 80),
+		});
+	}
+
+	/**
+	 * Sessions that still have messages waiting for them. A restart must bring
+	 * these agents back: a message queued for an agent is work in hand even
+	 * when no WorkItem records it (2026-09-24: Atlas was left down after a
+	 * restart with the owner's message queued, and answered four hours later
+	 * only because the owner wrote again).
+	 *
+	 * @returns Session names with at least one queued message
+	 */
+	sessionsWithPending(): string[] {
+		return [...this.pendingMessages.entries()].filter(([, q]) => q.length > 0).map(([name]) => name);
+	}
+
+	/**
+	 * Check if there are pending messages for a session.
+	 *
+	 * @param sessionName - The agent session name
+	 * @returns True if there are pending messages
+	 */
+	hasPending(sessionName: string): boolean {
+		const queue = this.pendingMessages.get(sessionName);
+		return !!queue && queue.length > 0;
+	}
+
+	/**
+	 * Clear all pending messages for a session (e.g. on agent stop/exit).
+	 *
+	 * @param sessionName - The agent session name
+	 */
+	clear(sessionName: string): void {
+		const queue = this.pendingMessages.get(sessionName);
+		if (queue && queue.length > 0) {
+			this.logger.info('Clearing queued messages for session', {
+				sessionName,
+				droppedCount: queue.length,
+			});
+		}
+		this.pendingMessages.delete(sessionName);
+		this.save();
+	}
+
+	/**
+	 * Get the number of pending messages for a session.
+	 *
+	 * @param sessionName - The agent session name
+	 * @returns Number of pending messages
+	 */
+	getQueueSize(sessionName: string): number {
+		const queue = this.pendingMessages.get(sessionName);
+		return queue ? queue.length : 0;
+	}
+
+	/**
+	 * Total number of messages waiting across every session. Used by restart
+	 * readiness to report how much is held on this (persistent) queue.
+	 *
+	 * @returns Number of queued messages
+	 */
+	getTotalQueued(): number {
+		let total = 0;
+		for (const queue of this.pendingMessages.values()) total += queue.length;
+		return total;
+	}
+}

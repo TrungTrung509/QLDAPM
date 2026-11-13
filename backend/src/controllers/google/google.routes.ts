@@ -1,0 +1,164 @@
+/**
+ * Google Workspace Routes
+ *
+ * Router for Gmail + Calendar on the owner's account via Crewly Cloud.
+ * Mounted at `/api/google` in the main API router.
+ *
+ * @module controllers/google/google.routes
+ */
+
+import { Router } from 'express';
+import { requireConnectorAccess } from '../connector/connector.controller.js';
+import {
+  getStatus,
+  getConnectUrl,
+  disconnect,
+  setSharing,
+  setDefaultAccount,
+  gmailSearch,
+  gmailRead,
+  gmailAttachment,
+  gmailSend,
+  gmailListHeld,
+  gmailResolveHeld,
+  gmailWatchThread,
+  gmailListWatches,
+  gmailUnwatchThread,
+  calendarList,
+  calendarCreate,
+  driveSearch,
+  driveGet,
+  driveContent,
+  driveUpload,
+  docsRead,
+  docsCreate,
+  docsAppend,
+  docsCommentsList,
+  docsCommentsAdd,
+  docsCommentsReply,
+  docsCommentsResolve,
+  docCommentBatchesList,
+  docCommentBatchSend,
+  docCommentBatchDiscard,
+  sheetsInfo,
+  sheetsRead,
+  sheetsCreate,
+  sheetsWrite,
+  slidesRead,
+  slidesCreate,
+} from './google.controller.js';
+import { postConnectCard } from './google-connect-card.js';
+import { ownerOnly } from '../../middleware/caller-identity.middleware.js';
+
+/** 403 for an agent on the owner's connection management (#999: these had no caller check). */
+const OWNER_ONLY_CONNECTION = Object.freeze({
+  success: false,
+  error: 'owner_only',
+  message: 'Only the owner can change or disconnect a connected account (Connections).',
+});
+
+/** 403 for an agent answering its own held mail (#999: this had no caller check). */
+const OWNER_ONLY_HELD_MAIL = Object.freeze({
+  success: false,
+  error: 'owner_only',
+  message: 'Only the owner can send or discard mail an agent drafted. Tell the owner it is waiting.',
+});
+
+
+/**
+ * Creates the Google Workspace router.
+ *
+ * Routes (everything after /disconnect is behind the connector's role allowlist):
+ * - GET    /status                — grant status (connected, email, scopes)
+ * - GET    /connect-url           — Cloud consent-start URL for the browser
+ * - POST   /default                — choose the account used when none is named
+ * - DELETE /disconnect            — revoke + forget the grant (optional ?account=)
+ * - GET    /gmail/search          — ?q=&max=
+ * - GET    /gmail/messages/:id    — read one message
+ * - GET    /gmail/messages/:id/attachments/:attachmentId — attachment bytes (base64, 25 MB cap)
+ * - POST   /gmail/send            — { to, cc?, subject, text, threadId?, inReplyTo?, dryRun? }
+ *                                   An agent gets a Gmail draft + a hold, not a send.
+ * - GET    /gmail/held             — mail waiting on the owner
+ * - POST   /gmail/held/:id         — { decision: 'send' | 'discard' }
+ * - GET    /calendar/events       — ?from=&to=&calendarId=&max=
+ * - POST   /calendar/events       — { calendarId?, summary, start, end, description?, attendees?, timezone? }
+ * - GET    /drive/files           — ?q=&mimeType=&folderId=&max=
+ * - GET    /drive/files/:id       — metadata
+ * - GET    /drive/files/:id/content — exported text / downloaded body
+ * - POST   /drive/files           — { name, content, encoding?, mimeType?, folderId?, convertTo? }
+ * - GET    /docs/:id              — document as text
+ * - POST   /docs                  — { title, text? }
+ * - POST   /docs/:id/append       — { text }
+ * - GET    /docs/:id/comments     — ?includeResolved=1
+ * - POST   /docs/:id/comments     — { text, quote? }
+ * - POST   /docs/:id/comments/:commentId/replies — { text }
+ * - POST   /docs/:id/comments/:commentId/resolve — { text? }
+ *                                   Comment writes are outbound: an agent's are queued (202), not posted.
+ * - GET    /doc-comment-batches   — comments queued for the owner's OK
+ * - POST   /doc-comment-batches/:code/send    — post a batch (owner, or agent after the owner's 「发 C<n>」)
+ * - POST   /doc-comment-batches/:code/discard — drop a batch
+ * - GET    /sheets/:id            — title + tabs
+ * - GET    /sheets/:id/values     — ?range=
+ * - POST   /sheets                — { title, sheetTitle?, rows? }
+ * - POST   /sheets/:id/values     — { range?, rows, mode?: append|update }
+ * - GET    /slides/:id            — deck as text
+ * - POST   /slides                — { title, slides: [{ title, bullets? }] }
+ *
+ * @returns Express router for /api/google routes
+ */
+export function createGoogleRouter(): Router {
+  const router = Router();
+
+  router.get('/status', getStatus);
+  router.get('/connect-url', getConnectUrl);
+  router.post('/default', ownerOnly(OWNER_ONLY_CONNECTION), setDefaultAccount);
+  router.delete('/disconnect', ownerOnly(OWNER_ONLY_CONNECTION), disconnect);
+  // Who owns a grant and who it is shared with (issue #968; owner only)
+  router.post('/sharing', setSharing);
+
+  // Everything below touches the owner's Google data, so it goes through the
+  // per-connector role allowlist. Registered here on purpose: Express matches
+  // in order, so the three grant-management routes above (the dashboard's)
+  // stay ungated.
+  router.use(requireConnectorAccess('google-workspace'));
+  router.get('/gmail/search', gmailSearch);
+  router.get('/gmail/messages/:id', gmailRead);
+  router.get('/gmail/messages/:id/attachments/:attachmentId', gmailAttachment);
+  router.post('/gmail/send', gmailSend);
+  // Mail an agent drafted and is waiting on the owner to send. The owner
+  // answers here; the agent cannot.
+  router.get('/gmail/held', gmailListHeld);
+  router.post('/gmail/held/:id', ownerOnly(OWNER_ONLY_HELD_MAIL), gmailResolveHeld);
+  // Wake the agent when a reply lands in a thread (CREW-257)
+  router.post('/gmail/watch', gmailWatchThread);
+  router.get('/gmail/watches', gmailListWatches);
+  router.delete('/gmail/watch/:threadId', gmailUnwatchThread);
+  router.get('/calendar/events', calendarList);
+  router.post('/calendar/events', calendarCreate);
+  router.get('/drive/files', driveSearch);
+  router.get('/drive/files/:id', driveGet);
+  router.get('/drive/files/:id/content', driveContent);
+  router.post('/drive/files', driveUpload);
+  router.get('/docs/:id', docsRead);
+  router.post('/docs', docsCreate);
+  router.post('/docs/:id/append', docsAppend);
+  router.get('/docs/:id/comments', docsCommentsList);
+  router.post('/docs/:id/comments', docsCommentsAdd);
+  router.post('/docs/:id/comments/:commentId/replies', docsCommentsReply);
+  router.post('/docs/:id/comments/:commentId/resolve', docsCommentsResolve);
+  // Comments an agent queued for the owner's OK (posted as a batch).
+  router.get('/doc-comment-batches', docCommentBatchesList);
+  router.post('/doc-comment-batches/:code/send', docCommentBatchSend);
+  router.post('/doc-comment-batches/:code/discard', docCommentBatchDiscard);
+  router.get('/sheets/:id', sheetsInfo);
+  router.get('/sheets/:id/values', sheetsRead);
+  router.post('/sheets', sheetsCreate);
+  router.post('/sheets/:id/values', sheetsWrite);
+  router.get('/slides/:id', slidesRead);
+  router.post('/slides', slidesCreate);
+  // Asking the owner to authorize is not itself a Google call, but it needs
+  // the same connector gate: only an agent allowed to use Google may ask.
+  router.post('/connect-card', postConnectCard);
+
+  return router;
+}

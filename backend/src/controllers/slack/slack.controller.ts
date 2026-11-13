@@ -1,0 +1,2084 @@
+/**
+ * Slack Controller
+ *
+ * REST API endpoints for managing Slack integration.
+ * Provides status monitoring, connection management, and message sending.
+ *
+ * @module controllers/slack
+ */
+
+import { Router, Request, Response, NextFunction } from 'express';
+import { describeSlackError, isSlackPlatformError } from './slack-error.utils.js';
+import { promises as fs } from 'fs';
+import path from 'path';
+import { getSlackService } from '../../services/slack/slack.service.js';
+import { getSlackOrchestratorBridge } from '../../services/slack/slack-orchestrator-bridge.js';
+import { saveSlackCredentials, deleteSlackCredentials, hasSavedCredentials } from '../../services/slack/slack-credentials.service.js';
+import { getSlackTeamChannelService } from '../../services/slack/slack-team-channel.service.js';
+import { getSlackAgentIdentityService, SlackIdentityCloudError } from '../../services/slack/slack-agent-identity.service.js';
+import { getSlackAgentPostService, SlackAgentPostError } from '../../services/slack/slack-agent-post.service.js';
+import {
+  startSlackTeamChannels,
+  ensureSlackCloudConfigService,
+  ensureSlackInstanceRegistry,
+  handleSlackCloudConfigChange,
+  getActiveSlackSource,
+  setActiveSlackSource,
+  recordSlackSource,
+  switchSlackSource,
+} from '../../services/slack/slack-initializer.js';
+import { resolveSlackSourceMode } from '../../services/slack/slack-cloud-config.service.js';
+import { isSlackSourceName } from '../../services/slack/slack-source-preference.service.js';
+import { getSlackInstanceRegistryService } from '../../services/slack/slack-instance-registry.service.js';
+import { CloudClientService } from '../../services/cloud/cloud-client.service.js';
+import { SlackConfig, SlackNotification, SlackNotificationType } from '../../types/slack.types.js';
+import { SLACK_IMAGE_CONSTANTS, SLACK_FILE_UPLOAD_CONSTANTS, SLACK_CLOUD_CONSTANTS, ORCHESTRATOR_SESSION_NAME } from '../../constants.js';
+import { reportOwnerThreadAgentPost } from '../../services/messaging/owner-thread-sentinel.service.js';
+import { OrcReplyRouteService } from '../../services/orc/orc-reply-route.service.js';
+import { readAgentSessionHeader } from '../../utils/agent-caller.utils.js';
+import { getBoardActivity } from '../../services/board/board-activity.tracker.js';
+import { rejectNonOwner } from '../../middleware/caller-identity.middleware.js';
+import { LoggerService } from '../../services/core/logger.service.js';
+import type { SlackCloudWorkspaceSummary } from '../../types/slack.types.js';
+import { getAgentBehaviorLogService } from '../../services/observability/agent-behavior-log.singleton.js';
+import { synthesizeSlackConversationId } from '../../services/chat-v2/legacy-dto.utils.js';
+
+const router = Router();
+const SLACK_MANIFEST_PATH = path.join(process.cwd(), 'config', 'slack-app-manifest.json');
+
+/**
+ * Cap for upload-marker content written to chat-v2.
+ *
+ * The marker is `[file uploaded: ${name}]${: comment}` — `initialComment`
+ * is caller-controlled and unbounded. Without this cap a 10KB comment
+ * would land in the chat history verbatim. Mirrors the bounded preview
+ * pattern used elsewhere (`THREAD_STATUS_CONSTANTS.MAX_PREVIEW_LENGTH`
+ * = 200 for inbound; 500 here so the file marker + a reasonable comment
+ * tail both fit). PR #562 review follow-up.
+ */
+const UPLOAD_MARKER_CONTENT_MAX = 500;
+
+/**
+ * Handle Slack platform errors consistently across endpoints.
+ * Returns true if the error was handled (422 sent), false otherwise.
+ *
+ * @param error - The caught error
+ * @param res - Express response object
+ * @returns True if a Slack platform error response was sent
+ */
+function handleSlackPlatformError(error: unknown, res: Response): boolean {
+  if (!isSlackPlatformError(error)) return false;
+  res.status(422).json(describeSlackError(error));
+  return true;
+}
+
+/**
+ * Post-Slack-send bookkeeping shared by /send, /upload-image, and /upload-file.
+ *
+ * After a successful Slack write, mirror the side-effects the orchestrator
+ * relies on for restart-safety and request lifecycle:
+ *
+ *  1. Persist a turn to chat-v2 so the agent's context-recovery sees the
+ *     action and does not re-send. The orchestrator was previously re-uploading
+ *     attached files after restart because file uploads landed in Slack but
+ *     never in chat-v2 (regression observed 2026-05-15 — dup `agentic_explainer.mp4`).
+ *  2. Mark the thread-status queue entry as `replied_completed` so
+ *     `recoverPendingThreads()` does not re-fire the inbound on the next boot.
+ *  3. Fire the V3 SLA `markResolvedByThread` cascade so the matching Request
+ *     auto-closes on file-only replies (it already worked for text replies
+ *     via the same hook).
+ *  5. Clear the OrcDeliveryEnforcer pending-delivery ledger for the thread.
+ *     Lives here rather than inline in `/send` so a deliverable handed over
+ *     as an image or a file counts as delivered too. Previously only text
+ *     replies cleared it, so an attachment reply left the watchdog armed and
+ *     it kept nudging the orchestrator to deliver what it had already
+ *     delivered — each nudge answered with another copy of the same reply.
+ *  4. Append the reply to the slack-thread `.md` store (the file orc reads
+ *     directly on session restart). The legacy `slack-orchestrator-bridge.
+ *     sendSlackResponse` path already did this for its internal flow, but
+ *     replies coming through `/api/slack/send` (the reply-slack skill path
+ *     orc actually uses) never reached the .md file. Without this, orc's
+ *     wake-up read of the thread context shows only user messages and
+ *     re-replies to everything (regression observed 2026-05-16 — orc
+ *     re-replied to all 3 user messages on the CE thread after a session
+ *     restart, even though /send had already marked chat-v2 + thread-status).
+ *
+ * All four steps are best-effort. The Slack send itself has already
+ * succeeded; failures here are bookkeeping-only and must never throw.
+ *
+ * @param params.channelId - Slack channel the send hit
+ * @param params.threadTs - Optional Slack thread root timestamp
+ * @param params.conversationId - Optional caller-supplied conversation id
+ * @param params.senderSessionName - Optional agent session that initiated the send
+ * @param params.content - The turn content to persist (text or file marker)
+ * @param params.source - Marker for the chat-v2 metadata.source field
+ */
+export async function recordSlackReplyBookkeeping(params: {
+  channelId: string;
+  threadTs?: string;
+  conversationId?: string;
+  senderSessionName?: string;
+  content: string;
+  /**
+   * Audit sub-kind for the chat-v2 metadata, recorded alongside the
+   * canonical `source: 'reply-tool'`. Keeps the closed `RECORD_TURN_SOURCES`
+   * enum intact while still letting downstream consumers distinguish text
+   * replies from attachment uploads.
+   */
+  replyKind: 'text' | 'file-upload' | 'image-upload';
+}): Promise<void> {
+  const { channelId, threadTs, conversationId, senderSessionName, content, replyKind } = params;
+
+  // 1. Persist agent turn into chat-v2 so context recovery sees the reply.
+  const resolvedConversationId: string | undefined =
+    (typeof conversationId === 'string' && conversationId.length > 0
+      ? conversationId
+      : undefined) ??
+    (typeof channelId === 'string' && typeof threadTs === 'string'
+      ? synthesizeSlackConversationId(channelId, threadTs)
+      : undefined);
+  if (resolvedConversationId) {
+    try {
+      const { getChatV2Service } = await import('../../services/chat-v2/chat-v2.singleton.js');
+      const { slackOutboundClientMessageId } = await import(
+        '../../services/chat-v2/legacy-dto.utils.js'
+      );
+      const chatV2 = getChatV2Service();
+      const agentSession =
+        typeof senderSessionName === 'string' && senderSessionName.length > 0
+          ? senderSessionName
+          : 'crewly-orc';
+      const channel = chatV2.ensureChannelForLegacyConversation({
+        conversationId: resolvedConversationId,
+        agentSession,
+      });
+      chatV2.recordTurn({
+        channelId: channel.id,
+        senderType: 'agent',
+        senderId: agentSession,
+        content,
+        // Shared idempotency key with SlackService.recordOutboundToChatV2 so a
+        // text reply (which goes out via sendMessage → that mirror) isn't
+        // persisted twice. File/image uploads don't go through sendMessage, so
+        // this stays their single persist; the key just makes it idempotent.
+        ...(typeof channelId === 'string' && typeof threadTs === 'string'
+          ? {
+              clientMessageId: slackOutboundClientMessageId(channelId, threadTs, content),
+            }
+          : {}),
+        metadata: {
+          source: 'reply-tool',
+          replyKind,
+          // Mirror the pre-PR /send guards exactly. `req.body` destructure
+          // is `any`, so a non-string slip-through would persist as-is into
+          // chat-v2 metadata without these `typeof` checks.
+          slackChannelId: typeof channelId === 'string' ? channelId : undefined,
+          slackThreadTs: typeof threadTs === 'string' ? threadTs : undefined,
+        },
+      });
+    } catch {
+      // Non-fatal — Slack delivery succeeded.
+    }
+  }
+
+  // 2. Mark thread-status replied_completed (idempotent — creates entry if missing).
+  if (threadTs && channelId) {
+    try {
+      const { ThreadStatusQueueService } = await import('../../services/messaging/thread-status-queue.service.js');
+      const tsq = ThreadStatusQueueService.getInstance();
+      const threadKey = `${channelId}:${threadTs}`;
+      if (!tsq.get(threadKey)) {
+        tsq.trackInbound({
+          threadKey,
+          conversationId: resolvedConversationId ?? synthesizeSlackConversationId(channelId, threadTs),
+          source: 'slack',
+          messagePreview: '[reply-only — no inbound recorded]',
+        });
+      }
+      tsq.markReplied(threadKey, 'replied_completed');
+    } catch {
+      // Non-fatal.
+    }
+  }
+
+  // 3. SLA cascade — closes the matching Request when orc replies in-thread.
+  if (threadTs) {
+    try {
+      const { getRequestSlaSubscriber } = await import('../../services/v3/request-sla.subscriber.js');
+      const sub = getRequestSlaSubscriber();
+      if (sub) {
+        await sub.markResolvedByThread(threadTs);
+      }
+    } catch {
+      // Non-fatal.
+    }
+  }
+
+  // 4. Append to the slack-thread .md store so orc's wake-up read of the
+  //    thread context file sees its own reply. Without this, orc reads the
+  //    file, sees only user messages, and re-replies to everything.
+  if (threadTs && channelId) {
+    try {
+      const { getSlackThreadStore } = await import('../../services/slack/slack-thread-store.service.js');
+      const store = getSlackThreadStore();
+      if (store) {
+        await store.appendOrchestratorReply(channelId, threadTs, content);
+      }
+    } catch {
+      // Non-fatal — Slack delivery succeeded.
+    }
+  }
+
+  // 5. Clear the pending-delivery reminder the enforcer is holding for this
+  //    thread (2026-05-23 incident ledger). Any successful reply to the
+  //    thread counts — text, image, or file.
+  if (threadTs && channelId) {
+    try {
+      const { OrcDeliveryEnforcerService } = await import(
+        '../../services/orc/orc-delivery-enforcer.service.js'
+      );
+      OrcDeliveryEnforcerService.getInstance()?.markDelivered({ channelId, threadTs });
+    } catch {
+      // Non-fatal — enforcer not wired (e.g. headless mode).
+    }
+  }
+}
+
+/**
+ * GET /api/slack/status
+ *
+ * Get Slack integration status including connection state and message counts.
+ * `connected` only says a connection exists; `degraded` (with
+ * `degradedReason` / `deliveryFailures`) says whether posts actually reach
+ * their channels, and `source` says which Slack app is connected (#753).
+ *
+ * @returns Status object with connection info
+ */
+router.get('/status', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const slackService = getSlackService();
+    const status = slackService.getStatus();
+    const connected = slackService.isConnected();
+
+    res.json({
+      success: true,
+      data: {
+        ...status,
+        degraded: status.degraded ?? false,
+        isConfigured: connected,
+        // Which Slack app holds the connection: `env` (self-hosted) or `cloud`.
+        source: connected ? getActiveSlackSource() : null,
+        sourceMode: resolveSlackSourceMode(),
+        transport: connected ? slackService.getTransport() : null,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/slack/install
+ *
+ * Returns the one-click Slack app manifest and an import URL payload to simplify setup.
+ */
+router.get('/install', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const manifestRaw = await fs.readFile(SLACK_MANIFEST_PATH, 'utf8');
+    const manifest = JSON.parse(manifestRaw) as Record<string, unknown>;
+    const encodedManifest = encodeURIComponent(JSON.stringify(manifest));
+    const importUrl = `https://api.slack.com/apps?new_app=1&manifest_json=${encodedManifest}`;
+
+    res.json({
+      success: true,
+      data: {
+        manifest,
+        importUrl,
+        instructions: [
+          'Open importUrl and create the app from manifest',
+          'Enable Socket Mode and install app to workspace',
+          'Copy Bot Token, App Token, Signing Secret into /api/slack/connect',
+        ],
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/slack/connect
+ *
+ * Initialize Slack connection with configuration.
+ * Uses request body or falls back to environment variables.
+ *
+ * @body botToken - Bot OAuth token (optional if env set)
+ * @body appToken - App-level token (optional if env set)
+ * @body signingSecret - Signing secret (optional if env set)
+ * @body defaultChannelId - Default notification channel
+ * @body allowedUserIds - Array of allowed user IDs
+ * @returns Connection status on success
+ */
+router.post('/connect', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const config: SlackConfig = {
+      botToken: req.body.botToken || process.env.SLACK_BOT_TOKEN || '',
+      appToken: req.body.appToken || process.env.SLACK_APP_TOKEN || '',
+      signingSecret: req.body.signingSecret || process.env.SLACK_SIGNING_SECRET || '',
+      defaultChannelId: req.body.defaultChannelId || process.env.SLACK_DEFAULT_CHANNEL,
+      allowedUserIds:
+        req.body.allowedUserIds ||
+        process.env.SLACK_ALLOWED_USERS?.split(',').filter(Boolean),
+      socketMode: true,
+    };
+
+    // Validate required fields
+    if (!config.botToken || !config.appToken || !config.signingSecret) {
+      res.status(400).json({
+        success: false,
+        error: 'Missing required Slack credentials (botToken, appToken, signingSecret)',
+      });
+      return;
+    }
+
+    const slackService = getSlackService();
+    // Replacing a Cloud connection: its registry heartbeat must not keep
+    // claiming this instance serves the Cloud workspace.
+    if (getActiveSlackSource() === 'cloud') getSlackInstanceRegistryService()?.stop();
+    await slackService.initialize(config);
+
+    // Initialize bridge
+    const bridge = getSlackOrchestratorBridge();
+    await bridge.initialize();
+
+    // Team channels (one Slack channel per team). Best-effort; never fails connect.
+    await startSlackTeamChannels();
+
+    // Persist credentials to disk so they survive server restarts, and
+    // record the self-hosted app as the chosen source so a restart does not
+    // swap it for a Cloud workspace (#753).
+    await saveSlackCredentials(config);
+    setActiveSlackSource('env');
+    await recordSlackSource('env', 'connect-route');
+
+    res.json({
+      success: true,
+      message: 'Slack connection established',
+      data: slackService.getStatus(),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * PUT /api/slack/source
+ *
+ * The owner's explicit choice of Slack app when both a self-hosted app and a
+ * Crewly Cloud workspace exist: connect with it now and keep it across
+ * restarts (#753). 409 when `CREWLY_SLACK_SOURCE` pins the other source,
+ * 404 when the chosen source has no credentials, 502 when it cannot connect
+ * (the previous connection is restored).
+ *
+ * @body source - `env` (self-hosted app) or `cloud` (Crewly Cloud app)
+ */
+router.put('/source', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const source: unknown = req.body?.source;
+    if (!isSlackSourceName(source)) {
+      res.status(400).json({ success: false, error: "source must be 'env' or 'cloud'" });
+      return;
+    }
+    const result = await switchSlackSource(source);
+    if (!result.success) {
+      const status = result.code === 'source_pinned' ? 409 : result.code === 'source_unavailable' ? 404 : 502;
+      res.status(status).json({ success: false, error: result.error, code: result.code, data: { activeSource: result.activeSource } });
+      return;
+    }
+    res.json({ success: true, data: { activeSource: result.activeSource, status: getSlackService().getStatus() } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/slack/disconnect
+ *
+ * Disconnect from Slack gracefully.
+ *
+ * @returns Success message on disconnect
+ */
+router.post('/disconnect', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const slackService = getSlackService();
+    await slackService.disconnect();
+    setActiveSlackSource(null);
+
+    // Remove saved credentials so Slack doesn't auto-reconnect on restart
+    await deleteSlackCredentials();
+
+    res.json({
+      success: true,
+      message: 'Slack disconnected',
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * Applies orchestrator reply routing to a Slack post
+ * (see `services/orc/orc-reply-route.service.ts`).
+ *
+ * Only posts by the orchestrator (X-Agent-Session header, else the body's
+ * `senderSessionName`) are considered, and only Slack DMs are ever re-routed.
+ * A re-route to a Slack conversation rewrites the target; a re-route to a
+ * chat-v2 conversation stores the text there as the orchestrator's reply,
+ * which the Slack DM bridge mirrors under the right bot.
+ *
+ * @param req - The request (for the agent header)
+ * @param target - Requested channel/thread, cross-post flag, text and body sender
+ * @returns Where to send, or the chat-v2 message that was stored instead
+ */
+async function planOrchestratorSlackReply(
+  req: Request,
+  target: { channelId: string; threadTs?: string; crossPost: boolean; text: string; senderSessionName?: unknown },
+): Promise<
+  | { kind: 'slack'; channelId: string; threadTs?: string }
+  | { kind: 'conversation'; conversationId: string; messageId: string }
+> {
+  const asRequested = { kind: 'slack' as const, channelId: target.channelId, threadTs: target.threadTs };
+  const header = readAgentSessionHeader(req);
+  const sender = header ?? (typeof target.senderSessionName === 'string' ? target.senderSessionName : undefined);
+  if (sender !== ORCHESTRATOR_SESSION_NAME) return asRequested;
+
+  const { getSlackAgentDmService } = await import('../../services/slack/slack-agent-dm.service.js');
+  const dm = getSlackAgentDmService();
+  const { plan, decision } = OrcReplyRouteService.getInstance().planSlackReply(
+    ORCHESTRATOR_SESSION_NAME,
+    { channelId: target.channelId, threadTs: target.threadTs, crossPost: target.crossPost },
+    (conversationId) => dm?.findByChatChannelId(conversationId)?.slackChannelId,
+  );
+  if (decision.action !== 'rerouted-to-origin') return asRequested;
+
+  const logger = LoggerService.getInstance().createComponentLogger('SlackController');
+  logger.warn('Orchestrator Slack reply re-routed to the conversation its turn came from', {
+    requestedChannelId: target.channelId,
+    requestedThreadTs: target.threadTs,
+    routedTo: plan.kind === 'slack' ? plan.channelId : plan.conversationId,
+    reason: decision.reason,
+    preview: target.text.substring(0, 80),
+  });
+  if (plan.kind === 'slack') return plan;
+
+  const { getChatService } = await import('../../services/chat/chat.service.js');
+  const saved = await getChatService().addDirectMessage(plan.conversationId, target.text, {
+    type: 'orchestrator',
+    name: 'Orchestrator',
+  });
+  return { kind: 'conversation', conversationId: plan.conversationId, messageId: saved.id };
+}
+
+/**
+ * POST /api/slack/send
+ *
+ * Send a message to Slack (for testing/manual notifications).
+ *
+ * @body channelId - Channel to send to (required)
+ * @body text - Message text (required)
+ * @body threadTs - Thread timestamp for replies (optional)
+ * @returns Message timestamp on success
+ */
+router.post('/send', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { channelId, text, threadTs, conversationId, senderSessionName } = req.body;
+
+    if (!channelId || !text) {
+      res.status(400).json({
+        success: false,
+        error: 'channelId and text are required',
+      });
+      return;
+    }
+
+    const slackService = getSlackService();
+
+    if (!slackService.isConnected()) {
+      res.status(503).json({
+        success: false,
+        error: 'Slack is not connected',
+      });
+      return;
+    }
+
+    // An orchestrator reply aimed at a Slack DM its turn did not come from
+    // goes back to the conversation it was asked in (2026-09-26: the answer
+    // to a question asked in the orc-bot DM went to the master-bot DM).
+    const orcRoute = await planOrchestratorSlackReply(req, {
+      channelId,
+      threadTs,
+      crossPost: req.body?.crossPost === true,
+      text: typeof text === 'string' ? text : String(text),
+      senderSessionName,
+    });
+    if (orcRoute.kind === 'conversation') {
+      res.json({
+        success: true,
+        data: { rerouted: true, conversationId: orcRoute.conversationId, messageId: orcRoute.messageId },
+      });
+      return;
+    }
+
+    const messageTs = await slackService.sendMessage({
+      channelId: orcRoute.channelId,
+      text,
+      threadTs: orcRoute.threadTs,
+    });
+
+    // F14: record `agent.action` with actionType='send_slack' on
+    // successful Slack send. Source `agent` from senderSessionName
+    // already on the request body. Best-effort — never blocks the
+    // response. Note: if sendMessage threw, we never reach here, and
+    // the slack.delivery.failed event was recorded at the throw site.
+    try {
+      getAgentBehaviorLogService()?.record({
+        type: 'agent.action',
+        agent: typeof senderSessionName === 'string' ? senderSessionName : '',
+        actionType: 'send_slack',
+        details: {
+          channelId: orcRoute.channelId,
+          threadTs: orcRoute.threadTs ?? null,
+          textLength: typeof text === 'string' ? text.length : 0,
+          deduplicated: messageTs === '',
+        },
+      });
+    } catch {
+      /* observability is best-effort */
+    }
+
+    // Post-send bookkeeping (chat-v2 persist + thread-status terminal mark +
+    // SLA cascade). The same helper is used by /upload-image and /upload-file
+    // so the orchestrator never has to re-derive "did I already reply here?".
+    await recordSlackReplyBookkeeping({
+      channelId: orcRoute.channelId,
+      threadTs: orcRoute.threadTs,
+      conversationId,
+      senderSessionName,
+      content: typeof text === 'string' ? text : String(text),
+      replyKind: 'text',
+    });
+
+    res.json({
+      success: true,
+      data: { messageTs },
+    });
+  } catch (error: unknown) {
+    if (!handleSlackPlatformError(error, res)) {
+      next(error);
+    }
+  }
+});
+
+/**
+ * POST /api/slack/notify
+ *
+ * Send a notification through the orchestrator bridge.
+ *
+ * @body type - Notification type (optional, defaults to 'alert')
+ * @body title - Notification title (required)
+ * @body message - Notification message (required)
+ * @body urgency - Urgency level (optional, defaults to 'normal')
+ * @body metadata - Additional metadata (optional)
+ * @returns Success message on send
+ */
+router.post('/notify', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const notification: SlackNotification = {
+      type: (req.body.type || 'alert') as SlackNotificationType,
+      title: req.body.title,
+      message: req.body.message,
+      urgency: req.body.urgency || 'normal',
+      timestamp: new Date().toISOString(),
+      metadata: req.body.metadata,
+    };
+
+    if (!notification.title || !notification.message) {
+      res.status(400).json({
+        success: false,
+        error: 'title and message are required',
+      });
+      return;
+    }
+
+    const bridge = getSlackOrchestratorBridge();
+    await bridge.sendNotification(notification);
+
+    res.json({
+      success: true,
+      message: 'Notification sent',
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/slack/upload-image
+ *
+ * Upload a local image file to a Slack channel.
+ * Accepts a JSON body with a filePath (not multipart) since the backend
+ * and agents share the same filesystem.
+ *
+ * @body channelId - Slack channel to upload to (required)
+ * @body filePath - Absolute path to the image file on disk (required)
+ * @body filename - Override filename (optional)
+ * @body title - Title for the uploaded file (optional)
+ * @body initialComment - Comment to include with the upload (optional)
+ * @body threadTs - Thread timestamp to upload in a thread (optional)
+ * @returns Object with fileId on success
+ */
+router.post('/upload-image', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { channelId, filePath, filename, title, initialComment, threadTs, conversationId, senderSessionName } = req.body;
+
+    if (!channelId || !filePath) {
+      res.status(400).json({
+        success: false,
+        error: 'channelId and filePath are required',
+      });
+      return;
+    }
+
+    // Validate file exists
+    try {
+      await fs.access(filePath);
+    } catch {
+      res.status(404).json({
+        success: false,
+        error: `File not found: ${filePath}`,
+      });
+      return;
+    }
+
+    // Validate file size
+    const stat = await fs.stat(filePath);
+    if (stat.size > SLACK_IMAGE_CONSTANTS.MAX_FILE_SIZE) {
+      const maxMB = Math.round(SLACK_IMAGE_CONSTANTS.MAX_FILE_SIZE / (1024 * 1024));
+      res.status(413).json({
+        success: false,
+        error: `File too large (max ${maxMB} MB)`,
+      });
+      return;
+    }
+
+    // Validate MIME type by extension
+    const ext = path.extname(filePath).toLowerCase();
+    const extToMime: Record<string, string> = {
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif',
+      '.webp': 'image/webp',
+      '.svg': 'image/svg+xml',
+    };
+    const mime = extToMime[ext];
+    if (!mime || !SLACK_IMAGE_CONSTANTS.SUPPORTED_MIMES.includes(mime as typeof SLACK_IMAGE_CONSTANTS.SUPPORTED_MIMES[number])) {
+      res.status(415).json({
+        success: false,
+        error: `Unsupported image type: ${ext}`,
+      });
+      return;
+    }
+
+    const slackService = getSlackService();
+    if (!slackService.isConnected()) {
+      res.status(503).json({
+        success: false,
+        error: 'Slack is not connected',
+      });
+      return;
+    }
+
+    const result = await slackService.uploadImage({
+      channelId,
+      filePath,
+      filename,
+      title,
+      initialComment,
+      threadTs,
+    });
+
+    // F14 observability parity with /send — record `agent.action` so
+    // dashboards counting `send_slack` include attachment uploads.
+    // `details.kind` discriminates text vs file vs image when finer-
+    // grained queries are needed.
+    try {
+      getAgentBehaviorLogService()?.record({
+        type: 'agent.action',
+        agent: typeof senderSessionName === 'string' ? senderSessionName : '',
+        actionType: 'send_slack',
+        details: {
+          kind: 'image',
+          channelId,
+          threadTs: threadTs ?? null,
+          fileId: result.fileId ?? null,
+          fileSize: stat.size,
+        },
+      });
+    } catch {
+      /* observability is best-effort */
+    }
+
+    // Mirror /send post-success bookkeeping so orc's context recovery sees
+    // the image was already delivered. Content captures the file marker so
+    // the chat history shows what was actually sent.
+    const displayName = typeof filename === 'string' && filename.length > 0 ? filename : path.basename(filePath);
+    const commentSuffix = typeof initialComment === 'string' && initialComment.length > 0 ? `: ${initialComment}` : '';
+    await recordSlackReplyBookkeeping({
+      channelId,
+      threadTs,
+      conversationId,
+      senderSessionName,
+      content: `[image uploaded: ${displayName}]${commentSuffix}`.slice(0, UPLOAD_MARKER_CONTENT_MAX),
+      replyKind: 'image-upload',
+    });
+
+    res.json({
+      success: true,
+      data: { fileId: result.fileId },
+    });
+  } catch (error: unknown) {
+    if (!handleSlackPlatformError(error, res)) {
+      next(error);
+    }
+  }
+});
+
+/**
+ * POST /api/slack/upload-file
+ *
+ * Upload a local file (PDF, image, document, etc.) to a Slack channel.
+ * Accepts a JSON body with a filePath (not multipart) since the backend
+ * and agents share the same filesystem.
+ *
+ * @body channelId - Slack channel to upload to (required)
+ * @body filePath - Absolute path to the file on disk (required)
+ * @body filename - Override filename (optional)
+ * @body title - Title for the uploaded file (optional)
+ * @body initialComment - Comment to include with the upload (optional)
+ * @body threadTs - Thread timestamp to upload in a thread (optional)
+ * @returns Object with fileId on success
+ */
+router.post('/upload-file', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { channelId, filePath, filename, title, initialComment, threadTs, conversationId, senderSessionName, allowNewThread } = req.body;
+
+    if (!channelId || !filePath) {
+      res.status(400).json({
+        success: false,
+        error: 'channelId and filePath are required',
+      });
+      return;
+    }
+
+    // Validate file exists
+    try {
+      await fs.access(filePath);
+    } catch {
+      res.status(404).json({
+        success: false,
+        error: `File not found: ${filePath}`,
+      });
+      return;
+    }
+
+    // Validate file size
+    const stat = await fs.stat(filePath);
+    if (stat.size > SLACK_FILE_UPLOAD_CONSTANTS.MAX_FILE_SIZE) {
+      const maxMB = Math.round(SLACK_FILE_UPLOAD_CONSTANTS.MAX_FILE_SIZE / (1024 * 1024));
+      res.status(413).json({
+        success: false,
+        error: `File too large (max ${maxMB} MB)`,
+      });
+      return;
+    }
+
+    // Validate file extension
+    const ext = path.extname(filePath).toLowerCase();
+    if (!SLACK_FILE_UPLOAD_CONSTANTS.SUPPORTED_EXTENSIONS.includes(ext as typeof SLACK_FILE_UPLOAD_CONSTANTS.SUPPORTED_EXTENSIONS[number])) {
+      res.status(415).json({
+        success: false,
+        error: `Unsupported file type: ${ext}`,
+      });
+      return;
+    }
+
+    const slackService = getSlackService();
+    if (!slackService.isConnected()) {
+      res.status(503).json({
+        success: false,
+        error: 'Slack is not connected',
+      });
+      return;
+    }
+
+    // `--thread` as a Slack thread key from another channel (an agent's
+    // send-pdf-to-slack): resolved by the harness, never swapped for a
+    // top-level upload here (specs/2026-10-02-harness-owned-routing.md §1).
+    const { parseSlackThreadKey } = await import('../../services/slack/slack-thread-key.js');
+    const namedKey = parseSlackThreadKey(threadTs);
+    let uploadChannel: string = channelId;
+    let uploadThread: string | undefined = namedKey ? namedKey.threadTs : threadTs;
+    if (namedKey && namedKey.slackChannelId !== channelId) {
+      const header = req.headers['x-agent-session'];
+      const session = typeof header === 'string' && header ? header : typeof senderSessionName === 'string' ? senderSessionName : '';
+      const { resolveSlackPlace } = await import('../../services/orc/reply-destination.wiring.js');
+      const place = session
+        ? await resolveSlackPlace({ session, hints: { thread: String(threadTs), slackChannelId: String(channelId) }, noOwnerDm: true }).catch(() => null)
+        : null;
+      if (!place) {
+        res.status(409).json({
+          success: false,
+          error: `File NOT sent: thread ${String(threadTs)} is not in channel ${String(channelId)}. Run attach-file --path <file> without a thread (the harness picks it).`,
+        });
+        return;
+      }
+      uploadChannel = place.slackChannelId;
+      uploadThread = place.threadTs;
+    }
+
+    // No thread: the file is never posted at the channel's top level as
+    // "Crewly" by default. The harness places it in the thread the caller's
+    // work answers, or the caller says it wants a new top-level post.
+    if (!uploadThread && allowNewThread !== true) {
+      const header = req.headers['x-agent-session'];
+      const session = typeof header === 'string' && header ? header : typeof senderSessionName === 'string' ? senderSessionName : '';
+      const { resolveSlackPlace } = await import('../../services/orc/reply-destination.wiring.js');
+      const place = session ? await resolveSlackPlace({ session, noOwnerDm: true }).catch(() => null) : null;
+      if (!place || place.slackChannelId !== channelId || !place.threadTs) {
+        res.status(409).json({
+          success: false,
+          code: 'thread_unresolved',
+          error: `File NOT sent: no thread named, and Crewly cannot tell which thread of ${String(channelId)} it answers. Pass --thread <ts> (or attach-file --work-item <id>); pass --allow-new-thread only for a deliberate new top-level post.`,
+        });
+        return;
+      }
+      uploadThread = place.threadTs;
+    }
+
+    const result = await slackService.uploadFile({
+      channelId: uploadChannel,
+      filePath,
+      filename,
+      title,
+      initialComment,
+      threadTs: uploadThread,
+    });
+
+    // F14 observability parity with /send — see /upload-image for the
+    // shared rationale.
+    try {
+      getAgentBehaviorLogService()?.record({
+        type: 'agent.action',
+        agent: typeof senderSessionName === 'string' ? senderSessionName : '',
+        actionType: 'send_slack',
+        details: {
+          kind: 'file',
+          channelId: uploadChannel,
+          threadTs: uploadThread ?? null,
+          fileId: result.fileId ?? null,
+          fileSize: stat.size,
+        },
+      });
+    } catch {
+      /* observability is best-effort */
+    }
+
+    // Mirror /send post-success bookkeeping. Without this the orchestrator
+    // re-uploads the same file after every restart (regression 2026-05-15:
+    // duplicate agentic_explainer.mp4 in D0AC7NF5N7L:1778816065.309289 thread).
+    const displayName = typeof filename === 'string' && filename.length > 0 ? filename : path.basename(filePath);
+    const commentSuffix = typeof initialComment === 'string' && initialComment.length > 0 ? `: ${initialComment}` : '';
+    await recordSlackReplyBookkeeping({
+      channelId: uploadChannel,
+      threadTs: uploadThread,
+      conversationId,
+      senderSessionName,
+      content: `[file uploaded: ${displayName}]${commentSuffix}`.slice(0, UPLOAD_MARKER_CONTENT_MAX),
+      replyKind: 'file-upload',
+    });
+
+    res.json({
+      success: true,
+      data: { fileId: result.fileId },
+    });
+  } catch (error: unknown) {
+    if (!handleSlackPlatformError(error, res)) {
+      next(error);
+    }
+  }
+});
+
+/**
+ * GET /api/slack/config
+ *
+ * Get current Slack configuration (sanitized, no secrets).
+ *
+ * @returns Configuration status object
+ */
+router.get('/config', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const hasSaved = await hasSavedCredentials();
+
+    res.json({
+      success: true,
+      data: {
+        hasToken: !!process.env.SLACK_BOT_TOKEN,
+        hasAppToken: !!process.env.SLACK_APP_TOKEN,
+        hasSigningSecret: !!process.env.SLACK_SIGNING_SECRET,
+        hasSavedConfig: hasSaved,
+        defaultChannel: process.env.SLACK_DEFAULT_CHANNEL || null,
+        allowedUsers: process.env.SLACK_ALLOWED_USERS?.split(',').filter(Boolean).length || 0,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Crewly Cloud owns Slack (Slack v3) — one-click install, status, primary
+// ---------------------------------------------------------------------------
+
+/**
+ * Answer 401 unless the OSS install is signed in to Crewly Cloud.
+ *
+ * @param res - Response used for the 401
+ * @returns `{ token, cloudUrl }` or null after the response was sent
+ */
+function requireCloudLogin(res: Response): { token: string; cloudUrl: string } | null {
+  const cloud = CloudClientService.getInstance();
+  const token = cloud.getToken();
+  const cloudUrl = cloud.getCloudUrl();
+  if (!cloud.isConnected() || !token || !cloudUrl) {
+    res.status(401).json({
+      success: false,
+      error: 'Log in to Crewly Cloud first (Settings → Cloud & devices) — Slack is installed through your Crewly account',
+      code: 'CLOUD_NOT_CONNECTED',
+    });
+    return null;
+  }
+  return { token, cloudUrl: cloudUrl.replace(/\/$/, '') };
+}
+
+/**
+ * The dashboard URL the Slack install flow returns to: the caller's
+ * `returnUrl` when it is an http(s) URL, otherwise this server's origin +
+ * the Settings Slack tab.
+ *
+ * @param req - The request
+ * @returns An absolute http(s) URL
+ */
+function resolveInstallReturnUrl(req: Request): string {
+  const requested = typeof req.query.returnUrl === 'string' ? req.query.returnUrl.trim() : '';
+  if (/^https?:\/\//i.test(requested)) return requested;
+  const host = req.get('host') || `localhost`;
+  return `${req.protocol}://${host}${SLACK_CLOUD_CONSTANTS.INSTALL_RETURN_PATH}`;
+}
+
+/**
+ * GET /api/slack/cloud/install-url
+ *
+ * Build the one-click install link: Cloud's `/api/cloud/slack/install`
+ * with the current Cloud JWT (a browser redirect cannot set headers) and
+ * the dashboard return URL.
+ *
+ * @query returnUrl - Optional absolute http(s) URL to come back to
+ * @returns `{ url, returnUrl }`
+ */
+router.get('/cloud/install-url', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const login = requireCloudLogin(res);
+    if (!login) return;
+    const returnUrl = resolveInstallReturnUrl(req);
+    // The instance id lets Cloud bind the installed workspace to this
+    // instance, so an account with several workspaces needs no extra pick.
+    const registry = await ensureSlackInstanceRegistry();
+    const instanceId = registry.getInstanceId() ?? (await registry.resolveInstanceId());
+    const url =
+      `${login.cloudUrl}${SLACK_CLOUD_CONSTANTS.CLOUD_PATH}${SLACK_CLOUD_CONSTANTS.INSTALL_PATH}` +
+      `?token=${encodeURIComponent(login.token)}&returnUrl=${encodeURIComponent(returnUrl)}` +
+      (instanceId ? `&instanceId=${encodeURIComponent(instanceId)}` : '');
+    res.json({ success: true, data: { url, returnUrl, instanceId } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/slack/cloud/status
+ *
+ * The Cloud-owned Slack picture for this instance: connected workspace,
+ * transport, primary flag, registry heartbeat and agents still waiting for
+ * their install click. `?refresh=1` re-fetches the config from Cloud first
+ * and connects when a workspace just appeared (the post-install landing).
+ */
+router.get('/cloud/status', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const cloud = CloudClientService.getInstance();
+    const cloudConnected = cloud.isConnected() && !!cloud.getToken() && !!cloud.getCloudUrl();
+    const configService = await ensureSlackCloudConfigService();
+    const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    if (refresh) {
+      await configService.refresh();
+    } else {
+      await configService.load();
+    }
+    const slackService = getSlackService();
+    const config = configService.getConfig();
+    if (refresh && config && !slackService.isConnected() && configService.getSourceMode() !== 'env') {
+      await handleSlackCloudConfigChange(config);
+    }
+    const registry = getSlackInstanceRegistryService();
+    const primary = registry ? await registry.isPrimary() : await (await ensureSlackInstanceRegistry()).isPrimary();
+    const hasSaved = await hasSavedCredentials();
+    // Every workspace on the account, for the Settings switcher. Best effort:
+    // a listing failure must not hide the rest of the status.
+    let workspaces: SlackCloudWorkspaceSummary[] | null = null;
+    if (cloudConnected && configService.getSourceMode() !== 'env') {
+      try {
+        workspaces = await configService.listWorkspaces();
+      } catch {
+        workspaces = null;
+      }
+    }
+    // Who is actually holding the socket. `workspace` below describes the
+    // CLOUD registration and is returned whether or not Cloud is the active
+    // source, so reading a bot identity out of it says nothing about the
+    // token currently in use. On an env-pinned instance the two can be
+    // different apps entirely, and believing otherwise is how a switch to
+    // Cloud silently breaks a DM: a `D…` channel belongs to one bot user, so
+    // the other bot gets `channel_not_found` while status still says
+    // "connected" (2026-09-20, the Air). `auth.test` is the only answer that
+    // survives that, so report it next to the registration.
+    let active: { botUserId: string | null } | null = null;
+    if (slackService.isConnected()) {
+      active = { botUserId: await slackService.getBotUserId().catch(() => null) };
+    }
+
+    res.json({
+      success: true,
+      data: {
+        cloudConnected,
+        sourceMode: configService.getSourceMode(),
+        activeSource: getActiveSlackSource(),
+        connected: slackService.isConnected(),
+        transport: slackService.isConnected() ? slackService.getTransport() : null,
+        // The identity of the token in use right now, from `auth.test`.
+        active,
+        // The Cloud-side registration. Present even when `activeSource` is
+        // `env`, in which case it describes an app that is NOT connected.
+        workspace: config
+          ? {
+              slackTeamId: config.workspace.slackTeamId,
+              slackTeamName: config.workspace.slackTeamName,
+              botUserId: config.workspace.botUserId,
+              appId: config.workspace.appId,
+              agentIdentities: config.agents.length,
+              describesActiveSource: getActiveSlackSource() === 'cloud',
+            }
+          : null,
+        configFetchedAt: configService.getFetchedAt(),
+        configError: configService.getLastError(),
+        primary,
+        instanceId: registry?.getInstanceId() ?? null,
+        lastHeartbeatAt: registry?.getLastHeartbeatAt() ?? null,
+        registryError: registry?.getLastError() ?? null,
+        // No queue id = the heartbeat is skipped, Cloud marks this instance
+        // stale and queues every inbound Slack event. That used to leave no
+        // trace anywhere in this payload (2026-09-21).
+        relayQueue: registry?.getRelayQueue() ?? { queueId: null, error: null },
+        pendingInstalls: registry?.getPendingInstalls() ?? [],
+        availableWorkspaces: configService.getAvailableWorkspaces(),
+        workspaces,
+        selectedWorkspaceId: registry ? await registry.getWorkspaceId() : null,
+        local: {
+          env: !!(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN && process.env.SLACK_SIGNING_SECRET),
+          saved: hasSaved,
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * PUT /api/slack/cloud/primary
+ *
+ * Make (or unmake) this instance the account's primary — the one that gets
+ * DMs to the master bot and messages in channels no team owns. Persisted
+ * locally and pushed to Cloud right away.
+ *
+ * @body primary - boolean (required)
+ */
+router.put('/cloud/primary', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { primary } = req.body ?? {};
+    if (typeof primary !== 'boolean') {
+      res.status(400).json({ success: false, error: 'primary (boolean) is required' });
+      return;
+    }
+    const registry = await ensureSlackInstanceRegistry();
+    await registry.setPrimary(primary);
+    res.json({
+      success: true,
+      data: { primary: await registry.isPrimary(), lastHeartbeatAt: registry.getLastHeartbeatAt(), registryError: registry.getLastError() },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/slack/directory?channel=C…
+ *
+ * Who an agent can @: every agent of the Crewly account (any machine) with
+ * team, machine and Slack mention, plus — when a channel is given — every
+ * bot and human actually in that channel, including agents of other
+ * Crewly accounts. Backs the `list-colleagues` skill.
+ */
+router.get('/directory', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { getSlackDirectoryService } = await import('../../services/slack/slack-directory.service.js');
+    const directory = getSlackDirectoryService();
+    if (!directory) {
+      res.status(503).json({ success: false, error: 'Slack directory is available only on the Cloud transport (Settings → Slack → Connect Slack)', code: 'directory_unavailable' });
+      return;
+    }
+    const channel = typeof req.query.channel === 'string' && req.query.channel ? req.query.channel : undefined;
+    const entries = await directory.list(channel);
+    res.json({ success: true, data: { channel: channel ?? null, colleagues: entries } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/slack/files/fetch
+ *
+ * Get a Slack file by link or id — also one posted in a channel the
+ * caller's own bot is not in, or by an agent on another machine. Local bot
+ * tokens first, then Crewly Cloud (which holds every bot of the account).
+ * Backs the `slack-file` skill.
+ *
+ * @body fileRef - File id (F…), file link, download URL, or message link (required)
+ * @returns `{ success, data: { path, file, preview? } }` — `preview` = the first lines of a text file
+ */
+router.post('/files/fetch', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const fileRef = typeof req.body?.fileRef === 'string' ? req.body.fileRef.trim() : '';
+    if (!fileRef || fileRef.length > 2000) {
+      res.status(400).json({ success: false, code: 'validation', error: 'fileRef (a Slack file id or link) is required' });
+      return;
+    }
+    const { getSlackFileFetchService, previewTextFile, SlackFileGetError, SLACK_FILE_GET_STATUS } = await import(
+      '../../services/slack/slack-file-fetch.service.js'
+    );
+    try {
+      const service = await getSlackFileFetchService();
+      const { meta, localPath } = await service.get(fileRef, { requesterAgent: readAgentSessionHeader(req) });
+      const preview = meta.isText ? await previewTextFile(localPath).catch(() => undefined) : undefined;
+      res.json({ success: true, data: { path: localPath, file: meta, ...(preview !== undefined ? { preview } : {}) } });
+    } catch (err) {
+      if (err instanceof SlackFileGetError) {
+        res.status(SLACK_FILE_GET_STATUS[err.code]).json({ success: false, code: err.code, error: err.message });
+        return;
+      }
+      throw err;
+    }
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/slack/cloud/workspaces
+ *
+ * Every Slack workspace installed on the Cloud account (redacted), plus the
+ * one this instance currently serves.
+ */
+router.get('/cloud/workspaces', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!requireCloudLogin(res)) return;
+    const configService = await ensureSlackCloudConfigService();
+    const registry = await ensureSlackInstanceRegistry();
+    const workspaces = await configService.listWorkspaces();
+    res.json({
+      success: true,
+      data: {
+        workspaces,
+        selectedWorkspaceId: await registry.getWorkspaceId(),
+        activeWorkspaceId: configService.getConfig()?.workspace.slackTeamId ?? null,
+      },
+    });
+  } catch (error) {
+    if (error instanceof SlackIdentityCloudError) {
+      res.status(error.status >= 400 && error.status < 600 ? error.status : 502).json({ success: false, error: error.message, code: error.code });
+      return;
+    }
+    next(error);
+  }
+});
+
+/**
+ * PUT /api/slack/cloud/workspace
+ *
+ * Choose which of the account's workspaces this instance serves. Persisted
+ * locally, pushed to Cloud (re-binding the instance), then the config is
+ * refreshed and Slack reconnects on the new workspace.
+ *
+ * @body slackTeamId - Slack team id (required)
+ */
+router.put('/cloud/workspace', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!requireCloudLogin(res)) return;
+    const { slackTeamId } = req.body ?? {};
+    if (typeof slackTeamId !== 'string' || !/^[TE][A-Z0-9]{2,20}$/.test(slackTeamId)) {
+      res.status(400).json({ success: false, error: 'slackTeamId (Slack team id) is required' });
+      return;
+    }
+    const registry = await ensureSlackInstanceRegistry();
+    await registry.setWorkspaceId(slackTeamId);
+    const configService = await ensureSlackCloudConfigService();
+    const config = await configService.refresh();
+    if (config) await handleSlackCloudConfigChange(config);
+    res.json({
+      success: true,
+      data: {
+        selectedWorkspaceId: slackTeamId,
+        activeWorkspaceId: config?.workspace.slackTeamId ?? null,
+        connected: getSlackService().isConnected(),
+        registryError: registry.getLastError(),
+        configError: configService.getLastError(),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/slack/cloud/agents/sync
+ *
+ * Re-run the per-agent app provisioning for every team and return the
+ * install links still pending (the Settings "Sync agents" button).
+ */
+router.post('/cloud/agents/sync', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!requireCloudLogin(res)) return;
+    const registry = await ensureSlackInstanceRegistry();
+    const result = await registry.syncAgents();
+    if (!result) {
+      res.status(502).json({ success: false, error: registry.getLastError() ?? 'Agent sync failed', code: 'AGENT_SYNC_FAILED' });
+      return;
+    }
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * DELETE /api/slack/cloud/workspace
+ *
+ * Remove the account's Slack workspace on Cloud and disconnect here.
+ */
+router.delete('/cloud/workspace', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!requireCloudLogin(res)) return;
+    const configService = await ensureSlackCloudConfigService();
+    const removed = await configService.removeWorkspace();
+    // The config change already asked the initializer to disconnect (async);
+    // make sure a cloud-sourced connection is down before answering.
+    await handleSlackCloudConfigChange(null);
+    const slackService = getSlackService();
+    if (slackService.isConnected() && slackService.getTransport() === 'cloud') {
+      await slackService.disconnect();
+      setActiveSlackSource(null);
+    }
+    res.json({ success: true, data: { removed } });
+  } catch (error) {
+    if (error instanceof SlackIdentityCloudError) {
+      res.status(error.status >= 400 && error.status < 600 ? error.status : 502).json({ success: false, error: error.message, code: error.code });
+      return;
+    }
+    next(error);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Team channels — one Slack channel + one chat-v2 huddle per Crewly team
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the team-channel service or answer 503 when Slack is not up.
+ *
+ * @param res - Response used for the 503
+ * @returns The service, or null after the response was sent
+ */
+function requireTeamChannels(res: Response) {
+  const service = getSlackTeamChannelService();
+  if (!service) {
+    res.status(503).json({
+      success: false,
+      error: 'Slack team channels are unavailable — connect Slack first',
+      code: 'SLACK_NOT_CONNECTED',
+    });
+    return null;
+  }
+  return service;
+}
+
+/**
+ * GET /api/slack/team-channels
+ *
+ * Settings plus every non-archived team with its mapping (or null).
+ */
+router.get('/team-channels', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const service = requireTeamChannels(res);
+    if (!service) return;
+    const [settings, teams] = await Promise.all([service.getSettings(), service.listTeamsWithMappings()]);
+    res.json({ success: true, data: { settings, teams } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * PUT /api/slack/team-channels/settings
+ *
+ * @body autoCreate - Create a channel automatically for every new team
+ * @body channelPrefix - Prefix for auto-created channel names
+ */
+router.put('/team-channels/settings', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const service = requireTeamChannels(res);
+    if (!service) return;
+    const { autoCreate, channelPrefix } = req.body ?? {};
+    if (autoCreate !== undefined && typeof autoCreate !== 'boolean') {
+      res.status(400).json({ success: false, error: 'autoCreate must be a boolean' });
+      return;
+    }
+    if (channelPrefix !== undefined && typeof channelPrefix !== 'string') {
+      res.status(400).json({ success: false, error: 'channelPrefix must be a string' });
+      return;
+    }
+    const settings = await service.updateSettings({ autoCreate, channelPrefix });
+    res.json({ success: true, data: settings });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/slack/team-channels
+ *
+ * Create (or link) the Slack channel for a team.
+ *
+ * @body teamId - Crewly team id (required)
+ * @body slackChannelId - Existing Slack channel to link instead of creating (optional)
+ */
+router.post('/team-channels', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const service = requireTeamChannels(res);
+    if (!service) return;
+    const { teamId, slackChannelId } = req.body ?? {};
+    if (typeof teamId !== 'string' || teamId.trim().length === 0) {
+      res.status(400).json({ success: false, error: 'teamId is required' });
+      return;
+    }
+    if (slackChannelId !== undefined && typeof slackChannelId !== 'string') {
+      res.status(400).json({ success: false, error: 'slackChannelId must be a string' });
+      return;
+    }
+    const team = await service.getTeam(teamId);
+    if (!team) {
+      res.status(404).json({ success: false, error: `Team not found: ${teamId}` });
+      return;
+    }
+    const mapping = await service.ensureTeamChannel(team, {
+      slackChannelId: slackChannelId?.trim() || undefined,
+    });
+    res.status(201).json({ success: true, data: mapping });
+  } catch (error) {
+    if (!handleSlackPlatformError(error, res)) {
+      next(error);
+    }
+  }
+});
+
+/**
+ * DELETE /api/slack/team-channels/:teamId
+ *
+ * Unlink a team. `?archive=true` also archives the Slack channel.
+ */
+router.delete('/team-channels/:teamId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const service = requireTeamChannels(res);
+    if (!service) return;
+    const archive = req.query.archive === 'true' || req.query.archive === '1';
+    const removed = await service.unlinkTeam(req.params.teamId, { archiveSlackChannel: archive });
+    if (!removed) {
+      res.status(404).json({ success: false, error: 'No Slack channel is linked to this team' });
+      return;
+    }
+    res.json({ success: true, data: { removed: true, archivedSlackChannel: archive } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Agent identities — one real Slack bot user per agent, via Crewly Cloud
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the identity service, answering 503 when Slack team channels are
+ * not started, and 401 when the OSS install is not logged in to Cloud.
+ *
+ * @param res - Response used for the error
+ * @returns The service, or null after the response was sent
+ */
+function requireIdentities(res: Response) {
+  const service = getSlackAgentIdentityService();
+  if (!service) {
+    res.status(503).json({ success: false, error: 'Slack is not connected', code: 'SLACK_NOT_CONNECTED' });
+    return null;
+  }
+  if (!service.isAvailable()) {
+    res.status(401).json({
+      success: false,
+      error: 'Log in to Crewly Cloud first (crewly cloud login) — agent identities are provisioned there',
+      code: 'CLOUD_NOT_CONNECTED',
+    });
+    return null;
+  }
+  return service;
+}
+
+/**
+ * Serialize a Cloud failure with its status and code, or pass on.
+ */
+function sendIdentityError(err: unknown, res: Response, next: NextFunction): void {
+  if (err instanceof SlackIdentityCloudError) {
+    res.status(err.status >= 400 && err.status < 600 ? err.status : 502).json({ success: false, error: err.message, code: err.code });
+    return;
+  }
+  next(err);
+}
+
+/** Strip bot tokens before anything leaves the process. */
+function publicIdentity<T extends { botToken?: string }>(record: T): Omit<T, 'botToken'> & { hasToken: boolean } {
+  const { botToken, ...rest } = record;
+  return { ...rest, hasToken: !!botToken };
+}
+
+/**
+ * GET /api/slack/agent-identities
+ *
+ * Cloud status (config token, counts) plus the local identity cache
+ * (without tokens). `?refresh=1` pulls from Cloud first.
+ */
+router.get('/agent-identities', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const service = requireIdentities(res);
+    if (!service) return;
+    const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const [cloud, identities] = await Promise.all([
+      service.getCloudStatus(),
+      refresh ? service.refreshFromCloud() : service.list(),
+    ]);
+    res.json({ success: true, data: { cloud, identities: identities.map(publicIdentity) } });
+  } catch (error) {
+    sendIdentityError(error, res, next);
+  }
+});
+
+/**
+ * PUT /api/slack/agent-identities/config-token
+ *
+ * @body token - Slack app configuration token (optional, may be expired)
+ * @body refreshToken - Its refresh token (required)
+ */
+router.put('/agent-identities/config-token', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const service = requireIdentities(res);
+    if (!service) return;
+    const { token, refreshToken } = req.body ?? {};
+    if (typeof refreshToken !== 'string' || !refreshToken.trim()) {
+      res.status(400).json({ success: false, error: 'refreshToken is required' });
+      return;
+    }
+    const status = await service.setConfigToken(typeof token === 'string' ? token.trim() : '', refreshToken.trim());
+    res.json({ success: true, data: status });
+  } catch (error) {
+    sendIdentityError(error, res, next);
+  }
+});
+
+/**
+ * DELETE /api/slack/agent-identities/config-token
+ */
+router.delete('/agent-identities/config-token', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const service = requireIdentities(res);
+    if (!service) return;
+    const removed = await service.deleteConfigToken();
+    res.json({ success: true, data: { removed } });
+  } catch (error) {
+    sendIdentityError(error, res, next);
+  }
+});
+
+/**
+ * POST /api/slack/agent-identities/provision
+ *
+ * Provision identities for every member of a mapped team and (re)announce
+ * the install links in its Slack channel.
+ *
+ * @body teamId - A team with a Slack channel (required)
+ */
+router.post('/agent-identities/provision', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const service = requireIdentities(res);
+    if (!service) return;
+    const teamChannels = getSlackTeamChannelService();
+    const { teamId } = req.body ?? {};
+    if (typeof teamId !== 'string' || !teamId.trim() || !teamChannels) {
+      res.status(400).json({ success: false, error: 'teamId is required' });
+      return;
+    }
+    const team = await teamChannels.getTeam(teamId);
+    const mapping = teamChannels.findByTeamId(teamId);
+    if (!team || !mapping) {
+      res.status(404).json({ success: false, error: 'Team has no Slack channel yet — create one first' });
+      return;
+    }
+    const result = await teamChannels.ensureIdentities(team, mapping);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    sendIdentityError(error, res, next);
+  }
+});
+
+/**
+ * POST /api/slack/agent-identities/:agentSession/uninstall
+ *
+ * Take the agent's bot out of the Slack workspace (frees one of a free
+ * plan's ten app slots). The app is kept; it can be installed again.
+ */
+router.post('/agent-identities/:agentSession/uninstall', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const service = requireIdentities(res);
+    if (!service) return;
+    const record = await service.uninstall(req.params.agentSession);
+    res.json({ success: true, data: { ...record, botToken: undefined } });
+  } catch (error) {
+    sendIdentityError(error, res, next);
+  }
+});
+
+/**
+ * DELETE /api/slack/agent-identities/:agentSession
+ *
+ * Delete the agent's Slack app on Cloud and forget it locally.
+ */
+router.delete('/agent-identities/:agentSession', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const service = requireIdentities(res);
+    if (!service) return;
+    const removed = await service.remove(req.params.agentSession);
+    res.json({ success: true, data: { removed } });
+  } catch (error) {
+    sendIdentityError(error, res, next);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Agent-initiated posts — an agent starting a Slack conversation itself
+// ---------------------------------------------------------------------------
+
+/** HTTP status per post-failure reason. */
+const POST_ERROR_STATUS: Record<string, number> = {
+  validation: 400,
+  not_connected: 503,
+  target_not_found: 404,
+  slack_error: 502,
+  thread_mismatch: 409,
+  thread_required: 409,
+};
+
+/**
+ * POST /api/slack/post
+ *
+ * Send a message to a Slack channel or DM as the calling agent. Used by the
+ * `slack-post` skill; the agent is taken from `X-Agent-Session`.
+ *
+ * @body target - `#channel`, `C…`/`D…` id, `@handle` or `U…` user id (required)
+ * @body text - Message text (required)
+ * @body threadTs - Reply inside an existing Slack thread (optional)
+ * @body newTopLevel - `true`: a new topic, posted top-level even where the agent owes a reply (optional)
+ * @returns `{ success, data: { channelId, messageTs, kind, postedAs, identity } }`
+ */
+router.post('/post', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const service = getSlackAgentPostService();
+    if (!service) {
+      res.status(503).json({ success: false, error: 'Slack is not connected', code: 'SLACK_NOT_CONNECTED' });
+      return;
+    }
+    const header = req.headers['x-agent-session'] ?? req.headers['x-crewly-agent-session'];
+    const agentSession = typeof header === 'string' && header.length > 0 ? header : '';
+    if (!agentSession) {
+      res.status(400).json({
+        success: false,
+        error: 'X-Agent-Session header is required — the post is sent under that agent\'s identity',
+        code: 'agent_session_required',
+      });
+      return;
+    }
+    const { target, text: rawPostText, threadTs, newTopLevel } = req.body ?? {};
+    // Files named with `--file` are uploaded into the channel next to the text.
+    // They pass the same guard as the Cloud handoff: inside the agent's project
+    // (realpath, so symlinks cannot escape), not in Crewly's home, no secret
+    // names or contents. Nothing is posted if any file is refused.
+    const requested: string[] = Array.isArray(req.body?.files)
+      ? (req.body.files as unknown[]).filter((f): f is string => typeof f === 'string' && f.length > 0).slice(0, 5)
+      : [];
+    const files: string[] = [];
+    if (requested.length > 0) {
+      const wiring = await import('../../services/file-handoff/file-handoff.wiring.js');
+      const projectDir = await wiring.projectDirForAgent(agentSession, typeof req.body?.projectPath === 'string' ? req.body.projectPath : undefined);
+      if (!projectDir) {
+        res.status(400).json({ success: false, code: 'file_outside_project', error: 'Cannot tell which project directory you work in, so no file can be attached' });
+        return;
+      }
+      const guard = wiring.getFileHandoffService();
+      for (const f of requested) {
+        const vetted = guard.vetFile(f, projectDir);
+        if (!vetted.ok) {
+          const code = vetted.reason === 'file not found' ? 'file_not_found' : 'file_outside_project';
+          res.status(code === 'file_not_found' ? 404 : 400).json({ success: false, code, error: `${f}: ${vetted.reason}` });
+          return;
+        }
+        files.push(vetted.real);
+      }
+    }
+    const text: unknown = rawPostText;
+    // Owner board: the agent is messaging a channel (an id shows as plain "Slack")
+    getBoardActivity().recordMessage(agentSession, typeof target === 'string' && /^[#@]?[A-Za-z][\w.-]{0,38}$/.test(target) ? target.replace(/^@/, '') : 'Slack');
+    try {
+      const result = await service.post({
+        agentSession,
+        target: typeof target === 'string' ? target : '',
+        text: typeof text === 'string' ? text : '',
+        threadTs: typeof threadTs === 'string' && threadTs ? threadTs : undefined,
+        // #808: scheduled output says so, and never lands in an owed thread.
+        ...(newTopLevel === true ? { newTopLevel: true } : {}),
+        ...(files.length ? { files } : {}),
+      });
+      res.json({ success: true, data: result });
+      return;
+    } catch (err) {
+      if (!(err instanceof SlackAgentPostError) || err.code !== 'thread_mismatch') throw err;
+      // `--thread` names a thread in another channel than `--target`: the
+      // harness decides where it belongs (specs/2026-10-02-harness-owned-routing.md
+      // §1) — the thread's own conversation when the agent is in it, else
+      // its references / turn origin — never a top-level post here.
+      const { deliverReply } = await import('../../services/orc/reply-destination.wiring.js');
+      const delivery = await deliverReply({
+        session: agentSession,
+        content: String(text ?? ''),
+        hints: { thread: String(threadTs), ...(typeof target === 'string' && /^[CGD][A-Z0-9]{6,}$/.test(target) ? { slackChannelId: target } : {}) },
+      });
+      if (!delivery.ok) {
+        res.status(409).json({ success: false, error: `${err.message}. ${delivery.error}`, code: 'thread_mismatch' });
+        return;
+      }
+      LoggerService.getInstance().createComponentLogger('SlackController').warn('slack-post thread named another channel than its target — delivered where the harness resolved it', {
+        agentSession,
+        target,
+        threadTs,
+        via: delivery.destination.source,
+      });
+      res.json({
+        success: true,
+        data: {
+          ...(delivery.slackChannelId ? { channelId: delivery.slackChannelId, messageTs: delivery.messageTs } : {}),
+          ...(delivery.conversationId ? { conversationId: delivery.conversationId, messageId: delivery.messageId } : {}),
+          note: `Your --thread was not in ${target}; the message went to ${delivery.destination.reason}.`,
+        },
+      });
+      return;
+    }
+  } catch (error) {
+    if (error instanceof SlackAgentPostError) {
+      res.status(POST_ERROR_STATUS[error.code] ?? 502).json({
+        success: false,
+        error: error.message,
+        code: error.code,
+      });
+      return;
+    }
+    if (!handleSlackPlatformError(error, res)) {
+      next(error);
+    }
+  }
+});
+
+/**
+ * POST /api/slack/attach — an agent puts a file into the channel it is replying in.
+ *
+ * Takes the chat channel the agent already has (`reply-channel` gives it one)
+ * rather than a Slack channel id, which an agent has no reason to know. The
+ * Slack channel, the thread its reply belongs in and its own bot token are
+ * resolved from that, so the file arrives in the right thread, from the same
+ * identity as its words.
+ *
+ * Exists because `reply-channel` carries text only. Asked for a PDF, an agent
+ * uploaded it to Drive and pasted a link — then correctly explained that the
+ * interface it had been told to use could not send binary attachments.
+ */
+router.post('/attach', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { channelId, filePath, filename, title, comment, threadId } = req.body ?? {};
+    const agentSession =
+      typeof req.headers['x-agent-session'] === 'string' ? (req.headers['x-agent-session'] as string) : '';
+
+    const hasReference = ['ticket', 'to', 'messageId', 'workItemId', 'decision'].some((k) => typeof req.body?.[k] === 'string' && req.body[k]);
+    if ((!channelId && !hasReference) || !filePath) {
+      res.status(400).json({ success: false, error: 'filePath and channelId (or ticket / to) are required' });
+      return;
+    }
+    if (!agentSession) {
+      res.status(400).json({ success: false, error: 'X-Agent-Session header is required' });
+      return;
+    }
+
+    try {
+      await fs.stat(filePath);
+    } catch {
+      res.status(404).json({ success: false, error: `No such file: ${filePath}` });
+      return;
+    }
+
+    // A chat channel is mirrored to Slack in one of two ways, and an agent
+    // has no idea which it is in: a team channel the whole team shares, or a
+    // one-to-one DM with its own bot. Try both rather than making the agent
+    // guess — the DM case is the one most single-agent conversations use, and
+    // it was the one that sent the owner a Drive link.
+    const { getSlackTeamChannelService } = await import('../../services/slack/slack-team-channel.service.js');
+    const { getSlackAgentDmService } = await import('../../services/slack/slack-agent-dm.service.js');
+
+    // Where the file goes is decided by the same resolver as `reply`
+    // (specs/2026-10-02-harness-owned-routing.md): references (--ticket,
+    // --to, …), then the channel/thread the agent named when they validate
+    // (a thread key from another channel is never swapped for "the latest
+    // thread" or a top-level post), then its prompt reference, turn origin
+    // and current work.
+    const { resolveSlackPlace, internalCoordinationThread } = await import('../../services/orc/reply-destination.wiring.js');
+    // A thread of agent-to-agent coordination kept inside Crewly is never a
+    // Slack place, whatever Slack thread key its row carries: `reply-channel`
+    // keeps text there internal, and a file stays internal too (Pia's videos
+    // for Ella went to Steve's thread, 2026-10-18).
+    const internalReply = (id: unknown, why: string): void => {
+      res.status(409).json({
+        success: false,
+        code: 'internal_thread',
+        error: `File NOT sent: thread ${String(id)} is agent-to-agent coordination kept inside Crewly (${why}), so it is not posted to Slack. Give the agent the file path with send-message; to deliver it to the owner, name the work: --work-item <id> or --to <owner message id>.`,
+      });
+    };
+    const internal = await internalCoordinationThread(threadId).catch(() => null);
+    if (internal) {
+      internalReply(threadId, internal);
+      return;
+    }
+    const { referenceOf } = await import('../chat/agent-reply.controller.js');
+    const { formatSlackThreadKey } = await import('../../services/slack/slack-thread-key.js');
+    const reference = referenceOf((req.body ?? {}) as Record<string, unknown>);
+    let place: Awaited<ReturnType<typeof resolveSlackPlace>> = null;
+    try {
+      place = await resolveSlackPlace({
+        session: agentSession,
+        ...(reference ? { reference } : {}),
+        ...(channelId || threadId
+          ? { hints: { ...(channelId ? { conversationId: String(channelId) } : {}), ...(threadId ? { thread: String(threadId) } : {}) } }
+          : {}),
+        noOwnerDm: true,
+      });
+    } catch {
+      place = null;
+    }
+    // The resolver may have picked a chat thread itself (turn origin, work):
+    // an internal one is still not a Slack place.
+    const resolvedDest = place?.destination;
+    const resolvedChatThread = resolvedDest?.kind === 'conversation' ? resolvedDest.thread : undefined;
+    const resolvedInternal = resolvedChatThread && resolvedChatThread !== threadId ? await internalCoordinationThread(resolvedChatThread).catch(() => null) : null;
+    if (resolvedInternal) {
+      internalReply(resolvedChatThread, resolvedInternal);
+      return;
+    }
+    // The orchestrator's primary owner DM is neither a team channel nor an
+    // agent DM: post there with the workspace bot (#1142).
+    const { orcOwnerDmTarget } = await import('../../services/slack/orc-owner-dm-target.js');
+    const orcDm = orcOwnerDmTarget(agentSession, { channelId, threadId });
+    // No place the harness can stand behind: the file is NOT sent. It used to
+    // go to the channel's top level whenever a channel was named without a
+    // thread — Kai's PDF for Steve's #daily-info thread landed there as
+    // "Crewly" after his --thread was refused (2026-10-18).
+    if (!place && !orcDm) {
+      const why = reference
+        ? 'the reference you named does not resolve to a Slack thread'
+        : threadId
+          ? `thread ${String(threadId)} is not a thread of a conversation you are in, nor one your work was delegated into`
+          : `Crewly cannot tell which thread of ${String(channelId)} this file answers (you are not in that conversation and your current work names no thread there)`;
+      res.status(409).json({
+        success: false,
+        code: 'thread_unresolved',
+        error: `File NOT sent: ${why}. Name what the file answers: --work-item <id from your [CREWLY-DISPATCH]>, --to <message id from your prompt> or --ticket <id>. It is never posted at the channel's top level instead.`,
+      });
+      return;
+    }
+    // The conversation the file belongs to: the resolved one, else the Slack
+    // channel's own conversation, else the one the agent named.
+    const chatChannelId =
+      place?.conversationId ??
+      (place ? getSlackTeamChannelService()?.findBySlackChannelId(place.slackChannelId)?.chatChannelId ?? getSlackAgentDmService()?.findBySlackChannelId(place.slackChannelId)?.chatChannelId : undefined) ??
+      (channelId ? String(channelId) : '');
+    const resolvedThread = place?.threadTs ? formatSlackThreadKey(place.slackChannelId, place.threadTs) : undefined;
+
+    const attach = {
+      chatChannelId,
+      agentSession,
+      filePath: String(filePath),
+      ...(filename ? { filename: String(filename) } : {}),
+      ...(title ? { title: String(title) } : {}),
+      ...(comment ? { comment: String(comment) } : {}),
+    };
+
+    let result = await getSlackTeamChannelService()?.attachFileForAgent({
+      ...attach,
+      ...(resolvedThread ? { threadId: resolvedThread } : {}),
+      destination: place ? { slackChannelId: place.slackChannelId, ...(place.threadTs ? { threadTs: place.threadTs } : {}), ...(place.topic ? { topic: place.topic } : {}) } : null,
+    });
+
+    if (!result || (!result.ok && result.reason === 'not_a_slack_channel')) {
+      // The thread goes along: without it the file landed in whichever DM
+      // thread the owner wrote in last (2026-09-28).
+      const viaDm = await getSlackAgentDmService()?.attachFileForAgent({
+        ...attach,
+        ...(resolvedThread ? { threadId: resolvedThread } : {}),
+      });
+      if (viaDm) result = viaDm;
+    }
+
+    if ((!result || (!result.ok && result.reason === 'not_a_slack_channel')) && (orcDm || (place && agentSession === ORCHESTRATOR_SESSION_NAME && place.slackChannelId.startsWith('D')))) {
+      const target = orcDm ?? { slackChannelId: place!.slackChannelId, ...(place!.threadTs ? { threadTs: place!.threadTs } : {}) };
+      try {
+        const uploaded = await getSlackService().uploadFile({
+          channelId: target.slackChannelId,
+          filePath: String(filePath),
+          ...(filename ? { filename: String(filename) } : {}),
+          ...(title ? { title: String(title) } : {}),
+          ...(comment ? { initialComment: String(comment) } : {}),
+          ...(target.threadTs ? { threadTs: target.threadTs } : {}),
+        });
+        result = {
+          ok: true,
+          slackChannelId: target.slackChannelId,
+          ...(target.threadTs ? { threadTs: target.threadTs } : {}),
+          ...(uploaded.fileId ? { fileId: uploaded.fileId } : {}),
+          asAgentBot: false,
+        };
+      } catch (err) {
+        result = { ok: false, reason: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
+    if (!result) {
+      res.status(503).json({ success: false, error: 'Slack is not running on this instance' });
+      return;
+    }
+
+    if (!result.ok) {
+      const status = result.reason === 'not_a_slack_channel' ? 400 : 502;
+      res.status(status).json({ success: false, error: result.reason });
+      return;
+    }
+
+    // The file is in Slack; put it in the local chat history too, or anyone
+    // reading the thread from there sees the agent as silent. Best effort, and
+    // flagged so the outbound mirrors do not post it a second time.
+    try {
+      const { getChatV2Service } = await import('../../services/chat-v2/chat-v2.singleton.js');
+      const { recordAttachedFileInChat } = await import('../../services/slack/attach-file-chat-record.js');
+      const size = await fs.stat(String(filePath)).then((st) => st.size).catch(() => undefined);
+      recordAttachedFileInChat(getChatV2Service(), {
+        chatChannelId,
+        agentSession,
+        filePath: String(filePath),
+        ...(filename ? { filename: String(filename) } : {}),
+        ...(title ? { title: String(title) } : {}),
+        ...(comment ? { comment: String(comment) } : {}),
+        slackChannelId: result.slackChannelId,
+        ...(result.threadTs ? { threadTs: result.threadTs } : {}),
+        ...(result.fileId ? { fileId: result.fileId } : {}),
+        ...(size !== undefined ? { sizeBytes: size } : {}),
+      });
+    } catch {
+      /* history is best effort — the upload already succeeded */
+    }
+
+    // A file the agent put into a thread is an agent post: the owner-thread
+    // sentinel must see it, or a promise the file kept ("the cover is done",
+    // sent as an image) stays open and a stop or restart re-creates a
+    // "Follow through" WorkItem for it.
+    reportOwnerThreadAgentPost({
+      agent: agentSession,
+      slackChannelId: result.slackChannelId,
+      ...(result.threadTs ? { threadTs: result.threadTs } : {}),
+      text: String(comment || title || filename || filePath),
+    });
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/slack/working — an agent says it has taken a message on.
+ *
+ * Shows "<agent> is working on it…" in the Slack thread; the agent's reply
+ * replaces it. Used by agents that were passed a message to judge rather than
+ * asked to answer, once they decide to answer — see `reply-channel --working`.
+ */
+router.post('/working', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { channelId, threadId } = req.body ?? {};
+    const agentSession =
+      typeof req.headers['x-agent-session'] === 'string' ? (req.headers['x-agent-session'] as string) : '';
+    if (!channelId) {
+      res.status(400).json({ success: false, error: 'channelId is required' });
+      return;
+    }
+    if (!agentSession) {
+      res.status(400).json({ success: false, error: 'X-Agent-Session header is required' });
+      return;
+    }
+
+    const { getSlackTeamChannelService } = await import('../../services/slack/slack-team-channel.service.js');
+    const result = await getSlackTeamChannelService()?.beginWorkingForAgent({
+      chatChannelId: String(channelId),
+      agentSession,
+      ...(threadId ? { threadId: String(threadId) } : {}),
+    });
+    if (!result) {
+      res.status(503).json({ success: false, error: 'Slack team channels are not running' });
+      return;
+    }
+    if (!result.ok) {
+      // Not a Slack channel (a local chat, say): nothing to show, and nothing
+      // for the agent to fix — answer as normal.
+      // No thread named: a placeholder answers a message, in its thread.
+      if (result.reason === 'no_thread') {
+        res.status(400).json({
+          success: false,
+          error: 'A working placeholder goes in the thread you are answering. Run it again with --thread <id> from your prompt.',
+          data: { shown: false, reason: result.reason },
+        });
+        return;
+      }
+      res.status(result.reason === 'not_a_slack_channel' ? 200 : 502).json({
+        success: result.reason === 'not_a_slack_channel',
+        data: { shown: false, reason: result.reason },
+      });
+      return;
+    }
+    res.json({ success: true, data: { shown: true, ...result } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/slack/handoff — pass a room message to the agent that should answer it.
+ *
+ * For a room's router: the orchestrator of a private channel, woken because
+ * nobody in it was awake. Its bot is usually not in the room, so it cannot @
+ * the agent there; this delivers the message to that agent directly, on this
+ * machine or — through Cloud — on another one.
+ */
+router.post('/handoff', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { channelId, threadId, messageId, name } = req.body ?? {};
+    if (!channelId || !name) {
+      res.status(400).json({ success: false, error: 'channelId and name are required' });
+      return;
+    }
+    const { getSlackTeamChannelService } = await import('../../services/slack/slack-team-channel.service.js');
+    const service = getSlackTeamChannelService();
+    if (!service) {
+      res.status(503).json({ success: false, error: 'Slack team channels are not running' });
+      return;
+    }
+    const result = await service.handoffForAgent({
+      chatChannelId: String(channelId),
+      name: String(name),
+      ...(threadId ? { threadId: String(threadId) } : {}),
+      ...(messageId ? { messageId: String(messageId) } : {}),
+    });
+    if (!result.ok) {
+      res.status(result.reason === 'unknown_agent' ? 404 : 400).json({
+        success: false,
+        error: result.reason,
+        ...(result.candidates ? { candidates: result.candidates } : {}),
+      });
+      return;
+    }
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/slack/delivery-audit?hours=24 — owner messages Slack has that never
+ * reached any machine (specs/2026-10-04-room-delivery-audit.md).
+ *
+ * Reads every channel this machine maps with a member bot, keeps the owner's
+ * messages of the last `hours` (1–168), and checks each against this
+ * machine's chat.db and Cloud's routing log. Owner-only (`rejectNonOwner`):
+ * an agent gets 403, anyone else without an owner credential 401.
+ */
+router.get('/delivery-audit', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (rejectNonOwner(req, res, { success: false, error: 'The delivery audit is for the owner, not agents', code: 'owner_only' })) return;
+    const { getSlackDeliveryAuditService } = await import('../../services/slack/slack-delivery-audit.service.js');
+    const audit = getSlackDeliveryAuditService();
+    if (!audit) {
+      res.status(503).json({ success: false, error: 'Slack team channels are not running', code: 'audit_unavailable' });
+      return;
+    }
+    const hoursRaw = typeof req.query.hours === 'string' ? Number(req.query.hours) : undefined;
+    const hours = hoursRaw !== undefined && Number.isFinite(hoursRaw) && hoursRaw > 0 ? hoursRaw : undefined;
+    const report = await audit.audit(hours !== undefined ? { hours } : {});
+    res.json({ success: true, data: report });
+  } catch (error) {
+    next(error);
+  }
+});
+
+export default router;

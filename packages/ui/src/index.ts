@@ -1,0 +1,158 @@
+export { CrewlyRoot } from './CrewlyRoot';
+export type { CrewlyRootProps } from './CrewlyRoot';
+
+export { Button, IconButton } from './Button';
+export type { ButtonProps, IconButtonProps, ButtonVariant, ButtonSize } from './Button';
+
+export { Card } from './Card';
+export type { CardProps, CardVariant, CardPadding } from './Card';
+
+export { Input } from './Input';
+export type { InputProps } from './Input';
+
+export { Badge } from './Badge';
+export type { BadgeProps, BadgeVariant, BadgeSize } from './Badge';
+
+export { Tabs, TabList, TabTrigger, TabContent } from './Tabs';
+export type { TabsProps, TabListProps, TabTriggerProps, TabContentProps } from './Tabs';
+
+export { Alert } from './Alert';
+export type { AlertProps, AlertVariant } from './Alert';
+
+export { StatusBadge } from './StatusBadge';
+export type { StatusType } from './StatusBadge';
+
+export { Modal, ModalFooter, ModalBody } from './Modal';
+export type { ModalProps, ModalFooterProps, ModalBodyProps } from './Modal';
+
+export { AlertDialog, ConfirmDialog, useAlert, useConfirm } from './Dialog';
+export type { AlertDialogProps, ConfirmDialogProps, AlertType } from './Dialog';
+
+export {
+  Form,
+  FormGroup,
+  FormRow,
+  FormLabel,
+  FormHelp,
+  FormError,
+  FormInput,
+  FormTextarea,
+  FormSelect,
+  FormSection
+} from './Form';
+export type {
+  FormProps,
+  FormGroupProps,
+  FormRowProps,
+  FormLabelProps,
+  FormHelpProps,
+  FormErrorProps,
+  FormInputProps,
+  FormTextareaProps,
+  FormSelectProps,
+  FormSectionProps
+} from './Form';
+
+export { Dropdown } from './Dropdown';
+export type { DropdownProps, DropdownOption } from './Dropdown';
+
+export { Toggle } from './Toggle';
+export type { ToggleProps } from './Toggle';
+
+export { Popup, FormPopup, ConfirmPopup } from './Popup';
+export type { PopupProps, FormPopupProps, ConfirmPopupProps } from './Popup';
+
+export { Avatar, AvatarGroup } from './Avatar';
+export type { AvatarProps, AvatarGroupProps, AvatarSize } from './Avatar';
+
+export { PageToolbar } from './PageToolbar';
+export type { PageToolbarProps, FilterTab, ViewMode, SecondaryFilter } from './PageToolbar';
+export { LoadingSpinner } from './LoadingSpinner';
+export type { LoadingSpinnerProps } from './LoadingSpinner';
+
+export { StatusDot } from './StatusDot';
+export type { StatusDotProps, DotStatus, DotSize } from './StatusDot';
+
+export { FilterPill } from './FilterPill';
+export type { FilterPillProps } from './FilterPill';
+
+export { FilterPillGroup } from './FilterPillGroup';
+export type { FilterPillGroupProps, FilterPillOption } from './FilterPillGroup';
+
+export { SaveButton } from './SaveButton';
+export type { SaveButtonProps, SaveStatus } from './SaveButton';
+
+export { ScoreCard, ScoreCardGrid } from './ScoreCard';
+export type { ScoreCardProps, ScoreCardGridProps } from './ScoreCard';
+
+export { SkeletonRows } from './SkeletonRows';
+
+export { OverflowMenu } from './OverflowMenu';
+export type { OverflowMenuItem, OverflowMenuProps } from './OverflowMenu';
+
+// ConfirmDialog.tsx (the standalone one) shares its name with Dialog's
+// ConfirmDialog; import it by path: '@crewly/ui/ConfirmDialog'.
+
+export { EmptyState } from './EmptyState';
+export type { EmptyStateProps } from './EmptyState';
+
+export { Tooltip } from './Tooltip';
+export type { TooltipProps, TooltipSide } from './Tooltip';
+
+export { SegmentedControl } from './SegmentedControl';
+export type { SegmentedControlProps, SegmentedOption } from './SegmentedControl';
+
+export { Menu } from './Menu';
+export type { MenuProps, MenuItem } from './Menu';
+
+export { Drawer } from './Drawer';
+export type { DrawerProps } from './Drawer';
+
+export { Table, TableHead, TableBody, TableRow, TableHeader, TableCell } from './Table';
+
+// Redesign kit (specs/2026-10-02-ui-redesign.md §Components)
+export { PageHeader } from './PageHeader';
+export type { PageHeaderProps } from './PageHeader';
+
+export { UnderlineTabs } from './UnderlineTabs';
+export type { UnderlineTabsProps, UnderlineTab } from './UnderlineTabs';
+
+export { CompactRow } from './CompactRow';
+export type { CompactRowProps, CompactRowActions } from './CompactRow';
+
+export { ShowAll } from './ShowAll';
+export type { ShowAllProps } from './ShowAll';
+
+export { CollapsibleSection } from './CollapsibleSection';
+export type { CollapsibleSectionProps } from './CollapsibleSection';
+
+export { StatusLabel, statusTone } from './StatusLabel';
+export type { StatusLabelProps, StatusTone } from './StatusLabel';
+
+export { FilterButton, activeFilterCount } from './FilterButton';
+export type { FilterButtonProps, FilterGroup, FilterOption, FilterValue } from './FilterButton';
+
+export { SystemStatusBar, sortStatusItems } from './SystemStatusBar';
+export type { SystemStatusBarProps, SystemStatusItem, SystemStatusTone } from './SystemStatusBar';
+
+export {
+  THEME_STORAGE_KEY,
+  THEME_INIT_SCRIPT,
+  THEME_COLORS,
+  isThemeMode,
+  readThemeMode,
+  writeThemeMode,
+  systemPrefersDark,
+  resolveTheme,
+  applyTheme,
+  clearTheme,
+  watchSystemTheme,
+  useTheme,
+} from './theme';
+export type { ThemeMode, ResolvedTheme, UseTheme } from './theme';
+
+export { StepKindChip, STEP_KINDS } from './StepKindChip';
+export type { StepKind, StepKindChipProps } from './StepKindChip';
+
+export { ThemeSelect } from './ThemeSelect';
+export type { ThemeSelectProps } from './ThemeSelect';

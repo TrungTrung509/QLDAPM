@@ -1,0 +1,223 @@
+#!/bin/bash
+# Co-located bash test for reply-channel skill.
+# Runs a tiny python HTTP stub to capture the outgoing request, then
+# asserts both the URL and the JSON body match the documented contract.
+#
+# Usage: bash execute.test.sh  (exit 0 on pass)
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL="${SCRIPT_DIR}/execute.sh"
+
+if [ ! -x "$SKILL" ]; then
+  echo "FAIL: skill not executable at $SKILL" >&2
+  exit 1
+fi
+
+PASS=0
+FAIL=0
+PORT=18787
+
+# --- Start stub backend on a fixed test port ---
+# Env MUST be exported BEFORE the python fork so the child inherits.
+STUB_LOG="$(mktemp)"
+export STUB_LOG
+export STUB_PORT="${PORT}"
+
+python3 -u <<'PY' >/tmp/reply-channel-stub.log 2>&1 &
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json, os, sys
+
+LOG_PATH = os.environ['STUB_LOG']
+PORT = int(os.environ['STUB_PORT'])
+
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get('content-length', '0'))
+        body = self.rfile.read(length).decode('utf-8') if length else ''
+        log = {
+            'path': self.path,
+            'body': body,
+            'agentSession': self.headers.get('x-agent-session', ''),
+            'contentType': self.headers.get('content-type', ''),
+        }
+        with open(LOG_PATH, 'w') as f:
+            f.write(json.dumps(log))
+        if '@Atlas' in body:
+            # R6: an agents-only post in an owner thread goes to the agent privately.
+            self.send_response(200)
+            reply = {'success': True, 'data': {'deliveredPrivately': True, 'to': ['tt-atlas-1'], 'note': 'Not posted in the owner thread'}}
+        else:
+            self.send_response(201)
+            reply = {'success': True, 'data': {'id': 'm-stub-123', 'channelId': 'chan-xyz'}}
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(reply).encode('utf-8'))
+    def do_GET(self):
+        # Channel lookup by name (reply-channel --channel '#name').
+        if self.path.startswith('/api/channels/%23tech-brief'):
+            self.send_response(200)
+            body = {'success': True, 'data': {'id': 'huddle-77', 'name': 'tech-brief'}}
+        else:
+            self.send_response(404)
+            body = {'success': False, 'error': 'not_found'}
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode('utf-8'))
+    def log_message(self, *a, **k):
+        pass
+
+srv = HTTPServer(('127.0.0.1', PORT), H)
+srv.serve_forever()
+PY
+STUB_PID=$!
+
+cleanup() { kill "$STUB_PID" >/dev/null 2>&1 || true; rm -f "$STUB_LOG" || true; }
+trap cleanup EXIT
+
+# Wait until the port actually accepts a connection (up to ~3s). This is
+# more reliable than a fixed sleep on slower boxes.
+for i in $(seq 1 30); do
+  if curl -s -o /dev/null -m 0.2 "http://127.0.0.1:${PORT}/__probe__" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+
+assert_contains() {
+  local name="$1" haystack="$2" needle="$3"
+  if echo "$haystack" | grep -q -- "$needle"; then
+    PASS=$((PASS + 1))
+    echo "  ✓ $name"
+  else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ $name (wanted: $needle)"
+    echo "    in: $haystack"
+  fi
+}
+
+run_skill() {
+  CREWLY_API_URL="http://127.0.0.1:${PORT}" \
+  CREWLY_SESSION_NAME="crewly-product-sam-TEST" \
+  bash "$SKILL" "$@"
+}
+
+# --- Test 1: flag form, single-line content ---
+echo "test 1: --channel + --content"
+: > "$STUB_LOG"
+OUT=$(run_skill --channel chan-xyz --content "hello from agent" 2>&1 || true)
+LOG=$(cat "$STUB_LOG" 2>/dev/null || echo '{}')
+assert_contains "success echoed" "$OUT" '"success":true'
+assert_contains "messageId echoed" "$OUT" 'm-stub-123'
+assert_contains "path targets /api/chat/channels/:id/messages" "$LOG" '/api/chat/channels/chan-xyz/messages'
+assert_contains "body carries content" "$LOG" 'hello from agent'
+assert_contains "body contentType markdown" "$LOG" 'markdown'
+assert_contains "X-Agent-Session header present" "$LOG" 'crewly-product-sam-TEST'
+
+# --- Test 2: JSON argument form ---
+echo "test 2: JSON payload"
+: > "$STUB_LOG"
+OUT=$(run_skill '{"channelId":"chan-xyz","content":"via json","clientMessageId":"cmid-123"}' 2>&1 || true)
+LOG=$(cat "$STUB_LOG" 2>/dev/null || echo '{}')
+assert_contains "success echoed (json form)" "$OUT" '"success":true'
+assert_contains "body has content (json form)" "$LOG" 'via json'
+assert_contains "body includes clientMessageId" "$LOG" 'cmid-123'
+
+# --- Test 3: multiline content via stdin ---
+echo "test 3: stdin pipe"
+: > "$STUB_LOG"
+OUT=$(printf 'line one\nline two\n' | run_skill --channel chan-xyz 2>&1 || true)
+LOG=$(cat "$STUB_LOG" 2>/dev/null || echo '{}')
+assert_contains "success echoed (stdin form)" "$OUT" '"success":true'
+assert_contains "body contains line one" "$LOG" 'line one'
+assert_contains "body contains line two" "$LOG" 'line two'
+
+# --- Test 4: missing --channel errors out ---
+echo "test 4: missing channel"
+if OUT=$(run_skill --content "no channel" 2>&1); then
+  FAIL=$((FAIL + 1))
+  echo "  ✗ expected non-zero exit when --channel missing"
+else
+  PASS=$((PASS + 1))
+  echo "  ✓ non-zero exit when --channel missing"
+fi
+assert_contains "error surfaces" "$OUT" '--channel is required'
+
+# --- Test 5: missing content errors out ---
+echo "test 5: missing content"
+if OUT=$(run_skill --channel chan-xyz 2>&1 </dev/null); then
+  FAIL=$((FAIL + 1))
+  echo "  ✗ expected non-zero exit when --content missing"
+else
+  PASS=$((PASS + 1))
+  echo "  ✓ non-zero exit when --content missing"
+fi
+assert_contains "content-required error surfaces" "$OUT" '--content is required'
+
+# --- Test 6: --interim flags the message (flag and JSON forms) ---
+echo "test 6: --interim"
+: > "$STUB_LOG"
+OUT=$(run_skill --channel chan-xyz --interim --content "got it, plan: …" 2>&1 </dev/null || true)
+LOG=$(cat "$STUB_LOG" 2>/dev/null || echo '{}')
+assert_contains "interim flag sent" "$LOG" 'interim'
+: > "$STUB_LOG"
+OUT=$(run_skill '{"channelId":"chan-xyz","content":"plan","interim":true}' 2>&1 </dev/null || true)
+LOG=$(cat "$STUB_LOG" 2>/dev/null || echo '{}')
+assert_contains "interim flag sent (json form)" "$LOG" 'interim'
+: > "$STUB_LOG"
+OUT=$(run_skill --channel chan-xyz --content "final answer" 2>&1 </dev/null || true)
+LOG=$(cat "$STUB_LOG" 2>/dev/null || echo '{}')
+if printf '%s' "$LOG" | grep -q '"interim"'; then
+  FAIL=$((FAIL + 1)); echo "  ✗ plain reply must not carry interim"
+else
+  PASS=$((PASS + 1)); echo "  ✓ plain reply carries no interim flag"
+fi
+
+# --- Test 7: a Crewly channel by #name is resolved to its id ---
+echo "test 7: --channel '#name'"
+: > "$STUB_LOG"
+OUT=$(run_skill --channel '#tech-brief' --content "posting by name" 2>&1 </dev/null || true)
+LOG=$(cat "$STUB_LOG" 2>/dev/null || echo '{}')
+assert_contains "posts to the resolved channel id" "$LOG" '/api/chat/channels/huddle-77/messages'
+assert_contains "success echoed (by name)" "$OUT" '"success":true'
+if OUT=$(run_skill --channel '#nope' --content "x" 2>&1 </dev/null); then
+  FAIL=$((FAIL + 1)); echo "  ✗ expected non-zero exit for an unknown channel name"
+else
+  PASS=$((PASS + 1)); echo "  ✓ unknown channel name fails"
+fi
+assert_contains "unknown name points at list-channels" "$OUT" 'list-channels'
+
+# --- Test 8: --file is repeatable and sent with the project path ---
+echo "test 8: --file"
+: > "$STUB_LOG"
+OUT=$(run_skill --channel chan-xyz --content "report attached" --file ./a.pdf --file /tmp/b.csv 2>&1 </dev/null || true)
+LOG=$(cat "$STUB_LOG" 2>/dev/null || echo '{}')
+assert_contains "success echoed (with files)" "$OUT" '"success":true'
+assert_contains "first file in body" "$LOG" 'a.pdf'
+assert_contains "second file in body" "$LOG" 'b.csv'
+assert_contains "project path in body" "$LOG" 'projectPath'
+: > "$STUB_LOG"
+OUT=$(run_skill --channel chan-xyz --content "no files" 2>&1 </dev/null || true)
+LOG=$(cat "$STUB_LOG" 2>/dev/null || echo '{}')
+if printf '%s' "$LOG" | grep -q '\\"files\\"'; then
+  FAIL=$((FAIL + 1)); echo "  ✗ a plain reply must not carry a files list"
+else
+  PASS=$((PASS + 1)); echo "  ✓ a plain reply carries no files list"
+fi
+
+echo "test: an agents-only post delivered privately says it was not posted (R6)"
+: > "$STUB_LOG"
+OUT=$(run_skill --channel chan-xyz --content "@Atlas the numbers" 2>&1 || true)
+assert_contains "reports posted:false" "$OUT" '"posted":false'
+assert_contains "reports deliveredPrivately" "$OUT" '"deliveredPrivately":true'
+assert_contains "names the agent it went to" "$OUT" 'tt-atlas-1'
+
+echo
+echo "========================================"
+echo "reply-channel skill: PASS=$PASS  FAIL=$FAIL"
+echo "========================================"
+if [ "$FAIL" -gt 0 ]; then
+  echo "--- stub server log ---"
+  cat /tmp/reply-channel-stub.log 2>/dev/null | tail -40
+  exit 1
+fi
+exit 0

@@ -1,0 +1,1114 @@
+/**
+ * Project page (specs/2026-10-02-ui-redesign.md §Projects).
+ *
+ * Header: breadcrumb, name, one line (status · tasks · teams · folder),
+ * Start/Stop as the primary action and "⋯" for Open in Finder / Assign team /
+ * Delete. The Detail / Editor / Tasks / Teams sections are UnderlineTabs in
+ * the header (they used to sit under Projects in the sidebar), kept in
+ * `?tab=`; old `#tasks`-style links are mapped on arrival.
+ *
+ * @module pages/ProjectDetail
+ */
+import React, { useState, useEffect, useCallback } from 'react';
+import { useParams, useLocation, useNavigate, Link } from 'react-router-dom';
+import { ChevronRight, MoreHorizontal, Play, Square } from 'lucide-react';
+import { Project, Team } from '../types';
+import { apiService } from '../services/api.service';
+import { listProjectTickets } from '../services/project-tickets.service';
+import { TeamAssignmentModal } from '../components/Modals/TeamAssignmentModal';
+import { MarkdownEditor } from '../components/MarkdownEditor/MarkdownEditor';
+import { useTerminal } from '../contexts/TerminalContext';
+import { Button, useAlert, useConfirm, FormPopup, FormGroup, FormLabel, FormTextarea, FormHelp, PageHeader, UnderlineTabs, StatusLabel } from '@crewly/ui';
+import { LoadingSpinner } from '@crewly/ui/LoadingSpinner';
+import { OverflowMenu } from '@crewly/ui/OverflowMenu';
+import { DetailView } from '../components/ProjectDetail/DetailView';
+import { ProjectTasksTab } from '../components/ProjectDetail/ProjectTasksTab';
+import { AutopilotTab } from '../components/ProjectDetail/AutopilotTab';
+import { EditorView } from '../components/ProjectDetail/EditorView';
+import { TeamsView } from '../components/ProjectDetail/TeamsView';
+import { projectStatus } from '../components/Projects/ProjectRow';
+import { useTabParam } from '../hooks/useTabParam';
+import { LINKS, PROJECT_TABS, ROUTES, projectTabFromHash, type ProjectTab } from '../constants/routes.constants';
+
+/** Tab labels on the project page. */
+const PROJECT_TAB_LABELS: Record<ProjectTab, string> = { detail: 'Detail', editor: 'Editor', tasks: 'Tasks', teams: 'Teams', autopilot: 'Autopilot' };
+
+/**
+ * Show a long folder path from the home directory on (`~/…`).
+ *
+ * @param path - Absolute path
+ * @returns Shortened path
+ */
+export function shortenPath(path: string): string {
+  return path.replace(/^\/(Users|home)\/[^/]+/, '~');
+}
+
+interface ProjectDetailState {
+  project: Project | null;
+  assignedTeams: Team[];
+  /** Open (not cancelled) project tickets — the Tasks tab badge */
+  ticketCount: number;
+  loading: boolean;
+  error: string | null;
+}
+
+interface AlignmentStatus {
+  hasAlignmentIssues: boolean;
+  alignmentFilePath: string | null;
+  content: string | null;
+}
+
+export const ProjectDetail: React.FC = () => {
+  const { id } = useParams<{ id: string }>();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { openTerminalWithSession } = useTerminal();
+  const { showAlert, showSuccess, showError, AlertComponent } = useAlert();
+  const { showConfirm, showDeleteConfirm, ConfirmComponent } = useConfirm();
+  
+  const [activeTab, setActiveTab] = useTabParam(PROJECT_TABS);
+
+  // Old links put the tab in the hash (`/projects/:id#tasks`, the sidebar
+  // sub-nav and bookmarks); move it to ?tab= and drop the hash.
+  useEffect(() => {
+    const fromHash = projectTabFromHash(location.hash);
+    if (!fromHash) return;
+    const params = new URLSearchParams(location.search);
+    if (fromHash === PROJECT_TABS[0]) params.delete('tab');
+    else params.set('tab', fromHash);
+    const qs = params.toString();
+    navigate({ pathname: location.pathname, search: qs ? `?${qs}` : '', hash: '' }, { replace: true });
+  }, [location.hash, location.search, location.pathname, navigate]);
+
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [isTeamAssignmentModalOpen, setIsTeamAssignmentModalOpen] = useState(false);
+  const [isMarkdownEditorOpen, setIsMarkdownEditorOpen] = useState(false);
+  const [isGoalModalOpen, setIsGoalModalOpen] = useState(false);
+  const [isUserJourneyModalOpen, setIsUserJourneyModalOpen] = useState(false);
+  const [goalContent, setGoalContent] = useState('');
+  const [userJourneyContent, setUserJourneyContent] = useState('');
+  const [buildSpecsWorkflow, setBuildSpecsWorkflow] = useState<{
+    isActive: boolean;
+    steps: Array<{
+      id: number;
+      name: string;
+      delayMinutes: number;
+      status: 'pending' | 'scheduled' | 'completed';
+      scheduledAt?: Date;
+    }>;
+  }>({
+    isActive: false,
+    steps: []
+  });
+  const [state, setState] = useState<ProjectDetailState>({
+    project: null,
+    assignedTeams: [],
+    ticketCount: 0,
+    loading: true,
+    error: null
+  });
+  
+  const [alignmentStatus, setAlignmentStatus] = useState<AlignmentStatus>({
+    hasAlignmentIssues: false,
+    alignmentFilePath: null,
+    content: null
+  });
+
+  const [selectedBuildSpecsTeam, setSelectedBuildSpecsTeam] = useState<string>('');
+  const [availableTeams, setAvailableTeams] = useState<any[]>([]);
+
+  /** Keep the Tasks tab badge in step with the tickets board (stable for the board's effect). */
+  const handleTicketCountChange = useCallback((count: number) => {
+    setState(prev => (prev.ticketCount === count ? prev : { ...prev, ticketCount: count }));
+  }, []);
+
+  useEffect(() => {
+    if (id) {
+      loadProjectData(id);
+    }
+  }, [id]);
+
+  // Refresh project data when Teams tab becomes active to show newly assigned teams
+  useEffect(() => {
+    if (id && activeTab === 'teams') {
+      loadProjectData(id, false);
+    }
+  }, [activeTab, id]);
+
+  const checkAlignmentStatus = async (projectId: string) => {
+    try {
+      const response = await fetch(`/api/projects/${projectId}/alignment-status`);
+      if (response.ok) {
+        const result = await response.json();
+        if (result.success) {
+          setAlignmentStatus(result.data);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to check alignment status:', error);
+    }
+  };
+
+  const handleContinueWithMisalignment = async () => {
+    if (!state.project) return;
+    
+    try {
+      const response = await fetch(`/api/projects/${state.project.id}/continue-with-misalignment`, {
+        method: 'POST'
+      });
+      
+      if (response.ok) {
+        showSuccess('Orchestrator notified to continue Build Specs despite alignment issues');
+        // Clear alignment issues since user decided to continue
+        setAlignmentStatus({
+          hasAlignmentIssues: false,
+          alignmentFilePath: null,
+          content: null
+        });
+      } else {
+        showError('Failed to notify orchestrator');
+      }
+    } catch (error) {
+      showError('Failed to continue with misalignment: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+  };
+
+  const handleViewAlignment = async () => {
+    if (!state.project) return;
+    
+    try {
+      const response = await fetch(`/api/projects/${state.project.id}/specs?fileName=alignment_comparison.md`);
+      if (response.ok) {
+        const result = await response.json();
+        if (result.success && result.data) {
+          // Create a new window/tab to display the content
+          const newWindow = window.open('', '_blank');
+          if (newWindow) {
+            newWindow.document.write(`
+              <html>
+                <head>
+                  <title>Alignment Comparison Analysis</title>
+                  <style>
+                    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; padding: 20px; max-width: 800px; margin: 0 auto; }
+                    h1, h2, h3 { color: #333; }
+                    pre { background: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; }
+                    code { background: #f5f5f5; padding: 2px 4px; border-radius: 3px; }
+                  </style>
+                </head>
+                <body>
+                  <h1>Codebase Alignment Analysis</h1>
+                  <pre>${result.data.content.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
+                </body>
+              </html>
+            `);
+            newWindow.document.close();
+          }
+        }
+      } else {
+        showError('Failed to load alignment analysis');
+      }
+    } catch (error) {
+      showError('Failed to view alignment analysis: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+  };
+
+  /**
+   * Load the project, its ticket count and assigned teams.
+   *
+   * @param projectId - Project id
+   * @param showSpinner - Replace the page with the spinner while loading
+   *   (false for background refreshes, e.g. opening the Teams tab)
+   */
+  const loadProjectData = async (projectId: string, showSpinner = true) => {
+    try {
+      if (showSpinner) setState(prev => ({ ...prev, loading: true, error: null }));
+      
+      // Project tickets (<project>/.crewly/tickets/) — only the count is
+      // needed here; the Tasks tab loads the board itself.
+      const [project, ticketCount] = await Promise.all([
+        apiService.getProject(projectId),
+        listProjectTickets(projectId)
+          .then((r) => r.tickets.filter((t) => t.status !== 'cancelled').length)
+          .catch(() => 0),
+      ]);
+      
+      // Get assigned teams based on project data
+      const allTeams = await apiService.getTeams();
+      const assignedTeams = allTeams.filter(team => {
+        // Match teams that have this project in their projectIds array
+        const matchesById = team.projectIds?.includes(projectId);
+        const matchesByName = team.projectIds?.includes(project.name);
+        
+        return matchesById || matchesByName;
+      });
+      
+      // Set available teams for Build Specs dropdown
+      setAvailableTeams(allTeams);
+      
+      setState({
+        project,
+        assignedTeams,
+        ticketCount,
+        loading: false,
+        error: null
+      });
+      
+      // Check alignment status after project data loads
+      await checkAlignmentStatus(projectId);
+    } catch (error) {
+      setState(prev => ({
+        ...prev,
+        loading: false,
+        error: error instanceof Error ? error.message : 'Failed to load project'
+      }));
+    }
+  };
+
+  const handleAssignTeams = () => {
+    setIsTeamAssignmentModalOpen(true);
+  };
+
+  const handleStartProject = async () => {
+    if (!state.project || state.assignedTeams.length === 0) return;
+    
+    try {
+      setState(prev => ({ ...prev, loading: true }));
+      
+      // Start the project with assigned teams
+      const response = await apiService.startProject(state.project.id, state.assignedTeams.map(t => t.id));
+      
+      // Reload project data to reflect updated statuses
+      await loadProjectData(state.project.id);
+      
+      // Show success message with details
+      showSuccess(
+        `${response.message || 'Project started with automated check-ins and git commit reminders.'}`,
+        'Project Started Successfully'
+      );
+      
+    } catch (error) {
+      console.error('Failed to start project:', error);
+      showError(
+        'Failed to start project: ' + (error instanceof Error ? error.message : 'Unknown error'),
+        'Start Project Failed'
+      );
+    } finally {
+      setState(prev => ({ ...prev, loading: false }));
+    }
+  };
+
+  const handleStopProject = async () => {
+    if (!state.project) return;
+    
+    showConfirm(
+      `Are you sure you want to stop "${state.project.name}"?\n\nThis will:\n• Stop all scheduled check-ins and git reminders\n• Set project status to 'stopped'\n• Keep all teams and work intact\n\nYou can restart the project at any time.`,
+      async () => await executeStopProject(),
+      {
+        title: 'Stop Project',
+        confirmText: 'Stop Project',
+        type: 'warning'
+      }
+    );
+  };
+
+  const executeStopProject = async () => {
+    if (!state.project) return;
+    
+    try {
+      setState(prev => ({ ...prev, loading: true }));
+      
+      const response = await fetch(`/api/projects/${state.project.id}/stop`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        }
+      });
+      
+      if (response.ok) {
+        const result = await response.json();
+        
+        // Reload project data to reflect updated status
+        await loadProjectData(state.project.id);
+        
+        showSuccess(
+          result.message || 'Project stopped successfully. Scheduled messages have been cancelled.',
+          'Project Stopped'
+        );
+      } else {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to stop project');
+      }
+      
+    } catch (error) {
+      console.error('Failed to stop project:', error);
+      showError(
+        'Failed to stop project: ' + (error instanceof Error ? error.message : 'Unknown error'),
+        'Stop Project Failed'
+      );
+    } finally {
+      setState(prev => ({ ...prev, loading: false }));
+    }
+  };
+
+  const handleTeamAssignmentComplete = () => {
+    // Reload project data to reflect new team assignments
+    if (id) {
+      loadProjectData(id);
+    }
+  };
+
+  const handleUnassignTeam = (teamId: string, teamName: string) => {
+    if (!state.project) return;
+    
+    showConfirm(
+      `Are you sure you want to unassign "${teamName}" from this project?\n\nThis will send a command to the orchestrator to delete the team's terminal sessions.`,
+      async () => await executeUnassignTeam(teamId, teamName),
+      {
+        title: 'Unassign Team',
+        confirmText: 'Unassign Team',
+        type: 'warning'
+      }
+    );
+  };
+
+  const executeUnassignTeam = async (teamId: string, teamName: string) => {
+    if (!state.project) return;
+    
+    try {
+      setState(prev => ({ ...prev, loading: true }));
+      
+      // Send unassign command to orchestrator to delete terminal sessions
+      await fetch('/api/orchestrator/execute', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ 
+          command: `unassign_team ${teamId} ${state.project.id}` 
+        }),
+      });
+      
+      // Unassign team from project
+      await apiService.unassignTeamFromProject(state.project.id, teamId);
+      
+      // Reload project data to reflect changes
+      await loadProjectData(state.project.id);
+      
+      showSuccess(
+        `Team "${teamName}" has been unassigned from the project and their terminal sessions have been terminated.`,
+        'Team Unassigned'
+      );
+      
+    } catch (error) {
+      console.error('Failed to unassign team:', error);
+      showError(
+        'Failed to unassign team: ' + (error instanceof Error ? error.message : 'Unknown error'),
+        'Unassign Failed'
+      );
+    } finally {
+      setState(prev => ({ ...prev, loading: false }));
+    }
+  };
+
+  const handleDeleteProject = () => {
+    if (!state.project) return;
+    
+    showConfirm(
+      `Are you sure you want to delete "${state.project.name}"?\n\nThis will:\n• Remove the project from Crewly registry\n• Keep all project files and .crewly folder intact\n• Unassign any active teams from this project\n\nThis action cannot be undone.`,
+      async () => await executeDeleteProject(),
+      {
+        title: 'Delete Project',
+        confirmText: 'Delete Project',
+        type: 'error'
+      }
+    );
+  };
+
+  const executeDeleteProject = async () => {
+    if (!state.project) return;
+    
+    try {
+      setState(prev => ({ ...prev, loading: true }));
+      
+      const response = await fetch(`/api/projects/${state.project.id}`, {
+        method: 'DELETE',
+      });
+      
+      if (response.ok) {
+        const result = await response.json();
+        showSuccess(
+          `Project deleted successfully!\n\n${result.message}`,
+          'Project Deleted'
+        );
+        // Navigate back to projects list after a brief delay
+        setTimeout(() => {
+          navigate(ROUTES.projects);
+        }, 1000);
+      } else {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to delete project');
+      }
+      
+    } catch (error) {
+      console.error('Failed to delete project:', error);
+      showError(
+        'Failed to delete project: ' + (error instanceof Error ? error.message : 'Unknown error'),
+        'Delete Failed'
+      );
+    } finally {
+      setState(prev => ({ ...prev, loading: false }));
+    }
+  };
+
+  // Modal handlers for spec creation/editing
+  const handleAddGoal = () => {
+    setGoalContent('');
+    setIsGoalModalOpen(true);
+  };
+
+  const handleEditGoal = async () => {
+    if (!state.project) return;
+    
+    try {
+      const response = await fetch(`/api/projects/${state.project.id}/specs?fileName=initial_goal.md`);
+      if (response.ok) {
+        const result = await response.json();
+        if (result.success) {
+          setGoalContent(result.data.content);
+          setIsGoalModalOpen(true);
+        } else {
+          throw new Error(result.error || 'Failed to load goal content');
+        }
+      } else {
+        throw new Error('Failed to load goal content');
+      }
+    } catch (error) {
+      console.error('Error loading goal content:', error);
+      showError('Failed to load goal content: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+  };
+  
+  const handleSaveGoal = async () => {
+    if (!goalContent.trim()) {
+      showAlert('Please enter project goal content');
+      return;
+    }
+    
+    if (!state.project) return;
+    
+    try {
+      const response = await fetch(`/api/projects/${state.project.id}/create-spec-file`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          fileName: 'initial_goal.md',
+          content: goalContent
+        }),
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        if (result.success) {
+          setIsGoalModalOpen(false);
+          setGoalContent('');
+          showSuccess('Project goal saved successfully!', 'Goal Saved');
+          // Reload project data to refresh the Detail view
+          if (id) {
+            loadProjectData(id);
+          }
+        } else {
+          throw new Error(result.error || 'Failed to save goal');
+        }
+      } else {
+        throw new Error('Failed to save goal');
+      }
+    } catch (error) {
+      console.error('Error saving goal:', error);
+      alert('Failed to save goal: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+  };
+
+  const handleAddUserJourney = () => {
+    setUserJourneyContent('');
+    setIsUserJourneyModalOpen(true);
+  };
+
+  const handleEditUserJourney = async () => {
+    if (!state.project) return;
+    
+    try {
+      const response = await fetch(`/api/projects/${state.project.id}/specs?fileName=initial_user_journey.md`);
+      if (response.ok) {
+        const result = await response.json();
+        if (result.success) {
+          setUserJourneyContent(result.data.content);
+          setIsUserJourneyModalOpen(true);
+        } else {
+          throw new Error(result.error || 'Failed to load user journey content');
+        }
+      } else {
+        throw new Error('Failed to load user journey content');
+      }
+    } catch (error) {
+      console.error('Error loading user journey content:', error);
+      showError('Failed to load user journey content: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+  };
+  
+  const handleSaveUserJourney = async () => {
+    if (!userJourneyContent.trim()) {
+      showAlert('Please enter user journey content');
+      return;
+    }
+    
+    if (!state.project) return;
+    
+    try {
+      const response = await fetch(`/api/projects/${state.project.id}/create-spec-file`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          fileName: 'initial_user_journey.md',
+          content: userJourneyContent
+        }),
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        if (result.success) {
+          setIsUserJourneyModalOpen(false);
+          setUserJourneyContent('');
+          showSuccess('User journey saved successfully!', 'User Journey Saved');
+          // Reload project data to refresh the Detail view
+          if (id) {
+            loadProjectData(id);
+          }
+        } else {
+          throw new Error(result.error || 'Failed to save user journey');
+        }
+      } else {
+        throw new Error('Failed to save user journey');
+      }
+    } catch (error) {
+      console.error('Error saving user journey:', error);
+      showError('Failed to save user journey: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+  };
+
+  const handleBuildSpecs = async () => {
+    if (!state.project) return;
+    
+    showConfirm(
+      'This will create a Product Manager for this project and instruct them to build detailed specifications and task planning using a step-by-step process. Continue?',
+      async () => await executeBuildSpecs(),
+      {
+        title: 'Build Specifications',
+        confirmText: 'Start Build Process',
+        type: 'info'
+      }
+    );
+  };
+
+  const handleOpenInFinder = async () => {
+    if (!state.project) return;
+    
+    try {
+      const response = await fetch(`/api/projects/${state.project.id}/open-finder`, {
+        method: 'POST'
+      });
+      
+      if (!response.ok) {
+        throw new Error('Failed to open Finder');
+      }
+      
+      const result = await response.json();
+      if (result.success) {
+        // Show success message briefly
+        showSuccess('Project folder opened in Finder', 'Finder Opened');
+      } else {
+        throw new Error(result.error || 'Failed to open Finder');
+      }
+    } catch (error) {
+      console.error('Error opening Finder:', error);
+      showError('Failed to open Finder: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+  };
+
+  const executeBuildSpecs = async () => {
+    if (!state.project) return;
+    
+    // Validate team selection
+    if (!selectedBuildSpecsTeam || selectedBuildSpecsTeam === 'orchestrator') {
+      showError('Please select a team member first. Build Specs must be assigned to an existing team member.');
+      return;
+    }
+    
+    // Find the selected team and member
+    const selectedTeam = availableTeams.find(t => t.id === selectedBuildSpecsTeam);
+    const selectedMember = selectedTeam?.members?.[0]; // For build specs, we use the first member
+    
+    // Validate that the team has been started (has session names)
+    if (!selectedMember?.sessionName) {
+      showError('Team must be started before using Build Specs. Please click "Start Team" first to create terminal sessions for team members.');
+      return;
+    }
+    
+    try {
+      // Load the step-by-step build specs configuration
+      const configResponse = await fetch('/api/build-specs/config');
+      if (!configResponse.ok) {
+        throw new Error('Failed to load Build Specs configuration');
+      }
+      const result = await configResponse.json();
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to load Build Specs configuration');
+      }
+      const config = result.data;
+
+      // Get the initial goal and user journey content
+      const [goalResponse, journeyResponse] = await Promise.all([
+        fetch(`/api/projects/${state.project.id}/specs?fileName=initial_goal.md`),
+        fetch(`/api/projects/${state.project.id}/specs?fileName=initial_user_journey.md`)
+      ]);
+
+      if (!goalResponse.ok || !journeyResponse.ok) {
+        throw new Error('Failed to load initial specifications');
+      }
+
+      const [goalResult, journeyResult] = await Promise.all([
+        goalResponse.json(),
+        journeyResponse.json()
+      ]);
+
+      if (!goalResult.success || !journeyResult.success) {
+        throw new Error('Failed to read initial specifications');
+      }
+
+      const initialGoal = goalResult.data.content;
+      const userJourney = journeyResult.data.content;
+
+      // Template substitution function
+      const substituteTemplate = (prompts: string[]) => {
+        return prompts.map(prompt => 
+          prompt
+            .replace(/\{PROJECT_NAME\}/g, state.project!.name)
+            .replace(/\{PROJECT_PATH\}/g, state.project!.path)
+            .replace(/\{PROJECT_ID\}/g, state.project!.id)
+            .replace(/\{INITIAL_GOAL\}/g, initialGoal)
+            .replace(/\{USER_JOURNEY\}/g, userJourney)
+        ).join('\n');
+      };
+
+      // Get the selected team and member information
+      console.log('Using selected team member:', selectedBuildSpecsTeam);
+      const [teamId, memberId] = selectedBuildSpecsTeam.split(':');
+      
+      const selectedTeam = availableTeams.find(team => team.id === teamId);
+      const selectedMember = selectedTeam?.members.find((m: any) => m.id === memberId);
+      
+      if (!selectedTeam || !selectedMember) {
+        throw new Error('Selected team member not found');
+      }
+      
+      console.log('Selected team:', selectedTeam.name, 'Member:', selectedMember.name);
+
+      // Skip team assignment since we're using an existing team
+      console.log('Using existing team - no assignment needed');
+
+      // Step 3: Process workflow steps (now that team is created and assigned)
+      const steps = config.steps;
+
+      // Get the actual session name for the selected member
+      const targetSessionName = selectedMember.sessionName || selectedMember.name;
+      console.log('Target session name:', targetSessionName);
+
+      // Send all steps as scheduled messages to the selected team member
+      const stepPromises = [];
+      
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        
+        console.log(`Scheduling Step ${step.id}: ${step.name} with ${step.delayMinutes} minute delay...`);
+        
+        const promise = fetch('/api/build-specs/retry-step', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            projectId: state.project!.id,
+            stepId: step.id,
+            targetSession: targetSessionName,
+            projectName: state.project!.name
+          })
+        });
+        
+        stepPromises.push(promise.then(async (response) => {
+          if (response.ok) {
+            const result = await response.json();
+            console.log(`Step ${step.id} scheduled:`, result.message);
+            return { stepId: step.id, success: true, message: result.message };
+          } else {
+            const error = await response.text();
+            console.error(`Step ${step.id} failed:`, error);
+            return { stepId: step.id, success: false, error };
+          }
+        }));
+      }
+
+      // Wait for all step requests to complete
+      const responses = await Promise.all(stepPromises);
+      
+      // Check if all steps were successful
+      const allSuccessful = await Promise.all(
+        responses.map(async (response, index) => {
+          const step = steps[index];
+          
+          if (step.delayMinutes === 0) {
+            // For immediate steps, response is the combined message + enter response
+            const result = await response;
+            const messageOk = result.messageResponse.ok;
+            const enterOk = result.enterResponse ? result.enterResponse.ok : true;
+            
+            if (messageOk && enterOk) {
+              console.log(`Step ${step.id} (${step.name}) sent successfully with Enter key`);
+              return true;
+            } else {
+              console.error(`Step ${step.id} (${step.name}) failed - Message: ${messageOk}, Enter: ${enterOk}`);
+              return false;
+            }
+          } else {
+            // For scheduled steps, response is the normal fetch response
+            if (response.ok) {
+              const result = await response.json();
+              console.log(`Step ${step.id} (${step.name}) scheduled successfully:`, result);
+              return true;
+            } else {
+              console.error(`Step ${step.id} (${step.name}) scheduling failed:`, response.status, response.statusText);
+              try {
+                const errorBody = await response.text();
+                console.error(`Step ${step.id} error body:`, errorBody);
+              } catch (e) {
+                console.error(`Could not read error body for step ${step.id}`);
+              }
+              return false;
+            }
+          }
+        })
+      );
+
+      if (allSuccessful.every(success => success)) {
+        // Initialize workflow display
+        const now = new Date();
+        const workflowSteps = steps.map((step, index) => ({
+          id: step.id,
+          name: step.name,
+          delayMinutes: step.delayMinutes,
+          status: step.delayMinutes === 0 ? 'scheduled' as const : 'pending' as const,
+          scheduledAt: step.delayMinutes === 0 ? now : new Date(now.getTime() + step.delayMinutes * 60000)
+        }));
+
+        setBuildSpecsWorkflow({
+          isActive: true,
+          steps: workflowSteps
+        });
+
+        // Auto-expand terminal to show selected member's session
+        openTerminalWithSession(targetSessionName);
+        
+        // Show success message
+        const totalSteps = steps.length;
+        const maxDelayMinutes = Math.max(...steps.map(s => s.delayMinutes));
+        
+        showSuccess(
+          `Build Specs process sent to ${selectedMember.name}!\n\n📋 ${totalSteps} steps sent to ${selectedTeam.name}\n⏱️ Final step in ${maxDelayMinutes} minutes\n\n🔍 Monitor ${selectedMember.name}'s terminal for progress.`,
+          'Build Specs Started'
+        );
+
+        // Start a timer to update step statuses
+        const updateTimer = setInterval(() => {
+          setBuildSpecsWorkflow(current => {
+            if (!current.isActive) return current;
+
+            const now = new Date();
+            const updatedSteps = current.steps.map(step => {
+              if (step.status === 'pending' && step.scheduledAt && now >= step.scheduledAt) {
+                return { ...step, status: 'scheduled' as const };
+              }
+              return step;
+            });
+
+            // Check if all steps are completed (this would need to be updated based on actual completion tracking)
+            const allScheduled = updatedSteps.every(step => step.status === 'scheduled');
+            if (allScheduled) {
+              clearInterval(updateTimer);
+              return {
+                ...current,
+                steps: updatedSteps
+              };
+            }
+
+            return {
+              ...current,
+              steps: updatedSteps
+            };
+          });
+        }, 30000); // Update every 30 seconds
+
+        // Calculate total time for cleanup
+        const totalTimeMinutes = steps.reduce((sum, step) => sum + step.delayMinutes, 0);
+        
+        // Clean up timer after workflow completion (estimated)
+        setTimeout(() => {
+          clearInterval(updateTimer);
+        }, (totalTimeMinutes + 5) * 60000); // Cleanup 5 minutes after expected completion
+      } else {
+        throw new Error('Some Build Specs steps failed to schedule');
+      }
+
+    } catch (error) {
+      console.error('Error building specs:', error);
+      showError('Failed to build specs: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+  };
+
+  if (state.loading) {
+    return (
+      <div className="flex items-center justify-center min-h-[400px]">
+        <LoadingSpinner size="xl" text="Loading project..." />
+      </div>
+    );
+  }
+
+  if (state.error || !state.project) {
+    return (
+      <div className="max-w-4xl mx-auto px-6 py-16">
+        <div className="text-center">
+          <h2 className="text-2xl font-bold mb-4">Error Loading Project</h2>
+          <p className="text-text-secondary-dark">{state.error || 'Project not found'}</p>
+        </div>
+      </div>
+    );
+  }
+
+  const { project, assignedTeams, ticketCount } = state;
+  const status = projectStatus(project.status);
+  const teamsWord = `${assignedTeams.length} team${assignedTeams.length === 1 ? '' : 's'}`;
+
+  const headerActions = (
+    <>
+      {project.status === 'active' ? (
+        <Button
+          variant="secondary"
+          icon={Square}
+          onClick={handleStopProject}
+          disabled={state.loading}
+          title="Stop project and cancel scheduled messages"
+        >
+          Stop Project
+        </Button>
+      ) : (
+        <Button
+          variant="primary"
+          icon={Play}
+          onClick={handleStartProject}
+          disabled={state.loading || assignedTeams.length === 0}
+          loading={state.loading}
+          title={assignedTeams.length === 0 ? 'Assign a team before starting the project' : 'Start project with assigned teams'}
+        >
+          {state.loading ? 'Starting...' : 'Start Project'}
+        </Button>
+      )}
+      <OverflowMenu
+        align="bottom-right"
+        icon={MoreHorizontal}
+        label="More project actions"
+        buttonClassName="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-border-soft text-text-2 transition-colors hover:bg-surface-hover hover:text-text"
+        items={[
+          { label: 'Open in Finder', onClick: handleOpenInFinder },
+          { label: 'Assign Team', onClick: handleAssignTeams },
+          { label: 'Delete Project', onClick: handleDeleteProject, danger: true, separator: true },
+        ]}
+      />
+    </>
+  );
+
+  return (
+    <div className="max-w-7xl mx-auto px-6 py-8">
+      <PageHeader
+        data-testid="project-header"
+        eyebrow={
+          <nav aria-label="Breadcrumb" className="flex items-center gap-1.5">
+            <Link to={ROUTES.projects} className="text-text-2 hover:text-text">Projects</Link>
+            <ChevronRight className="h-3.5 w-3.5 text-text-3" aria-hidden="true" />
+            <span className="text-text-2">{project.name}</span>
+          </nav>
+        }
+        title={project.name}
+        subtitle={
+          <span className="inline-flex min-w-0 items-center gap-1.5">
+            <StatusLabel tone={status.tone}>{status.label}</StatusLabel>
+            <span className="text-text-3">·</span>
+            <span>{ticketCount} task{ticketCount === 1 ? '' : 's'} · {teamsWord}</span>
+            <span className="text-text-3">·</span>
+            <button
+              type="button"
+              onClick={handleOpenInFinder}
+              title={`${project.path} — open in Finder`}
+              className="truncate text-text-2 hover:text-text hover:underline underline-offset-2"
+              data-testid="project-path"
+            >
+              {shortenPath(project.path)}
+            </button>
+          </span>
+        }
+        actions={headerActions}
+        tabs={
+          <UnderlineTabs
+            aria-label="Project sections"
+            idPrefix="project"
+            value={activeTab}
+            onChange={(v) => setActiveTab(v as ProjectTab)}
+            tabs={PROJECT_TABS.map((t) => ({
+              value: t,
+              label: PROJECT_TAB_LABELS[t],
+              count: t === 'tasks' ? ticketCount : t === 'teams' ? assignedTeams.length : undefined,
+            }))}
+          />
+        }
+      />
+
+      <div role="tabpanel" id={`project-panel-${activeTab}`} aria-labelledby={`project-tab-${activeTab}`}>
+        {activeTab === 'detail' ? (
+          <DetailView
+            project={project}
+            onAddGoal={handleAddGoal}
+            onEditGoal={handleEditGoal}
+            onAddUserJourney={handleAddUserJourney}
+            onEditUserJourney={handleEditUserJourney}
+            onBuildSpecs={handleBuildSpecs}
+            buildSpecsWorkflow={buildSpecsWorkflow}
+            alignmentStatus={alignmentStatus}
+            onContinueWithMisalignment={handleContinueWithMisalignment}
+            onViewAlignment={handleViewAlignment}
+            selectedBuildSpecsTeam={selectedBuildSpecsTeam}
+            setSelectedBuildSpecsTeam={setSelectedBuildSpecsTeam}
+            availableTeams={availableTeams}
+            onShowTab={(t) => setActiveTab(t)}
+            onOpenChat={() => navigate(ROUTES.chat)}
+            key={project.updatedAt} // Force re-render when project updates
+          />
+        ) : activeTab === 'editor' ? (
+          <EditorView
+            project={project}
+            selectedFile={selectedFile}
+            onFileSelect={setSelectedFile}
+            setIsMarkdownEditorOpen={setIsMarkdownEditorOpen}
+          />
+        ) : activeTab === 'tasks' ? (
+          // The shared Tickets board filtered to this project (+ Task Flow).
+          <ProjectTasksTab project={project} teams={assignedTeams} onCountChange={handleTicketCountChange} />
+        ) : activeTab === 'autopilot' ? (
+          // Ticket autopilot: what shipped, where it stalled (specs/2026-10-03-autopilot-experiments.md)
+          <AutopilotTab projectId={project.id} />
+        ) : (
+          <TeamsView
+            assignedTeams={assignedTeams}
+            onUnassignTeam={handleUnassignTeam}
+            openTerminalWithSession={openTerminalWithSession}
+            onAssignTeam={handleAssignTeams}
+            projectName={project.name}
+            onViewTeam={(teamId) => navigate(LINKS.team(teamId))}
+            onEditTeam={(teamId) => navigate(`${LINKS.team(teamId)}?edit=true`)}
+          />
+        )}
+      </div>
+
+      {/* Team Assignment Modal */}
+      {isTeamAssignmentModalOpen && (
+        <TeamAssignmentModal
+          project={project}
+          onClose={() => setIsTeamAssignmentModalOpen(false)}
+          onAssignmentComplete={handleTeamAssignmentComplete}
+        />
+      )}
+
+      {/* Markdown Editor Modal */}
+      {isMarkdownEditorOpen && (
+        <MarkdownEditor
+          projectPath={project.path}
+          onClose={() => setIsMarkdownEditorOpen(false)}
+        />
+      )}
+
+      {/* Goal Modal */}
+      {isGoalModalOpen && (
+        <FormPopup
+          isOpen={isGoalModalOpen}
+          onClose={() => setIsGoalModalOpen(false)}
+          title="Add Project Goal"
+          subtitle="Define your project's main objective and success criteria"
+          onSubmit={(e) => { e.preventDefault(); handleSaveGoal(); }}
+          submitText="Save Goal"
+          size="md"
+        >
+          <FormGroup>
+            <FormLabel htmlFor="goal-content" required>
+              Project Goal
+            </FormLabel>
+            <FormTextarea
+              id="goal-content"
+              value={goalContent}
+              onChange={(e) => setGoalContent(e.target.value)}
+              placeholder="Describe your project's main objective, success criteria, and key outcomes..."
+              rows={8}
+              required
+            />
+            <FormHelp>
+              Define what you want to achieve with this project. Be specific about goals, target users, and success metrics.
+            </FormHelp>
+          </FormGroup>
+        </FormPopup>
+      )}
+
+      {/* User Journey Modal */}
+      {isUserJourneyModalOpen && (
+        <FormPopup
+          isOpen={isUserJourneyModalOpen}
+          onClose={() => setIsUserJourneyModalOpen(false)}
+          title="Add User Journey"
+          subtitle="Map out how users will interact with your solution"
+          onSubmit={(e) => { e.preventDefault(); handleSaveUserJourney(); }}
+          submitText="Save User Journey"
+          size="md"
+        >
+          <FormGroup>
+            <FormLabel htmlFor="journey-content" required>
+              User Journey
+            </FormLabel>
+            <FormTextarea
+              id="journey-content"
+              value={userJourneyContent}
+              onChange={(e) => setUserJourneyContent(e.target.value)}
+              placeholder="Describe your users' journey from discovery to success. Include user personas, key interactions, pain points, and desired outcomes..."
+              rows={8}
+              required
+            />
+            <FormHelp>
+              Map out how users will interact with your solution. Include user types, main flows, and critical touchpoints.
+            </FormHelp>
+          </FormGroup>
+        </FormPopup>
+      )}
+
+      {/* Alert and Confirm Dialogs */}
+      <AlertComponent />
+      <ConfirmComponent />
+    </div>
+  );
+};
+

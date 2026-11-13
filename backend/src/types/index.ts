@@ -1,0 +1,629 @@
+import type { TicketAutopilotSettings } from './ticket-autopilot.types.js';
+
+/**
+ * Role types available for team members.
+ * 'team-leader' and 'tech-lead' lead their team when it names no lead
+ * explicitly (TEAM_LEAD_CONSTANTS.LEAD_ROLES, utils/team.utils).
+ */
+export type TeamMemberRole =
+  | 'orchestrator'
+  | 'team-leader'
+  | 'tech-lead'
+  | 'tpm'
+  | 'architect'
+  | 'pgm'
+  | 'developer'
+  | 'frontend-developer'
+  | 'backend-developer'
+  | 'fullstack-dev'
+  | 'qa'
+  | 'qa-engineer'
+  | 'tester'
+  | 'designer'
+  | 'product-manager'
+  | 'sales'
+  | 'support';
+
+export interface TeamMember {
+  id: string;
+  name: string;
+  /**
+   * The agent's permanent id — the session it always runs under. Assigned
+   * once (existing members keep the session name they had; new members get
+   * `<team>-<name>-<id8>` at creation) and never recomputed, so renaming the
+   * member or its team changes only the display name. Everything that stores
+   * "which agent" (triggers, work items, Slack bots, chat channels) keeps
+   * pointing at the same agent (owner, 2026-09-24).
+   */
+  agentId?: string;
+  sessionName: string; // tmux session name (set while running; equals agentId)
+  role: TeamMemberRole;
+  avatar?: string; // URL or emoji for member avatar
+  systemPrompt: string;
+  agentStatus: 'inactive' | 'starting' | 'started' | 'active' | 'suspended' | 'activating'; // Connection/registration status (activating is deprecated)
+  workingStatus: 'idle' | 'in_progress'; // Activity level status
+  runtimeType: 'claude-code' | 'gemini-cli' | 'codex-cli' | 'opencode-cli' | 'antigravity-cli' | 'crewly-agent'; // AI runtime to use
+  /**
+   * Per-agent model. For the PTY runtimes this is the name the harness
+   * itself accepts and is passed at launch (`claude --model opus`,
+   * `codex -m gpt-5.6-sol`, `gemini -m gemini-2.5-pro`,
+   * `opencode --model anthropic/claude-sonnet-4`); for `crewly-agent` it is
+   * `provider/modelId` (e.g. google/gemini-3-flash-preview). Unset = the
+   * harness's own default.
+   */
+  modelId?: string;
+  /**
+   * Per-agent reasoning effort where the harness supports it: Claude Code
+   * `--effort low|medium|high|xhigh|max`, Codex `model_reasoning_effort`
+   * (low|medium|high). Ignored by other runtimes.
+   */
+  reasoningEffort?: string;
+  /**
+   * Model tier (`strong` | `mid` | `weak`, crewly#1173). Resolved to a model
+   * for the member's runtime at launch (team override, else the global map in
+   * `MODEL_TIER_CONSTANTS`). An explicit {@link modelId} always wins.
+   */
+  tier?: ModelTier;
+  skillOverrides?: string[]; // Additional skill IDs beyond what the role provides
+  excludedRoleSkills?: string[]; // Role skills to exclude for this specific member
+  enableBrowserAutomation?: boolean; // Per-agent browser override (undefined = use global setting)
+  currentTickets?: string[];
+  readyAt?: string; // ISO timestamp when agent reported ready
+  /**
+   * Set (in API responses only — never persisted) while the agent's runtime
+   * is waiting on a human sign-in. Carries the login URL / device code the
+   * OAuth monitor captured from the PTY so the UI can show them.
+   */
+  loginRequired?: {
+    url: string | null;
+    code: string | null;
+    detectedAt: string;
+  };
+  /**
+   * Set (in API responses only — never persisted) while the agent's runtime
+   * is out of usage (e.g. Claude Code's weekly limit). The agent is not
+   * restarted or written to before `retryAt`; `until` is the reset time the
+   * runtime named, when it named one.
+   */
+  usageLimited?: {
+    until?: string;
+    retryAt: string;
+    detectedAt: string;
+    runtime: string | null;
+  };
+  /**
+   * Set (in API responses only — never persisted on the member) while the
+   * agent runs on a fallback runtime because its own ran out of usage.
+   * `runtimeType` stays the configured runtime. specs/2026-10-01-runtime-fallback.md
+   */
+  runtimeOverride?: {
+    runtime: string;
+    primary: string;
+    reason: 'usage_limit';
+    since: string;
+    until?: string;
+    /** e.g. "on DeepSeek (Claude limit)" */
+    badge: string;
+  };
+  capabilities?: string[]; // Agent-reported capabilities
+  /**
+   * Owner-declared skill tags (lowercase, e.g. `["devops","docker","sql"]`).
+   * Used by poll-tasks / the task pool to match work to this member; falls
+   * back to `capabilities` when empty. See `normalizeMemberSkills`.
+   */
+  skills?: string[];
+  lastActivityCheck?: string; // ISO timestamp of last activity monitoring
+  createdAt: string;
+  updatedAt: string;
+
+  // === Hierarchy fields (for hierarchical team management) ===
+
+  /** Parent member ID in the hierarchy. undefined = root (orchestrator). */
+  parentMemberId?: string;
+
+  /**
+   * Position in hierarchy: 0=orchestrator, 1=team leader, 2=worker.
+   * Supports N-level depth for future expansion.
+   */
+  hierarchyLevel?: number;
+
+  /** IDs of direct subordinate members. Maintained by backend. */
+  subordinateIds?: string[];
+
+  /** Whether this member can delegate tasks to subordinates. */
+  canDelegate?: boolean;
+
+  /** Maximum number of concurrent tasks this member can handle. */
+  maxConcurrentTasks?: number;
+
+  /** #235: Reason the agent last went inactive */
+  dropoutReason?:
+    | 'idle_exit'
+    /** Stopped while idle because memory was tight (IdleDetectionService / reconciler) */
+    | 'idle_exit_pressure'
+    /** Exited with no recognised cause within EARLY_EXIT_WINDOW_MS of starting (#791) */
+    | 'startup_exit'
+    | 'update_exit'
+    | 'crash'
+    | 'manual'
+    | 'task_complete'
+    | 'loop_detected'
+    | 'startup_timeout'
+    | 'invalid_role';
+
+  /** Why the last start failed and when; cleared by the next successful start (B8 O2). */
+  lastStartError?: { reason: string; at: string };
+
+  // === Architecture Upgrade fields ===
+
+  /** Autonomy level: directed (default), bounded, or domain_autonomous */
+  autonomyLevel?: 'directed' | 'bounded' | 'domain_autonomous';
+  /** Domain SOP name — loads config/domain-sops/{domainSOP}.sop.md */
+  domainSOP?: string;
+  /** Risk policy name — loads config/risk-policies/{riskPolicy}.policy.md */
+  riskPolicy?: string;
+
+  // === Organization Model fields ===
+
+  /** Job title: "Frontend Tech Lead", "Backend Developer", "QA Lead" */
+  jobTitle?: string;
+  /** What this member is responsible for in the team */
+  jobDescription?: string;
+  /** Ownership scope — domains, deliverables, and areas this member owns */
+  ownershipScope?: import('./team-template.types.js').OwnershipScope;
+  /** Accountability type — how this member is responsible */
+  responsibilityType?: import('./team-template.types.js').ResponsibilityType;
+  /** Expert profile ID — loads thinking patterns from config/experts/{expertId}.md */
+  expertId?: string;
+  /**
+   * The one person this agent works for (a Slack user id, or `owner`) —
+   * issue #968. Anyone else who DMs or @'s it gets a polite decline that
+   * points to the team lead; nothing is dispatched and it is not woken.
+   * Absent = a shared agent.
+   */
+  dedicatedTo?: string;
+}
+
+export interface Team {
+  id: string;
+  name: string;
+  description?: string;
+  members: TeamMember[];
+  projectIds: string[];
+  /** `'off'` opts this team's WorkItems out of per-WorkItem worktrees (#814), even on an opted-in project. */
+  worktrees?: 'off';
+  createdAt: string;
+  updatedAt: string;
+
+  // === Hierarchy fields ===
+
+  /** Whether this team uses hierarchical management (TL → Workers). Default: false. */
+  hierarchical?: boolean;
+
+  /**
+   * @deprecated Use `leaderIds` instead. Retained for backward compatibility.
+   * When both exist, `leaderId` equals `leaderIds[0]`.
+   */
+  leaderId?: string;
+
+  /** Member IDs of the team leaders. Supports multiple TLs per team. */
+  leaderIds?: string[];
+
+  /** Template ID this team was created from (see TeamTemplate system). */
+  templateId?: string;
+
+  /** Parent team ID for team organization/grouping. null/undefined = top-level team. */
+  parentTeamId?: string;
+
+  /** Whether this team is archived. Archived teams are hidden from default listings. (#171) */
+  archived?: boolean;
+
+  /** ISO timestamp when the team was archived. (#171) */
+  archivedAt?: string;
+
+  // === Org Chart fields (#173) ===
+
+  /** Team mission statement — displayed in get-team-status and org chart. */
+  mission?: string;
+  /**
+   * What this team is responsible for, in the lead's own words (a few
+   * sentences). The orchestrator routes owner requests with it (team roster,
+   * specs/2026-10-10-team-roster.md); a lead keeps it current with
+   * `update-charter`. Absent = the roster falls back to `description`, then
+   * to a charter derived from roles, projects and recent tickets.
+   */
+  charter?: string;
+  /** ISO time the charter was last written */
+  charterUpdatedAt?: string;
+  /** Who wrote it: `owner`, `orchestrator`, or the lead's session */
+  charterUpdatedBy?: string;
+
+  /** Token/cost budget configuration for the team. */
+  budget?: TeamBudget;
+
+  /** Quality gate configuration for task review. */
+  qualityGate?: TeamQualityGate;
+
+  /**
+   * Give-up recovery policy (#841). `giveUpMaxRetries`: how many times a
+   * worker that gives up on a feasible task is sent back with a different
+   * approach before one escalation to the team lead (default 2; 0 = off).
+   */
+  recoveryPolicy?: { giveUpMaxRetries?: number };
+
+  // === Organization Model fields ===
+
+  /**
+   * Authenticated principal that materialised this team (Cloud Portal
+   * multi-tenant attribution — N1b, Phase E pre-beta). Populated by the
+   * provision route from `req.user.userId` so a team is bound to the user
+   * that triggered its creation. Undefined for OSS single-user teams and
+   * for legacy teams created before this field existed; consumers must
+   * tolerate both shapes.
+   *
+   * Read-side scoping (filter Team list/get by `ownerUserId`) is a
+   * separate ticket — N1b only closes the *attribution* leak so audit
+   * trails and future scoping have a stable field to key on.
+   */
+  ownerUserId?: string;
+  /** Team-level ownership scope — what this team is responsible for */
+  ownershipScope?: import('./team-template.types.js').OwnershipScope;
+  /** Service contract — what the team accepts, avoids, and delivers */
+  serviceContract?: import('./team-template.types.js').ServiceContract;
+  /**
+   * Declarative trigger specs that materialise the team's operating cadence
+   * (monthly kickoff, weekly review, daily EOD, ...). Reconciled with
+   * TriggerEngine on team load/update so SOP timing fires autonomously.
+   */
+  triggers?: TeamTriggerSpec[];
+
+  // === Temporary pause (specs/2026-10-04-team-pause.md) ===
+
+  /**
+   * Set while the owner has paused the team. A paused team is never woken
+   * by automation and is hidden from other agents. Persisted with the team,
+   * so a pause survives restarts.
+   */
+  paused?: TeamPauseState;
+
+  /**
+   * GitHub repository (`owner/name`) where other agents file work for this
+   * team while it is paused, e.g. `stevehuang0115/crewly`.
+   */
+  issueRepo?: string;
+
+  // === Model tiers (crewly#1173, specs/2026-10-08-model-tiers.md) ===
+
+  /**
+   * "Optimize usage": the team lead reviews the team's token usage weekly
+   * (and on demand) and proposes tier changes and task routing; the owner
+   * approves every change. Default off.
+   */
+  optimizeUsage?: boolean;
+  /**
+   * Who changes tiers while "Optimize usage" is on (owner-only setting):
+   * `approve` (default) — the lead proposes, the owner approves each change
+   * on a card; `auto` — the lead's changes apply at once and the owner gets a
+   * notice with Undo.
+   */
+  tierChangeMode?: TierChangeMode;
+  /** Per-team tier → model overrides, per runtime (wins over the global map) */
+  tierModels?: TeamTierModels;
+  /** Owner-approved task routing rules ("polling / formatting -> Ella"), shown to the lead */
+  tierRoutingRules?: string[];
+}
+
+/** Model tiers, strongest first (crewly#1173). */
+export type ModelTier = 'strong' | 'mid' | 'weak';
+
+/** Who changes a team's model tiers (crewly#1173 phase 2): the owner approves, or the lead decides and tells the owner. */
+export type TierChangeMode = 'approve' | 'auto';
+
+/** Tier → model per runtime (`{ 'claude-code': { weak: 'haiku' } }`). */
+export type TeamTierModels = Partial<Record<string, Partial<Record<ModelTier, string>>>>;
+
+/** The owner's pause of a team (see {@link Team.paused}). */
+export interface TeamPauseState {
+  /** ISO time the pause started */
+  pausedAt: string;
+  /** Only the owner pauses a team */
+  by: 'owner';
+  /** Optional reason shown on the dashboard and in refusals */
+  reason?: string;
+  /** Optional ISO time the pause ends by itself (auto-resume) */
+  until?: string;
+}
+
+/**
+ * Declarative spec for a team-owned trigger. Persisted on the Team config and
+ * reconciled with the runtime TriggerEngine. The pair (teamId, name) forms
+ * the identity key — editing this spec edits the running trigger in place
+ * rather than duplicating it.
+ */
+export interface TeamTriggerSpec {
+  /** Stable identifier within the team (e.g. "youtube-monthly-kickoff"). */
+  name: string;
+  /** Human-readable label used for logs and optional WorkItem titles. */
+  description?: string;
+  /** Whether the reconciler should register/keep this trigger active. */
+  enabled?: boolean;
+  /** Time or signal config, mirrors TriggerEngine.create input. */
+  config: import('./v2/trigger.types.js').TriggerConfig;
+  /** What to do when the trigger fires. */
+  action: import('./v2/trigger.types.js').TriggerAction;
+  /** Optional fire cap — undefined = unlimited. */
+  maxFires?: number;
+  /** Optional idle-fire tolerance before auto-cancel. */
+  maxIdleFires?: number;
+}
+
+/**
+ * Token and cost budget for a team (#173).
+ */
+export interface TeamBudget {
+  /** Maximum tokens per day across all team members. */
+  maxTokensPerDay?: number;
+  /** Maximum USD spend per month. */
+  maxUsdPerMonth?: number;
+  /** Percentage (0-100) at which to alert (e.g., 80 = alert at 80% usage). */
+  alertThreshold?: number;
+}
+
+/**
+ * Quality gate configuration for task review (#173).
+ */
+export interface TeamQualityGate {
+  /** Member ID of the designated reviewer. */
+  reviewerId?: string;
+  /** Whether tasks below minQualityScore are auto-approved. */
+  autoApprove?: boolean;
+  /** Minimum quality score (0-100) required for auto-approval. */
+  minQualityScore?: number;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  path: string; // absolute filesystem path
+  teams: Record<string, string[]>; // team assignments
+  status: 'active' | 'paused' | 'completed' | 'stopped';
+  scheduledMessageId?: string; // ID of auto-assignment scheduled message
+  /**
+   * ISO timestamp of the first successful orchestrator bootstrap against
+   * this project (Onboarding v3 — B1). Set once on first orc launch and
+   * never overwritten thereafter; absence (or undefined) signals a
+   * "cold-start" candidate to the onboarding bootstrap detector.
+   *
+   * Defends the cold-start signal against the edge case where chat-v2 is
+   * wiped accidentally — if the user has been here before, this marker
+   * stays set even if the chat store is empty.
+   */
+  firstLaunchedAt?: string;
+  /**
+   * Per-WorkItem git worktrees (#814). `'on'` opts this project in: each
+   * WorkItem targeting it gets `.crewly/worktrees/<id>` on branch
+   * `wi/<id>`. Absent or `'off'` = work in the shared checkout (v1 default).
+   */
+  worktrees?: 'on' | 'off';
+  /** Repo-relative heavy directories to symlink into worktrees (default `['node_modules']`). */
+  worktreeSharedDirs?: string[];
+  /**
+   * Ticket autopilot switch (specs/2026-09-30-ticket-autopilot.md). Absent =
+   * off. Changed only by the owner or the orchestrator.
+   */
+  ticketAutopilot?: TicketAutopilotSettings;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SessionInfo {
+  sessionName: string;
+  pid: number;
+  windows: number;
+  created: string;
+  attached: boolean;
+}
+
+export interface ScheduledCheck {
+  id: string;
+  targetSession: string;
+  message: string;
+  scheduledFor: string;
+  intervalMinutes?: number;
+  isRecurring: boolean;
+  label?: string;
+  persistent?: boolean;
+  timezone?: string;
+  recurrenceType?: 'interval' | 'daily' | 'weekdays' | 'weekly';
+  timeOfDay?: string;
+  dayOfWeek?: number;
+  maxOccurrences?: number;
+  currentOccurrence?: number;
+  createdAt: string;
+  /** Optional session name of the agent being monitored (for status enrichment) */
+  watchedSession?: string;
+  /** Task ID that this schedule monitors — auto-cancels when task completes */
+  taskId?: string;
+  /** Cron expression for cron-based scheduling (e.g., '0 9 * * *'). Overrides intervalMinutes when set. (#167) */
+  cronExpression?: string;
+  /** Session ID that created this check — used to auto-cancel stale checks from previous sessions on restart (#169) */
+  sessionId?: string;
+}
+
+export interface ScheduledMessage {
+  id: string;
+  name: string;
+  targetTeam: string; // e.g. 'orchestrator', 'frontend-team-pm', 'frontend-team-dev'
+  targetProject?: string; // project ID, optional
+  message: string; // message content to send
+  delayAmount: number; // numeric amount
+  delayUnit: 'seconds' | 'minutes' | 'hours'; // time unit
+  isRecurring: boolean; // one-time or recurring
+  isActive: boolean;
+  lastRun?: string;
+  nextRun?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MessageDeliveryLog {
+  id: string;
+  scheduledMessageId: string;
+  messageName: string;
+  targetTeam: string;
+  targetProject?: string;
+  message: string;
+  sentAt: string;
+  success: boolean;
+  error?: string;
+}
+
+export interface FileChange {
+  type: 'created' | 'updated' | 'deleted';
+  path: string;
+  timestamp: string;
+}
+
+export interface TeamMemberConfig {
+  name: string;
+  role: TeamMemberRole;
+  systemPrompt: string;
+  skillOverrides?: string[];
+  excludedRoleSkills?: string[];
+}
+
+export interface TeamConfig {
+  name: string;
+  description?: string;
+  members: TeamMemberConfig[];
+  projectPath?: string;
+}
+
+/**
+ * Subordinate info resolved from TeamMember data, used by the prompt builder
+ * to tell a Team Lead who their direct reports are.
+ */
+export interface SubordinateInfo {
+  name: string;
+  sessionName: string;
+  role: TeamMemberRole;
+  memberId: string;
+}
+
+export interface TeamMemberSessionConfig {
+  name: string;
+  role: TeamMemberRole;
+  systemPrompt: string;
+  projectPath?: string;
+  memberId?: string;
+  runtimeType?: TeamMember['runtimeType'];
+  skillOverrides?: string[];
+  excludedRoleSkills?: string[];
+  /** Owner-declared skill tags, rendered into the prompt as {{MEMBER_SKILLS_JSON}} */
+  skills?: string[];
+  /** Agent-reported capabilities (fallback for skills) */
+  capabilities?: string[];
+
+  // === Team Lead fields (for TL-aware prompt building) ===
+
+  /** The team ID this member belongs to (used for TL skill template variables). */
+  teamId?: string;
+
+  /** Whether this member can delegate tasks to subordinates. */
+  canDelegate?: boolean;
+
+  /** Resolved subordinate details for prompt injection. */
+  subordinates?: SubordinateInfo[];
+
+  // === Architecture Upgrade fields ===
+
+  /** Autonomy level: directed (default), bounded, or domain_autonomous */
+  autonomyLevel?: 'directed' | 'bounded' | 'domain_autonomous';
+  /** Domain SOP name — loads config/domain-sops/{domainSOP}.sop.md */
+  domainSOP?: string;
+  /** Risk policy name — loads config/risk-policies/{riskPolicy}.policy.md */
+  riskPolicy?: string;
+}
+
+export interface TerminalOutput {
+  sessionName: string;
+  content: string;
+  timestamp: string;
+  type: 'stdout' | 'stderr';
+}
+
+export interface WebSocketMessage {
+  type: 'terminal_output' | 'file_change' | 'team_status' | 'schedule_update'
+       | 'connection_established' | 'subscription_confirmed' | 'unsubscription_confirmed'
+       | 'session_not_found' | 'session_pending' | 'input_error' | 'initial_terminal_state'
+       | 'terminal_state_error' | 'system_notification' | 'orchestrator_status_changed'
+       | 'team_member_status_changed' | 'team_activity_updated' | 'read_only';
+  payload: any;
+  timestamp: string;
+}
+
+export interface ApiResponse<T = any> {
+  success: boolean;
+  data?: T;
+  error?: string;
+  message?: string;
+  /**
+   * Optional non-fatal advisory string. Used by graceful-degradation paths
+   * (e.g. project-task endpoints) to signal "the service is healthy but the
+   * underlying source failed; treat as empty rather than down". Consumers
+   * should display this without breaking the page when present alongside
+   * `success: true`.
+   */
+  warning?: string;
+}
+
+export interface StartupConfig {
+  webPort: number;
+  crewlyHome: string;
+  defaultCheckInterval: number;
+  autoCommitInterval: number;
+  /** When true, skip frontend serving (API-only mode for cloud deployment) */
+  headless: boolean;
+  /**
+   * Host/interface passed to `httpServer.listen` (`CREWLY_BIND_HOST`).
+   * Defaults to `0.0.0.0` for backward compatibility; set `127.0.0.1` to
+   * keep a server install reachable from the box only.
+   */
+  bindHost: string;
+}
+
+// Re-export memory types
+export * from './memory.types.js';
+
+// Re-export continuation types
+export * from './continuation.types.js';
+
+// Re-export quality gate types
+export * from './quality-gate.types.js';
+
+// Re-export SOP types
+export * from './sop.types.js';
+
+// Re-export budget types
+export * from './budget.types.js';
+
+// Re-export scheduler types
+export * from './scheduler.types.js';
+
+// Re-export role types
+export * from './role.types.js';
+
+// Re-export settings types
+export * from './settings.types.js';
+
+// Re-export skill types
+export * from './skill.types.js';
+
+// Re-export chat types
+export * from './chat.types.js';
+
+// Re-export task output types
+export * from './task-output.types.js';
+
+// Re-export thread status types
+export * from './thread-status.types.js';

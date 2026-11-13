@@ -1,0 +1,379 @@
+/**
+ * WikiReflectTriggerService — periodic nudge that pings ORC when no
+ * `wiki-queue-add` has fired against a vault recently.
+ *
+ * Rationale (2026-05-24):
+ *   The wiki infrastructure (queue, ingest, process, bookkeep) is shipped
+ *   and instrumented, but `wiki-queue-add` fire-rate is effectively zero —
+ *   the per-turn discipline in the role prompts is soft and rarely runs
+ *   in practice. This trigger raises a hard nudge: every `intervalMs`,
+ *   per vault, if no queue-add happened in the last `quietWindowMs`,
+ *   fire a `[REFLECT-WIKI] vault=…` message via the caller-injected
+ *   `fireFn`. ORC then either queues recent worth-saving items or no-ops.
+ *
+ * Mechanism mirrors `WikiBookkeepTriggerService` so they coexist cleanly:
+ *   - scan vaults via `discoverWikiVaults`
+ *   - per vault: count queue items added within `quietWindowMs`
+ *   - if zero AND debounce window has elapsed → fire
+ *
+ * @module services/wiki/wiki-reflect-trigger.service
+ */
+
+import * as path from 'path';
+import { LoggerService, ComponentLogger } from '../core/logger.service.js';
+import {
+  WikiQueueService,
+  WikiQueueItem,
+} from './wiki-queue.service.js';
+import { discoverWikiVaults } from './wiki-bookkeep-trigger.service.js';
+import { atomicWriteJson, safeReadJson, ensureDir } from '../../utils/file-io.utils.js';
+import { getCrewlyHomePath } from '../core/crewly-home.utils.js';
+
+const STATE_FILE_NAME = 'wiki-reflect-trigger-state.json';
+/**
+ * Key under which the last BATCH fire time is persisted, alongside the
+ * per-vault entries. Starts with a character no vault path can, so it can
+ * never collide with a real vault.
+ */
+const GLOBAL_LAST_FIRED_KEY = '*batch';
+
+export interface WikiReflectFireMeta {
+  /** vault path being nudged. */
+  vaultPath: string;
+  /** ms since the last queued item (Infinity if none). */
+  msSinceLastQueueAdd: number;
+  /** queue items added within `quietWindowMs`. */
+  recentQueueAdds: number;
+  /** total queue items (any status) currently in the vault. */
+  totalQueueItems: number;
+}
+
+export type WikiReflectFireFn = (meta: WikiReflectFireMeta) => Promise<void> | void;
+
+/** Batched notifier — one call per tick with every vault that fired. */
+export type WikiReflectBatchFireFn = (metas: WikiReflectFireMeta[]) => Promise<void> | void;
+
+export interface WikiReflectTriggerOptions {
+  /** Interval between scans, ms. Default 60 minutes. */
+  intervalMs?: number;
+  /** "Quiet" window — fire only when no add happened in this window. Default 4 hours. */
+  quietWindowMs?: number;
+  /** Minimum gap between fires for the same vault, ms. Default 4 hours. */
+  debounceMs?: number;
+  /**
+   * Caller-injected notifier, called once PER VAULT (e.g. enqueue a
+   * `[REFLECT-WIKI]` chat to ORC). Either this or `batchFireFn` is required.
+   */
+  fireFn?: WikiReflectFireFn;
+  /**
+   * Batched notifier, called once PER TICK with every vault that fired.
+   * Prefer this in production: each message to ORC is a full model turn,
+   * and a box with six vaults was paying six turns per reflect cycle
+   * (2026-09-16). When both are given, only `batchFireFn` is called.
+   */
+  batchFireFn?: WikiReflectBatchFireFn;
+  /**
+   * Whether there has been any conversation since `sinceMs` (epoch ms).
+   * When given, a batched tick fires only if this returns true for the last
+   * batch fire — the nudge asks ORC to sweep *recent conversation*, so with
+   * no new conversation there is nothing to sweep and the wake-up (a full
+   * model turn, usually uncached after an hour) is pure cost. Production
+   * wires this to chat-v2 (`hasConversationSince`).
+   */
+  hasConversationSince?: (sinceMs: number) => Promise<boolean> | boolean;
+  /**
+   * Minimum gap between two batched fires, whatever the per-vault ledgers
+   * say. Per-vault debounce alone let six vaults on staggered 4-hour
+   * windows wake ORC every single hour (2026-09-17). Default: `debounceMs`.
+   */
+  batchDebounceMs?: number;
+  /** Optional discovery override (tests). */
+  discoverRoots?: () => Promise<string[]>;
+  /** Optional queue service override (tests). */
+  queueService?: WikiQueueService;
+  /** Optional time override (tests). */
+  now?: () => number;
+  /**
+   * Where to persist the per-vault debounce ledger. Defaults to
+   * `~/.crewly/wiki-reflect-trigger-state.json`. Pass `null` to disable
+   * persistence (tests). Without persistence the ledger resets on every
+   * restart, so the next tick re-fires for every idle vault at once.
+   */
+  statePath?: string | null;
+}
+
+const DEFAULT_INTERVAL_MS = 60 * 60 * 1000;
+const DEFAULT_QUIET_WINDOW_MS = 4 * 60 * 60 * 1000;
+const DEFAULT_DEBOUNCE_MS = 4 * 60 * 60 * 1000;
+
+/**
+ * Reflect-trigger service. Start at boot, stop at shutdown.
+ */
+export class WikiReflectTriggerService {
+  private static instance: WikiReflectTriggerService | null = null;
+  private readonly logger: ComponentLogger;
+  private readonly intervalMs: number;
+  private readonly batchFireFn: WikiReflectBatchFireFn | null;
+  private readonly hasConversationSince: ((sinceMs: number) => Promise<boolean> | boolean) | null;
+  private readonly batchDebounceMs: number;
+  /** Last time a batched fire went out (epoch ms); persisted. */
+  private lastBatchFiredAt = 0;
+  private readonly quietWindowMs: number;
+  private readonly debounceMs: number;
+  private readonly fireFn: WikiReflectFireFn | null;
+  private readonly discoverRoots: () => Promise<string[]>;
+  private readonly queueService: WikiQueueService;
+  private readonly nowFn: () => number;
+  private timer: NodeJS.Timeout | null = null;
+  /** vaultPath → last fired timestamp (ms since epoch). */
+  private readonly lastFiredAt = new Map<string, number>();
+  /** Per-vault locks so overlapping ticks don't double-fire. */
+  private readonly inflight = new Set<string>();
+  private readonly statePath: string | null;
+  private stateLoaded = false;
+
+  constructor(opts: WikiReflectTriggerOptions) {
+    this.logger = LoggerService.getInstance().createComponentLogger('WikiReflectTrigger');
+    this.intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
+    if (!opts.fireFn && !opts.batchFireFn) {
+      throw new Error('WikiReflectTriggerService needs fireFn or batchFireFn');
+    }
+    this.batchFireFn = opts.batchFireFn ?? null;
+    this.hasConversationSince = opts.hasConversationSince ?? null;
+    this.quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
+    this.debounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE_MS;
+    this.batchDebounceMs = opts.batchDebounceMs ?? this.debounceMs;
+    this.fireFn = opts.fireFn ?? null;
+    this.discoverRoots = opts.discoverRoots ?? discoverWikiVaults;
+    this.queueService = opts.queueService ?? WikiQueueService.getInstance();
+    this.nowFn = opts.now ?? (() => Date.now());
+    if (opts.statePath === null) {
+      this.statePath = null;
+    } else if (typeof opts.statePath === 'string') {
+      this.statePath = opts.statePath;
+    } else {
+      this.statePath = path.join(getCrewlyHomePath(), STATE_FILE_NAME);
+    }
+  }
+
+  /** Load the persisted debounce ledger (once) so restarts don't re-burst. */
+  private async loadStateFromDisk(): Promise<void> {
+    if (this.stateLoaded) return;
+    this.stateLoaded = true;
+    if (!this.statePath) return;
+    try {
+      const data = await safeReadJson<Record<string, number> | null>(this.statePath, null);
+      if (data && typeof data === 'object') {
+        for (const [vault, ts] of Object.entries(data)) {
+          if (typeof ts !== 'number') continue;
+          if (vault === GLOBAL_LAST_FIRED_KEY) this.lastBatchFiredAt = ts;
+          else this.lastFiredAt.set(vault, ts);
+        }
+        this.logger.info('WikiReflectTrigger loaded persisted state', {
+          statePath: this.statePath,
+          vaults: this.lastFiredAt.size,
+        });
+      }
+    } catch (err) {
+      // A transient read error must not abort the tick — proceed with an empty
+      // ledger this run (worst case: one extra fire, then it re-persists).
+      this.logger.warn('WikiReflectTrigger: failed to load state (non-fatal)', {
+        statePath: this.statePath,
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  /** Persist the debounce ledger (best-effort; failures logged, not thrown). */
+  private async saveStateToDisk(): Promise<void> {
+    if (!this.statePath) return;
+    try {
+      const payload: Record<string, number> = {};
+      for (const [vault, ts] of this.lastFiredAt) payload[vault] = ts;
+      if (this.lastBatchFiredAt > 0) payload[GLOBAL_LAST_FIRED_KEY] = this.lastBatchFiredAt;
+      await ensureDir(path.dirname(this.statePath));
+      await atomicWriteJson(this.statePath, payload);
+    } catch (err) {
+      this.logger.warn('WikiReflectTrigger: failed to persist state (non-fatal)', {
+        statePath: this.statePath,
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  static getInstance(): WikiReflectTriggerService | null {
+    return this.instance;
+  }
+
+  static setInstance(next: WikiReflectTriggerService | null): void {
+    if (this.instance && this.instance !== next) this.instance.stop();
+    this.instance = next;
+  }
+
+  start(): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => void this.tick(), this.intervalMs);
+    this.timer.unref?.();
+    this.logger.info('WikiReflectTrigger started', {
+      intervalMs: this.intervalMs,
+      quietWindowMs: this.quietWindowMs,
+      debounceMs: this.debounceMs,
+    });
+  }
+
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+      this.logger.info('WikiReflectTrigger stopped');
+    }
+  }
+
+  /**
+   * Run one scan. Returns the per-vault outcome for observability + tests.
+   */
+  async tick(opts?: { ignoreDebounce?: boolean }): Promise<{
+    scanned: string[];
+    fired: string[];
+    skippedByActivity: string[];
+    skippedByDebounce: string[];
+    /** Why the whole tick was skipped before any vault was looked at. */
+    skippedTick?: 'batch_debounce' | 'no_conversation';
+  }> {
+    await this.loadStateFromDisk();
+    const ignoreDebounce = opts?.ignoreDebounce === true;
+    const result = {
+      scanned: [] as string[],
+      fired: [] as string[],
+      skippedByActivity: [] as string[],
+      skippedByDebounce: [] as string[],
+      skippedTick: undefined as 'batch_debounce' | 'no_conversation' | undefined,
+    };
+
+    const now = this.nowFn();
+
+    // Whole-tick gates (batched mode only). Checked before the vault scan so
+    // the per-vault ledgers are untouched when we bail: a vault that was due
+    // stays due for the next tick that is allowed to fire.
+    if (this.batchFireFn && !ignoreDebounce) {
+      if (now - this.lastBatchFiredAt < this.batchDebounceMs) {
+        result.skippedTick = 'batch_debounce';
+        return result;
+      }
+      if (this.hasConversationSince) {
+        let active = true;
+        try {
+          active = await this.hasConversationSince(this.lastBatchFiredAt);
+        } catch (err) {
+          // Fail open: a broken probe must not silence the trigger for good.
+          this.logger.warn('WikiReflectTrigger: hasConversationSince threw — assuming activity', {
+            error: (err as Error).message,
+          });
+        }
+        if (!active) {
+          result.skippedTick = 'no_conversation';
+          this.logger.debug('WikiReflectTrigger: no conversation since last fire — not waking ORC', {
+            lastBatchFiredAt: this.lastBatchFiredAt,
+          });
+          return result;
+        }
+      }
+    }
+
+    const vaults = await this.discoverRoots();
+    result.scanned = [...vaults];
+    const cutoff = now - this.quietWindowMs;
+    let stateDirty = false;
+    const batch: WikiReflectFireMeta[] = [];
+
+    for (const v of vaults) {
+      if (this.inflight.has(v)) continue;
+      this.inflight.add(v);
+      try {
+        const items: WikiQueueItem[] = await this.queueService.list({ vaultPath: v });
+
+        let recentAdds = 0;
+        let lastAddMs = -Infinity;
+        for (const item of items) {
+          const queuedAt = Date.parse(item.queuedAt);
+          if (Number.isFinite(queuedAt)) {
+            if (queuedAt >= cutoff) recentAdds++;
+            if (queuedAt > lastAddMs) lastAddMs = queuedAt;
+          }
+        }
+
+        if (recentAdds > 0) {
+          result.skippedByActivity.push(v);
+          continue;
+        }
+        const last = this.lastFiredAt.get(v) ?? 0;
+        if (!ignoreDebounce && now - last < this.debounceMs) {
+          result.skippedByDebounce.push(v);
+          continue;
+        }
+
+        this.lastFiredAt.set(v, now);
+        stateDirty = true;
+        const msSinceLastQueueAdd =
+          lastAddMs === -Infinity ? Number.POSITIVE_INFINITY : now - lastAddMs;
+        const meta: WikiReflectFireMeta = {
+          vaultPath: v,
+          msSinceLastQueueAdd,
+          recentQueueAdds: recentAdds,
+          totalQueueItems: items.length,
+        };
+        if (this.batchFireFn) {
+          batch.push(meta);
+          result.fired.push(v);
+          continue;
+        }
+        try {
+          await this.fireFn?.(meta);
+          result.fired.push(v);
+          this.logger.info('WikiReflectTrigger fired', {
+            vault: v,
+            totalQueueItems: items.length,
+            msSinceLastQueueAdd:
+              msSinceLastQueueAdd === Number.POSITIVE_INFINITY
+                ? 'never'
+                : Math.floor(msSinceLastQueueAdd / 1000),
+          });
+        } catch (err) {
+          this.logger.warn('WikiReflectTrigger: fireFn threw (swallowed)', {
+            vault: v,
+            error: (err as Error).message,
+          });
+        }
+      } finally {
+        this.inflight.delete(v);
+      }
+    }
+    if (this.batchFireFn && batch.length > 0) {
+      this.lastBatchFiredAt = now;
+      stateDirty = true;
+      try {
+        await this.batchFireFn(batch);
+        this.logger.info('WikiReflectTrigger fired (batched)', {
+          vaults: batch.map((m) => m.vaultPath),
+        });
+      } catch (err) {
+        this.logger.warn('WikiReflectTrigger: batchFireFn threw (swallowed)', {
+          vaults: batch.length,
+          error: (err as Error).message,
+        });
+      }
+    }
+    if (stateDirty) await this.saveStateToDisk();
+    return result;
+  }
+
+  /**
+   * Test affordance — clear the in-memory debounce ledger. Leaves `stateLoaded`
+   * set so a subsequent `tick()` does NOT reload the persisted ledger (which
+   * would undo the clear). To force a real fire past debounce in production,
+   * use `tick({ ignoreDebounce: true })` instead of this.
+   */
+  _resetDebounceForTesting(): void {
+    this.lastFiredAt.clear();
+  }
+}

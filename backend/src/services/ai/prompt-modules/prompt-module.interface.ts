@@ -1,0 +1,325 @@
+import * as fs from 'fs';
+import * as path from 'path';
+
+/**
+ * Interface for modular prompt components.
+ *
+ * Each module is responsible for one concern (identity, skills, team, etc.)
+ * and produces a markdown string that gets assembled into the final agent prompt.
+ *
+ * Modules are assembled in priority order (1 = highest, assembled first).
+ * Non-compactable modules are never truncated when token budget is tight.
+ */
+
+/**
+ * Configuration passed to each prompt module during assembly.
+ * Contains all the context needed to build module-specific content.
+ */
+/**
+ * Organizational role derived from team hierarchy.
+ * Determines role boundary rules and event subscriptions.
+ */
+export type OrgRole = 'orchestrator' | 'team-lead' | 'executor';
+
+/**
+ * Autonomy level controls the decision rights matrix.
+ * - directed: Execute assigned tasks only, escalate all ambiguity.
+ * - bounded: Make decisions within task/domain scope, log rationale.
+ * - domain_autonomous: Monitor domain continuously, make approved decisions without waiting.
+ */
+export type AutonomyLevel = 'directed' | 'bounded' | 'domain_autonomous';
+
+export interface ModuleConfig {
+	/** Agent's session name (e.g. 'crewly-product-sam-217bfbbf') */
+	sessionName: string;
+	/** Agent's member ID (UUID) */
+	memberId: string;
+	/** Agent's role (e.g. 'developer', 'orchestrator') */
+	role: string;
+	/** Team ID this agent belongs to */
+	teamId?: string;
+	/** Absolute path to the project directory */
+	projectPath?: string;
+	/** Runtime type determines formatting and injection strategy */
+	runtimeType?: 'claude-code' | 'gemini-cli' | 'codex' | 'crewly-agent';
+	/** Whether this agent can delegate tasks to subordinates */
+	canDelegate?: boolean;
+	/** Resolved subordinate details for TL agents */
+	subordinates?: SubordinateInfoCompat[];
+	/** Absolute path to agent skill scripts */
+	agentSkillsPath: string;
+	/** Absolute path to team-leader skill scripts */
+	tlSkillsPath: string;
+	/** Absolute path to the project root (where config/ lives) */
+	projectRoot: string;
+
+	// === Architecture Upgrade fields ===
+
+	/** Organizational role derived from team hierarchy (orchestrator, team-lead, executor) */
+	orgRole?: OrgRole;
+	/** Autonomy level controlling the decision rights matrix */
+	autonomyLevel?: AutonomyLevel;
+	/** Capability flags (e.g., ['can-decide', 'can-verify']) */
+	capabilities?: string[];
+	/** Owner-declared skill tags; rendered as `{{MEMBER_SKILLS_JSON}}` in role prompts. */
+	skills?: string[];
+	/** Domain SOP name — loads config/domain-sops/{domainSOP}.sop.md */
+	domainSOP?: string;
+	/** Risk policy name — loads config/risk-policies/{riskPolicy}.policy.md */
+	riskPolicy?: string;
+
+	// === Organization Model fields ===
+
+	/** Job title for this position: "Frontend Tech Lead" */
+	jobTitle?: string;
+	/** What this member is responsible for */
+	jobDescription?: string;
+	/** Member-level ownership scope */
+	ownershipScope?: { domains: string[]; deliverables: string[]; areas?: string[] };
+	/** Team-level ownership scope */
+	teamOwnershipScope?: { domains: string[]; deliverables: string[]; areas?: string[] };
+	/** Team's service contract */
+	serviceContract?: { accepts: string[]; avoids: string[]; expectedOutput: string[] };
+	/** Expert profile ID — loads config/experts/{expertId}.md or Pro expert library */
+	expertId?: string;
+	/** Team description — injected into agent prompt to guide team-aligned behavior */
+	teamDescription?: string;
+	/** Team mission / OKR statement — injected into agent prompt for goal alignment */
+	teamMission?: string;
+	/** Team budget configuration — injected so agents can respect cost constraints */
+	teamBudget?: { maxTokensPerDay?: number; maxUsdPerMonth?: number; alertThreshold?: number };
+	/**
+	 * Model tiers of the team (crewly#1173): set when the team has
+	 * "Optimize usage" on; rendered for its leads by the model-tiers module.
+	 */
+	teamTiers?: {
+		optimizeUsage: boolean;
+		/** `approve`: the owner approves each change; `auto`: the lead's changes apply at once (owner can undo). Absent = approve. */
+		changeMode?: 'approve' | 'auto';
+		members: Array<{ name: string; tier: string | null; model: string }>;
+		routingRules: string[];
+	};
+	/** Team quality gate — injected so agents know review requirements */
+	teamQualityGate?: { reviewerId?: string; autoApprove?: boolean; minQualityScore?: number };
+	/** Absolute path to team norms directory (from template application) */
+	teamNormsPath?: string;
+	/**
+	 * Human-readable team slug used for resolving slug-named team files
+	 * (e.g. `<teamSlug>-team-sub-okr.md` under `.crewly/goals/`).
+	 * Populated by PromptBuilderService from team metadata when available.
+	 * Optional — modules MUST tolerate undefined and skip slug-dependent
+	 * sections silently.
+	 */
+	teamSlug?: string;
+	/**
+	 * Team-graph ancestor IDs (parent, grandparent, ...) used by modules
+	 * that need to surface inherited org context such as parent-team
+	 * missions / OKRs. Caller resolves the chain; modules consume it
+	 * read-only. Empty / undefined means "no ancestors" — modules MUST
+	 * default to a single-team view rather than error.
+	 */
+	teamAncestorIds?: string[];
+
+	// === Startup briefings (#395, #816) ===
+
+	/**
+	 * Pre-rendered `## Your Active Work` markdown (Requests + WorkItems) from
+	 * ActiveWorkBriefingService. Rendered by the `active-work` module. The
+	 * caller generates it (registration does) so modules stay free of
+	 * TaskPool/Request I/O. Undefined means "not generated for this prompt":
+	 * the module then tells the agent to fetch it with get-my-active-work.
+	 */
+	activeWorkBriefing?: string;
+	/**
+	 * Pre-rendered session-memory startup briefing (`## Your Previous
+	 * Knowledge`) from SessionMemoryService. Rendered by the
+	 * `session-briefing` module; omitted when undefined or empty.
+	 */
+	sessionBriefing?: string;
+
+	// === Eval mode ===
+
+	/**
+	 * When true, the prompt assembler skips non-core modules to reduce token usage
+	 * during eval runs. Core modules: identity, soul, role-boundary, recovery.
+	 */
+	evalMode?: boolean;
+
+	// === Prompt profile ===
+
+	/**
+	 * Prompt tier to assemble. `full` (default) includes every applicable
+	 * module; `lite` drops the modules that only matter for planning /
+	 * onboarding (expert profile, domain SOP, learning reference, SOP-vs-norm
+	 * distinction, lazy anti-patterns) and collapses the mission card to one
+	 * line, so routine wake-ups re-read a smaller system prompt. Operational
+	 * modules (identity, communication, lifecycle, recovery, project and
+	 * memory references) are always kept. See {@link PromptProfile}.
+	 */
+	promptProfile?: PromptProfile;
+}
+
+/**
+ * Prompt tiers understood by the assembler. `full` is the default and the
+ * historical behaviour; `lite` is the reduced tier for routine wake-ups.
+ */
+export const PROMPT_PROFILES = ['full', 'lite'] as const;
+
+/** One of {@link PROMPT_PROFILES}. */
+export type PromptProfile = (typeof PROMPT_PROFILES)[number];
+
+/** Profile used when none is requested — the historical full assembly. */
+export const DEFAULT_PROMPT_PROFILE: PromptProfile = 'full';
+
+/**
+ * Environment variable selecting the orchestrator's prompt profile at
+ * registration time. Any value other than a known profile falls back to
+ * {@link DEFAULT_PROMPT_PROFILE}.
+ */
+export const ORC_PROMPT_PROFILE_ENV = 'CREWLY_ORC_PROMPT_PROFILE';
+
+/**
+ * Type guard for {@link PromptProfile}.
+ *
+ * @param value - Candidate value (typically an env var)
+ * @returns true when `value` names a known profile
+ */
+export function isPromptProfile(value: unknown): value is PromptProfile {
+	return typeof value === 'string' && (PROMPT_PROFILES as readonly string[]).includes(value);
+}
+
+/**
+ * Resolve the orchestrator prompt profile from the environment.
+ *
+ * @param env - Environment map (defaults to `process.env`)
+ * @returns The configured profile, or {@link DEFAULT_PROMPT_PROFILE} when
+ *   the variable is unset or invalid
+ */
+export function resolveOrcPromptProfile(env: NodeJS.ProcessEnv = process.env): PromptProfile {
+	const raw = env[ORC_PROMPT_PROFILE_ENV]?.trim().toLowerCase();
+	return isPromptProfile(raw) ? raw : DEFAULT_PROMPT_PROFILE;
+}
+
+/**
+ * Subordinate info compatible with the existing SubordinateInfo type
+ */
+export interface SubordinateInfoCompat {
+	name: string;
+	sessionName: string;
+	role: string;
+	memberId: string;
+}
+
+/**
+ * Result of building a single prompt module.
+ * Includes the content and metadata for budget tracking.
+ */
+export interface ModuleBuildResult {
+	/** Module name */
+	name: string;
+	/** Generated markdown content */
+	content: string;
+	/** Estimated token count of the content */
+	estimatedTokens: number;
+}
+
+/**
+ * Interface that all prompt modules must implement.
+ *
+ * @example
+ * ```typescript
+ * class IdentityModule implements PromptModule {
+ *   name = 'identity';
+ *   priority = 1;
+ *   maxTokens = 150;
+ *   compactable = false;
+ *
+ *   shouldInclude(_config: ModuleConfig): boolean { return true; }
+ *
+ *   async build(config: ModuleConfig): Promise<string> {
+ *     return `## Your Identity\n- **Session Name:** ${config.sessionName}`;
+ *   }
+ * }
+ * ```
+ */
+export interface PromptModule {
+	/** Module name (used for logging and debugging) */
+	name: string;
+	/** Assembly priority (1 = highest, assembled first) */
+	priority: number;
+	/** Token soft cap for this module */
+	maxTokens: number;
+	/** Whether this module can be skipped when token budget is tight */
+	compactable: boolean;
+	/** Condition check — return false to skip this module */
+	shouldInclude(config: ModuleConfig): boolean;
+	/** Build module content as markdown string */
+	build(config: ModuleConfig): Promise<string>;
+}
+
+/**
+ * Report returned by PromptAssemblyService.assemble() describing
+ * token usage and any truncation that occurred.
+ */
+export interface AssemblyReport {
+	/** Prompt profile the assembly ran under (see {@link PromptProfile}). */
+	profile: PromptProfile;
+	/** Total estimated tokens in the final prompt */
+	totalTokens: number;
+	/** Per-module token breakdown */
+	moduleBreakdown: ModuleBuildResult[];
+	/** Modules that were truncated or removed to fit budget */
+	truncated: TruncatedModuleInfo[];
+}
+
+/**
+ * Info about a module that was truncated or removed during assembly.
+ */
+export interface TruncatedModuleInfo {
+	/** Module name */
+	name: string;
+	/** Original estimated tokens before truncation */
+	originalTokens: number;
+	/** Tokens after truncation (0 if fully removed) */
+	finalTokens: number;
+	/** What happened: 'trimmed' (to 50%) or 'removed' (dropped entirely) */
+	action: 'trimmed' | 'removed';
+}
+
+/**
+ * Load a role-specific fragment file from config/roles/{role}/fragments/{fragmentName}.md.
+ * Returns null if the file doesn't exist.
+ *
+ * @param projectRoot - Project root path (where config/ lives)
+ * @param role - Agent role (e.g. 'orchestrator')
+ * @param fragmentName - Fragment file name without .md extension
+ * @returns Fragment content string or null
+ */
+export function loadRoleFragment(
+	projectRoot: string,
+	role: string,
+	fragmentName: string
+): string | null {
+	try {
+		const fragmentPath = path.join(projectRoot, 'config', 'roles', role, 'fragments', `${fragmentName}.md`);
+		if (fs.existsSync(fragmentPath)) {
+			return fs.readFileSync(fragmentPath, 'utf-8');
+		}
+	} catch {
+		// Fragment not found — fall back to inline content
+	}
+	return null;
+}
+
+/**
+ * Estimate token count from a string.
+ * Uses the rough heuristic of ~4 characters per token (suitable for English/code mix).
+ *
+ * @param text - Text to estimate tokens for
+ * @returns Estimated token count
+ */
+export function estimateTokens(text: string): number {
+	if (!text) return 0;
+	// ~4 chars per token is a reasonable estimate for English + code
+	return Math.ceil(text.length / 4);
+}

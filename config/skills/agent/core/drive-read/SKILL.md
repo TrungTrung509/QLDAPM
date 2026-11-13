@@ -1,0 +1,58 @@
+---
+name: Drive Read
+description: "Read the content of a Google Drive file (via the Google Workspace grant held by Crewly Cloud) — Docs → text, Sheets → CSV, Slides → text, other files downloaded (text printed, binaries saved with --out). Read-only."
+version: 1.0.0
+category: productivity
+skillType: claude-skill
+triggers:
+  - read drive file
+  - open file from drive
+  - download from drive
+tags:
+  - google
+  - drive
+execution:
+  type: script
+  script:
+    file: execute.sh
+    interpreter: bash
+    timeoutMs: 600000
+---
+
+# Drive Read
+
+```bash
+bash execute.sh --id 1AbC…                        # print content (text/CSV) as JSON
+bash execute.sh --id 1AbC… --out /tmp/report.pdf  # save (binary decoded) and print metadata
+```
+
+A file over the skill output cap (60 KB) is too big to print: without `--out` you get a one-line `{"truncated":true,...,"next":"...--out <path>..."}` envelope. With `--out` the cap is skipped and the exact bytes are saved (a binary of any size); `--out` fails with `reason: no_content` / `truncated_response` rather than report success without a file.
+
+## Output
+
+```json
+{"file":{"id":"1AbC…","name":"Q3 plan","mimeType":"application/vnd.google-apps.document","webViewLink":"https://…"},"contentType":"text/plain","encoding":"utf8","bytes":1234,"content":"…"}
+```
+
+For a Google Doc / Sheet / Slides prefer `docs-read` / `sheets-read` /
+`slides-read` — they keep structure (headings, cell grid, per-slide lines).
+Files over 10 MB are refused with a `webViewLink` to open instead.
+
+## Failures
+
+`{"success":false,"reason":"not_connected","hint":"<connect URL>"}` (exit 1)
+when the owner has not connected Google Workspace. Run the `google-connect` skill
+to post the owner a one-tap card in Slack (never send them to Crewly settings or
+the Connections page — they are usually on a phone). Manual fallback: https://crewlyai.com/portal/integrations/google.
+A `403` with `reason: "google_error"` on a write means the file was not
+created by Crewly — the grant only edits files Crewly made (`drive.file`).
+
+## Choosing a Google account
+
+Several Google accounts can be connected at once. Without `--account` the call uses the default one (the first you connected, or whichever the owner marked default). Name one explicitly when it matters:
+
+```bash
+bash execute.sh --account work@company.com ...
+```
+
+The account must be connected *for this product* — Google consent is per product (Gmail / Calendar / Drive), so an account connected only for Calendar cannot read Drive.

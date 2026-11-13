@@ -1,0 +1,2853 @@
+// Updated: 2026-04-13T15:54:17Z - request title summarization + dangling fix
+/**
+ * Tests for Reconcile Rules
+ *
+ * @module services/reconciler/reconcile-rules.test
+ */
+
+import {
+  isHousekeepingWorkItem,
+  detectStuckWorkItems,
+  detectRetryableFailedWorkItems,
+  detectExpiredClaims,
+  isAgentVisiblyWorking,
+  reconcileRequestStatus,
+  detectOrphanWorkItems,
+  detectTTLExpiredWorkItems,
+  pickTTLExpiryTarget,
+  pickCascadeTarget,
+  detectUnverifiedWorkItems,
+  detectUnreviewedPastTTL,
+  REVIEW_OWNER_ESCALATED_AT_KEY,
+  DEFAULT_VERIFY_ESCALATE_MS,
+  VERIFY_ESCALATED_AT_KEY,
+  detectRecoverableWorkItems,
+  detectDependencyResolvedWorkItems,
+  detectDueBlockedWorkItems,
+  cascadeCancelChildren,
+  detectStaleQueuedWorkItems,
+  detectUnclaimedTasks,
+  detectWaitingOnHumanWorkItems,
+  selectBestAgent,
+  computeAgentScore,
+  runPruningPass,
+  decisionHoldPredicate,
+  detectUndisposedStrandedWorkItems,
+  hasUnresolvedDependencies,
+  UNCLAIMED_THRESHOLD_MS,
+  MAX_WAKE_ACTIONS_PER_PASS,
+} from './reconcile-rules.js';
+import type { AgentHealth } from './reconcile-rules.js';
+import { collectRequestWorkItems } from '../v3/request-completion.js';
+import { createWorkItem, createRequest, createTaskClaim } from '../../types/v2/index.js';
+import type { WorkItem, WorkItemStatus, Request, TaskClaim } from '../../types/v2/index.js';
+import {
+  WORK_ITEM_TRANSITIONS,
+  WORK_ITEM_STATUSES,
+  TERMINAL_WORK_ITEM_STATUSES,
+  LAST_REQUEUED_AT_METADATA_KEY,
+  DISPOSITION_METADATA_KEY,
+  WORK_ITEM_BLOCK_SOURCES,
+  isValidWorkItemTransition,
+  isTransitionPermitted,
+  TRANSITION_PERMISSIONS,
+} from '../../types/v2/work-item.types.js';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Creates a WorkItem with overrides. */
+function makeWorkItem(overrides: Partial<WorkItem> = {}): WorkItem {
+  return {
+    ...createWorkItem({ type: 'delegate', owner: 'agent', title: 'Test', target: 'agent-1' }),
+    ...overrides,
+  };
+}
+
+/** Creates a Request with overrides. */
+function makeRequest(overrides: Partial<Request> = {}): Request {
+  return {
+    ...createRequest({ sourceConversationItemId: 'conv-1', title: 'Test', description: 'Test desc' }),
+    ...overrides,
+  };
+}
+
+/** Creates a healthy agent map. */
+function makeAgentMap(entries: Array<[string, Partial<AgentHealth>]>): Map<string, AgentHealth> {
+  return new Map(entries.map(([name, overrides]) => [name, {
+    sessionName: name,
+    status: 'active',
+    lastSeenAt: new Date().toISOString(),
+    ...overrides,
+  }]));
+}
+
+// ---------------------------------------------------------------------------
+// detectStuckWorkItems
+// ---------------------------------------------------------------------------
+describe('detectStuckWorkItems', () => {
+  it('should detect WorkItems with dead agents', () => {
+    const wi = makeWorkItem({ status: 'running', target: 'agent-dead', startedAt: new Date().toISOString() });
+    const agentMap = makeAgentMap([['agent-dead', { status: 'inactive' }]]);
+
+    const { corrections, stuckIds } = detectStuckWorkItems([wi], agentMap);
+    expect(stuckIds).toContain(wi.id);
+    expect(corrections).toHaveLength(1);
+    expect(corrections[0].newState).toBe('blocked'); // retryCount < maxRetries
+  });
+
+  it('should mark as failed when retries exhausted', () => {
+    const wi = makeWorkItem({
+      status: 'running',
+      target: 'agent-dead',
+      startedAt: new Date().toISOString(),
+      retryCount: 3,
+      maxRetries: 3,
+    });
+    const agentMap = makeAgentMap([['agent-dead', { status: 'inactive' }]]);
+
+    const { corrections } = detectStuckWorkItems([wi], agentMap);
+    expect(corrections[0].newState).toBe('failed');
+  });
+
+  it('should detect WorkItems with unknown agents', () => {
+    const wi = makeWorkItem({ status: 'running', target: 'agent-missing', startedAt: new Date().toISOString() });
+    const agentMap = new Map<string, AgentHealth>();
+
+    const { stuckIds } = detectStuckWorkItems([wi], agentMap);
+    expect(stuckIds).toContain(wi.id);
+  });
+
+  // WI ece797e7 — the two branches of this rule deliberately disagree, and
+  // that asymmetry is load-bearing enough to pin. The agent-dead branch
+  // respects the retry budget; the TIMEOUT branch does not, because
+  // `detectRetryableFailedWorkItems` is what retries a timed-out item.
+  // Routing timeouts to `blocked` instead would recover them through the
+  // agent-back-online rule and report "Agent is back online" for an agent
+  // that never left. What must NOT happen is escalating off the back of
+  // this `failed` — that gate lives in applyCorrection.
+  it('sets failed (not blocked) for a first-attempt timeout, and the retry rule then re-queues it', () => {
+    const oldStart = new Date(Date.now() - 700_000).toISOString();
+    const wi = makeWorkItem({
+      status: 'running',
+      type: 'check',
+      target: 'agent-alive',
+      startedAt: oldStart,
+      retryCount: 0,
+      maxRetries: 3,
+    });
+    const agentMap = makeAgentMap([['agent-alive', { status: 'active' }]]);
+
+    const { corrections } = detectStuckWorkItems([wi], agentMap);
+    expect(corrections).toHaveLength(1);
+    expect(corrections[0].newState).toBe('failed');
+
+    // The retry genuinely happens — this is why `failed` is the right
+    // target state and why escalating here would be a false alarm.
+    const failed = { ...wi, status: 'failed' as const };
+    const { corrections: retries } = detectRetryableFailedWorkItems([failed]);
+    expect(retries).toHaveLength(1);
+    expect(retries[0].newState).toBe('queued');
+    expect(retries[0].reason).toContain('attempt 1/3');
+  });
+
+  it('should detect timed-out WorkItems even with active agents', () => {
+    const oldStart = new Date(Date.now() - 700_000).toISOString(); // 11+ min ago
+    // type='check' falls back to the default 600_000ms timeout;
+    // 'delegate' / 'review' / 'project_task' / 'confirm' have per-type
+    // overrides that would skip this case (see DEFAULT_PER_TYPE_TIMEOUT_MS).
+    const wi = makeWorkItem({
+      type: 'check',
+      status: 'running',
+      target: 'agent-1',
+      startedAt: oldStart,
+    });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    const { stuckIds } = detectStuckWorkItems([wi], agentMap, 600_000);
+    expect(stuckIds).toContain(wi.id);
+  });
+
+  it('SW-1: mark as failed immediately when maxRetries is 0', () => {
+    const wi = makeWorkItem({
+      status: 'running',
+      target: 'agent-dead',
+      startedAt: new Date().toISOString(),
+      retryCount: 0,
+      maxRetries: 0,
+    });
+    const agentMap = makeAgentMap([['agent-dead', { status: 'inactive' }]]);
+
+    const { corrections } = detectStuckWorkItems([wi], agentMap);
+    expect(corrections[0].newState).toBe('failed');
+    expect(corrections[0].reason).toContain('inactive');
+  });
+
+  it('should skip non-running WorkItems', () => {
+    const wi = makeWorkItem({ status: 'queued', target: 'agent-1' });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    const { stuckIds } = detectStuckWorkItems([wi], agentMap);
+    expect(stuckIds).toHaveLength(0);
+  });
+
+  it('should skip WorkItems without target', () => {
+    const wi = makeWorkItem({ status: 'running', target: undefined });
+    const agentMap = new Map<string, AgentHealth>();
+
+    const { stuckIds } = detectStuckWorkItems([wi], agentMap);
+    expect(stuckIds).toHaveLength(0);
+  });
+
+  it('should not flag healthy running WorkItems', () => {
+    const wi = makeWorkItem({ status: 'running', target: 'agent-1', startedAt: new Date().toISOString() });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    const { stuckIds } = detectStuckWorkItems([wi], agentMap);
+    expect(stuckIds).toHaveLength(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // Per-type timeout (2026-05-06 dogfood regression — see DEFAULT_PER_TYPE_TIMEOUT_MS)
+  // -------------------------------------------------------------------------
+  it('should NOT timeout delegate-type WIs at the default 10min threshold', () => {
+    // 11 minutes of running — past the legacy 10min default but well within
+    // the 4h delegate-type override. A TL umbrella WI must not flip to failed
+    // here, otherwise the cascade-cancel rules will wipe its children.
+    const oldStart = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    const wi = makeWorkItem({
+      type: 'delegate',
+      status: 'running',
+      target: 'agent-1',
+      startedAt: oldStart,
+    });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    const { stuckIds } = detectStuckWorkItems([wi], agentMap, 600_000);
+    expect(stuckIds).toHaveLength(0);
+  });
+
+  it('should NOT timeout review-type WIs at the default 10min threshold', () => {
+    const oldStart = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const wi = makeWorkItem({
+      type: 'review',
+      status: 'running',
+      target: 'agent-1',
+      startedAt: oldStart,
+    });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    const { stuckIds } = detectStuckWorkItems([wi], agentMap, 600_000);
+    expect(stuckIds).toHaveLength(0);
+  });
+
+  it('should still timeout delegate WIs once the 4h ceiling is exceeded', () => {
+    const oldStart = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(); // 5h
+    const wi = makeWorkItem({
+      type: 'delegate',
+      status: 'running',
+      target: 'agent-1',
+      startedAt: oldStart,
+    });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    const { stuckIds } = detectStuckWorkItems([wi], agentMap, 600_000);
+    expect(stuckIds).toContain(wi.id);
+  });
+
+  it('should NEVER timeout confirm-type WIs (waiting on user)', () => {
+    const ancientStart = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(); // 24h
+    const wi = makeWorkItem({
+      type: 'confirm',
+      status: 'running',
+      target: 'agent-1',
+      startedAt: ancientStart,
+    });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    const { stuckIds } = detectStuckWorkItems([wi], agentMap, 600_000);
+    expect(stuckIds).toHaveLength(0);
+  });
+
+  it('should honor caller-provided per-type timeout overrides', () => {
+    const oldStart = new Date(Date.now() - 30_000).toISOString(); // 30s
+    const wi = makeWorkItem({
+      type: 'project_task',
+      status: 'running',
+      target: 'agent-1',
+      startedAt: oldStart,
+    });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    // Override default 10min → 10s for project_task; the 30s-old WI should now timeout.
+    const { stuckIds } = detectStuckWorkItems([wi], agentMap, 600_000, { project_task: 10_000 });
+    expect(stuckIds).toContain(wi.id);
+  });
+
+  it('gives a project task 4 h, not the 10 min default (CE-415 failed three times while Vera worked on it)', () => {
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+    const at = (agoMs: number) => makeWorkItem({ type: 'project_task', status: 'running', target: 'agent-1', startedAt: new Date(Date.now() - agoMs).toISOString() });
+    expect(detectStuckWorkItems([at(60 * 60_000)], agentMap, 600_000).stuckIds).toHaveLength(0);
+    const late = at(4 * 60 * 60_000 + 60_000);
+    expect(detectStuckWorkItems([late], agentMap, 600_000).stuckIds).toContain(late.id);
+  });
+
+  it('does not time out an item whose claim lease is live (renewed while its holder works)', () => {
+    const wi = makeWorkItem({ type: 'check', status: 'running', target: 'agent-1', startedAt: new Date(Date.now() - 700_000).toISOString() });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+    const claim = createTaskClaim({ workItemId: wi.id, agentId: 'agent-1' });
+    expect(detectStuckWorkItems([wi], agentMap, 600_000, undefined, [claim]).stuckIds).toHaveLength(0);
+    const lapsed: TaskClaim = { ...claim, leaseExpiresAt: new Date(Date.now() - 1000).toISOString() };
+    expect(detectStuckWorkItems([wi], agentMap, 600_000, undefined, [lapsed]).stuckIds).toContain(wi.id);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectExpiredClaims
+// ---------------------------------------------------------------------------
+describe('detectExpiredClaims', () => {
+  it('should detect lease-expired active claims', () => {
+    const claim = createTaskClaim({ workItemId: 'wi-1', agentId: 'agent-1' });
+    // Simulate lease expired
+    const expiredClaim: TaskClaim = {
+      ...claim,
+      leaseExpiresAt: new Date(Date.now() - 1000).toISOString(),
+    };
+
+    const { expiringIds } = detectExpiredClaims([expiredClaim]);
+    expect(expiringIds).toContain(claim.id);
+  });
+
+  it('should detect grace-period-exceeded expiring claims', () => {
+    const claim = createTaskClaim({ workItemId: 'wi-1', agentId: 'agent-1' });
+    const expiringClaim: TaskClaim = {
+      ...claim,
+      status: 'expiring',
+      leaseExpiresAt: new Date(Date.now() - 200_000).toISOString(), // 200s ago > 180s grace
+    };
+
+    const { revokedIds } = detectExpiredClaims([expiringClaim], 180_000);
+    expect(revokedIds).toContain(claim.id);
+  });
+
+  it('should not flag fresh active claims', () => {
+    const claim = createTaskClaim({ workItemId: 'wi-1', agentId: 'agent-1' });
+    const { expiringIds, revokedIds } = detectExpiredClaims([claim]);
+    expect(expiringIds).toHaveLength(0);
+    expect(revokedIds).toHaveLength(0);
+  });
+
+  it('should skip released/revoked claims', () => {
+    const claim = createTaskClaim({ workItemId: 'wi-1', agentId: 'agent-1' });
+    const released: TaskClaim = { ...claim, status: 'released' };
+    const { expiringIds } = detectExpiredClaims([released]);
+    expect(expiringIds).toHaveLength(0);
+  });
+
+  // 2026-09-29, WI f34f09b0 / CE-19: nobody runs the heartbeat skill, so the
+  // lease was a fixed 10 min + 3 min from the claim and Vera's claim was
+  // revoked four times while she worked the item.
+  describe('liveness renewal', () => {
+    const now = Date.parse('2026-09-29T23:39:55.000Z');
+    const health = (over: Partial<AgentHealth> = {}): Map<string, AgentHealth> =>
+      new Map([['ce-vera', {
+        sessionName: 'ce-vera',
+        status: 'active',
+        lastActivityAt: new Date(now - 30_000).toISOString(),
+        ...over,
+      } as AgentHealth]]);
+    const claimAt = (status: TaskClaim['status'], leaseAgoMs: number): TaskClaim => ({
+      ...createTaskClaim({ workItemId: 'f34f09b0', agentId: 'ce-vera' }),
+      status,
+      leaseExpiresAt: new Date(now - leaseAgoMs).toISOString(),
+    });
+
+    it('renews an expiring claim past its grace when the holder is working', () => {
+      const claim = claimAt('expiring', 200_000);
+      const { renewedIds, revokedIds, expiringIds, corrections } = detectExpiredClaims([claim], 180_000, health(), now);
+      expect(renewedIds).toEqual([claim.id]);
+      expect(revokedIds).toHaveLength(0);
+      expect(expiringIds).toHaveLength(0);
+      expect(corrections[0]).toMatchObject({ entityType: 'claim', previousState: 'expiring', newState: 'active' });
+      expect(corrections[0].reason).toContain('ce-vera is working');
+    });
+
+    it('renews an active claim whose lease just ran out instead of marking it expiring', () => {
+      const claim = claimAt('active', 1_000);
+      const { renewedIds, expiringIds } = detectExpiredClaims([claim], 180_000, health(), now);
+      expect(renewedIds).toEqual([claim.id]);
+      expect(expiringIds).toHaveLength(0);
+    });
+
+    it('does nothing to a claim whose lease has not run out', () => {
+      const claim = claimAt('active', -60_000);
+      expect(detectExpiredClaims([claim], 180_000, health(), now).corrections).toHaveLength(0);
+    });
+
+    it('still revokes when the holder went quiet (hung session keeps being detected)', () => {
+      const claim = claimAt('expiring', 200_000);
+      const quiet = health({ lastActivityAt: new Date(now - 20 * 60_000).toISOString() });
+      const { renewedIds, revokedIds } = detectExpiredClaims([claim], 180_000, quiet, now);
+      expect(renewedIds).toHaveLength(0);
+      expect(revokedIds).toEqual([claim.id]);
+    });
+
+    it('still revokes when the holder is inactive, on a human prompt, never seen, or unknown', () => {
+      const claim = claimAt('expiring', 200_000);
+      for (const map of [
+        health({ status: 'inactive' }),
+        health({ waitingOnHumanSince: new Date(now - 60_000).toISOString() }),
+        health({ lastActivityAt: undefined }),
+        new Map<string, AgentHealth>(),
+        undefined,
+      ]) {
+        expect(detectExpiredClaims([claim], 180_000, map, now).revokedIds).toEqual([claim.id]);
+      }
+    });
+  });
+});
+
+describe('isAgentVisiblyWorking', () => {
+  const now = Date.now();
+  const base: AgentHealth = { sessionName: 'a', status: 'active', lastActivityAt: new Date(now - 1_000).toISOString() };
+
+  it('is true for an active or starting agent with recent activity', () => {
+    expect(isAgentVisiblyWorking(base, now)).toBe(true);
+    expect(isAgentVisiblyWorking({ ...base, status: 'started' }, now)).toBe(true);
+  });
+
+  it('is false outside the window, without activity, on a prompt, or when not up', () => {
+    expect(isAgentVisiblyWorking({ ...base, lastActivityAt: new Date(now - 10 * 60_000).toISOString() }, now)).toBe(false);
+    expect(isAgentVisiblyWorking({ ...base, lastActivityAt: undefined }, now)).toBe(false);
+    expect(isAgentVisiblyWorking({ ...base, lastActivityAt: 'not a date' }, now)).toBe(false);
+    expect(isAgentVisiblyWorking({ ...base, waitingOnHumanSince: new Date(now).toISOString() }, now)).toBe(false);
+    expect(isAgentVisiblyWorking({ ...base, status: 'suspended' }, now)).toBe(false);
+    expect(isAgentVisiblyWorking(undefined, now)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reconcileRequestStatus
+// ---------------------------------------------------------------------------
+describe('reconcileRequestStatus', () => {
+  it('leaves a ticket in 待验收 and a ticket with no WorkItems alone (Phase 2)', () => {
+    expect(reconcileRequestStatus(makeRequest({ status: 'waiting_confirmation', ticketNumber: 3, workItemIds: [] }), [])).toBeNull();
+    expect(reconcileRequestStatus(makeRequest({ status: 'running', ticketNumber: 3, workItemIds: [] }), [])).toBeNull();
+    const inReview = makeRequest({ status: 'waiting_confirmation', ticketNumber: 3, workItemIds: ['wi-1'] });
+    expect(reconcileRequestStatus(inReview, [makeWorkItem({ id: 'wi-1', status: 'done' })])).toBeNull();
+  });
+
+  it('leaves a ticket awaiting follow-up alone (reply-open-items)', () => {
+    const waiting = makeRequest({ status: 'awaiting_followup', ticketNumber: 185, workItemIds: ['wi-1', 'wi-2'] });
+    expect(reconcileRequestStatus(waiting, [makeWorkItem({ id: 'wi-1', status: 'running' }), makeWorkItem({ id: 'wi-2', status: 'done' })])).toBeNull();
+    expect(reconcileRequestStatus(waiting, [])).toBeNull();
+  });
+
+  it('should transition running request to done when all WorkItems done', () => {
+    const request = makeRequest({ status: 'running', workItemIds: ['wi-1', 'wi-2'] });
+    const workItems = [
+      makeWorkItem({ id: 'wi-1', status: 'done' }),
+      makeWorkItem({ id: 'wi-2', status: 'done' }),
+    ];
+
+    const correction = reconcileRequestStatus(request, workItems);
+    expect(correction).not.toBeNull();
+    expect(correction!.newState).toBe('done');
+  });
+
+  it('should transition to waiting_confirmation when requiresConfirmation', () => {
+    const request = makeRequest({
+      status: 'running',
+      requiresConfirmation: true,
+      workItemIds: ['wi-1'],
+    });
+    const workItems = [makeWorkItem({ id: 'wi-1', status: 'done' })];
+
+    const correction = reconcileRequestStatus(request, workItems);
+    expect(correction).not.toBeNull();
+    expect(correction!.newState).toBe('waiting_confirmation');
+  });
+
+  it('should transition to blocked when all WorkItems blocked/failed', () => {
+    const request = makeRequest({ status: 'running', workItemIds: ['wi-1', 'wi-2'] });
+    const workItems = [
+      makeWorkItem({ id: 'wi-1', status: 'blocked' }),
+      makeWorkItem({ id: 'wi-2', status: 'failed' }),
+    ];
+
+    const correction = reconcileRequestStatus(request, workItems);
+    expect(correction).not.toBeNull();
+    expect(correction!.newState).toBe('blocked');
+  });
+
+  it('should keep running if mix of running and done', () => {
+    const request = makeRequest({ status: 'running', workItemIds: ['wi-1', 'wi-2'] });
+    const workItems = [
+      makeWorkItem({ id: 'wi-1', status: 'done' }),
+      makeWorkItem({ id: 'wi-2', status: 'running' }),
+    ];
+
+    const correction = reconcileRequestStatus(request, workItems);
+    expect(correction).toBeNull(); // already running
+  });
+
+  it('should transition ready to running when WorkItems are running', () => {
+    const request = makeRequest({ status: 'ready', workItemIds: ['wi-1'] });
+    const workItems = [makeWorkItem({ id: 'wi-1', status: 'running' })];
+
+    const correction = reconcileRequestStatus(request, workItems);
+    expect(correction).not.toBeNull();
+    expect(correction!.newState).toBe('running');
+  });
+
+  it('should not touch terminal requests', () => {
+    const doneRequest = makeRequest({ status: 'done' });
+    expect(reconcileRequestStatus(doneRequest, [])).toBeNull();
+
+    const cancelledRequest = makeRequest({ status: 'cancelled' });
+    expect(reconcileRequestStatus(cancelledRequest, [])).toBeNull();
+  });
+
+  it('should not touch open request with no WorkItems', () => {
+    const request = makeRequest({ status: 'open' });
+    expect(reconcileRequestStatus(request, [])).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // 2026-09-26, Request d86b5faf: closed as done on {verified:2, cancelled:2}
+  // while the only real work (re-routed WI 806dc528) was still running.
+  // -------------------------------------------------------------------------
+  describe('does not close a Request whose real work was cancelled or moved', () => {
+    const REQ = 'd86b5faf-4693-4941-aa9b-7216ffb90005';
+    const DUP =
+      'Duplicate/stale: Plan WI 8249a788 already re-routed this Request to Ella as WI 806dc528 with full G+O+E.';
+    const decomposed = { autoDecomposed: true };
+
+    /**
+     * Pool as it stood at 03:49:08 on 2026-09-26.
+     *
+     * @param reroutedStatus - Status of the re-routed WorkItem 806dc528
+     * @returns Pool snapshot
+     */
+    function incidentPool(reroutedStatus: WorkItemStatus): WorkItem[] {
+      return [
+        makeWorkItem({ id: '8249a788-1ea7-4687-ac1a-47d078a34afe', requestId: REQ, title: 'Plan: Fake-door', status: 'verified', metadata: decomposed }),
+        makeWorkItem({ id: '51f24f4c-e1ad-4cce-8359-e3e37526d147', requestId: REQ, title: 'Execute: Fake-door', status: 'verified', metadata: decomposed }),
+        makeWorkItem({ id: '8e7466a2-f36c-4d8e-bfb9-60c880d6027e', requestId: REQ, title: 'Review: Fake-door', status: 'cancelled', metadata: decomposed, cancelReason: DUP }),
+        makeWorkItem({ id: '673193ce-e5eb-45c1-b44d-9ade964fa352', requestId: REQ, title: 'Demand test', status: 'cancelled', cancelReason: DUP }),
+        makeWorkItem({
+          id: '806dc528-acbf-4456-af51-5351fa48fada',
+          title: `[Request ${REQ} | WorkItem 8249a788-1ea7-4687-ac1a-47d078a34afe] GOAL: plan`,
+          status: reroutedStatus,
+        }),
+      ];
+    }
+
+    it('reproduces the incident: stays running while the replacement runs', () => {
+      const request = makeRequest({ id: REQ, status: 'running' });
+      const items = collectRequestWorkItems(REQ, incidentPool('running'));
+      expect(reconcileRequestStatus(request, items)).toBeNull();
+    });
+
+    it('closes once the replacement is verified', () => {
+      const request = makeRequest({ id: REQ, status: 'running' });
+      const correction = reconcileRequestStatus(request, collectRequestWorkItems(REQ, incidentPool('verified')));
+      expect(correction?.newState).toBe('done');
+    });
+
+    it('only Plan/Review bookkeeping finished → blocked, never done', () => {
+      const request = makeRequest({ status: 'running' });
+      const items = [
+        makeWorkItem({ title: 'Plan: x', status: 'verified', metadata: decomposed }),
+        makeWorkItem({ title: 'Execute: x', status: 'cancelled', metadata: decomposed, cancelReason: 'no execution needed' }),
+        makeWorkItem({ title: 'Review: x', status: 'verified', metadata: { decompositionPhase: 'review' } }),
+      ];
+      const correction = reconcileRequestStatus(request, items);
+      expect(correction?.newState).toBe('blocked');
+      expect(correction?.reason).toMatch(/no deliverable WorkItem was completed/);
+    });
+
+    it('a verified Plan next to a cancelled duplicate is not done', () => {
+      const request = makeRequest({ status: 'running' });
+      const items = [
+        makeWorkItem({ title: 'Plan: x', status: 'verified', metadata: decomposed }),
+        makeWorkItem({ status: 'cancelled', cancelReason: 'Duplicate of the Plan' }),
+      ];
+      expect(reconcileRequestStatus(request, items)?.newState).toBe('blocked');
+    });
+
+    it('all WorkItems cancelled → cancelled, not done', () => {
+      const request = makeRequest({ status: 'running' });
+      const items = [makeWorkItem({ status: 'cancelled' }), makeWorkItem({ status: 'cancelled' })];
+      expect(reconcileRequestStatus(request, items)?.newState).toBe('cancelled');
+    });
+  });
+
+  it('should count cancelled WorkItems as done for completion', () => {
+    const request = makeRequest({ status: 'running', workItemIds: ['wi-1', 'wi-2'] });
+    const workItems = [
+      makeWorkItem({ id: 'wi-1', status: 'done' }),
+      makeWorkItem({ id: 'wi-2', status: 'cancelled' }),
+    ];
+
+    const correction = reconcileRequestStatus(request, workItems);
+    expect(correction).not.toBeNull();
+    expect(correction!.newState).toBe('done');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectOrphanWorkItems
+// ---------------------------------------------------------------------------
+describe('detectOrphanWorkItems', () => {
+  it('should detect children of cancelled parents', () => {
+    const parent = makeWorkItem({ id: 'parent-1', status: 'cancelled' });
+    const child = makeWorkItem({ id: 'child-1', status: 'running', parentWorkItemId: 'parent-1' });
+    const workItemMap = new Map([[parent.id, parent], [child.id, child]]);
+
+    const { orphanIds } = detectOrphanWorkItems([child], workItemMap);
+    expect(orphanIds).toContain('child-1');
+  });
+
+  it('should detect children of permanently-failed parents (retries exhausted)', () => {
+    const parent = makeWorkItem({
+      id: 'parent-1',
+      status: 'failed',
+      retryCount: 3,
+      maxRetries: 3,
+    });
+    const child = makeWorkItem({ id: 'child-1', status: 'queued', parentWorkItemId: 'parent-1' });
+    const workItemMap = new Map([[parent.id, parent], [child.id, child]]);
+
+    const { orphanIds } = detectOrphanWorkItems([child], workItemMap);
+    expect(orphanIds).toContain('child-1');
+  });
+
+  it('should NOT cascade-cancel when parent is failed but retries remain', () => {
+    // Regression: 2026-05-06 dogfood — umbrella WI hit a 10min timeout, was
+    // marked failed, all 6 children got cancelled, then auto-retry resurrected
+    // the parent leaving it childless. The cascade must skip retry-eligible
+    // parents so the auto-retry pass can revive the whole subtree.
+    const parent = makeWorkItem({
+      id: 'parent-retryable',
+      status: 'failed',
+      retryCount: 0,
+      maxRetries: 3,
+    });
+    const child = makeWorkItem({ id: 'child-1', status: 'queued', parentWorkItemId: 'parent-retryable' });
+    const workItemMap = new Map([[parent.id, parent], [child.id, child]]);
+
+    const { orphanIds, corrections } = detectOrphanWorkItems([child], workItemMap);
+    expect(orphanIds).toHaveLength(0);
+    expect(corrections).toHaveLength(0);
+  });
+
+  it('should skip children with active parents', () => {
+    const parent = makeWorkItem({ id: 'parent-1', status: 'running' });
+    const child = makeWorkItem({ id: 'child-1', status: 'running', parentWorkItemId: 'parent-1' });
+    const workItemMap = new Map([[parent.id, parent], [child.id, child]]);
+
+    const { orphanIds } = detectOrphanWorkItems([child], workItemMap);
+    expect(orphanIds).toHaveLength(0);
+  });
+
+  it('should skip terminal children', () => {
+    const parent = makeWorkItem({ id: 'parent-1', status: 'cancelled' });
+    const child = makeWorkItem({ id: 'child-1', status: 'done', parentWorkItemId: 'parent-1' });
+    const workItemMap = new Map([[parent.id, parent], [child.id, child]]);
+
+    const { orphanIds } = detectOrphanWorkItems([child], workItemMap);
+    expect(orphanIds).toHaveLength(0);
+  });
+
+  it('should skip WorkItems without parent', () => {
+    const wi = makeWorkItem({ id: 'wi-1', status: 'running' });
+    const workItemMap = new Map([[wi.id, wi]]);
+
+    const { orphanIds } = detectOrphanWorkItems([wi], workItemMap);
+    expect(orphanIds).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectTTLExpiredWorkItems
+// ---------------------------------------------------------------------------
+describe('detectTTLExpiredWorkItems', () => {
+  it('should detect WorkItems older than TTL', () => {
+    const old = makeWorkItem({
+      status: 'queued',
+      createdAt: new Date(Date.now() - 25 * 3600 * 1000).toISOString(), // 25h ago
+    });
+
+    const { expiredIds } = detectTTLExpiredWorkItems([old], 24 * 3600 * 1000);
+    expect(expiredIds).toContain(old.id);
+  });
+
+  it('should not flag fresh WorkItems', () => {
+    const fresh = makeWorkItem({ status: 'queued' });
+    const { expiredIds } = detectTTLExpiredWorkItems([fresh]);
+    expect(expiredIds).toHaveLength(0);
+  });
+
+  it('should skip terminal WorkItems', () => {
+    const done = makeWorkItem({
+      status: 'done',
+      createdAt: new Date(Date.now() - 48 * 3600 * 1000).toISOString(),
+    });
+    const { expiredIds } = detectTTLExpiredWorkItems([done]);
+    expect(expiredIds).toHaveLength(0);
+  });
+
+  // #813: a TTL-expired done_by_worker item NEVER reaches verified. The
+  // 2026-05-12 fix for the illegal `→ cancelled` correction special-cased it
+  // to `→ verified`, which turned 24h of silence into a pass. It is now
+  // skipped here (no correction at all, so nothing throws either) and the
+  // owner is asked instead — see detectUnreviewedPastTTL below.
+  it('never routes an expired `done_by_worker` item to `verified` — it emits no correction', () => {
+    const ages = [25, 48, 24 * 30]; // hours: just past TTL, 2 days, a month
+    const stale = ages.map((h) =>
+      makeWorkItem({
+        status: 'done_by_worker',
+        createdAt: new Date(Date.now() - h * 3600 * 1000).toISOString(),
+      }),
+    );
+
+    const { corrections, expiredIds } = detectTTLExpiredWorkItems(stale);
+
+    expect(stale).toHaveLength(3); // examined 3 items, not an empty set
+    expect(corrections).toEqual([]);
+    expect(expiredIds).toEqual([]);
+    expect(pickTTLExpiryTarget('done_by_worker')).toBeNull();
+  });
+
+  it('keeps `cancelled` as the default expiry target for non-done_by_worker statuses', () => {
+    // queued, running, blocked, scheduled, proposed, accepted, escalated
+    // — all of these have a `→ cancelled` edge in WORK_ITEM_TRANSITIONS,
+    // and `cancelled` is the right "abandoned work" semantic. Verify the
+    // picker doesn't accidentally over-generalise to other statuses.
+    const old = (status: WorkItemStatus) => makeWorkItem({
+      status,
+      createdAt: new Date(Date.now() - 25 * 3600 * 1000).toISOString(),
+    });
+    const items = [
+      old('queued'),
+      old('running'),
+      old('blocked'),
+      old('scheduled'),
+    ];
+
+    const { corrections } = detectTTLExpiredWorkItems(items);
+
+    expect(corrections).toHaveLength(4);
+    for (const c of corrections) {
+      expect(c.newState).toBe('cancelled');
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Request 13548bd5 (2026-08-20 Orca audit) — the `done_by_worker` fix above
+  // was never applied to its siblings. `rejected` and `failed` are equally
+  // non-terminal, equally absent from TERMINAL_WORK_ITEM_STATUSES, and equally
+  // lack a `→ cancelled` edge — so the TTL rule emitted an illegal correction
+  // for them on EVERY pass, forever, exactly as it had for `done_by_worker`.
+  // -------------------------------------------------------------------------
+  describe('legal-target invariant (Request 13548bd5)', () => {
+    const staleAt = () => new Date(Date.now() - 25 * 3600 * 1000).toISOString();
+
+    /**
+     * THE regression guard. Rather than enumerating the statuses that were
+     * broken when this was written, assert the INVARIANT over every status
+     * the type system knows about. A newly-added WorkItemStatus that has no
+     * legal terminal edge now fails this test at author time instead of
+     * throwing on every reconciler pass in production.
+     */
+    /**
+     * THE regression guard, in BOTH directions.
+     *
+     * An earlier version of this test only asserted that emitted corrections
+     * were legal. That is soundness alone — it passes just as happily if the
+     * picker returns null for everything, or if detectTTLExpiredWorkItems is
+     * gutted to return no corrections at all. A rule that does nothing is
+     * trivially never illegal.
+     *
+     * So the expectation is DERIVED from the transition table rather than
+     * hand-listed, and both halves are asserted: every status that HAS a
+     * legal terminal edge must emit exactly one correction (liveness), and
+     * every correction must be a legal terminal edge (soundness).
+     */
+    it('emits exactly the statuses with a legal terminal edge, and only legal edges', () => {
+      const emitted = new Map<WorkItemStatus, WorkItemStatus>();
+      const nonTerminal = WORK_ITEM_STATUSES.filter(
+        (st) => !TERMINAL_WORK_ITEM_STATUSES.has(st),
+      );
+      expect(nonTerminal.length).toBeGreaterThan(0);
+
+      for (const status of nonTerminal) {
+        const { corrections } = detectTTLExpiredWorkItems([
+          makeWorkItem({ status, createdAt: staleAt() }),
+        ]);
+        // `verified` is a legal terminal edge but never a TTL target (#813):
+        // a timer is not a reviewer.
+        const hasTerminalEdge = [...WORK_ITEM_TRANSITIONS[status]]
+          .some((t) => TERMINAL_WORK_ITEM_STATUSES.has(t) && t !== 'verified');
+
+        // Liveness — the rule must still DO something where it legally can.
+        expect(corrections).toHaveLength(hasTerminalEdge ? 1 : 0);
+        if (!hasTerminalEdge) continue;
+
+        // Soundness — what it does must be legal AND terminal.
+        const to = corrections[0].newState as WorkItemStatus;
+        expect(WORK_ITEM_TRANSITIONS[status].has(to)).toBe(true);
+        expect(TERMINAL_WORK_ITEM_STATUSES.has(to)).toBe(true);
+        emitted.set(status, to);
+      }
+
+      // Pin the exact shape so a silent widening or narrowing shows in the diff.
+      expect(Object.fromEntries(emitted)).toEqual({
+        queued: 'cancelled',
+        scheduled: 'cancelled',
+        proposed: 'cancelled',
+        accepted: 'cancelled',
+        running: 'cancelled',
+        blocked: 'cancelled',
+        escalated: 'cancelled',
+      });
+      expect(emitted.has('done_by_worker')).toBe(false);
+      expect(emitted.has('rejected')).toBe(false);
+      expect(emitted.has('failed')).toBe(false);
+    });
+
+    it('skips TTL-expired `rejected` items instead of emitting `rejected → cancelled`', () => {
+      const stale = makeWorkItem({ status: 'rejected', createdAt: staleAt() });
+
+      const { corrections, expiredIds } = detectTTLExpiredWorkItems([stale]);
+
+      expect(corrections).toHaveLength(0);
+      expect(expiredIds).toHaveLength(0);
+    });
+
+    it('skips TTL-expired `failed` items instead of emitting `failed → cancelled`', () => {
+      const stale = makeWorkItem({ status: 'failed', createdAt: staleAt() });
+
+      const { corrections, expiredIds } = detectTTLExpiredWorkItems([stale]);
+
+      expect(corrections).toHaveLength(0);
+      expect(expiredIds).toHaveLength(0);
+    });
+
+    it('still sweeps healthy statuses when a skipped status is in the same batch', () => {
+      // Regression on the `continue` placement: a skipped item must not
+      // short-circuit the rest of the batch.
+      const items = [
+        makeWorkItem({ status: 'rejected', createdAt: staleAt() }),
+        makeWorkItem({ status: 'queued', createdAt: staleAt() }),
+        makeWorkItem({ status: 'failed', createdAt: staleAt() }),
+        makeWorkItem({ status: 'running', createdAt: staleAt() }),
+      ];
+
+      const { corrections, expiredIds } = detectTTLExpiredWorkItems(items);
+
+      expect(corrections).toHaveLength(2);
+      expect(expiredIds).toHaveLength(2);
+      expect(corrections.map((c) => c.previousState).sort())
+        .toEqual(['queued', 'running']);
+      for (const c of corrections) {
+        expect(c.newState).toBe('cancelled');
+      }
+    });
+
+    /**
+     * Data-loss regression: a granted retry must not be TTL-cancelled a
+     * minute after it is granted.
+     *
+     * Before the TTL anchor, age was measured from `createdAt`, which is
+     * never mutated — not by `requeueAfterFailure`, not by anything in the
+     * repo. So a WorkItem that ran for more than the 24h TTL, failed, and was
+     * legitimately auto-retried by `detectRetryableFailedWorkItems` landed
+     * back in `queued` still carrying its original `createdAt`. The very next
+     * reconciler pass (60s later) then saw a >24h-old `queued` item and
+     * cancelled it. The retry was destroyed before the agent could pick it up,
+     * and — because `→ cancelled` from `queued` is perfectly legal — it did so
+     * without a single error log.
+     *
+     * `maxRetries` was therefore unreachable for any WorkItem whose work
+     * outlived the TTL: every retry died on arrival.
+     */
+    describe('TTL anchor — a requeued item gets a fresh window (data-loss regression)', () => {
+      it('does NOT cancel a just-requeued item whose original createdAt is stale', () => {
+        const justRequeued = makeWorkItem({
+          status: 'queued',
+          createdAt: staleAt(), // first asked for 25h ago
+          metadata: { [LAST_REQUEUED_AT_METADATA_KEY]: new Date().toISOString() },
+        });
+
+        const { corrections, expiredIds } = detectTTLExpiredWorkItems([justRequeued]);
+
+        expect(corrections).toHaveLength(0);
+        expect(expiredIds).toHaveLength(0);
+      });
+
+      it('still cancels a requeued item once the NEW window itself expires', () => {
+        // Liveness: the anchor must postpone the TTL, never disable it.
+        // Without this half, "never cancel anything requeued" would pass.
+        const staleSinceRequeue = makeWorkItem({
+          status: 'queued',
+          createdAt: staleAt(),
+          metadata: { [LAST_REQUEUED_AT_METADATA_KEY]: staleAt() },
+        });
+
+        const { corrections, expiredIds } = detectTTLExpiredWorkItems([staleSinceRequeue]);
+
+        expect(expiredIds).toEqual([staleSinceRequeue.id]);
+        expect(corrections).toHaveLength(1);
+        expect(corrections[0].newState).toBe('cancelled');
+      });
+
+      it('is inert for an item that has never been requeued', () => {
+        // The anchor must change nothing for the overwhelmingly common case.
+        const neverRequeued = makeWorkItem({ status: 'queued', createdAt: staleAt() });
+
+        const { corrections } = detectTTLExpiredWorkItems([neverRequeued]);
+
+        expect(corrections).toHaveLength(1);
+        expect(corrections[0].previousState).toBe('queued');
+        expect(corrections[0].newState).toBe('cancelled');
+      });
+
+      it('reports which clock it actually measured, so the audit trail is not misleading', () => {
+        // The evidence string previously said only "Created at <createdAt>",
+        // which would now describe a different timestamp than the one the
+        // decision was made on.
+        const requeuedAt = staleAt();
+        const wi = makeWorkItem({
+          status: 'queued',
+          createdAt: new Date(Date.now() - 100 * 3600 * 1000).toISOString(),
+          metadata: { [LAST_REQUEUED_AT_METADATA_KEY]: requeuedAt },
+        });
+
+        const { corrections } = detectTTLExpiredWorkItems([wi]);
+
+        expect(corrections[0].evidence).toContain(requeuedAt);
+        expect(corrections[0].evidence).toContain('TTL measured from');
+      });
+    });
+  });
+
+  // Request 13548bd5 follow-through: the TTL rule was not the only site
+  // hardcoding `→ cancelled`. detectOrphanWorkItems and cascadeCancelChildren
+  // did too, reproducing the identical forever-throwing loop for orphaned
+  // children in `rejected` / `failed` / `done_by_worker`.
+  //
+  // The FIRST fix (469a3a21) routed both rules through `pickTTLExpiryTarget`.
+  // That stopped the throw but imported the TTL rule's time semantics, so a
+  // `done_by_worker` child was stamped `verified` the moment an unrelated
+  // ancestor died. These tests pin BOTH halves: the rule still fires where a
+  // cancel is legal (liveness), and it never emits a non-cancel outcome
+  // (soundness). A test that only checks "every emitted correction is legal"
+  // passes when the rule emits nothing at all — do not weaken these back to
+  // that shape.
+  describe('illegal-cancel guard in orphan + cascade rules', () => {
+    /** Non-terminal statuses that legally permit `→ cancelled`. */
+    const CANCELLABLE = WORK_ITEM_STATUSES.filter(
+      (st) => !TERMINAL_WORK_ITEM_STATUSES.has(st) && WORK_ITEM_TRANSITIONS[st].has('cancelled'),
+    );
+    /** Non-terminal statuses with NO `→ cancelled` edge — must be skipped. */
+    const NOT_CANCELLABLE = WORK_ITEM_STATUSES.filter(
+      (st) => !TERMINAL_WORK_ITEM_STATUSES.has(st) && !WORK_ITEM_TRANSITIONS[st].has('cancelled'),
+    );
+
+    /** Guards the table itself, so an empty sweep can never pass silently. */
+    it('the status table actually contains both cancellable and skippable statuses', () => {
+      expect(CANCELLABLE.length).toBeGreaterThan(0);
+      expect(NOT_CANCELLABLE.length).toBeGreaterThan(0);
+      // Pin today's shape so a transition-table edit surfaces here.
+      expect([...NOT_CANCELLABLE].sort()).toEqual(['done_by_worker', 'failed', 'rejected']);
+    });
+
+    const deadParent = () => makeWorkItem({
+      id: 'parent-dead', status: 'failed', retryCount: 3, maxRetries: 3,
+    });
+
+    it('detectOrphanWorkItems cancels every child whose status permits it (liveness)', () => {
+      const parent = deadParent();
+
+      for (const status of CANCELLABLE) {
+        const child = makeWorkItem({ status, parentWorkItemId: parent.id });
+        const map = new Map([[parent.id, parent], [child.id, child]]);
+        const { corrections, orphanIds } = detectOrphanWorkItems([child], map);
+
+        expect(corrections).toHaveLength(1);
+        expect(corrections[0].previousState).toBe(status);
+        expect(corrections[0].newState).toBe('cancelled');
+        expect(orphanIds).toEqual([child.id]);
+      }
+    });
+
+    it('detectOrphanWorkItems emits nothing for a child with no legal cancel edge (soundness)', () => {
+      const parent = deadParent();
+
+      for (const status of NOT_CANCELLABLE) {
+        const child = makeWorkItem({ status, parentWorkItemId: parent.id });
+        const map = new Map([[parent.id, parent], [child.id, child]]);
+        const { corrections, orphanIds } = detectOrphanWorkItems([child], map);
+
+        expect(corrections).toEqual([]);
+        expect(orphanIds).toEqual([]);
+      }
+    });
+
+    it('detectOrphanWorkItems never emits an illegal transition for any non-terminal child', () => {
+      const nonTerminal = WORK_ITEM_STATUSES.filter(
+        (st) => !TERMINAL_WORK_ITEM_STATUSES.has(st),
+      );
+      const parent = deadParent();
+      let emitted = 0;
+
+      for (const status of nonTerminal) {
+        const child = makeWorkItem({ status, parentWorkItemId: parent.id });
+        const map = new Map([[parent.id, parent], [child.id, child]]);
+        const { corrections } = detectOrphanWorkItems([child], map);
+
+        for (const c of corrections) {
+          expect(WORK_ITEM_TRANSITIONS[status].has(c.newState as WorkItemStatus)).toBe(true);
+          emitted++;
+        }
+      }
+      // Liveness floor: without this the loop above is vacuously true.
+      expect(emitted).toBe(CANCELLABLE.length);
+    });
+
+    it('skips a rejected orphan rather than emitting rejected → cancelled', () => {
+      const parent = deadParent();
+      const child = makeWorkItem({ status: 'rejected', parentWorkItemId: parent.id });
+      const map = new Map([[parent.id, parent], [child.id, child]]);
+
+      const { corrections } = detectOrphanWorkItems([child], map);
+      expect(corrections).toHaveLength(0);
+    });
+
+    it('cascadeCancelChildren cancels every child whose status permits it (liveness)', () => {
+      for (const status of CANCELLABLE) {
+        const child = makeWorkItem({ status, parentWorkItemId: 'ancestor-1' });
+        const { corrections, cascadedIds } = cascadeCancelChildren(new Set(['ancestor-1']), [child]);
+
+        expect(corrections).toHaveLength(1);
+        expect(corrections[0].previousState).toBe(status);
+        expect(corrections[0].newState).toBe('cancelled');
+        expect(cascadedIds).toEqual([child.id]);
+      }
+    });
+
+    it('cascadeCancelChildren emits nothing for a child with no legal cancel edge (soundness)', () => {
+      for (const status of NOT_CANCELLABLE) {
+        const child = makeWorkItem({ status, parentWorkItemId: 'ancestor-1' });
+        const { corrections, cascadedIds } = cascadeCancelChildren(new Set(['ancestor-1']), [child]);
+
+        expect(corrections).toEqual([]);
+        expect(cascadedIds).toEqual([]);
+      }
+    });
+
+    it('cascadeCancelChildren never emits an illegal transition for any non-terminal child', () => {
+      const nonTerminal = WORK_ITEM_STATUSES.filter(
+        (st) => !TERMINAL_WORK_ITEM_STATUSES.has(st),
+      );
+      let emitted = 0;
+
+      for (const status of nonTerminal) {
+        const child = makeWorkItem({ status, parentWorkItemId: 'ancestor-1' });
+        const { corrections } = cascadeCancelChildren(new Set(['ancestor-1']), [child]);
+
+        for (const c of corrections) {
+          expect(WORK_ITEM_TRANSITIONS[status].has(c.newState as WorkItemStatus)).toBe(true);
+          emitted++;
+        }
+      }
+      expect(emitted).toBe(CANCELLABLE.length);
+    });
+
+    it('still cascades a queued child (guard must not disable the rule)', () => {
+      const child = makeWorkItem({ status: 'queued', parentWorkItemId: 'ancestor-1' });
+      const { corrections } = cascadeCancelChildren(new Set(['ancestor-1']), [child]);
+
+      expect(corrections).toHaveLength(1);
+      expect(corrections[0].newState).toBe('cancelled');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // The defect this branch's second round exists to remove.
+  // -------------------------------------------------------------------------
+  describe('TTL time-semantics must not leak into orphan/cascade', () => {
+    /**
+     * `pickTTLExpiryTarget('done_by_worker') → 'verified'` is a deliberate
+     * TIME judgement: 24h with nobody objecting counts as implicit acceptance.
+     * Orphan and cascade have no time dimension — they fire the instant a dead
+     * ancestor is reconciled. Sharing the picker meant seconds-old, entirely
+     * unreviewed work was auto-accepted because something unrelated upstream
+     * failed.
+     */
+    it('a ~1s-old done_by_worker child under a permanently-failed parent produces NO correction', () => {
+      const parent = makeWorkItem({
+        id: 'parent-dead', status: 'failed', retryCount: 3, maxRetries: 3,
+      });
+      const child = makeWorkItem({
+        id: 'child-fresh',
+        status: 'done_by_worker',
+        parentWorkItemId: parent.id,
+        createdAt: new Date(Date.now() - 1000).toISOString(),
+      });
+      const map = new Map([[parent.id, parent], [child.id, child]]);
+
+      const { corrections, orphanIds } = detectOrphanWorkItems([child], map);
+
+      expect(corrections).toEqual([]);
+      expect(orphanIds).toEqual([]);
+      // The point of the regression: it must not be auto-accepted.
+      expect(corrections.map((c) => c.newState)).not.toContain('verified');
+    });
+
+    it('cascadeCancelChildren never auto-verifies a fresh done_by_worker descendant', () => {
+      const child = makeWorkItem({
+        id: 'child-fresh',
+        status: 'done_by_worker',
+        parentWorkItemId: 'ancestor-1',
+        createdAt: new Date(Date.now() - 1000).toISOString(),
+      });
+
+      const { corrections, cascadedIds } = cascadeCancelChildren(new Set(['ancestor-1']), [child]);
+
+      expect(corrections).toEqual([]);
+      expect(cascadedIds).toEqual([]);
+    });
+
+    it('a skipped done_by_worker child does not stop its cancellable sibling being cancelled', () => {
+      // Liveness guard on the `continue`: skipping one child must not abort
+      // the sweep for the rest of the generation.
+      const parent = makeWorkItem({
+        id: 'parent-dead', status: 'failed', retryCount: 3, maxRetries: 3,
+      });
+      const unreviewed = makeWorkItem({
+        id: 'child-dbw', status: 'done_by_worker', parentWorkItemId: parent.id,
+      });
+      const live = makeWorkItem({ id: 'child-running', status: 'running', parentWorkItemId: parent.id });
+      const map = new Map<string, WorkItem>([
+        [parent.id, parent], [unreviewed.id, unreviewed], [live.id, live],
+      ]);
+
+      const { corrections, orphanIds } = detectOrphanWorkItems([unreviewed, live], map);
+
+      expect(orphanIds).toEqual(['child-running']);
+      expect(corrections).toHaveLength(1);
+      expect(corrections[0].newState).toBe('cancelled');
+    });
+
+    it('a skipped done_by_worker child keeps its own descendants alive (no phantom ancestor)', () => {
+      // `cascadedIds` doubles as the next generation of dead ancestors. If a
+      // skipped child were pushed anyway, its grandchildren would be cancelled
+      // off a parent that was never cancelled.
+      const unreviewed = makeWorkItem({
+        id: 'child-dbw', status: 'done_by_worker', parentWorkItemId: 'ancestor-1',
+      });
+      const grandchild = makeWorkItem({
+        id: 'grandchild', status: 'running', parentWorkItemId: 'child-dbw',
+      });
+
+      const { corrections, cascadedIds } = cascadeCancelChildren(
+        new Set(['ancestor-1']),
+        [unreviewed, grandchild],
+      );
+
+      expect(cascadedIds).toEqual([]);
+      expect(corrections).toEqual([]);
+    });
+
+    it('cascade reason/evidence are DERIVED from the actual newState', () => {
+      // A `toContain(newState)` check is too weak to catch this: the old
+      // hardcoded "Cascade cancel: ancestor WorkItem was cancelled/failed"
+      // contains the substring "cancelled" by accident. Pin the derivation.
+      const child = makeWorkItem({ id: 'c1', status: 'running', parentWorkItemId: 'ancestor-1' });
+      const { corrections } = cascadeCancelChildren(new Set(['ancestor-1']), [child]);
+
+      const c = corrections[0];
+      expect(c.reason.startsWith(`Cascade ${c.newState}`)).toBe(true);
+      // Evidence must record the transition that was actually chosen.
+      expect(c.evidence).toContain(`${c.previousState} → ${c.newState}`);
+    });
+
+    it('orphan reason/evidence are DERIVED from the actual newState', () => {
+      const parent = makeWorkItem({
+        id: 'parent-dead', status: 'failed', retryCount: 3, maxRetries: 3,
+      });
+      const child = makeWorkItem({ id: 'c1', status: 'running', parentWorkItemId: parent.id });
+      const map = new Map([[parent.id, parent], [child.id, child]]);
+      const { corrections } = detectOrphanWorkItems([child], map);
+
+      const c = corrections[0];
+      expect(c.evidence.startsWith(`Orphan ${c.newState}`)).toBe(true);
+      expect(c.evidence).not.toContain('Cascade cancel');
+      // The reason still names the parent that caused it.
+      expect(c.reason).toContain(parent.id);
+    });
+  });
+
+  describe('pickCascadeTarget', () => {
+    it('returns `cancelled` or null for every status — never an accomplishment', () => {
+      for (const status of WORK_ITEM_STATUSES) {
+        const target = pickCascadeTarget(status);
+        expect(target === null || target === 'cancelled').toBe(true);
+        if (target === null) continue;
+        expect(WORK_ITEM_TRANSITIONS[status].has(target)).toBe(true);
+        expect(TERMINAL_WORK_ITEM_STATUSES.has(target)).toBe(true);
+      }
+    });
+
+    it('cancels the statuses a cascade legitimately owns (liveness)', () => {
+      expect(pickCascadeTarget('running')).toBe('cancelled');
+      expect(pickCascadeTarget('queued')).toBe('cancelled');
+      expect(pickCascadeTarget('blocked')).toBe('cancelled');
+      expect(pickCascadeTarget('escalated')).toBe('cancelled');
+    });
+
+    it('declines done_by_worker instead of auto-accepting it', () => {
+      expect(pickCascadeTarget('done_by_worker')).toBeNull();
+    });
+
+    it('declines rejected and failed, consistent with the TTL rule', () => {
+      expect(pickCascadeTarget('rejected')).toBeNull();
+      expect(pickCascadeTarget('failed')).toBeNull();
+    });
+
+    it('diverges from pickTTLExpiryTarget exactly where time semantics apply', () => {
+      // Since #813 neither picker accepts unreviewed work.
+      expect(pickTTLExpiryTarget('done_by_worker')).toBeNull();
+      expect(pickCascadeTarget('done_by_worker')).toBeNull();
+      // Everywhere a cancel is legal they agree.
+      for (const status of WORK_ITEM_STATUSES) {
+        if (pickCascadeTarget(status) === 'cancelled') {
+          expect(pickTTLExpiryTarget(status)).toBe('cancelled');
+        }
+      }
+    });
+  });
+
+  describe('pickTTLExpiryTarget', () => {
+    it('returns a legal, strictly-terminal target or null for every status', () => {
+      for (const status of WORK_ITEM_STATUSES) {
+        const target = pickTTLExpiryTarget(status);
+        if (target === null) continue;
+        expect(WORK_ITEM_TRANSITIONS[status].has(target)).toBe(true);
+        expect(TERMINAL_WORK_ITEM_STATUSES.has(target)).toBe(true);
+      }
+    });
+
+    it('never returns verified for any status (#813)', () => {
+      let examined = 0;
+      for (const status of WORK_ITEM_STATUSES) {
+        examined += 1;
+        expect(pickTTLExpiryTarget(status)).not.toBe('verified');
+      }
+      expect(examined).toBe(WORK_ITEM_STATUSES.length);
+      expect(examined).toBeGreaterThan(0);
+    });
+
+    it('prefers `cancelled` over `done` for `running` (timeout is not completion)', () => {
+      // `running` permits both. A TTL sweep must never mark work as `done`.
+      expect(pickTTLExpiryTarget('running')).toBe('cancelled');
+    });
+
+    it('returns null for statuses whose only outbound edge is non-terminal', () => {
+      // `failed → queued` is the retry edge and is genuinely live; there is
+      // no terminal edge, so TTL must decline rather than invent one.
+      expect(pickTTLExpiryTarget('failed')).toBeNull();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectRecoverableWorkItems
+// ---------------------------------------------------------------------------
+describe('detectRecoverableWorkItems', () => {
+  // 2026-09-25 (WI 92327d6d): the agent is active *because* it just blocked;
+  // re-queuing an explicit block re-dispatched it every few minutes.
+  it('never re-queues an explicitly blocked WorkItem, even with the agent active', () => {
+    const wi = makeWorkItem({
+      status: 'blocked',
+      target: 'agent-1',
+      retryCount: 0,
+      maxRetries: 3,
+      blockSource: 'explicit',
+    });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    const { corrections, recoverableIds } = detectRecoverableWorkItems([wi], agentMap);
+    expect(recoverableIds).toHaveLength(0);
+    expect(corrections).toHaveLength(0);
+  });
+
+  // 2026-09-26 (Request d86b5faf): Execute/Review were blocked on Plan, their
+  // target crewly-orc was active, and this rule re-queued them 19s after
+  // creation — Execute then ran (and was verified) before Plan.
+  it('never re-queues a WorkItem still waiting on an unfinished dependency', () => {
+    const plan = makeWorkItem({ id: 'plan', status: 'queued', target: 'crewly-orc' });
+    const execute = makeWorkItem({
+      id: 'execute',
+      status: 'blocked',
+      target: 'crewly-orc',
+      dependsOn: ['plan'],
+      blockedReason: 'Waiting on dependency: Plan',
+    });
+    const review = makeWorkItem({ id: 'review', status: 'blocked', target: 'crewly-orc', dependsOn: ['execute'] });
+    const agentMap = makeAgentMap([['crewly-orc', { status: 'active' }]]);
+
+    const { recoverableIds } = detectRecoverableWorkItems([plan, execute, review], agentMap);
+    expect(recoverableIds).toEqual([]);
+  });
+
+  it('re-queues a dependency-blocked item once its dependency is terminal (or gone from the active set)', () => {
+    const plan = makeWorkItem({ id: 'plan', status: 'verified' });
+    const execute = makeWorkItem({ id: 'execute', status: 'blocked', target: 'agent-1', dependsOn: ['plan'] });
+    const orphaned = makeWorkItem({ id: 'orphaned', status: 'blocked', target: 'agent-1', dependsOn: ['done-and-pruned'] });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    const { recoverableIds } = detectRecoverableWorkItems([plan, execute, orphaned], agentMap);
+    expect(recoverableIds.sort()).toEqual(['execute', 'orphaned']);
+  });
+
+  it('hasUnresolvedDependencies: only a present, non-terminal dependency blocks', () => {
+    const map = new Map<string, WorkItem>([
+      ['q', makeWorkItem({ id: 'q', status: 'queued' })],
+      ['v', makeWorkItem({ id: 'v', status: 'verified' })],
+    ]);
+    expect(hasUnresolvedDependencies(makeWorkItem({ dependsOn: ['q'] }), map)).toBe(true);
+    expect(hasUnresolvedDependencies(makeWorkItem({ dependsOn: ['v', 'missing'] }), map)).toBe(false);
+    expect(hasUnresolvedDependencies(makeWorkItem({}), map)).toBe(false);
+  });
+
+  it('should detect blocked WorkItems with agent back online', () => {
+    const wi = makeWorkItem({
+      status: 'blocked',
+      target: 'agent-1',
+      retryCount: 1,
+      maxRetries: 3,
+    });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    const { recoverableIds } = detectRecoverableWorkItems([wi], agentMap);
+    expect(recoverableIds).toContain(wi.id);
+  });
+
+  it('should not recover if max retries exhausted', () => {
+    const wi = makeWorkItem({
+      status: 'blocked',
+      target: 'agent-1',
+      retryCount: 3,
+      maxRetries: 3,
+    });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    const { recoverableIds } = detectRecoverableWorkItems([wi], agentMap);
+    expect(recoverableIds).toHaveLength(0);
+  });
+
+  it('should not recover if agent still dead', () => {
+    const wi = makeWorkItem({
+      status: 'blocked',
+      target: 'agent-dead',
+      retryCount: 0,
+      maxRetries: 3,
+    });
+    const agentMap = makeAgentMap([['agent-dead', { status: 'inactive' }]]);
+
+    const { recoverableIds } = detectRecoverableWorkItems([wi], agentMap);
+    expect(recoverableIds).toHaveLength(0);
+  });
+
+  it('should skip non-blocked WorkItems', () => {
+    const wi = makeWorkItem({ status: 'running', target: 'agent-1' });
+    const agentMap = makeAgentMap([['agent-1', { status: 'active' }]]);
+
+    const { recoverableIds } = detectRecoverableWorkItems([wi], agentMap);
+    expect(recoverableIds).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F4: cascadeCancelChildren
+// ---------------------------------------------------------------------------
+describe('cascadeCancelChildren', () => {
+  it('should cascade cancel direct children', () => {
+    const parent = makeWorkItem({ id: 'p1', status: 'cancelled' });
+    const child = makeWorkItem({ id: 'c1', status: 'running', parentWorkItemId: 'p1' });
+
+    const { cascadedIds } = cascadeCancelChildren(new Set(['p1']), [parent, child]);
+    expect(cascadedIds).toContain('c1');
+  });
+
+  it('should cascade cancel grandchildren (deep cascade)', () => {
+    const gp = makeWorkItem({ id: 'gp', status: 'cancelled' });
+    const parent = makeWorkItem({ id: 'p', status: 'running', parentWorkItemId: 'gp' });
+    const child = makeWorkItem({ id: 'c', status: 'queued', parentWorkItemId: 'p' });
+
+    const { cascadedIds } = cascadeCancelChildren(new Set(['gp']), [gp, parent, child]);
+    expect(cascadedIds).toContain('p');
+    expect(cascadedIds).toContain('c');
+  });
+
+  it('should not cascade to terminal children', () => {
+    const parent = makeWorkItem({ id: 'p1', status: 'cancelled' });
+    const child = makeWorkItem({ id: 'c1', status: 'done', parentWorkItemId: 'p1' });
+
+    const { cascadedIds } = cascadeCancelChildren(new Set(['p1']), [parent, child]);
+    expect(cascadedIds).toHaveLength(0);
+  });
+
+  it('should not cascade when no parent is cancelled', () => {
+    const parent = makeWorkItem({ id: 'p1', status: 'running' });
+    const child = makeWorkItem({ id: 'c1', status: 'queued', parentWorkItemId: 'p1' });
+
+    const { cascadedIds } = cascadeCancelChildren(new Set(), [parent, child]);
+    expect(cascadedIds).toHaveLength(0);
+  });
+
+  it('should handle empty inputs', () => {
+    const { cascadedIds } = cascadeCancelChildren(new Set(), []);
+    expect(cascadedIds).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F4: detectStaleQueuedWorkItems
+// ---------------------------------------------------------------------------
+describe('detectStaleQueuedWorkItems', () => {
+  it('should detect WorkItems queued for too long', () => {
+    const old = makeWorkItem({
+      status: 'queued',
+      createdAt: new Date(Date.now() - 2 * 3600 * 1000).toISOString(), // 2h ago
+    });
+
+    const { staleIds } = detectStaleQueuedWorkItems([old], 60 * 60 * 1000); // 1h threshold
+    expect(staleIds).toContain(old.id);
+  });
+
+  it('should not flag recently queued WorkItems', () => {
+    const fresh = makeWorkItem({ status: 'queued' });
+    const { staleIds } = detectStaleQueuedWorkItems([fresh], 60 * 60 * 1000);
+    expect(staleIds).toHaveLength(0);
+  });
+
+  it('should only check queued status', () => {
+    const running = makeWorkItem({
+      status: 'running',
+      createdAt: new Date(Date.now() - 5 * 3600 * 1000).toISOString(),
+    });
+    const { staleIds } = detectStaleQueuedWorkItems([running], 60 * 60 * 1000);
+    expect(staleIds).toHaveLength(0);
+  });
+
+  // 2026-05-16 policy change — stale-queued WIs MUST NOT be auto-cancelled.
+  // The pre-2026-05-16 behavior emitted `queued→cancelled` corrections
+  // when a WI sat queued past staleThresholdMs. That destroyed real
+  // user work on 2026-05-16 (Steve's X-article task dispatched to
+  // inactive Atlas → cancelled at 60min). PR #585 (eviction-under-
+  // memory-pressure) is the right mechanism to actually make progress
+  // on stale queued WIs. The function now returns staleIds for
+  // observability only; corrections is always empty.
+  describe('2026-05-16 no-auto-cancel policy', () => {
+    it('emits NO corrections — staleIds is observability-only', () => {
+      const stale = makeWorkItem({
+        status: 'queued',
+        createdAt: new Date(Date.now() - 16 * 3600 * 1000).toISOString(), // 16h ago
+      });
+
+      const { corrections, staleIds } = detectStaleQueuedWorkItems([stale], 60 * 60 * 1000);
+
+      expect(corrections).toEqual([]);
+      // Still surfaced for callers that want to log/escalate.
+      expect(staleIds).toEqual([stale.id]);
+    });
+
+    it('emits no corrections even for very-long-queued WIs (945min real-world case)', () => {
+      const stale = makeWorkItem({
+        status: 'queued',
+        createdAt: new Date(Date.now() - 945 * 60 * 1000).toISOString(), // 945min — earlier real-world case
+      });
+
+      const { corrections, staleIds } = detectStaleQueuedWorkItems([stale], 60 * 60 * 1000);
+
+      // Old behaviour cancelled this; new behaviour keeps it queued
+      // so the target agent can eventually pick it up via the wake /
+      // eviction-under-pressure path.
+      expect(corrections).toHaveLength(0);
+      expect(staleIds).toContain(stale.id);
+    });
+
+    it('does not mutate caller-supplied WorkItem objects', () => {
+      const stale = makeWorkItem({
+        status: 'queued',
+        createdAt: new Date(Date.now() - 2 * 3600 * 1000).toISOString(),
+      });
+      const before = { ...stale };
+      detectStaleQueuedWorkItems([stale], 60 * 60 * 1000);
+      expect(stale).toEqual(before);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F4: runPruningPass
+// ---------------------------------------------------------------------------
+describe('runPruningPass', () => {
+  it('should combine TTL + orphan + cascade + stale detection', () => {
+    const now = Date.now();
+    const workItems = [
+      // TTL expired
+      makeWorkItem({ id: 'ttl-1', status: 'queued', createdAt: new Date(now - 25 * 3600000).toISOString() }),
+      // Orphan (parent cancelled)
+      makeWorkItem({ id: 'parent-x', status: 'cancelled' }),
+      makeWorkItem({ id: 'orphan-1', status: 'running', parentWorkItemId: 'parent-x' }),
+      // Stale queued
+      makeWorkItem({ id: 'stale-1', status: 'queued', createdAt: new Date(now - 2 * 3600000).toISOString() }),
+      // Normal active item
+      makeWorkItem({ id: 'ok-1', status: 'running' }),
+    ];
+
+    const result = runPruningPass(workItems, 24 * 3600000, 60 * 60 * 1000);
+    // ttl-1 is `queued`, so its TTL target is `cancelled` — real cleanup.
+    expect(result.ttlCancelledCount).toBe(1);
+    expect(result.ttlAutoVerifiedCount).toBe(0);
+    expect(result.orphanCancelledCount).toBe(1);
+    // stale-1 is stale (2h old), ttl-1 is also queued and old (25h) so it's also stale
+    expect(result.staleQueuedCount).toBe(2);
+    expect(result.totalCorrections.length).toBeGreaterThan(0);
+  });
+
+  it('should return zero counts when nothing to prune', () => {
+    const workItems = [
+      makeWorkItem({ id: 'ok-1', status: 'running' }),
+      makeWorkItem({ id: 'ok-2', status: 'queued' }),
+    ];
+
+    const result = runPruningPass(workItems);
+    expect(result.ttlCancelledCount).toBe(0);
+    expect(result.ttlAutoVerifiedCount).toBe(0);
+    expect(result.orphanCancelledCount).toBe(0);
+    expect(result.cascadeCancelledCount).toBe(0);
+    expect(result.staleQueuedCount).toBe(0);
+  });
+
+  it('should handle empty WorkItems array', () => {
+    const result = runPruningPass([]);
+    expect(result.totalCorrections).toHaveLength(0);
+  });
+
+  it('REGRESSION 2026-05-06: failed-but-retryable parent must NOT cascade-cancel its children', () => {
+    // Reproduces the dogfood data-loss: umbrella WI hits running-timeout →
+    // status='failed' (retryCount=0/max=3). Same reconciler pass runs the
+    // pruning loop; before the fix this cancelled all 6 P0 children. After
+    // the fix, the children stay queued so the auto-retry can revive the
+    // whole subtree.
+    const parent = makeWorkItem({
+      id: 'umbrella',
+      status: 'failed',
+      retryCount: 0,
+      maxRetries: 3,
+    });
+    const children = [
+      makeWorkItem({ id: 'p0-1', status: 'queued', parentWorkItemId: 'umbrella' }),
+      makeWorkItem({ id: 'p0-2', status: 'queued', parentWorkItemId: 'umbrella' }),
+      makeWorkItem({ id: 'p0-3', status: 'queued', parentWorkItemId: 'umbrella' }),
+      makeWorkItem({ id: 'p0-4', status: 'queued', parentWorkItemId: 'umbrella' }),
+      makeWorkItem({ id: 'p0-5', status: 'queued', parentWorkItemId: 'umbrella' }),
+      makeWorkItem({ id: 'p0-6', status: 'queued', parentWorkItemId: 'umbrella' }),
+    ];
+
+    const result = runPruningPass([parent, ...children]);
+    expect(result.orphanCancelledCount).toBe(0);
+    expect(result.cascadeCancelledCount).toBe(0);
+  });
+
+  it('should still cascade-cancel children when parent has exhausted retries', () => {
+    const parent = makeWorkItem({
+      id: 'umbrella-dead',
+      status: 'failed',
+      retryCount: 3,
+      maxRetries: 3,
+    });
+    const child = makeWorkItem({ id: 'c1', status: 'queued', parentWorkItemId: 'umbrella-dead' });
+
+    const result = runPruningPass([parent, child]);
+    expect(result.orphanCancelledCount).toBe(1);
+  });
+
+  it('never emits a `verified` correction from the orphan or cascade rules', () => {
+    // `verified` may only ever originate from the TTL rule's 24h
+    // implicit-acceptance fallback. Anything else is unreviewed work being
+    // rubber-stamped. Pin it at the aggregate level so a future rule wired
+    // into the pruning pass cannot reintroduce it unnoticed.
+    const deadParent = makeWorkItem({
+      id: 'dead', status: 'failed', retryCount: 3, maxRetries: 3,
+    });
+    const items: WorkItem[] = [deadParent];
+    for (const status of WORK_ITEM_STATUSES) {
+      items.push(makeWorkItem({ id: `child-${status}`, status, parentWorkItemId: 'dead' }));
+    }
+
+    const result = runPruningPass(items);
+    // Fresh items, so nothing is TTL-expired — every correction here comes
+    // from orphan/cascade, and none of them may be an accomplishment.
+    expect(result.ttlCancelledCount).toBe(0);
+    expect(result.ttlAutoVerifiedCount).toBe(0);
+    expect(result.totalCorrections.length).toBeGreaterThan(0);
+    for (const c of result.totalCorrections) {
+      expect(c.newState).toBe('cancelled');
+    }
+  });
+
+  it('a TTL-expired done_by_worker parent is left for review and does not cascade-cancel its children (#813)', () => {
+    // Before #813 the TTL rule emitted `done_by_worker → verified` here, and
+    // an earlier bug then cascaded off that ACCEPTED parent. Now the rule does
+    // not act on the parent at all — it stays awaiting review.
+    const now = Date.now();
+    const parent = makeWorkItem({
+      id: 'awaiting-parent',
+      status: 'done_by_worker',
+      createdAt: new Date(now - 25 * 3600000).toISOString(),
+    });
+    const child = makeWorkItem({ id: 'live-child', status: 'running', parentWorkItemId: 'awaiting-parent' });
+
+    const result = runPruningPass([parent, child]);
+
+    expect(result.ttlAutoVerifiedCount).toBe(0);
+    expect(result.ttlCancelledCount).toBe(0);
+    expect(result.totalCorrections.find((c) => c.entityId === 'awaiting-parent')).toBeUndefined();
+    expect(result.totalCorrections.some((c) => c.newState === 'verified')).toBe(false);
+    expect(result.cascadeCancelledCount).toBe(0);
+    expect(result.totalCorrections.find((c) => c.entityId === 'live-child')).toBeUndefined();
+  });
+
+  it('a TTL-cancelled parent still cascade-cancels its children', () => {
+    // Companion to the test above: filtering the seed set must not disable
+    // the genuine TTL → cascade chain.
+    const now = Date.now();
+    const parent = makeWorkItem({
+      id: 'ttl-dead-parent',
+      status: 'running',
+      createdAt: new Date(now - 25 * 3600000).toISOString(),
+    });
+    const child = makeWorkItem({ id: 'doomed-child', status: 'running', parentWorkItemId: 'ttl-dead-parent' });
+
+    const result = runPruningPass([parent, child]);
+
+    expect(result.ttlCancelledCount).toBe(1);
+    expect(result.ttlAutoVerifiedCount).toBe(0);
+    expect(result.cascadeCancelledCount).toBe(1);
+    expect(result.totalCorrections.find((c) => c.entityId === 'doomed-child')?.newState)
+      .toBe('cancelled');
+  });
+
+  it('partitions TTL outcomes: an expired done_by_worker item is neither cancelled nor accepted (#813)', () => {
+    // Before #813 the two TTL outcomes were `running → cancelled` (discard)
+    // and `done_by_worker → verified` (accept). The second is gone: the
+    // counters must still partition the TTL corrections exactly, with the
+    // acceptance counter at 0.
+    const now = Date.now();
+    const awaiting = makeWorkItem({
+      id: 'ttl-awaiting',
+      status: 'done_by_worker',
+      createdAt: new Date(now - 25 * 3600000).toISOString(),
+    });
+    const discarded = makeWorkItem({
+      id: 'ttl-discarded',
+      status: 'running',
+      createdAt: new Date(now - 25 * 3600000).toISOString(),
+    });
+
+    const result = runPruningPass([awaiting, discarded]);
+
+    expect(result.ttlCancelledCount).toBe(1);
+    expect(result.ttlAutoVerifiedCount).toBe(0);
+    expect(result.orphanCancelledCount).toBe(0);
+    expect(result.cascadeCancelledCount).toBe(0);
+
+    const ttlCorrections = result.totalCorrections.filter(
+      (c) => c.entityId === 'ttl-awaiting' || c.entityId === 'ttl-discarded',
+    );
+    expect(result.ttlCancelledCount + result.ttlAutoVerifiedCount).toBe(ttlCorrections.length);
+    expect(result.totalCorrections.find((c) => c.entityId === 'ttl-awaiting')).toBeUndefined();
+    expect(result.totalCorrections.find((c) => c.entityId === 'ttl-discarded')?.newState)
+      .toBe('cancelled');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H3: computeAgentScore
+// ---------------------------------------------------------------------------
+describe('computeAgentScore', () => {
+  it('should give max skillMatch when target matches agent', () => {
+    const wi = makeWorkItem({ target: 'agent-1', type: 'delegate' });
+    const agent: AgentHealth = {
+      sessionName: 'agent-1',
+      status: 'suspended',
+      role: 'developer',
+    };
+
+    const score = computeAgentScore(wi, agent, 5 * 60_000);
+    expect(score.skillMatch).toBe(40);
+    expect(score.contextFamiliarity).toBe(20);
+  });
+
+  it('should score tag matches for agents with tags', () => {
+    const wi = makeWorkItem({ type: 'delegate', title: 'Fix backend API issue' });
+    const agent: AgentHealth = {
+      sessionName: 'agent-2',
+      status: 'suspended',
+      tags: ['backend', 'api'],
+    };
+
+    const score = computeAgentScore(wi, agent, 3 * 60_000);
+    expect(score.skillMatch).toBeGreaterThan(10); // base + tag matches
+  });
+
+  it('should scale urgency based on wait time', () => {
+    const wi = makeWorkItem({ type: 'delegate' });
+    const agent: AgentHealth = { sessionName: 'agent-1', status: 'suspended' };
+
+    const shortWait = computeAgentScore(wi, agent, 2 * 60_000); // 2min
+    const longWait = computeAgentScore(wi, agent, 10 * 60_000); // 10min
+
+    expect(longWait.urgency).toBeGreaterThan(shortWait.urgency);
+    expect(longWait.urgency).toBe(30); // Max urgency at 10min
+  });
+
+  it('should apply load penalty for busy agents', () => {
+    const wi = makeWorkItem({ type: 'delegate' });
+    const idle: AgentHealth = { sessionName: 'agent-1', status: 'suspended', activeWorkItemCount: 0 };
+    const busy: AgentHealth = { sessionName: 'agent-2', status: 'suspended', activeWorkItemCount: 4 };
+
+    const idleScore = computeAgentScore(wi, idle, 5 * 60_000);
+    const busyScore = computeAgentScore(wi, busy, 5 * 60_000);
+
+    expect(idleScore.loadPenalty).toBe(0);
+    expect(busyScore.loadPenalty).toBe(20); // capped at 20
+  });
+
+  it('should give developers moderate skill match for delegate type', () => {
+    const wi = makeWorkItem({ type: 'delegate', target: undefined });
+    const agent: AgentHealth = { sessionName: 'agent-dev', status: 'inactive', role: 'developer' };
+
+    const score = computeAgentScore(wi, agent, 3 * 60_000);
+    expect(score.skillMatch).toBe(25);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H3: selectBestAgent
+// ---------------------------------------------------------------------------
+describe('selectBestAgent', () => {
+  it('should select agent with highest score', () => {
+    const wi = makeWorkItem({ target: 'agent-1', type: 'delegate' });
+    const agents: AgentHealth[] = [
+      { sessionName: 'agent-1', status: 'suspended', role: 'developer' },
+      { sessionName: 'agent-2', status: 'inactive', role: 'developer' },
+    ];
+
+    const result = selectBestAgent(wi, agents, 5 * 60_000);
+    expect(result).not.toBeNull();
+    expect(result!.agent.sessionName).toBe('agent-1'); // target match = highest score
+  });
+
+  it('should exclude agents in excludeAgents set (no-target WI falls back to others)', () => {
+    // No `target` on the WI → fall back to skill-based scoring across all agents.
+    // `makeWorkItem` defaults `target: 'agent-1'`, so we explicitly clear it
+    // to exercise the no-target branch.
+    const wi = { ...makeWorkItem({ type: 'delegate' }), target: undefined } as WorkItem;
+    const agents: AgentHealth[] = [
+      { sessionName: 'agent-1', status: 'suspended', role: 'developer' },
+      { sessionName: 'agent-2', status: 'inactive', role: 'developer' },
+    ];
+
+    const result = selectBestAgent(wi, agents, 5 * 60_000, new Set(['agent-1']));
+    expect(result).not.toBeNull();
+    expect(result!.agent.sessionName).toBe('agent-2');
+  });
+
+  it('should return null when no agents available', () => {
+    const wi = makeWorkItem({ type: 'delegate' });
+    const result = selectBestAgent(wi, [], 5 * 60_000);
+    expect(result).toBeNull();
+  });
+
+  it('should return null when all agents excluded', () => {
+    const wi = makeWorkItem({ type: 'delegate' });
+    const agents: AgentHealth[] = [
+      { sessionName: 'agent-1', status: 'suspended', role: 'developer' },
+    ];
+    const result = selectBestAgent(wi, agents, 5 * 60_000, new Set(['agent-1']));
+    expect(result).toBeNull();
+  });
+
+  // 2026-05-17 — when a WorkItem has an explicit `target`, the reconciler
+  // must ONLY wake that exact agent. The previous "best-score across all
+  // agents" fallback was substituting unrelated agents (Quinn / Reed /
+  // Victor) for SLA-tracker `respond_to_user` WIs targeted at crewly-orc,
+  // causing the team to spin up on every restart with no actual work.
+  describe('2026-05-17 target-strict policy', () => {
+    it('only considers the explicit target when wi.target is set', () => {
+      const wi = makeWorkItem({ target: 'agent-1', type: 'delegate' });
+      const agents: AgentHealth[] = [
+        { sessionName: 'agent-1', status: 'suspended', role: 'developer' },
+        { sessionName: 'agent-2', status: 'inactive', role: 'developer' },
+      ];
+      const result = selectBestAgent(wi, agents, 5 * 60_000);
+      expect(result?.agent.sessionName).toBe('agent-1');
+    });
+
+    it('returns null when the explicit target is excluded — does NOT substitute another agent', () => {
+      const wi = makeWorkItem({ target: 'agent-1', type: 'delegate' });
+      const agents: AgentHealth[] = [
+        { sessionName: 'agent-1', status: 'suspended', role: 'developer' },
+        { sessionName: 'agent-2', status: 'inactive', role: 'developer' },
+      ];
+      const result = selectBestAgent(wi, agents, 5 * 60_000, new Set(['agent-1']));
+      expect(result).toBeNull();
+    });
+
+    it('returns null when the explicit target is not in the wakable list', () => {
+      const wi = makeWorkItem({ target: 'crewly-orc', type: 'review' });
+      const agents: AgentHealth[] = [
+        { sessionName: 'product-quinn', status: 'inactive', role: 'developer' },
+        { sessionName: 'support-reed', status: 'inactive', role: 'customer-support' },
+      ];
+      const result = selectBestAgent(wi, agents, 5 * 60_000);
+      expect(result).toBeNull();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H3: detectUnclaimedTasks (Hybrid Wake)
+// ---------------------------------------------------------------------------
+describe('detectUnclaimedTasks', () => {
+  const TWO_MIN_AGO = new Date(Date.now() - 3 * 60_000).toISOString(); // 3min ago (past threshold)
+  const JUST_NOW = new Date().toISOString();
+
+  it('should detect unclaimed tasks past threshold and select dormant agent', () => {
+    const wi = makeWorkItem({
+      status: 'queued',
+      createdAt: TWO_MIN_AGO,
+      type: 'delegate',
+      // 2026-05-17 target-strict policy: explicit target must match a wakable
+      // agent. Earlier this test relied on skill-based fallback when target
+      // was 'agent-1' (the makeWorkItem default) and no such agent existed —
+      // that fallback is gone. Target the actual wakable agent.
+      target: 'agent-suspended',
+    });
+    const agentMap = makeAgentMap([
+      ['agent-suspended', { status: 'suspended', role: 'developer' }],
+    ]);
+
+    const { wakeActions, unclaimedWorkItemIds } = detectUnclaimedTasks([wi], agentMap);
+    expect(wakeActions).toHaveLength(1);
+    expect(wakeActions[0].agentSessionName).toBe('agent-suspended');
+    expect(wakeActions[0].strategy).toBe('rehydrate');
+    expect(unclaimedWorkItemIds).toContain(wi.id);
+  });
+
+  // #929: a restart leaves idle agents down. A scheduled trigger that fires
+  // for one of them creates a WorkItem targeted at it; the next reconcile pass
+  // starts the agent at once, even while other agents of the team are running.
+  it('starts an agent the restart left down when its trigger fires (#929)', () => {
+    const triggered = makeWorkItem({
+      status: 'queued',
+      createdAt: JUST_NOW,
+      type: 'delegate',
+      target: 'crewly-marketing-dana-45506487',
+      triggerId: 'crewly-daily-metrics-2200',
+    });
+    const agentMap = makeAgentMap([
+      ['crewly-marketing-dana-45506487', { status: 'inactive', role: 'content-strategist' }],
+      ['crewly-marketing-ella-e6a6b8ea', { status: 'active', role: 'team-leader', activeWorkItemCount: 1 }],
+    ]);
+
+    const { wakeActions } = detectUnclaimedTasks([triggered], agentMap);
+    expect(wakeActions).toEqual([
+      expect.objectContaining({
+        workItemId: triggered.id,
+        agentSessionName: 'crewly-marketing-dana-45506487',
+        strategy: 'start',
+      }),
+    ]);
+  });
+
+  it('should use start strategy for inactive agents', () => {
+    const wi = makeWorkItem({
+      status: 'queued',
+      createdAt: TWO_MIN_AGO,
+      type: 'delegate',
+      target: 'agent-off', // target-strict policy
+    });
+    const agentMap = makeAgentMap([
+      ['agent-off', { status: 'inactive', role: 'developer' }],
+    ]);
+
+    const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+    expect(wakeActions).toHaveLength(1);
+    expect(wakeActions[0].strategy).toBe('start');
+  });
+
+  it('should not wake if there are no unclaimed tasks past threshold', () => {
+    const wi = makeWorkItem({
+      status: 'queued',
+      createdAt: JUST_NOW, // just created
+      type: 'delegate',
+    });
+    const agentMap = makeAgentMap([
+      ['agent-suspended', { status: 'suspended', role: 'developer' }],
+    ]);
+
+    const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+    expect(wakeActions).toHaveLength(0);
+  });
+
+  it('should not wake if there are no dormant agents', () => {
+    const wi = makeWorkItem({
+      status: 'queued',
+      createdAt: TWO_MIN_AGO,
+      type: 'delegate',
+    });
+    const agentMap = makeAgentMap([
+      ['agent-active', { status: 'active' }],
+    ]);
+
+    const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+    expect(wakeActions).toHaveLength(0);
+  });
+
+  it('should skip non-queued WorkItems', () => {
+    const wi = makeWorkItem({
+      status: 'running',
+      createdAt: TWO_MIN_AGO,
+      type: 'delegate',
+    });
+    const agentMap = makeAgentMap([
+      ['agent-suspended', { status: 'suspended', role: 'developer' }],
+    ]);
+
+    const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+    expect(wakeActions).toHaveLength(0);
+  });
+
+  it('should not wake same agent for multiple items', () => {
+    const wi1 = makeWorkItem({ status: 'queued', createdAt: TWO_MIN_AGO, type: 'delegate' });
+    const wi2 = makeWorkItem({ status: 'queued', createdAt: TWO_MIN_AGO, type: 'delegate' });
+    const agentMap = makeAgentMap([
+      ['agent-1', { status: 'suspended', role: 'developer' }],
+    ]);
+
+    const { wakeActions } = detectUnclaimedTasks([wi1, wi2], agentMap);
+    // Only one agent available, so max 1 wake action
+    expect(wakeActions).toHaveLength(1);
+  });
+
+  it('should limit wake actions per pass', () => {
+    const items = Array.from({ length: 10 }, (_, i) =>
+      makeWorkItem({
+        status: 'queued',
+        createdAt: TWO_MIN_AGO,
+        type: 'delegate',
+      })
+    );
+    const agents: Array<[string, Partial<AgentHealth>]> = Array.from({ length: 10 }, (_, i) => [
+      `agent-${i}`,
+      { status: 'suspended' as const, role: 'developer' },
+    ]);
+    const agentMap = makeAgentMap(agents);
+
+    const { wakeActions } = detectUnclaimedTasks(items, agentMap);
+    expect(wakeActions.length).toBeLessThanOrEqual(MAX_WAKE_ACTIONS_PER_PASS);
+  });
+
+  it('should use higher threshold when active agents exist', () => {
+    // WorkItem only 3min old — below the 5min effective threshold when active agents exist
+    const wi = makeWorkItem({
+      status: 'queued',
+      createdAt: new Date(Date.now() - 3 * 60_000).toISOString(),
+      type: 'delegate',
+    });
+    const agentMap = makeAgentMap([
+      ['agent-active', { status: 'active' }],
+      ['agent-suspended', { status: 'suspended', role: 'developer' }],
+    ]);
+
+    const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+    expect(wakeActions).toHaveLength(0); // Below 5min threshold
+  });
+
+  it('should wake when items exceed elevated threshold with active agents', () => {
+    // WorkItem 6min old — above the 5min effective threshold
+    const wi = makeWorkItem({
+      status: 'queued',
+      createdAt: new Date(Date.now() - 6 * 60_000).toISOString(),
+      type: 'delegate',
+      target: 'agent-suspended', // target-strict policy
+    });
+    const agentMap = makeAgentMap([
+      ['agent-active', { status: 'active' }],
+      ['agent-suspended', { status: 'suspended', role: 'developer' }],
+    ]);
+
+    const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+    expect(wakeActions).toHaveLength(1);
+    expect(wakeActions[0].agentSessionName).toBe('agent-suspended');
+  });
+
+  it('should handle empty inputs', () => {
+    const { wakeActions } = detectUnclaimedTasks([], new Map());
+    expect(wakeActions).toHaveLength(0);
+  });
+
+  // -----------------------------------------------------------------------
+  // 2026-05-23 Atlas case — explicit-target + target-inactive bypass threshold
+  //
+  // Background: 3 RESEARCH BRIEF WIs created by orchestrator with
+  // target=think-tank-atlas sat stuck for 30 min+ each. The
+  // delegate-task skill pre-claims the WI before atlas is spawned,
+  // pushing it to `running`. detectStuckWorkItems then marks it
+  // `blocked`. The wake-rule never fires because the WI is no longer
+  // `queued`. Fix #1 (task-pool agent-liveness gate) keeps the WI in
+  // `queued`. Fix #2 (here) ensures the wake-rule fires *immediately*
+  // for that case — not after a 2- or 5-min wait — since the named
+  // target is provably dead and no live agent is going to claim it.
+  // -----------------------------------------------------------------------
+
+  describe('explicit-target-inactive bypasses threshold (Atlas 2026-05-23)', () => {
+    const JUST_NOW_ISO = new Date(Date.now() - 5_000).toISOString(); // 5s old, well under any threshold
+
+    it('wakes immediately when WI target is inactive and other agents are active', () => {
+      // The Atlas scenario: ORC is active, Atlas is inactive, WI just queued.
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: JUST_NOW_ISO,
+        type: 'delegate',
+        target: 'atlas',
+      });
+      const agentMap = makeAgentMap([
+        ['orc', { status: 'active', role: 'orchestrator' }],
+        ['atlas', { status: 'inactive', role: 'developer' }],
+      ]);
+
+      const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+      expect(wakeActions).toHaveLength(1);
+      expect(wakeActions[0].agentSessionName).toBe('atlas');
+      expect(wakeActions[0].strategy).toBe('start');
+    });
+
+    it('wakes immediately when WI target is suspended', () => {
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: JUST_NOW_ISO,
+        type: 'delegate',
+        target: 'paused-agent',
+      });
+      const agentMap = makeAgentMap([
+        ['paused-agent', { status: 'suspended', role: 'developer' }],
+      ]);
+
+      const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+      expect(wakeActions).toHaveLength(1);
+      expect(wakeActions[0].agentSessionName).toBe('paused-agent');
+      expect(wakeActions[0].strategy).toBe('rehydrate');
+    });
+
+    it('does NOT bypass threshold when target is active (redeliver path waits)', () => {
+      // Active-but-idle targets still wait for the full threshold —
+      // they might be mid-startup-banner; redeliver after 2 min is fine.
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: JUST_NOW_ISO,
+        type: 'delegate',
+        target: 'live-agent',
+      });
+      const agentMap = makeAgentMap([
+        ['live-agent', { status: 'active', role: 'developer', activeWorkItemCount: 0 }],
+      ]);
+
+      const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+      expect(wakeActions).toHaveLength(0);
+    });
+
+    it('does NOT bypass threshold for untargeted WI even if dormant agents exist', () => {
+      // Strict target-only policy (2026-05-17) still holds — never wake
+      // for untargeted WIs, regardless of dormant-agent presence.
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: JUST_NOW_ISO,
+        type: 'delegate',
+        // no target
+      });
+      const agentMap = makeAgentMap([
+        ['atlas', { status: 'inactive', role: 'developer' }],
+      ]);
+
+      const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+      expect(wakeActions).toHaveLength(0);
+    });
+  });
+
+  it('should include score breakdown in wake actions', () => {
+    const wi = makeWorkItem({
+      status: 'queued',
+      createdAt: TWO_MIN_AGO,
+      type: 'delegate',
+    });
+    const agentMap = makeAgentMap([
+      ['agent-1', { status: 'suspended', role: 'developer' }],
+    ]);
+
+    const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+    expect(wakeActions).toHaveLength(1);
+    expect(wakeActions[0].scoreBreakdown).toBeDefined();
+    expect(wakeActions[0].scoreBreakdown.skillMatch).toBeGreaterThanOrEqual(0);
+    expect(wakeActions[0].scoreBreakdown.urgency).toBeGreaterThanOrEqual(0);
+    expect(wakeActions[0].score).toBeGreaterThan(0);
+  });
+
+  // -----------------------------------------------------------------------
+  // 2026-05-20 Sora case — redeliver strategy for active-but-idle targets
+  // -----------------------------------------------------------------------
+
+  describe('redeliver strategy (active-but-idle target)', () => {
+    // Active-but-idle agents only act AFTER the 5-min effective threshold
+    // when any active agent is in the map. Make WIs ~7min old.
+    const SEVEN_MIN_AGO = new Date(Date.now() - 7 * 60_000).toISOString();
+
+    it('emits redeliver when WI target is active with no active claims', () => {
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: SEVEN_MIN_AGO,
+        type: 'delegate',
+        target: 'sora',
+      });
+      const agentMap = makeAgentMap([
+        ['sora', { status: 'active', role: 'developer', activeWorkItemCount: 0 }],
+      ]);
+
+      const { wakeActions, unclaimedWorkItemIds } = detectUnclaimedTasks([wi], agentMap);
+      expect(wakeActions).toHaveLength(1);
+      expect(wakeActions[0].strategy).toBe('redeliver');
+      expect(wakeActions[0].agentSessionName).toBe('sora');
+      expect(wakeActions[0].workItemId).toBe(wi.id);
+      expect(wakeActions[0].score).toBe(0);
+      expect(unclaimedWorkItemIds).toContain(wi.id);
+    });
+
+    it('does NOT redeliver when target is active but has active claims', () => {
+      // active-but-busy: the agent already has work and presumably saw
+      // the WI; not a banner-drop scenario.
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: SEVEN_MIN_AGO,
+        type: 'delegate',
+        target: 'sora',
+      });
+      const agentMap = makeAgentMap([
+        ['sora', { status: 'active', role: 'developer', activeWorkItemCount: 2 }],
+      ]);
+
+      const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+      expect(wakeActions).toHaveLength(0);
+    });
+
+    it('does NOT redeliver when WI has no target', () => {
+      // Untargeted WIs never trigger ANY wake (2026-05-17 strict policy).
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: SEVEN_MIN_AGO,
+        type: 'delegate',
+        target: undefined,
+      });
+      const agentMap = makeAgentMap([
+        ['sora', { status: 'active', role: 'developer', activeWorkItemCount: 0 }],
+      ]);
+
+      const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+      expect(wakeActions).toHaveLength(0);
+    });
+
+    it('does NOT redeliver before the effective threshold', () => {
+      // 4min old < 5min effective threshold when an active agent exists.
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: new Date(Date.now() - 4 * 60_000).toISOString(),
+        type: 'delegate',
+        target: 'sora',
+      });
+      const agentMap = makeAgentMap([
+        ['sora', { status: 'active', role: 'developer', activeWorkItemCount: 0 }],
+      ]);
+
+      const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+      expect(wakeActions).toHaveLength(0);
+    });
+
+    it('prefers redeliver over start when target is active-but-idle and another inactive agent exists', () => {
+      // The target should ALWAYS get the work — never substitute by score
+      // (2026-05-17 strict-target policy). Verifies redeliver takes
+      // precedence over best-score search.
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: SEVEN_MIN_AGO,
+        type: 'delegate',
+        target: 'sora',
+      });
+      const agentMap = makeAgentMap([
+        ['sora', { status: 'active', role: 'developer', activeWorkItemCount: 0 }],
+        // Another developer is inactive — the OLD behaviour would have
+        // tried to start them. The new behaviour must redeliver to sora.
+        ['other-dev', { status: 'inactive', role: 'developer' }],
+      ]);
+
+      const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+      expect(wakeActions).toHaveLength(1);
+      expect(wakeActions[0].strategy).toBe('redeliver');
+      expect(wakeActions[0].agentSessionName).toBe('sora');
+    });
+
+    it('does NOT redeliver to the same agent twice in a single pass', () => {
+      const wi1 = makeWorkItem({
+        status: 'queued',
+        createdAt: SEVEN_MIN_AGO,
+        type: 'delegate',
+        target: 'sora',
+      });
+      const wi2 = makeWorkItem({
+        status: 'queued',
+        createdAt: SEVEN_MIN_AGO,
+        type: 'delegate',
+        target: 'sora',
+      });
+      const agentMap = makeAgentMap([
+        ['sora', { status: 'active', role: 'developer', activeWorkItemCount: 0 }],
+      ]);
+
+      const { wakeActions } = detectUnclaimedTasks([wi1, wi2], agentMap);
+      // One redeliver per pass per agent; the oldest WI wins.
+      expect(wakeActions).toHaveLength(1);
+      expect(wakeActions[0].strategy).toBe('redeliver');
+    });
+
+    it('returns empty when only active-but-idle agents exist but no targeted WIs match', () => {
+      // Defensive — verifies the early-return path doesn't skip the
+      // active-idle bucket. WI targets a different (absent) agent.
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: SEVEN_MIN_AGO,
+        type: 'delegate',
+        target: 'someone-else',
+      });
+      const agentMap = makeAgentMap([
+        ['sora', { status: 'active', role: 'developer', activeWorkItemCount: 0 }],
+      ]);
+
+      const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+      expect(wakeActions).toHaveLength(0);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectUnverifiedWorkItems — verification enforcement (P1)
+// ---------------------------------------------------------------------------
+
+describe('detectUnverifiedWorkItems', () => {
+  const PAST = (ms: number) => new Date(Date.now() - ms).toISOString();
+  const NOW = Date.now();
+
+  it('flags a done_by_worker item awaiting verification past the deadline', () => {
+    const stale = makeWorkItem({
+      status: 'done_by_worker',
+      completedAt: PAST(DEFAULT_VERIFY_ESCALATE_MS + 60_000),
+    });
+    const { items, unverifiedIds } = detectUnverifiedWorkItems([stale], NOW);
+    expect(unverifiedIds).toContain(stale.id);
+    expect(items).toHaveLength(1);
+  });
+
+  it('does NOT flag a freshly-done item still within the deadline', () => {
+    const fresh = makeWorkItem({
+      status: 'done_by_worker',
+      completedAt: PAST(60_000), // 1 min ago
+    });
+    const { unverifiedIds } = detectUnverifiedWorkItems([fresh], NOW);
+    expect(unverifiedIds).toHaveLength(0);
+  });
+
+  it('ignores items that are not done_by_worker', () => {
+    const running = makeWorkItem({ status: 'running', startedAt: PAST(DEFAULT_VERIFY_ESCALATE_MS * 5) });
+    const verified = makeWorkItem({ status: 'verified', completedAt: PAST(DEFAULT_VERIFY_ESCALATE_MS * 5) });
+    const { unverifiedIds } = detectUnverifiedWorkItems([running, verified], NOW);
+    expect(unverifiedIds).toHaveLength(0);
+  });
+
+  it('fires once per item — skips items already escalated', () => {
+    const alreadyEscalated = makeWorkItem({
+      status: 'done_by_worker',
+      completedAt: PAST(DEFAULT_VERIFY_ESCALATE_MS * 10),
+      metadata: { [VERIFY_ESCALATED_AT_KEY]: new Date().toISOString() },
+    });
+    const { unverifiedIds } = detectUnverifiedWorkItems([alreadyEscalated], NOW);
+    expect(unverifiedIds).toHaveLength(0);
+  });
+
+  it('honours a custom escalation deadline', () => {
+    const wi = makeWorkItem({ status: 'done_by_worker', completedAt: PAST(90_000) }); // 90s ago
+    // 60s deadline → flagged; 120s deadline → not flagged.
+    expect(detectUnverifiedWorkItems([wi], NOW, 60_000).unverifiedIds).toContain(wi.id);
+    expect(detectUnverifiedWorkItems([wi], NOW, 120_000).unverifiedIds).toHaveLength(0);
+  });
+
+  it('falls back to startedAt / createdAt when completedAt is absent', () => {
+    const wi = makeWorkItem({
+      status: 'done_by_worker',
+      completedAt: undefined,
+      startedAt: PAST(DEFAULT_VERIFY_ESCALATE_MS + 60_000),
+    });
+    const { unverifiedIds } = detectUnverifiedWorkItems([wi], NOW);
+    expect(unverifiedIds).toContain(wi.id);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectUndisposedStrandedWorkItems — successor model safety net
+// ---------------------------------------------------------------------------
+describe('detectRetryableFailedWorkItems — disposed items are never re-queued', () => {
+  function disposed(kind: 'succeeded_by' | 'terminal', extra: Record<string, unknown> = {}): WorkItem {
+    return makeWorkItem({
+      status: 'failed',
+      retryCount: 0,
+      maxRetries: 3,
+      metadata: {
+        [DISPOSITION_METADATA_KEY]: {
+          kind,
+          at: new Date().toISOString(),
+          by: 'system',
+          reason: 'already handled',
+          ...extra,
+        },
+      },
+    });
+  }
+
+  it('re-queues an undisposed failed item with budget left (baseline)', () => {
+    const wi = makeWorkItem({ status: 'failed', retryCount: 0, maxRetries: 3 });
+    const { corrections, retriedIds } = detectRetryableFailedWorkItems([wi]);
+    expect(retriedIds).toEqual([wi.id]);
+    expect(corrections[0].newState).toBe('queued');
+  });
+
+  it('skips a failed item that was succeeded by another WorkItem (would double-run the work)', () => {
+    const wi = disposed('succeeded_by', { successorWorkItemId: 'wi-x:review:max_retries' });
+    const { corrections, retriedIds } = detectRetryableFailedWorkItems([wi]);
+    expect(retriedIds).toEqual([]);
+    expect(corrections).toEqual([]);
+  });
+
+  it('skips a failed item with a terminal disposition even if retryCount is below maxRetries', () => {
+    const wi = disposed('terminal', { escalationId: 'esc-1' });
+    const { retriedIds } = detectRetryableFailedWorkItems([wi]);
+    expect(retriedIds).toEqual([]);
+  });
+
+  it('still skips a failed item whose budget is spent', () => {
+    const wi = makeWorkItem({ status: 'failed', retryCount: 3, maxRetries: 3 });
+    expect(detectRetryableFailedWorkItems([wi]).retriedIds).toEqual([]);
+  });
+});
+
+describe('detectUndisposedStrandedWorkItems', () => {
+  const HOUR = 3600 * 1000;
+
+  /** A WI that entered a stranding status `hoursAgo` ago. */
+  function stranded(
+    status: 'rejected' | 'failed',
+    hoursAgo = 1,
+    overrides: Partial<WorkItem> = {},
+  ): WorkItem {
+    return makeWorkItem({
+      status,
+      completedAt: new Date(Date.now() - hoursAgo * HOUR).toISOString(),
+      ...overrides,
+    });
+  }
+
+  /** Build a well-formed disposition stamp. */
+  function stamp(
+    kind: 'succeeded_by' | 'terminal',
+    extra: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      [DISPOSITION_METADATA_KEY]: {
+        kind,
+        at: new Date().toISOString(),
+        by: 'system',
+        reason: 'already handled',
+        ...extra,
+      },
+    };
+  }
+
+  it('flags an undisposed stranded item once the grace window has passed', () => {
+    const { items } = detectUndisposedStrandedWorkItems([stranded('rejected')]);
+    expect(items).toHaveLength(1);
+  });
+
+  it('covers both stranding statuses, and only those', () => {
+    // Derived from the transition table, so this really asserts that the set of
+    // "neither terminal nor able to reach terminal" statuses is exactly
+    // {rejected, failed} — a future status of that shape is covered for free
+    // instead of silently stranding.
+    const all = WORK_ITEM_STATUSES.map((status) =>
+      makeWorkItem({
+        status,
+        completedAt: new Date(Date.now() - HOUR).toISOString(),
+      }),
+    );
+    const { items } = detectUndisposedStrandedWorkItems(all);
+    expect(items.map((i) => i.status).sort()).toEqual(['failed', 'rejected']);
+  });
+
+  it('leaves an item alone inside the grace window so the eager writer wins', () => {
+    const fresh = makeWorkItem({
+      status: 'failed',
+      completedAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    expect(detectUndisposedStrandedWorkItems([fresh]).items).toHaveLength(0);
+  });
+
+  it('returns the oldest strand first', () => {
+    const young = stranded('failed', 1);
+    const old = stranded('rejected', 10);
+    const { items } = detectUndisposedStrandedWorkItems([young, old]);
+    expect(items.map((i) => i.id)).toEqual([old.id, young.id]);
+  });
+
+  /**
+   * The two directions the reverted 469a3a21 rule got wrong.
+   *
+   * It answered "does a successor exist?" by scanning `getActiveWorkItems()`
+   * for a child. Both failures follow from the QUESTION, not the code, and no
+   * refinement of the query fixes either — which is why the predicate is now a
+   * local field read instead of a scan.
+   */
+  describe('successor predicate — correct in BOTH directions', () => {
+    it('direction 1: does NOT re-dispatch an item whose successor already finished', () => {
+      // The reverted rule looked for successors in getActiveWorkItems(), which
+      // drops `done`/`cancelled`. A successor that had already completed was
+      // invisible, so the rule concluded "no successor" and re-dispatched the
+      // source — executing completed work a second time.
+      const completedSuccessor = makeWorkItem({ status: 'done' });
+      const source = stranded(
+        'rejected',
+        10,
+        { metadata: stamp('succeeded_by', { successorWorkItemId: completedSuccessor.id }) },
+      );
+
+      const { items } = detectUndisposedStrandedWorkItems([source, completedSuccessor]);
+
+      // Read off the source itself, so the successor's status is irrelevant —
+      // there is no collection for a filter to hide it from.
+      expect(items).toHaveLength(0);
+    });
+
+    it('direction 2: DOES flag an item whose only child is an unrelated VERIFY WI', () => {
+      // `buildAutoWorkItem` sets `parentWorkItemId` on VERIFY WorkItems too, so
+      // the reverted rule read a verification child as a successor and skipped
+      // the exact SLA case it existed to rescue.
+      const source = stranded('rejected', 10);
+      const verifyChild = makeWorkItem({
+        id: `${source.id}:verify:${source.id}`,
+        status: 'queued',
+        parentWorkItemId: source.id,
+      });
+
+      const { items } = detectUndisposedStrandedWorkItems([source, verifyChild]);
+
+      // No stamp on the source → still stranded, regardless of who claims it as
+      // a parent. `parentWorkItemId` is never consulted.
+      expect(items.map((i) => i.id)).toEqual([source.id]);
+    });
+  });
+
+  it('skips an item already disposed, whatever the disposition was', () => {
+    for (const kind of ['succeeded_by', 'terminal'] as const) {
+      const disposed = stranded('failed', 10, { metadata: stamp(kind) });
+      expect(detectUndisposedStrandedWorkItems([disposed]).items).toHaveLength(0);
+    }
+  });
+
+  it('treats a malformed stamp as absent rather than trusting it', () => {
+    // `metadata` is Record<string, unknown> and round-trips through storage.
+    // Re-disposing is idempotent and safe; trusting a broken record is not.
+    const malformed: unknown[] = [{ kind: 'nonsense' }, { at: 'x' }, 'string', 42, null];
+    for (const bad of malformed) {
+      const wi = stranded('failed', 10, {
+        metadata: { [DISPOSITION_METADATA_KEY]: bad },
+      });
+      expect(detectUndisposedStrandedWorkItems([wi]).items).toHaveLength(1);
+    }
+  });
+
+  it('emits no status corrections at all — a disposition is not a transition', () => {
+    // The `terminal` outcome leaves the item exactly where it is. Returning a
+    // correction here would put an illegal edge back into the pipeline that
+    // #733 just cleaned of them, since neither stranding status has a legal
+    // terminal target.
+    const result = detectUndisposedStrandedWorkItems([stranded('rejected', 10)]);
+    expect(Object.keys(result)).toEqual(['items']);
+  });
+});
+
+describe('detectDependencyResolvedWorkItems', () => {
+  it('unblocks a dependency-blocked WorkItem once every dependency is terminal', () => {
+    const dep = makeWorkItem({ status: 'done' });
+    const wi = makeWorkItem({ status: 'blocked', dependsOn: [dep.id] });
+    const map = new Map([[dep.id, dep], [wi.id, wi]]);
+
+    expect(detectDependencyResolvedWorkItems([wi], map).unblockedIds).toEqual([wi.id]);
+  });
+
+  it('leaves an explicitly blocked WorkItem alone even when its dependencies are done', () => {
+    const dep = makeWorkItem({ status: 'done' });
+    const wi = makeWorkItem({ status: 'blocked', dependsOn: [dep.id], blockSource: 'explicit' });
+    const map = new Map([[dep.id, dep], [wi.id, wi]]);
+
+    const { corrections, unblockedIds } = detectDependencyResolvedWorkItems([wi], map);
+    expect(unblockedIds).toHaveLength(0);
+    expect(corrections).toHaveLength(0);
+  });
+});
+
+describe('detectDueBlockedWorkItems (block-task until)', () => {
+  const NOW = Date.parse('2026-10-27T08:30:00Z');
+
+  it('lifts an explicit block whose until time has passed, marking the correction as the explicit-block requeue', () => {
+    const wi = makeWorkItem({
+      status: 'blocked',
+      blockSource: 'explicit',
+      target: 'ce-vera',
+      metadata: { blockedUntil: '2026-10-27T08:30:00Z' },
+    });
+    const { corrections, releasedIds } = detectDueBlockedWorkItems([wi], NOW);
+    expect(releasedIds).toEqual([wi.id]);
+    expect(corrections).toHaveLength(1);
+    expect(corrections[0]).toMatchObject({
+      entityType: 'work_item',
+      entityId: wi.id,
+      previousState: 'blocked',
+      newState: 'queued',
+      blockSource: 'explicit',
+    });
+    expect(corrections[0].reason).toContain('2026-10-27T08:30:00.000Z');
+    expect(corrections[0].reason).toContain('ce-vera');
+  });
+
+  it('leaves a timed block alone while its time is still ahead', () => {
+    const wi = makeWorkItem({ status: 'blocked', blockSource: 'explicit', metadata: { blockedUntil: '2026-10-27T08:31:00Z' } });
+    expect(detectDueBlockedWorkItems([wi], NOW).releasedIds).toEqual([]);
+  });
+
+  it('never touches an explicit block without a time, a system block, or a waiting_on_human park', () => {
+    const openEnded = makeWorkItem({ status: 'blocked', blockSource: 'explicit' });
+    const systemBlocked = makeWorkItem({ status: 'blocked', metadata: { blockedUntil: '2026-10-27T08:00:00Z' } });
+    const waiting = makeWorkItem({ status: 'blocked', blockSource: 'waiting_on_human', metadata: { blockedUntil: '2026-10-27T08:00:00Z' } });
+    const { corrections, releasedIds } = detectDueBlockedWorkItems([openEnded, systemBlocked, waiting], NOW);
+    expect(releasedIds).toEqual([]);
+    expect(corrections).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectUnreviewedPastTTL — owner step of the review escalation chain (#813)
+// ---------------------------------------------------------------------------
+
+describe('detectUnreviewedPastTTL', () => {
+  const NOW = Date.parse('2026-09-26T12:00:00Z');
+  const hoursAgo = (h: number) => new Date(NOW - h * 3600 * 1000).toISOString();
+
+  it('picks done_by_worker items awaiting review longer than the TTL, and reports what it examined', () => {
+    const old = makeWorkItem({ status: 'done_by_worker', createdAt: hoursAgo(30), completedAt: hoursAgo(25) });
+    const fresh = makeWorkItem({ status: 'done_by_worker', createdAt: hoursAgo(30), completedAt: hoursAgo(3) });
+    const running = makeWorkItem({ status: 'running', createdAt: hoursAgo(40) });
+    const { items, examined } = detectUnreviewedPastTTL([old, fresh, running], NOW);
+    expect(items.map((w) => w.id)).toEqual([old.id]);
+    expect(examined).toBe(2);
+  });
+
+  it('fires once per item — skips items already escalated to the owner', () => {
+    const stamped = makeWorkItem({
+      status: 'done_by_worker',
+      completedAt: hoursAgo(50),
+      metadata: { [REVIEW_OWNER_ESCALATED_AT_KEY]: hoursAgo(26) },
+    });
+    const { items, examined } = detectUnreviewedPastTTL([stamped], NOW);
+    expect(items).toEqual([]);
+    expect(examined).toBe(1);
+  });
+
+  it('measures from when the worker reported done, not from creation', () => {
+    const wi = makeWorkItem({ status: 'done_by_worker', createdAt: hoursAgo(100), completedAt: hoursAgo(2) });
+    expect(detectUnreviewedPastTTL([wi], NOW).items).toEqual([]);
+  });
+
+  it('honours a custom TTL', () => {
+    const wi = makeWorkItem({ status: 'done_by_worker', completedAt: hoursAgo(2) });
+    expect(detectUnreviewedPastTTL([wi], NOW, 3600 * 1000).items).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectWaitingOnHumanWorkItems (#815)
+// ---------------------------------------------------------------------------
+describe('detectWaitingOnHumanWorkItems', () => {
+  const NOW = Date.parse('2026-09-26T12:00:00Z');
+  const minsAgo = (m: number): string => new Date(NOW - m * 60_000).toISOString();
+  const waitingBlocked = (): WorkItem => makeWorkItem({
+    status: 'blocked', target: 'agent-1', blockSource: WORK_ITEM_BLOCK_SOURCES.WAITING_ON_HUMAN,
+  });
+
+  it('parks a running item once its agent has waited more than 5 minutes', () => {
+    const wi = makeWorkItem({ status: 'running', target: 'agent-1' });
+    const r = detectWaitingOnHumanWorkItems([wi], makeAgentMap([['agent-1', { waitingOnHumanSince: minsAgo(6) }]]), NOW);
+    expect(r.blockedIds).toEqual([wi.id]);
+    expect(r.corrections[0]).toMatchObject({ previousState: 'running', newState: 'blocked', blockSource: 'waiting_on_human' });
+    expect(r.corrections[0].reason).toMatch(/^waiting_on_human: agent agent-1 .* 6 min/);
+  });
+
+  it('does not park before 5 minutes, or when the agent is not waiting', () => {
+    const wi = makeWorkItem({ status: 'running', target: 'agent-1' });
+    expect(detectWaitingOnHumanWorkItems([wi], makeAgentMap([['agent-1', { waitingOnHumanSince: minsAgo(4) }]]), NOW).corrections).toHaveLength(0);
+    expect(detectWaitingOnHumanWorkItems([wi], makeAgentMap([['agent-1', {}]]), NOW).corrections).toHaveLength(0);
+  });
+
+  it('resumes a waiting_on_human block to running when the agent stops waiting', () => {
+    const wi = waitingBlocked();
+    const r = detectWaitingOnHumanWorkItems([wi], makeAgentMap([['agent-1', {}]]), NOW);
+    expect(r.resumedIds).toEqual([wi.id]);
+    expect(r.corrections[0]).toMatchObject({ previousState: 'blocked', newState: 'running' });
+  });
+
+  it('keeps it blocked while the agent is still waiting', () => {
+    const r = detectWaitingOnHumanWorkItems([waitingBlocked()], makeAgentMap([['agent-1', { waitingOnHumanSince: minsAgo(30) }]]), NOW);
+    expect(r.corrections).toHaveLength(0);
+  });
+
+  it('re-queues (no failure, no retry) when the agent is gone', () => {
+    const wi = waitingBlocked();
+    const r = detectWaitingOnHumanWorkItems([wi], makeAgentMap([['agent-1', { status: 'inactive' }]]), NOW);
+    expect(r.requeuedIds).toEqual([wi.id]);
+    expect(r.corrections[0]).toMatchObject({ previousState: 'blocked', newState: 'queued' });
+    expect(detectWaitingOnHumanWorkItems([wi], new Map(), NOW).requeuedIds).toEqual([wi.id]);
+  });
+
+  it('never touches other blocked items (explicit or system blocks)', () => {
+    const explicit = makeWorkItem({ status: 'blocked', target: 'agent-1', blockSource: WORK_ITEM_BLOCK_SOURCES.EXPLICIT });
+    const system = makeWorkItem({ status: 'blocked', target: 'agent-1' });
+    expect(detectWaitingOnHumanWorkItems([explicit, system], makeAgentMap([['agent-1', {}]]), NOW).corrections).toHaveLength(0);
+  });
+
+  it('the recoverable and dependency rules skip waiting_on_human blocks', () => {
+    const wi = { ...waitingBlocked(), dependsOn: [] as string[] } as WorkItem;
+    expect(detectRecoverableWorkItems([wi], makeAgentMap([['agent-1', {}]])).corrections).toHaveLength(0);
+    const withDep = { ...waitingBlocked(), dependsOn: ['gone'] } as unknown as WorkItem;
+    expect(detectDependencyResolvedWorkItems([withDep], new Map()).corrections).toHaveLength(0);
+  });
+
+  it('blocked -> running is a legal edge, permitted to system only', () => {
+    expect(isValidWorkItemTransition('blocked', 'running')).toBe(true);
+    expect(TRANSITION_PERMISSIONS['blocked→running']).toEqual(new Set(['system']));
+    const item = { status: 'blocked' as const, target: 'agent-1', metadata: {} };
+    expect(isTransitionPermitted(item, 'running', { role: 'system', via: 'reconciler' })).toBe(true);
+    expect(isTransitionPermitted(item, 'running', 'agent')).toBe(false);
+    expect(isTransitionPermitted(item, 'running', 'team_lead')).toBe(false);
+    expect(isTransitionPermitted(item, 'running', undefined)).toBe(false);
+  });
+});
+
+describe('detectUnclaimedTasks — never redeliver into a prompt (#815)', () => {
+  it('does not redeliver to an active, empty agent that is waiting on a human', () => {
+    const wi = makeWorkItem({ status: 'queued', createdAt: new Date(Date.now() - 7 * 60_000).toISOString(), target: 'sora' });
+    const waiting = makeAgentMap([['sora', { activeWorkItemCount: 0, waitingOnHumanSince: new Date().toISOString() }]]);
+    expect(detectUnclaimedTasks([wi], waiting).wakeActions.filter((a) => a.strategy === 'redeliver')).toHaveLength(0);
+    const notWaiting = makeAgentMap([['sora', { activeWorkItemCount: 0 }]]);
+    expect(detectUnclaimedTasks([wi], notWaiting).wakeActions.filter((a) => a.strategy === 'redeliver')).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Housekeeping WorkItems never wake a stopped agent (steamfun-ops 2026-09-30)
+// ---------------------------------------------------------------------------
+describe('housekeeping WorkItems', () => {
+  const OLD = new Date(Date.now() - 3 * 60 * 60_000).toISOString();
+  const chore = (overrides: Partial<WorkItem> = {}): WorkItem =>
+    makeWorkItem({
+      status: 'queued',
+      createdAt: OLD,
+      target: 'tl-dormant',
+      metadata: { kind: 'standing-refresh', autoCreated: true },
+      ...overrides,
+    });
+
+  it('recognises autoCreated / housekeeping metadata', () => {
+    expect(isHousekeepingWorkItem(chore())).toBe(true);
+    expect(isHousekeepingWorkItem(makeWorkItem({ metadata: { housekeeping: true } }))).toBe(true);
+    expect(isHousekeepingWorkItem(makeWorkItem())).toBe(false);
+    expect(isHousekeepingWorkItem(makeWorkItem({ metadata: { autoCreated: 'yes' } }))).toBe(false);
+  });
+
+  it('does not start an inactive target for a housekeeping item', () => {
+    const agentMap = makeAgentMap([['tl-dormant', { status: 'inactive', teamId: 't1', memberId: 'm1' }]]);
+    expect(detectUnclaimedTasks([chore()], agentMap).wakeActions).toHaveLength(0);
+  });
+
+  it('does not rehydrate a suspended target for a housekeeping item', () => {
+    const agentMap = makeAgentMap([['tl-dormant', { status: 'suspended' }]]);
+    expect(detectUnclaimedTasks([chore()], agentMap).wakeActions).toHaveLength(0);
+  });
+
+  it('still wakes the same target for real work queued next to the chore', () => {
+    const agentMap = makeAgentMap([['tl-dormant', { status: 'inactive', teamId: 't1', memberId: 'm1' }]]);
+    const real = makeWorkItem({ status: 'queued', createdAt: OLD, target: 'tl-dormant' });
+    const { wakeActions } = detectUnclaimedTasks([chore(), real], agentMap);
+    expect(wakeActions).toHaveLength(1);
+    expect(wakeActions[0]).toMatchObject({ workItemId: real.id, strategy: 'start' });
+  });
+
+  it('still re-delivers a housekeeping item to an awake, idle target', () => {
+    const agentMap = makeAgentMap([['tl-awake', { status: 'active', activeWorkItemCount: 0 }]]);
+    const { wakeActions } = detectUnclaimedTasks([chore({ target: 'tl-awake' })], agentMap);
+    expect(wakeActions).toHaveLength(1);
+    expect(wakeActions[0].strategy).toBe('redeliver');
+  });
+
+  it('is not reported as stale-queued while it waits', () => {
+    const real = makeWorkItem({ status: 'queued', createdAt: OLD });
+    const { staleIds } = detectStaleQueuedWorkItems([chore(), real], 60 * 60_000);
+    expect(staleIds).toEqual([real.id]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Team pause (specs/2026-10-04-team-pause.md)
+// ---------------------------------------------------------------------------
+describe('team pause (specs/2026-10-04-team-pause.md)', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const registry = require('../team/team-pause.registry.js') as typeof import('../team/team-pause.registry.js');
+  const PAST = new Date(Date.now() - 10 * 60_000).toISOString();
+
+  function pause(teamId: string, sessions: string[]): void {
+    registry.notePausedTeam({
+      id: teamId,
+      name: teamId,
+      projectIds: [],
+      createdAt: PAST,
+      updatedAt: PAST,
+      paused: { pausedAt: PAST, by: 'owner' },
+      members: sessions.map((s, i) => ({ id: `m-${i}`, name: s, sessionName: s, agentId: s })) as never,
+    });
+  }
+
+  afterEach(() => registry.resetTeamPauseRegistryForTesting());
+
+  it('does not wake an inactive agent whose team is paused (by session)', () => {
+    pause('team-p', ['agent-paused']);
+    const wi = makeWorkItem({ status: 'queued', createdAt: PAST, type: 'delegate', target: 'agent-paused' });
+    const agentMap = makeAgentMap([['agent-paused', { status: 'inactive', role: 'developer' }]]);
+    expect(detectUnclaimedTasks([wi], agentMap).wakeActions).toEqual([]);
+  });
+
+  it('does not wake or redeliver to an agent whose teamId is paused', () => {
+    pause('team-p', []);
+    const a = makeWorkItem({ status: 'queued', createdAt: PAST, type: 'delegate', target: 'agent-off' });
+    const b = makeWorkItem({ status: 'queued', createdAt: PAST, type: 'delegate', target: 'agent-idle' });
+    const agentMap = makeAgentMap([
+      ['agent-off', { status: 'inactive', role: 'developer', teamId: 'team-p' }],
+      ['agent-idle', { status: 'active', role: 'developer', teamId: 'team-p', activeWorkItemCount: 0 }],
+    ]);
+    expect(detectUnclaimedTasks([a, b], agentMap).wakeActions).toEqual([]);
+  });
+
+  it('still wakes an agent of a team that is not paused', () => {
+    pause('team-p', ['agent-paused']);
+    const wi = makeWorkItem({ status: 'queued', createdAt: PAST, type: 'delegate', target: 'agent-free' });
+    const agentMap = makeAgentMap([
+      ['agent-paused', { status: 'inactive', role: 'developer' }],
+      ['agent-free', { status: 'inactive', role: 'developer', teamId: 'team-other' }],
+    ]);
+    const { wakeActions } = detectUnclaimedTasks([wi], agentMap);
+    expect(wakeActions).toHaveLength(1);
+    expect(wakeActions[0].agentSessionName).toBe('agent-free');
+  });
+});
+
+describe('detectStuckWorkItems — live claim lease (CE-232)', () => {
+  const claimFor = (workItemId: string, leaseMs: number): TaskClaim => ({
+    id: 'c1', workItemId, agentId: 'agent-dead', status: 'active',
+    claimedAt: new Date().toISOString(), leaseExpiresAt: new Date(Date.now() + leaseMs).toISOString(),
+  } as TaskClaim);
+
+  it('skips a dead-looking agent while its claim lease is live', () => {
+    const wi = makeWorkItem({ status: 'running', target: 'agent-dead', startedAt: new Date().toISOString() });
+    const agentMap = makeAgentMap([['agent-dead', { status: 'inactive' }]]);
+    const { corrections, stuckIds } = detectStuckWorkItems([wi], agentMap, 600_000, undefined, [claimFor(wi.id, 60_000)]);
+    expect(corrections).toHaveLength(0);
+    expect(stuckIds).toHaveLength(0);
+  });
+
+  it('still blocks when the lease has expired', () => {
+    const wi = makeWorkItem({ status: 'running', target: 'agent-dead', startedAt: new Date().toISOString() });
+    const agentMap = makeAgentMap([['agent-dead', { status: 'inactive' }]]);
+    const { corrections } = detectStuckWorkItems([wi], agentMap, 600_000, undefined, [claimFor(wi.id, -60_000)]);
+    expect(corrections[0].newState).toBe('blocked');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// crewly#1369 §5: work waiting on an open owner decision card is not TTL-cancelled
+// ---------------------------------------------------------------------------
+describe('decision-card hold on the TTL', () => {
+  const old = (extra: Record<string, unknown> = {}) =>
+    makeWorkItem({ status: 'running', createdAt: new Date(Date.now() - 30 * 3600 * 1000).toISOString(), ...extra });
+
+  it('skips the work item the open card was asked from', () => {
+    const asked = old();
+    const other = old();
+    const held = decisionHoldPredicate([{ workItemId: asked.id }]);
+    const { expiredIds } = detectTTLExpiredWorkItems([asked, other], 24 * 3600 * 1000, held);
+    expect(expiredIds).toEqual([other.id]);
+  });
+
+  it('skips work on the open card\'s ticket (metadata link or bare ticket id)', () => {
+    const linked = old({ metadata: { projectTicket: { projectPath: '/proj', id: 'CREW-646' } } });
+    const bare = old({ projectTaskId: 'CREW-646' });
+    const otherProject = old({ metadata: { projectTicket: { projectPath: '/other', id: 'CREW-646' } } });
+    const held = decisionHoldPredicate([{ ticket: { projectPath: '/proj', id: 'CREW-646' } }]);
+    expect(held(linked)).toBe(true);
+    expect(held(bare)).toBe(true);
+    expect(held(otherProject)).toBe(false);
+    const { expiredIds } = detectTTLExpiredWorkItems([linked, bare, otherProject], 24 * 3600 * 1000, held);
+    expect(expiredIds).toEqual([otherProject.id]);
+  });
+
+  it('no open cards: nothing is held', () => {
+    expect(decisionHoldPredicate([])(old())).toBe(false);
+  });
+
+  it('runPruningPass passes the hold to the TTL rule', () => {
+    const asked = old();
+    const result = runPruningPass([asked], undefined, undefined, decisionHoldPredicate([{ workItemId: asked.id }]));
+    expect(result.ttlCancelledCount).toBe(0);
+    expect(runPruningPass([asked]).ttlCancelledCount).toBe(1);
+  });
+});

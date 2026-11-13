@@ -1,0 +1,87 @@
+# Dependencies (rebuilt inside container)
+node_modules/
+*/node_modules/
+
+# Build artifacts (rebuilt inside container)
+dist/
+*/dist/
+build/
+*.tsbuildinfo
+
+# Version control
+.git/
+.gitignore
+
+# Environment files (passed via docker-compose env_file)
+.env
+.env.*
+
+# Test files
+coverage/
+test-results/
+playwright-report/
+*.test.ts
+*.test.tsx
+*.spec.ts
+*.spec.js
+jest.config.js
+jest.unit.config.js
+playwright.config.ts
+mcp-test-report.json
+test.sh
+test-claude.sh
+test-mcp-registration.js
+
+# Documentation (not needed in container)
+*.md
+!config/**/*.md
+CLAUDE.md
+CONTRIBUTING.md
+DEPLOYMENT.md
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Development files
+specs/
+tests/
+improvement_plans/
+desktop/
+avatar-3d/
+docs/
+examples/
+scripts/
+.crewly/
+.agentmux/
+.claude/
+.gemini/
+.github/
+
+# Logs and temp files
+logs/
+*.log
+tmp/
+temp/
+output.log
+
+# Large 3D model files (not needed for production API server)
+frontend/public/models/
+
+# Misc
+*.tgz
+*.tar.gz
+.eslintcache
+.eslintrc.js
+.npmignore
+.mcp.json
+ecosystem.config.js
+kill-vibecoder.sh
+restart-backend.sh

@@ -1,0 +1,4254 @@
+/**
+ * Task Pool Service — Unified task entry and queue management
+ *
+ * The Task Pool holds execution-ready WorkItems. Agents claim items
+ * from the pool, and the Reconciler returns unclaimed or failed items.
+ *
+ * CEO Decision: Pool only holds execution-ready WorkItems, not all ProjectTasks.
+ *
+ * @module services/task-pool/task-pool.service
+ */
+
+import { PoolStorage } from './pool-storage.js';
+import { ClaimService, type HeartbeatResult, type ExtendLeaseResult, type ExpiredClaimsSummary } from './claim.service.js';
+import { LoggerService, type ComponentLogger } from '../core/logger.service.js';
+import { formatError } from '../../utils/format-error.js';
+import {
+  TeamBudgetExceededError,
+  type TeamBudgetGateService,
+} from '../budget/team-budget-gate.service.js';
+import type {
+  WorkItem,
+  WorkItemStatus,
+  WorkItemType,
+  WorkItemOwner,
+} from '../../types/v2/work-item.types.js';
+import {
+  isWorkItem,
+  isValidWorkItemTransition,
+  checkTransitionPermission,
+  normalizeTransitionActor,
+  describeTransitionActor,
+  getWorkItemReviewer,
+  ForbiddenTransitionError,
+  VERDICT_TRANSITIONS,
+  WORK_ITEM_REVIEWER_KEY,
+  LAST_REQUEUED_AT_METADATA_KEY,
+  DISPOSITION_METADATA_KEY,
+  DISPOSITION_REQUIRED_STATUSES,
+  getWorkItemDisposition,
+  WORK_ITEM_BLOCK_SOURCES,
+  WORK_ITEM_BLOCKED_UNTIL_KEY,
+  isExplicitlyBlocked,
+  TERMINAL_WORK_ITEM_STATUSES,
+} from '../../types/v2/work-item.types.js';
+import type {
+  WorkItemDisposition,
+  WorkItemBlockSource,
+  TransitionActor,
+  TransitionActorInput,
+} from '../../types/v2/work-item.types.js';
+import {
+  createTaskClaim,
+  type TaskClaim,
+  type CreateClaimInput,
+} from '../../types/v2/claim.types.js';
+import type { EventBusService } from '../event-bus/event-bus.service.js';
+import { orderForAgent, type ClaimTicketLookup } from './ticket-claim-policy.js';
+import { SUPERSEDED_BY_METADATA_KEY } from '../v3/request-completion.js';
+import { OrcReplyRouteService, type TurnOrigin } from '../orc/orc-reply-route.service.js';
+import {
+  currentWorkItemOf,
+  inheritedOrigin,
+  isOwnerRequestTooOld,
+  isWorkItemOrigin,
+  originOfWorkItem,
+  ownerOriginFromConversation,
+  ownerOriginFromThreadKey,
+  planWorkDestination,
+  type WorkItemOrigin,
+} from '../orc/work-item-destination.js';
+import { reportOwnerThreadBlocking } from '../messaging/owner-thread-sentinel.service.js';
+import { getThreadAnswerLog, type ThreadPost } from '../messaging/thread-answer-log.js';
+import { getOwnerRequestContext, type OwnerRequestContext } from '../orc/owner-request-context.js';
+import { leadReportOf, orchestratorNote, type LeadReport } from '../orc/team-lead-report.js';
+import { resolveLeadReport } from '../orc/team-lead-report.wiring.js';
+import { formatSlackThreadKey, parseSlackThreadKey } from '../slack/slack-thread-key.js';
+import { OPEN_ITEMS_CONSTANTS, TEAM_LEAD_REPORT_CONSTANTS, TEAM_PAUSE_CONSTANTS, TL_DELEGATION_CONSTANTS, WORK_ITEM_DESTINATION_CONSTANTS } from '../../constants.js';
+import { assignWorkItemTrace } from '../trace/trace-recorder.js';
+
+/**
+ * Narrow Request-link contract consumed by {@link TaskPoolService.addToPool}.
+ *
+ * Defined as a duck-typed interface (rather than importing the full
+ * `RequestService` class) so tests can supply fakes without depending on
+ * the RequestService transitive imports, and to keep the dependency
+ * direction one-way: TaskPool → Request, never the reverse.
+ *
+ * P1 Bug B (Pool umbrella WI 72ca743a-3a66-4d0e-a6cf-1a861f849dbd):
+ * the production `linkWorkItem` is idempotent — it short-circuits when
+ * `workItemId` is already in `request.workItemIds[]` — so the
+ * intrinsic-link path here is safe to coexist with downstream
+ * subscriber-driven linking (request-sla.subscriber, V3DataService).
+ */
+export interface IRequestWorkItemLinker {
+  /**
+   * Idempotently link a WorkItem id to a Request's workItemIds[].
+   *
+   * @param requestId - The parent Request id (already on the WI).
+   * @param workItemId - The WorkItem id to link.
+   * @returns The updated Request, or null if the Request was not found.
+   *   `addToPool` ignores the return value — link failure is best-effort.
+   */
+  linkWorkItem(requestId: string, workItemId: string): Promise<unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// Bulk-DELETE types (P1 1ffffb84 component a)
+// ---------------------------------------------------------------------------
+
+/** Result of {@link TaskPoolService.removeFromPool}. */
+export interface RemoveFromPoolResult {
+  /** `true` when the WorkItem existed and was removed. */
+  removed: boolean;
+  /** The deleted WorkItem (only when removed === true). */
+  workItem?: WorkItem;
+  /** `true` when an active claim was found at delete time. */
+  hadActiveClaim?: boolean;
+  /** Cause when removed === false. */
+  reason?: 'not_found';
+}
+
+/**
+ * Structured error thrown by {@link TaskPoolService.removeFromPool}
+ * when an active claim exists and `force: true` was not passed.
+ */
+export class WorkItemClaimedError extends Error {
+  public readonly workItemId: string;
+  public readonly claimId: string;
+  public readonly claimedBy: string;
+
+  constructor(args: { workItemId: string; claimId: string; claimedBy: string }) {
+    super(
+      `WorkItem '${args.workItemId}' has an active claim ` +
+      `(claimId='${args.claimId}', claimedBy='${args.claimedBy}'). ` +
+      `Pass { force: true } to delete anyway (will revoke the claim).`,
+    );
+    this.name = 'WorkItemClaimedError';
+    this.workItemId = args.workItemId;
+    this.claimId = args.claimId;
+    this.claimedBy = args.claimedBy;
+    Object.setPrototypeOf(this, WorkItemClaimedError.prototype);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Filter / Snapshot Types
+// ---------------------------------------------------------------------------
+
+/**
+ * Filters for claiming work items from the pool.
+ */
+export interface PoolFilters {
+  /** Only match items of these types */
+  types?: WorkItemType[];
+  /** Only match items with this owner role */
+  owner?: WorkItemOwner;
+  /** Only match items targeting a specific agent/team */
+  target?: string;
+  /** Only match items belonging to this mission */
+  missionId?: string;
+}
+
+/**
+ * Statistics snapshot of the pool's current state.
+ */
+export interface PoolSnapshot {
+  /** Total items in the pool (all statuses) */
+  total: number;
+  /** Items available for claiming (queued, no active claim) */
+  available: number;
+  /** Items currently claimed by an agent */
+  claimed: number;
+  /** Average wait time in ms for items that have been claimed */
+  avgWaitTimeMs: number;
+  /** Breakdown by WorkItem type */
+  byType: Record<string, number>;
+  /** Breakdown by status */
+  byStatus: Record<string, number>;
+  /** ISO8601 timestamp of this snapshot */
+  timestamp: string;
+}
+
+/**
+ * Result returned when claiming a work item.
+ *
+ * `alreadyHeld` (Steve 2026-05-15, issue #513): true when the caller
+ * already had an active claim — we return that claim + its WorkItem
+ * instead of returning null. Callers (skill scripts, controller) can
+ * distinguish "fresh claim" from "you already own this" and route
+ * accordingly. Default `false` for new claims so existing callers
+ * stay source-compat.
+ */
+export interface ClaimResult {
+  /** The claimed work item */
+  workItem: WorkItem;
+  /** The claim object tracking the lease */
+  claim: TaskClaim;
+  /** Set when the caller already held an active claim before this call */
+  alreadyHeld?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+/**
+ * TaskPoolService manages the lifecycle of execution-ready WorkItems.
+ *
+ * Core operations:
+ * - {@link addToPool} — enqueue an execution-ready WorkItem
+ * - {@link claimFromPool} — agent claims the next available item
+ * - {@link releaseBack} — release a claimed item back to the pool
+ * - {@link getPoolStatus} — snapshot of pool statistics
+ *
+ * @example
+ * ```typescript
+ * const pool = TaskPoolService.getInstance();
+ * pool.addToPool(workItem);
+ * const result = pool.claimFromPool('agent-leo', { types: ['delegate'] });
+ * if (result) {
+ *   // agent works on result.workItem
+ *   // when done:
+ *   pool.completeItem(result.workItem.id);
+ * }
+ * ```
+ */
+
+/**
+ * Options for {@link TaskPoolService.addToPool}.
+ */
+export interface AddToPoolOptions {
+  /**
+   * The agent session creating the item (the caller's X-Agent-Session). Used
+   * to link the item to the ticket of that agent's current turn when it has
+   * no `requestId`.
+   */
+  creatorSession?: string;
+  /**
+   * Inherit only an OWNER origin from the creator (never its current ticket /
+   * trigger work's): a lead assigning a project ticket while it handles the
+   * owner's request (the ticket's own link already says which ticket it is).
+   */
+  ownerOriginOnly?: boolean;
+  /**
+   * Whether an item the creator assigns to ITSELF inherits the creator's
+   * current owner turn, owner context or current work's origin (default
+   * true for harness-made items). An agent's own `create-task` passes false:
+   * its item gets an owner place only when it names one
+   * (`--thread` / `--conversation`), never the creator's last owner thread
+   * (message-routing audit 2026-10-18).
+   */
+  inheritCreatorTurn?: boolean;
+}
+
+/**
+ * Options for {@link TaskPoolService.releaseBack}.
+ */
+/** Note put on an unassigned item when it is routed to a decider. */
+export const UNASSIGNED_ROUTE_NOTE =
+  '[No assignee set — yours to decide] If it suits you, do it yourself; if someone else is a better fit, hand it to them with delegate-task (include the original content), then cancel this item. ' +
+  'If nobody picks it up for a while, it goes to the next level up.';
+
+/** Who decides unassigned work (owner, 2026-09-24). */
+export interface UntargetedRouterDeps {
+  /** First decider for an unassigned item */
+  decide(workItem: WorkItem, creatorSession?: string): Promise<string | null>;
+  /** One level up from the current decider; null at the top */
+  next(current: string): Promise<string | null>;
+}
+
+/** Ticket claim policy wiring (ticket loop Phase 3). */
+export interface TicketClaimPolicyDeps {
+  /** Current tickets by Request id */
+  snapshot(): Promise<ClaimTicketLookup>;
+  /** An agent self-claimed an untargeted item of this ticket */
+  onSelfClaimed?(requestId: string, agentId: string): Promise<void>;
+}
+
+export interface ReleaseBackOptions {
+  /**
+   * When true, clear the item's `target` as well, returning it to the
+   * unassigned pool.
+   *
+   * Defaults to false: a release ends an attempt, it does not revoke an
+   * assignment. This must be requested BY NAME so that un-assignment is
+   * always a deliberate act by a caller who means it, never a silent
+   * side effect of a lease expiring.
+   */
+  unassign?: boolean;
+}
+
+/**
+ * Who a session belongs to, for task events that a team lead subscribes to by
+ * team. Returns null for a session no member is bound to.
+ */
+export type SessionTeamResolver = (sessionName: string) => Promise<{
+  teamId: string;
+  teamName: string;
+  memberId: string;
+  memberName: string;
+} | null>;
+
+export class TaskPoolService {
+  private static instance: TaskPoolService | null = null;
+
+  private readonly storage: PoolStorage;
+  private readonly claimService: ClaimService;
+  private readonly logger: ComponentLogger;
+
+  /**
+   * Optional EventBus reference — wired via {@link setEventBusService} from
+   * the boot path. When set, {@link addToPool} publishes a `workitem:queued`
+   * event so subscribers (notably {@link RequestSlaSubscriber}) can react to
+   * queue mutations. Optional because singleton callers (tests, CLI) bring
+   * up the pool before the bus exists; missing bus is treated as a no-op
+   * publish at warn level.
+   */
+  private eventBus: EventBusService | null = null;
+
+  /**
+   * Optional Request-linker reference — wired via {@link setRequestService}
+   * from the boot path. When set, {@link addToPool} pushes the new WI's id
+   * into the parent `Request.workItemIds[]` immediately after the storage
+   * flush, independent of any downstream subscriber.
+   *
+   * P1 Bug B (Pool umbrella WI 72ca743a) intrinsic-link contract:
+   *  - The pre-fix path relied on `workitem:queued` / `task:delegated`
+   *    subscribers (request-sla.subscriber, V3DataService) to backfill
+   *    `Request.workItemIds[]`. Manual / programmatic / cron callers that
+   *    bypass the standard event chain left Requests with
+   *    `workItemIds=[]` even though their WIs were in the pool.
+   *  - The intrinsic path here is the source-of-truth link and runs on
+   *    every `addToPool`. Subscriber-driven linking remains as
+   *    belt-and-suspenders (idempotent — see request.service.ts:328
+   *    short-circuit on duplicate id).
+   *  - Optional because singleton callers (tests, CLI) bring up the pool
+   *    before RequestService exists; missing linker is a no-op debug log.
+   */
+  private requestService: IRequestWorkItemLinker | null = null;
+
+  /**
+   * Optional agent-liveness probe — wired via {@link setIsAgentActive} from
+   * the boot path. When set, {@link claimFromPool} and {@link claimSpecificItem}
+   * refuse to issue a claim if the requesting agent's PTY session is not alive.
+   *
+   * Why: the invariant is that a WI in `running` status is being executed by
+   * a live agent. The orchestrator's `delegate-task` skill pre-claims a fresh
+   * WI for its target before the target session is actually spawned (see
+   * `config/skills/orchestrator/delegate-task/execute.sh` "self-heal fix #1"
+   * 2026-04). That pushes the WI from `queued` to `running` while the target
+   * is still inactive. 5 s later the reconciler's `detectStuckWorkItems`
+   * rule sees `running` + dead agent and marks the WI `blocked` — and the
+   * reconciler's `detectUnclaimedTasks` wake-rule only handles `queued`
+   * items, so the agent never gets spawned and the WI is stuck forever.
+   *
+   * Rejecting the claim at the source keeps the WI in `queued`, letting the
+   * wake-rule do its job (start the agent → agent auto-claims when it boots).
+   * delegate-task's existing fallback path (line 277 of execute.sh — "if
+   * claim fails (race, target locked, etc.) the work proceeds via the
+   * async path") already handles a rejected pre-claim gracefully.
+   *
+   * Optional because singleton callers (tests, CLI) bring up the pool
+   * before any agent-registration plumbing exists; missing probe = "trust
+   * the caller" (current behavior preserved for those code paths).
+   */
+  private isAgentActive: ((agentId: string) => Promise<boolean>) | null = null;
+
+  /**
+   * Team budget gate consulted by {@link claimFromPool}. Wired from the
+   * backend boot path via {@link setTeamBudgetGate} (mirrors
+   * {@link setIsAgentActive}); `null` — the default — disables the gate so
+   * tests and single-process CLI paths never touch the team store.
+   */
+  private teamBudgetGate: Pick<TeamBudgetGateService, 'checkForSession'> | null = null;
+  /** Session → team lookup for task:blocked / task:failed (see {@link setSessionTeamResolver}). */
+  private sessionTeamResolver: SessionTeamResolver | null = null;
+
+  /**
+   * Ticket loop (specs/ticket-loop.md §3): resolves the ticket an agent's
+   * current turn is about, from the `[TICKET:…]` markers in the messages
+   * delivered into it (safe-restart InFlightTurnTracker). Wired from boot;
+   * `null` disables the fallback.
+   */
+  private ticketResolver: ((sessionName: string) => string | null) | null = null;
+
+  /** Ticket claim order + lock (ticket loop Phase 3); null = plain FIFO */
+  private ticketClaimPolicy: TicketClaimPolicyDeps | null = null;
+
+  /** Routes unassigned work to a decider; null = legacy broadcast pool */
+  private untargetedRouter: UntargetedRouterDeps | null = null;
+
+  /**
+   * The creating agent's last owner turn (origin chain: a delegate made while
+   * answering the owner answers in the owner's thread). null disables it.
+   */
+  private turnOriginLookup: ((sessionName: string) => TurnOrigin | undefined) | null = (session) =>
+    OrcReplyRouteService.getInstance().getLastOrigin(session);
+
+  /**
+   * The conversation a Slack thread belongs to, for an explicit owner thread
+   * on a delegation (`delegate-task --thread`). null = only the creator's own
+   * turn origin can name it. Default: the Slack team-channel / DM mappings.
+   */
+  private slackThreadConversationLookup: ((slackChannelId: string, threadTs: string) => Promise<string | null>) | null =
+    defaultSlackThreadConversation;
+
+  /**
+   * The Slack thread of a chat message, for a delegation that names the
+   * owner's message by its chat id (`--thread <message id>`) instead of a
+   * Slack thread key. CE-199 (2026-10-07): Owen passed the owner's message id,
+   * it was ignored, and Vera's answer opened a new ticket thread instead of
+   * landing in the owner's thread. null disables it.
+   */
+  private chatMessageThreadLookup: ((messageId: string) => Promise<{ slackChannelId: string; threadTs: string; conversationId: string } | null>) | null =
+    defaultChatMessageThread;
+
+  /**
+   * The owner request the creating agent handles that is not a chat turn (an
+   * app comment, a colleague's hand-over). null disables it.
+   */
+  private ownerContextLookup: ((sessionName: string) => Promise<OwnerRequestContext | null>) | null = (session) =>
+    getOwnerRequestContext().resolve(session);
+
+  /**
+   * When the owner last wrote in a place a delegation names explicitly
+   * (crewly#1357: an explicit owner origin older than
+   * `ORIGIN_INHERIT_MAX_AGE_MS` is not taken). null = unknown (taken as given).
+   * Default: the chat-v2 store.
+   */
+  private ownerAskedAtLookup: ((origin: Extract<WorkItemOrigin, { kind: 'owner' }>) => Promise<number | null>) | null = defaultOwnerAskedAt;
+
+  /**
+   * Who reports a new owner-origin delegation to the owner, and where
+   * (crewly#1371: the team lead, in the team channel). null disables the
+   * stamp. Default: the real teams and Slack team channels.
+   */
+  private leadReportResolver: ((input: { workItem: WorkItem; creator?: string; items: readonly WorkItem[] }) => Promise<LeadReport | null>) | null = (input) =>
+    resolveLeadReport(input);
+
+  /**
+   * Serializes claim operations to prevent the race where two concurrent
+   * claimFromPool / claimSpecificItem calls both select the same queued
+   * WorkItem between their read and write phases. In-process only — does
+   * not protect against cross-process races, but the backend runs as a
+   * single process today.
+   */
+  private claimMutex: Promise<void> = Promise.resolve();
+
+  constructor(storage?: PoolStorage) {
+    this.storage = storage ?? new PoolStorage();
+    this.claimService = new ClaimService(this.storage);
+    this.logger = LoggerService.getInstance().createComponentLogger('TaskPoolService');
+  }
+
+  /**
+   * Wire the EventBus reference used by {@link addToPool} to publish
+   * `workitem:queued` events (INBOUND-1.f1). Called from the backend boot
+   * path after both services have been constructed. Idempotent and may be
+   * called with `null` to disable publishing (testing).
+   *
+   * @param bus - The EventBus instance, or null to clear
+   */
+  setEventBusService(bus: EventBusService | null): void {
+    this.eventBus = bus;
+  }
+
+  /**
+   * Listeners told after a WorkItem is newly claimed (not for an
+   * already-held claim). There is no claim event on the bus; the claim sites
+   * are the HTTP controller, AgentAutoClaim and the boot path, so the hook
+   * lives here. Listeners run fire-and-forget: a slow or failing listener
+   * never delays or fails the claim. Used by the per-WorkItem worktree
+   * service (#814).
+   */
+  private claimListeners: Array<(workItem: WorkItem, agentId: string) => void | Promise<void>> = [];
+
+  /**
+   * Register a claim listener (see {@link claimListeners}).
+   *
+   * @param listener - Called with the claimed WorkItem and the claiming agent
+   * @returns Unsubscribe function
+   */
+  onClaimed(listener: (workItem: WorkItem, agentId: string) => void | Promise<void>): () => void {
+    this.claimListeners.push(listener);
+    return () => {
+      this.claimListeners = this.claimListeners.filter((l) => l !== listener);
+    };
+  }
+
+  /** Fire claim listeners without awaiting them; errors are logged, never thrown. */
+  private notifyClaimed(workItem: WorkItem, agentId: string): void {
+    for (const listener of this.claimListeners) {
+      Promise.resolve()
+        .then(() => listener(workItem, agentId))
+        .catch((err) => {
+          this.logger.warn('Claim listener failed (non-fatal)', { workItemId: workItem.id, error: formatError(err) });
+        });
+    }
+  }
+
+  /**
+   * Wire the Request-linker reference used by {@link addToPool} to
+   * intrinsically link the new WI into its parent `Request.workItemIds[]`
+   * (P1 Bug B — Pool umbrella WI 72ca743a).
+   *
+   * Called from the backend boot path after both services exist.
+   * Idempotent and may be called with `null` to disable intrinsic
+   * linking (testing). Mirrors the {@link setEventBusService} setter
+   * pattern so the dependency wiring stays uniform and grep-able.
+   *
+   * @param svc - The RequestService instance (or any object satisfying
+   *   {@link IRequestWorkItemLinker}), or null to clear.
+   */
+  setRequestService(svc: IRequestWorkItemLinker | null): void {
+    this.requestService = svc;
+  }
+
+  /**
+   * Wire the agent-liveness probe used by {@link claimFromPool} and
+   * {@link claimSpecificItem} to refuse claims for dead/missing target
+   * sessions. Called from the backend boot path after the agent runtime
+   * exists. Idempotent and may be called with `null` to disable the gate
+   * (testing or single-process CLI).
+   *
+   * @param probe - Async function returning whether the named session is
+   *   currently alive (PTY exists + child runtime running), or null to clear
+   */
+  setIsAgentActive(probe: ((agentId: string) => Promise<boolean>) | null): void {
+    this.isAgentActive = probe;
+  }
+
+  /**
+   * Wire (or disable with `null`) the team budget gate consulted by
+   * {@link claimFromPool}. Called from the backend boot path with the
+   * {@link TeamBudgetGateService} singleton.
+   *
+   * @param gate - Gate implementation, or null to bypass budget checks
+   */
+  setTeamBudgetGate(gate: Pick<TeamBudgetGateService, 'checkForSession'> | null): void {
+    this.teamBudgetGate = gate;
+  }
+
+  /**
+   * Wire (or disable with `null`) the session → team lookup used to put a
+   * real `teamId` on `task:blocked` / `task:failed`, so a team lead's
+   * standing subscription (filtered by teamId) receives them (#842).
+   *
+   * @param resolver - Session name → the member's team and identity, or null
+   */
+  setSessionTeamResolver(resolver: SessionTeamResolver | null): void {
+    this.sessionTeamResolver = resolver;
+  }
+
+  /**
+   * Wire (or disable with `null`) the in-flight-turn ticket resolver used by
+   * {@link addToPool} when a WorkItem arrives without a `requestId`.
+   *
+   * @param resolver - Session name → ticket id (or null)
+   */
+  setTicketResolver(resolver: ((sessionName: string) => string | null) | null): void {
+    this.ticketResolver = resolver;
+  }
+
+  /**
+   * Wire the ticket claim policy (specs/ticket-loop.md Phase 3): claim order
+   * (own rejected → own unblocked → queue rejected → P0..P3) and the
+   * one-ticket-per-agent lock, for every claim path.
+   *
+   * @param policy - Ticket snapshot + self-claim hook, or null for FIFO
+   */
+  setTicketClaimPolicy(policy: TicketClaimPolicyDeps | null): void {
+    this.ticketClaimPolicy = policy;
+  }
+
+  /**
+   * Replace (or disable with `null`) the owner-turn lookup used to give a
+   * new item its creator's origin.
+   *
+   * @param lookup - Session → its last owner turn origin
+   */
+  setTurnOriginLookup(lookup: ((sessionName: string) => TurnOrigin | undefined) | null): void {
+    this.turnOriginLookup = lookup;
+  }
+
+  /**
+   * Replace (or disable with `null`) the Slack-thread → conversation lookup
+   * used for an explicit owner thread on a delegation.
+   *
+   * @param lookup - (Slack channel, thread ts) → chat conversation id
+   */
+  setSlackThreadConversationLookup(lookup: ((slackChannelId: string, threadTs: string) => Promise<string | null>) | null): void {
+    this.slackThreadConversationLookup = lookup;
+  }
+
+  /**
+   * Replace (or disable with `null`) the owner request context lookup.
+   *
+   * @param lookup - Session → the owner request it handles
+   */
+  setOwnerContextLookup(lookup: ((sessionName: string) => Promise<OwnerRequestContext | null>) | null): void {
+    this.ownerContextLookup = lookup;
+  }
+
+  /**
+   * Replace (or disable with `null`) the lead-report resolver (crewly#1371).
+   *
+   * @param resolver - New item + creator + pool → its lead report, or null
+   */
+  setLeadReportResolver(resolver: ((input: { workItem: WorkItem; creator?: string; items: readonly WorkItem[] }) => Promise<LeadReport | null>) | null): void {
+    this.leadReportResolver = resolver;
+  }
+
+  /**
+   * Override how a chat message id resolves to its Slack thread (tests).
+   *
+   * @param lookup - Lookup, or null to disable
+   */
+  setChatMessageThreadLookup(lookup: ((messageId: string) => Promise<{ slackChannelId: string; threadTs: string; conversationId: string } | null>) | null): void {
+    this.chatMessageThreadLookup = lookup;
+  }
+
+  /**
+   * Wire (or disable) the lookup of when the owner last wrote in an
+   * explicitly named place (crewly#1357).
+   *
+   * @param lookup - Lookup, or null (ages unknown: explicit origins are taken as given)
+   */
+  setOwnerAskedAtLookup(lookup: ((origin: Extract<WorkItemOrigin, { kind: 'owner' }>) => Promise<number | null>) | null): void {
+    this.ownerAskedAtLookup = lookup;
+  }
+
+  /**
+   * Wire the unassigned-work router: an item added with no target goes to
+   * someone who decides (ticket owner → team lead → creator's lead →
+   * orchestrator) instead of whoever is idle.
+   *
+   * @param router - The router, or null for the old broadcast pool
+   */
+  setUntargetedRouter(router: UntargetedRouterDeps | null): void {
+    this.untargetedRouter = router;
+  }
+
+  /**
+   * Give an unassigned item its decider (in place, before it is stored).
+   *
+   * @param wi - The item
+   * @param creatorSession - Who created it
+   */
+  private async routeUntargeted(wi: WorkItem, creatorSession?: string): Promise<void> {
+    if (wi.target || !this.untargetedRouter || wi.id.endsWith(':respond_to_user')) return;
+    const decider = await this.untargetedRouter.decide(wi, creatorSession).catch(() => null);
+    if (!decider) return;
+    wi.target = decider;
+    wi.targetSource = 'escalated';
+    wi.metadata = { ...(wi.metadata ?? {}), routedAt: new Date().toISOString(), routeLevel: 0, ...(creatorSession ? { createdBy: creatorSession } : {}) };
+    wi.description = `${UNASSIGNED_ROUTE_NOTE}\n\n${wi.description ?? ''}`.trim();
+    this.logger.info('Unassigned WorkItem routed to a decider', { workItemId: wi.id, decider, creatorSession });
+  }
+
+  /**
+   * Move routed items nobody took one level up (member → lead →
+   * orchestrator), and route any unassigned queued item left from before.
+   *
+   * @param maxAgeMs - How long a decider has before it moves up
+   * @returns Items that moved, with their new target
+   */
+  async escalateUnassigned(maxAgeMs: number): Promise<Array<{ id: string; to: string }>> {
+    const router = this.untargetedRouter;
+    if (!router) return [];
+    const moved: Array<{ id: string; to: string }> = [];
+    const claims = await this.storage.getClaims();
+    const claimed = new Set(claims.filter((c) => c.status === 'active').map((c) => c.workItemId));
+    const now = Date.now();
+    for (const wi of await this.storage.getWorkItems()) {
+      if (wi.status !== 'queued' || claimed.has(wi.id) || wi.id.endsWith(':respond_to_user')) continue;
+      let to: string | null = null;
+      let level = typeof wi.metadata?.routeLevel === 'number' ? (wi.metadata.routeLevel as number) : 0;
+      if (!wi.target) {
+        to = await router.decide(wi).catch(() => null);
+      } else if (wi.targetSource === 'escalated') {
+        const at = Date.parse(String(wi.metadata?.routedAt ?? wi.createdAt));
+        if (now - at < maxAgeMs) continue;
+        to = await router.next(wi.target).catch(() => null);
+        level += 1;
+      }
+      if (!to || to === wi.target) continue;
+      const ok = await this.storage.updateWorkItem(wi.id, (item) => {
+        const first = !item.target;
+        item.target = to as string;
+        item.targetSource = 'escalated';
+        item.metadata = { ...(item.metadata ?? {}), routedAt: new Date(now).toISOString(), routeLevel: level };
+        if (first) item.description = `${UNASSIGNED_ROUTE_NOTE}\n\n${item.description ?? ''}`.trim();
+      });
+      if (ok) {
+        moved.push({ id: wi.id, to });
+        this.logger.info('Unassigned WorkItem moved up to the next decider', { workItemId: wi.id, from: wi.target ?? null, to, level });
+      }
+    }
+    if (moved.length > 0) await this.storage.flush();
+    return moved;
+  }
+
+  /**
+   * Order claim candidates for an agent under the ticket policy (FIFO
+   * without one). Used by claimFromPool and by AutoClaim.
+   *
+   * @param agentId - The claiming agent
+   * @param candidates - Queued, unclaimed, target-respecting items
+   * @returns Candidates in claim order, lock applied
+   */
+  async orderClaimCandidates(agentId: string, candidates: WorkItem[]): Promise<WorkItem[]> {
+    const fifo = [...candidates].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    if (!this.ticketClaimPolicy) return fifo;
+    try {
+      const tickets = await this.ticketClaimPolicy.snapshot();
+      return orderForAgent(fifo, agentId, await this.storage.getWorkItems(), tickets);
+    } catch (err) {
+      this.logger.warn('Ticket claim policy failed — falling back to FIFO', {
+        agentId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return fifo;
+    }
+  }
+
+  /**
+   * After a broadcast claim: an untargeted ticket item makes its claimer the
+   * ticket's assignee when it has none (the lock). Best-effort.
+   *
+   * @param item - The claimed item
+   * @param agentId - The claimer
+   */
+  private async noteTicketSelfClaim(item: WorkItem, agentId: string): Promise<void> {
+    if (!this.ticketClaimPolicy?.onSelfClaimed || !item.requestId || item.targetSource !== 'claim') return;
+    await this.ticketClaimPolicy.onSelfClaimed(item.requestId, agentId).catch((err: unknown) => {
+      this.logger.debug('Ticket self-claim hook failed (non-fatal)', {
+        workItemId: item.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
+  /**
+   * Chains the given critical section after any in-flight claim operation.
+   * Guarantees FIFO ordering even under concurrent invocation.
+   */
+  private withClaimLock<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.claimMutex;
+    let release!: () => void;
+    this.claimMutex = new Promise<void>((r) => {
+      release = r;
+    });
+    return prev.then(fn).finally(() => release());
+  }
+
+  /**
+   * Get singleton instance of TaskPoolService.
+   *
+   * @returns The singleton TaskPoolService
+   */
+  static getInstance(): TaskPoolService {
+    if (!TaskPoolService.instance) {
+      TaskPoolService.instance = new TaskPoolService();
+    }
+    return TaskPoolService.instance;
+  }
+
+  /**
+   * Reset singleton (for testing).
+   */
+  static resetInstance(): void {
+    TaskPoolService.instance = null;
+  }
+
+  // -----------------------------------------------------------------------
+  // Core Pool Operations
+  // -----------------------------------------------------------------------
+
+  /**
+   * Add work items that came with a team from another machine (team move,
+   * crewly#1189), exactly as they were: ids, status and links are kept, no
+   * routing or request inference is applied. Items already in the pool are
+   * skipped, so a resumed import adds nothing twice.
+   *
+   * @param items - Work items from the package
+   * @returns How many were added
+   */
+  async importWorkItems(items: readonly WorkItem[]): Promise<number> {
+    let added = 0;
+    for (const item of items) {
+      if (!isWorkItem(item)) continue;
+      if (await this.storage.findWorkItem(item.id)) continue;
+      await this.storage.addWorkItem(item);
+      added += 1;
+    }
+    if (added > 0) await this.storage.flush();
+    return added;
+  }
+
+  /**
+   * Remove the work items of a team that moved to another machine (team move,
+   * crewly#1189) together with their claims, so nothing here tries to wake
+   * agents that live elsewhere now. The mover keeps copies for rollback.
+   *
+   * @param ids - Work item ids
+   * @returns How many items were removed
+   */
+  async removeWorkItemsForMove(ids: readonly string[]): Promise<number> {
+    if (ids.length === 0) return 0;
+    const idSet = new Set(ids);
+    const claimIds = new Set((await this.storage.getClaims()).filter((c) => idSet.has(c.workItemId)).map((c) => c.id));
+    const removed = await this.storage.removeWorkItems(idSet);
+    await this.storage.removeClaims(claimIds);
+    await this.storage.flush();
+    return removed;
+  }
+
+  /**
+   * Adds an execution-ready WorkItem to the pool.
+   *
+   * Accepted statuses:
+   * - `queued`  — ready to run
+   * - `blocked` — waiting on unresolved dependsOn; the resolver will promote
+   *               it to `queued` when every upstream dep reaches terminal success.
+   *
+   * Ticket loop: when the item has no `requestId` and `options.creatorSession`
+   * names the agent creating it, the ticket of that agent's current turn (if
+   * exactly one) is filled in, and `metadata.requestIdSource` records that it
+   * was inferred.
+   *
+   * @param workItem - The work item to add
+   * @param options - `creatorSession`: the agent creating it (X-Agent-Session)
+   * @throws Error if workItem is invalid or in an ineligible status
+   */
+  async addToPool(workItem: WorkItem, options: AddToPoolOptions = {}): Promise<void> {
+    if (!isWorkItem(workItem)) {
+      throw new Error('Invalid WorkItem: does not conform to WorkItem interface');
+    }
+    if (workItem.status !== 'queued' && workItem.status !== 'blocked') {
+      throw new Error(
+        `Cannot add WorkItem to pool: status must be 'queued' or 'blocked', got '${workItem.status}'`,
+      );
+    }
+
+    // Check for duplicates
+    const existing = await this.storage.findWorkItem(workItem.id);
+    if (existing) {
+      this.logger.warn('WorkItem already in pool, skipping', { workItemId: workItem.id });
+      return;
+    }
+
+    // An owner-origin-only add (a ticket assignment) keeps its own links.
+    if (!options.ownerOriginOnly) this.inferRequestIdFromTurn(workItem, options.creatorSession);
+    await this.inheritOrigin(workItem, options.creatorSession, options.ownerOriginOnly === true, options.inheritCreatorTurn !== false);
+    await this.routeUntargeted(workItem, options.creatorSession);
+    assignWorkItemTrace(workItem, options.creatorSession);
+
+    await this.storage.addWorkItem(workItem);
+    await this.storage.flush();
+    this.logger.info('WorkItem added to pool', {
+      workItemId: workItem.id,
+      type: workItem.type,
+      title: workItem.title,
+    });
+
+    // P1 Bug B (Pool umbrella WI 72ca743a): intrinsically link the new
+    // WI into its parent `Request.workItemIds[]` if a linker is wired
+    // and the WI carries a requestId. This is the SOURCE-OF-TRUTH link
+    // and runs unconditionally on every successful addToPool, fixing
+    // the bug where manual / programmatic / cron / orchestrator-script
+    // callers that bypass the standard event chain left Requests with
+    // empty `workItemIds[]`.
+    //
+    // Subscriber-driven linking (request-sla.subscriber.ts on
+    // workitem:queued, V3DataService.onTaskDelegated on task:delegated)
+    // continues to run as belt-and-suspenders — `linkWorkItem` is
+    // idempotent (request.service.ts:328 short-circuits on duplicate id),
+    // so double-link is safe.
+    //
+    // Failure isolation: pool mutation is the source of truth. Link
+    // failures are warn-logged and swallowed; subscriber path remains
+    // as a backup, and a future addToPool of the same WI is a no-op
+    // (storage dedup) so retry comes via natural traffic.
+    await this.linkWorkItemToRequest(workItem);
+
+    // INBOUND-1.f1: announce the queue mutation so subscribers (notably the
+    // RequestSlaSubscriber) can react. We publish AFTER the storage flush
+    // so any subscriber that re-reads via taskPool.findWorkItem sees the
+    // committed item. Publish failures are logged-but-isolated — the pool
+    // mutation is the source of truth, the event is informational.
+    this.publishWorkItemQueued(workItem);
+  }
+
+  /**
+   * Stamp `metadata.origin` from the item this one continues (verify / retry
+   * / subtask parent) or from the creating agent's current work, so the
+   * answer goes where the request came from (specs/2026-10-01-orc-status-wakes.md §2).
+   * Mutates the item before it is stored; failures are logged and ignored.
+   *
+   * A DELEGATION (an agent handing the item to someone else) takes an owner
+   * origin only when the delegator named the owner conversation (`--thread`,
+   * `--conversation`) and the owner asked there within
+   * `ORIGIN_INHERIT_MAX_AGE_MS`; otherwise its origin is the delegator itself
+   * (specs/2026-10-04-tl-delegation.md §1a, crewly#1357). A verbatim
+   * `metadata.origin` in the body is kept as given.
+   *
+   * @param workItem - The item about to be stored
+   * @param creatorSession - The agent creating it, when known
+   * @param ownerOnly - Stamp only an owner origin
+   */
+  private async inheritOrigin(workItem: WorkItem, creatorSession?: string, ownerOnly = false, inheritCreatorTurn = true): Promise<void> {
+    await this.inheritOriginOnly(workItem, creatorSession, ownerOnly, inheritCreatorTurn);
+    await this.stampLeadReport(workItem, creatorSession);
+  }
+
+  /**
+   * Stamp `metadata.leadReport` (crewly#1371): team work the orchestrator
+   * delegated on the owner's behalf is reported to the owner by the team's
+   * lead, in the team channel. A verify / retry / subtask item takes its
+   * parent's stamp; a new owner-origin delegation asks the resolver. Mutates
+   * the item before it is stored; failures are logged and ignored.
+   *
+   * @param workItem - The item about to be stored (origin already stamped)
+   * @param creatorSession - The agent creating it, when known
+   */
+  private async stampLeadReport(workItem: WorkItem, creatorSession?: string): Promise<void> {
+    try {
+      if (leadReportOf(workItem)) return;
+      const meta = (workItem.metadata ?? {}) as Record<string, unknown>;
+      const parentId = [workItem.parentWorkItemId, meta.verifyOf, meta.sourceWorkItemId].find(
+        (v): v is string => typeof v === 'string' && v.length > 0,
+      );
+      const parent = parentId ? await this.storage.findWorkItem(parentId) : null;
+      let stamp = parent ? leadReportOf(parent) : null;
+      if (!stamp) {
+        if (parent || !this.leadReportResolver || originOfWorkItem(workItem)?.kind !== 'owner') return;
+        const creator = creatorSession ?? (typeof meta.delegatedBy === 'string' ? meta.delegatedBy : undefined);
+        stamp = await this.leadReportResolver({ workItem, ...(creator ? { creator } : {}), items: await this.storage.getWorkItems() });
+      }
+      if (!stamp) return;
+      workItem.metadata = { ...meta, [TEAM_LEAD_REPORT_CONSTANTS.METADATA_KEY]: stamp };
+      this.logger.info('WorkItem is reported to the owner by its team lead, in the team channel', {
+        workItemId: workItem.id,
+        lead: stamp.lead,
+        teamId: stamp.teamId,
+        from: parent ? `parent ${parent.id}` : 'delegation',
+      });
+    } catch (err) {
+      this.logger.warn('Lead report stamp failed — WorkItem keeps the default report path', {
+        workItemId: workItem.id,
+        error: formatError(err),
+      });
+    }
+  }
+
+  /**
+   * The origin half of {@link inheritOrigin}.
+   *
+   * @param workItem - The item about to be stored
+   * @param creatorSession - The agent creating it, when known
+   * @param ownerOnly - Stamp only an owner origin
+   * @param inheritCreatorTurn - A self-assigned item may take the creator's turn / context / current work origin
+   */
+  private async inheritOriginOnly(workItem: WorkItem, creatorSession?: string, ownerOnly = false, inheritCreatorTurn = true): Promise<void> {
+    try {
+      const meta = (workItem.metadata ?? {}) as Record<string, unknown>;
+      const parentId = [workItem.parentWorkItemId, meta.verifyOf, meta.sourceWorkItemId].find(
+        (v): v is string => typeof v === 'string' && v.length > 0,
+      );
+      const parent = (parentId ? await this.storage.findWorkItem(parentId) : null) ?? null;
+      const delegatedBy = typeof meta.delegatedBy === 'string' ? meta.delegatedBy : undefined;
+      const creator = creatorSession ?? delegatedBy;
+      const delegation = !!creator && workItem.target !== creator;
+      const now = Date.now();
+      // An owner place the delegator named (`delegate-task --thread <key>` /
+      // `--conversation <id>`) wins over its last owner turn, which may be a
+      // newer, different thread (specs/2026-10-04-tl-delegation.md §1).
+      const explicit = !isWorkItemOrigin(meta[WORK_ITEM_DESTINATION_CONSTANTS.METADATA_KEY])
+        ? (await this.explicitOwnerOrigin(meta[TL_DELEGATION_CONSTANTS.OWNER_THREAD_FIELD], creator)) ??
+          this.explicitOwnerConversation(meta[TL_DELEGATION_CONSTANTS.OWNER_CONVERSATION_FIELD], creator)
+        : null;
+      if (!explicit && meta[TL_DELEGATION_CONSTANTS.OWNER_THREAD_FIELD] !== undefined && !isWorkItemOrigin(meta[WORK_ITEM_DESTINATION_CONSTANTS.METADATA_KEY])) {
+        this.logger.warn('WorkItem names an owner thread Crewly cannot read — it gets no owner origin from it', {
+          workItemId: workItem.id,
+          ownerThread: meta[TL_DELEGATION_CONSTANTS.OWNER_THREAD_FIELD],
+        });
+      }
+      if (explicit?.kind === 'owner') {
+        const askedAt = await this.ownerAskedAt(explicit, creator, now);
+        if (isOwnerRequestTooOld(askedAt, now)) {
+          this.logger.info('WorkItem did not take the owner place its delegator named: the owner last asked there too long ago', {
+            workItemId: workItem.id,
+            creator,
+            askedAt: askedAt ? new Date(askedAt).toISOString() : null,
+          });
+        } else {
+          if (creator && !explicit.receivedBy) explicit.receivedBy = creator;
+          workItem.metadata = { ...meta, [WORK_ITEM_DESTINATION_CONSTANTS.METADATA_KEY]: explicit };
+          this.logger.info('WorkItem took the owner place its delegator named', { workItemId: workItem.id, creator });
+          return;
+        }
+      }
+      let creatorWorkItem: WorkItem | null = null;
+      let creatorDestination = null;
+      let creatorOwnerContext: OwnerRequestContext | null = null;
+      if (!parent && creator && !delegation && !inheritCreatorTurn) {
+        this.logger.info('Self-assigned WorkItem names no owner place — it inherits none from its creator', { workItemId: workItem.id, creator });
+        return;
+      }
+      if (!parent && creator && !delegation) {
+        creatorWorkItem = currentWorkItemOf(await this.storage.getWorkItems(), creator);
+        creatorDestination = planWorkDestination({
+          workItem: creatorWorkItem,
+          ownerOrigin: this.turnOriginLookup?.(creator),
+          now,
+        });
+        creatorOwnerContext = this.ownerContextLookup ? await this.ownerContextLookup(creator).catch(() => null) : null;
+      }
+      const origin = inheritedOrigin({
+        workItem,
+        parent,
+        creatorDestination,
+        creatorWorkItem,
+        ...(creator ? { creatorSession: creator } : {}),
+        creatorOwnerContext,
+        delegation,
+        now,
+      });
+      if (!origin) return;
+      if (ownerOnly && origin.kind !== 'owner') return;
+      // Ticket work delegated by an agent answers in the ticket's thread (its
+      // link is read as the origin); the delegator is not stamped over it.
+      if (origin.kind === 'agent' && meta.projectTicket) return;
+      workItem.metadata = { ...meta, [WORK_ITEM_DESTINATION_CONSTANTS.METADATA_KEY]: origin };
+      this.logger.info('WorkItem inherited its origin', {
+        workItemId: workItem.id,
+        origin: origin.kind,
+        from: parent ? `parent ${parent.id}` : delegation ? `delegator ${creator}` : `creator ${creator}`,
+      });
+    } catch (err) {
+      this.logger.warn('Origin inheritance failed — WorkItem keeps no origin', {
+        workItemId: workItem.id,
+        error: formatError(err),
+      });
+    }
+  }
+
+  /**
+   * Whether a delegation names an owner thread (`delegate-task --thread`)
+   * Crewly cannot read. Such a delegation is refused rather than created
+   * without the owner's place: Atlas's `<conversation>:<thread>` was dropped
+   * silently, and Kai's PDF went to the channel top level (2026-10-18).
+   *
+   * @param rawKey - `metadata.ownerThread`
+   * @param creator - The delegating agent, when known
+   * @returns True when a thread is named and unreadable
+   */
+  async isOwnerThreadUnreadable(rawKey: unknown, creator?: string): Promise<boolean> {
+    if (rawKey === undefined || rawKey === null || (typeof rawKey === 'string' && !rawKey.trim())) return false;
+    return !(await this.explicitOwnerOrigin(rawKey, creator).catch(() => null));
+  }
+
+  /**
+   * Agent posts in an explicitly named Slack thread that are newer than the
+   * owner's last message there, by anyone but the delegator and the target
+   * (the answerer's own follow-up is not a second answer). A delegation
+   * into such a thread would get the owner a second answer (CREW-878).
+   * Unknown history (no log yet, the owner's message time unknown, an unreadable
+   * key) gives none: only a certain answer blocks a delegation.
+   *
+   * @param rawKey - `metadata.ownerThread`
+   * @param creator - The delegating agent, when known
+   * @param target - The agent delegated to
+   * @returns Posts oldest first; empty when none or unknown
+   */
+  async agentAnswersInOwnerThread(rawKey: unknown, creator?: string, target?: string): Promise<ThreadPost[]> {
+    const log = getThreadAnswerLog();
+    const key = parseSlackThreadKey(rawKey);
+    if (!log || !key) return [];
+    const origin = await this.explicitOwnerOrigin(rawKey, creator).catch(() => null);
+    if (!origin || origin.kind !== 'owner') return [];
+    const ownerAt = await this.ownerAskedAt(origin, creator, Date.now()).catch(() => null);
+    if (ownerAt === null) return [];
+    return log.answersSince(formatSlackThreadKey(key.slackChannelId, key.threadTs), ownerAt, creator, target);
+  }
+
+  /**
+   * The owner origin of an explicitly named Slack thread: the creator's own
+   * turn origin when it is that thread (it knows the conversation), else the
+   * conversation the Slack channel maps to.
+   *
+   * @param rawKey - `metadata.ownerThread` (thread key or tag)
+   * @param creator - The delegating agent, when known
+   * @returns The origin, or null when the key is unreadable
+   */
+  private async explicitOwnerOrigin(rawKey: unknown, creator?: string): Promise<ReturnType<typeof ownerOriginFromThreadKey>> {
+    const key = parseSlackThreadKey(rawKey);
+    if (!key) {
+      if (typeof rawKey !== 'string') return null;
+      // `<conversation id>:<thread id>` — the `[CHAT:<id>]` conversation and
+      // the `--thread` id from a delegator's own reply command. Atlas passed
+      // exactly this (2026-10-18, #daily-info); it was not read, the work got
+      // no owner origin, and Kai's PDF went to the channel top level.
+      const pair = CHAT_CONVERSATION_THREAD_RE.exec(rawKey.trim());
+      if (pair) return this.chatThreadOwnerOrigin(pair[1], pair[2]);
+      if (!CHAT_MESSAGE_ID_RE.test(rawKey.trim()) || !this.chatMessageThreadLookup) return null;
+      const found = await this.chatMessageThreadLookup(rawKey.trim()).catch(() => null);
+      return found ? ownerOriginFromThreadKey(formatSlackThreadKey(found.slackChannelId, found.threadTs), found.conversationId) : null;
+    }
+    const turn = creator ? this.turnOriginLookup?.(creator) : undefined;
+    const keyText = formatSlackThreadKey(key.slackChannelId, key.threadTs);
+    const turnKey = turnThreadKey(turn);
+    let conversationId: string | null = turn && turnKey === keyText ? turn.conversationId : null;
+    if (!conversationId && this.slackThreadConversationLookup) {
+      conversationId = await this.slackThreadConversationLookup(key.slackChannelId, key.threadTs).catch(() => null);
+    }
+    return ownerOriginFromThreadKey(keyText, conversationId);
+  }
+
+  /**
+   * The owner origin of a chat conversation + thread pair. The thread's Slack
+   * place comes along when the chat message has one; a thread of another
+   * conversation contradicts the pair and gives nothing.
+   *
+   * @param conversationId - chat-v2 conversation id
+   * @param threadId - chat-v2 thread root message id in it
+   * @returns The origin, or null when the pair contradicts itself
+   */
+  private async chatThreadOwnerOrigin(conversationId: string, threadId: string): Promise<WorkItemOrigin | null> {
+    const found = this.chatMessageThreadLookup ? await this.chatMessageThreadLookup(threadId).catch(() => null) : null;
+    if (found && found.conversationId !== conversationId) {
+      this.logger.warn('Delegation named a thread of another conversation — not used', { conversationId, threadId, threadConversation: found.conversationId });
+      return null;
+    }
+    if (found) {
+      return { kind: 'owner', conversationId, slackChannelId: found.slackChannelId, threadTs: found.threadTs, chatThreadId: threadId };
+    }
+    return ownerOriginFromConversation(conversationId, threadId);
+  }
+
+  /**
+   * The owner origin of an explicitly named chat conversation
+   * (`delegate-task --conversation <id>`, crewly#1357). When it is the
+   * creator's own turn, the turn's thread and Slack place come along.
+   *
+   * @param rawId - `metadata.ownerConversation`
+   * @param creator - The delegating agent, when known
+   * @returns The origin, or null when the id is unusable
+   */
+  private explicitOwnerConversation(rawId: unknown, creator?: string): WorkItemOrigin | null {
+    const base = ownerOriginFromConversation(rawId);
+    if (!base || base.kind !== 'owner') return null;
+    const turn = creator ? this.turnOriginLookup?.(creator) : undefined;
+    if (!turn || turn.conversationId !== base.conversationId) return base;
+    const key = parseSlackThreadKey(turn.slackThreadKey);
+    return {
+      ...base,
+      ...(key ? { slackChannelId: key.slackChannelId, threadTs: key.threadTs } : turn.slackChannelId ? { slackChannelId: turn.slackChannelId, ...(turn.slackThreadTs ? { threadTs: turn.slackThreadTs } : {}) } : {}),
+      ...(turn.chatThreadId ? { chatThreadId: turn.chatThreadId } : {}),
+    };
+  }
+
+  /**
+   * When the owner last asked in an explicitly named place: the creator's own
+   * turn when it is that place, else the store. null when nothing says.
+   *
+   * @param origin - The explicit owner origin
+   * @param creator - The delegating agent, when known
+   * @param now - Clock (epoch ms)
+   * @returns Epoch ms, or null
+   */
+  private async ownerAskedAt(origin: Extract<WorkItemOrigin, { kind: 'owner' }>, creator: string | undefined, now: number): Promise<number | null> {
+    const turn = creator ? this.turnOriginLookup?.(creator) : undefined;
+    if (turn && turn.receivedAt <= now) {
+      const samePlace =
+        (origin.slackChannelId && origin.threadTs && turnThreadKey(turn) === formatSlackThreadKey(origin.slackChannelId, origin.threadTs)) ||
+        (!origin.slackChannelId && origin.conversationId && turn.conversationId === origin.conversationId);
+      if (samePlace) return turn.receivedAt;
+    }
+    if (!this.ownerAskedAtLookup) return null;
+    return this.ownerAskedAtLookup(origin).catch(() => null);
+  }
+
+  /**
+   * Fill in `requestId` from the creating agent's in-flight turn (ticket
+   * loop §3). Mutates the item before it is stored; a resolver failure is
+   * logged and ignored.
+   *
+   * @param workItem - The item about to be stored
+   * @param creatorSession - The agent creating it, when known
+   */
+  private inferRequestIdFromTurn(workItem: WorkItem, creatorSession?: string): void {
+    if (workItem.requestId || !creatorSession || !this.ticketResolver) return;
+    try {
+      const ticketId = this.ticketResolver(creatorSession);
+      if (!ticketId) return;
+      workItem.requestId = ticketId;
+      workItem.metadata = { ...(workItem.metadata ?? {}), requestIdSource: 'in-flight-turn' };
+      this.logger.info('WorkItem linked to the ticket of its creator\'s turn', {
+        workItemId: workItem.id,
+        requestId: ticketId,
+        creatorSession,
+      });
+    } catch (err) {
+      this.logger.warn('Ticket resolver failed — WorkItem stays unlinked', {
+        workItemId: workItem.id,
+        creatorSession,
+        error: formatError(err),
+      });
+    }
+  }
+
+  /**
+   * P1 Bug B helper: intrinsically link a freshly-added WI into its
+   * parent `Request.workItemIds[]`.
+   *
+   * Stays a separate method (vs inlining) so:
+   *   1. The dependency on RequestService stays explicit and grep-able,
+   *      mirroring {@link publishWorkItemQueued}.
+   *   2. Future enqueue paths (e.g. a batch addAll) can route through
+   *      the same linker for consistent behaviour.
+   *   3. Error handling stays in one place — a thrown linker must NOT
+   *      back out the pool mutation (the storage write already committed).
+   *
+   * @param workItem - The WI just persisted into the pool.
+   */
+  private async linkWorkItemToRequest(workItem: WorkItem): Promise<void> {
+    if (!workItem.requestId) {
+      // No parent Request — nothing to link.
+      return;
+    }
+    if (!this.requestService) {
+      this.logger.debug(
+        'No RequestService wired — skipping intrinsic Request link',
+        { workItemId: workItem.id, requestId: workItem.requestId },
+      );
+      return;
+    }
+    try {
+      await this.requestService.linkWorkItem(workItem.requestId, workItem.id);
+    } catch (linkError) {
+      this.logger.warn(
+        'Bug B intrinsic link failed (subscriber path remains as fallback)',
+        {
+          requestId: workItem.requestId,
+          workItemId: workItem.id,
+          error: formatError(linkError),
+        },
+      );
+    }
+  }
+
+  /**
+   * INBOUND-1.f1 helper: publish a `workitem:queued` event with correlation
+   * ids the SLA subscriber needs (`requestId`, `missionId`, plus the new
+   * `workItemId`). Called by {@link addToPool} after the storage flush.
+   *
+   * Stays a separate method (vs inlining) so:
+   *   1. The dependency on EventBus stays explicit and grep-able.
+   *   2. A future caller adding an alternate enqueue path (e.g. a batch
+   *      addAll) can route through the same publisher for consistent
+   *      observability.
+   *   3. Error handling stays in one place — a thrown publisher must NOT
+   *      back out the pool mutation (the storage write already committed).
+   */
+  private publishWorkItemQueued(workItem: WorkItem): void {
+    if (!this.eventBus) {
+      this.logger.debug('No EventBus wired — skipping workitem:queued publish', {
+        workItemId: workItem.id,
+      });
+      return;
+    }
+    try {
+      this.eventBus.publish({
+        // Deterministic event id keyed on the WI id so a redelivered storage
+        // path (theoretical) collapses through the bus's per-(type,session)
+        // debounce window without firing the SLA handler twice.
+        id: `workitem:queued:${workItem.id}`,
+        type: 'workitem:queued',
+        timestamp: new Date().toISOString(),
+        teamId: '',
+        teamName: '',
+        memberId: '',
+        memberName: '',
+        // sessionName is empty — `workitem:queued` is a system-level event
+        // not attributable to a specific agent session. The bus's dedup key
+        // is `${type}:${sessionName}` so a unique sessionName per WI would
+        // defeat the dedup; an empty sessionName scoped per-id is fine since
+        // the event id already encodes the WI uniquely.
+        sessionName: '',
+        previousValue: '',
+        newValue: workItem.status,
+        changedField: 'taskStatus',
+        // INBOUND-1.f1 correlation fields. Mandatory: workItemId. Optional:
+        // requestId, missionId — populated when the WI carries them. The SLA
+        // subscriber no-ops when requestId is undefined (per spec), so we
+        // don't need a fallback chain here.
+        workItemId: workItem.id,
+        requestId: workItem.requestId,
+        missionId: workItem.missionId,
+        // The dispatcher pushes the task to this session on queue.
+        ...(workItem.target ? { target: workItem.target } : {}),
+      });
+    } catch (err) {
+      this.logger.warn('workitem:queued publish threw', {
+        workItemId: workItem.id,
+        error: formatError(err),
+      });
+    }
+  }
+
+  /**
+   * F1-BRIDGE-1 helper: publish `task:done_by_worker` after a successful
+   * `submitForVerification` transition. The {@link EventToWorkItemBridge}
+   * subscribes to this event and creates a verification WorkItem for the
+   * resolved team-lead session.
+   *
+   * Stays a separate method (mirrors {@link publishWorkItemQueued}) so:
+   *   1. The dependency on EventBus stays explicit and grep-able — Arch's
+   *      grep guard checks both the type declaration AND a publish call
+   *      site for `task:done_by_worker`.
+   *   2. Error handling is uniform with the other publishers — a thrown
+   *      bus must NOT back out the verified state transition; the storage
+   *      flush has already committed.
+   *   3. A future caller adding an alternate verification-submission path
+   *      (e.g. an admin endpoint or a CLI) routes through the same publisher.
+   *
+   * The deterministic event id (`task:done_by_worker:${workItemId}`) keys
+   * dedup so a redelivered submitForVerification (theoretical) collapses
+   * through the bus without firing the bridge handler twice.
+   */
+  private publishTaskDoneByWorker(workItem: WorkItem): void {
+    if (!this.eventBus) {
+      this.logger.debug('No EventBus wired — skipping task:done_by_worker publish', {
+        workItemId: workItem.id,
+      });
+      return;
+    }
+    try {
+      this.eventBus.publish({
+        id: `task:done_by_worker:${workItem.id}`,
+        type: 'task:done_by_worker',
+        timestamp: new Date().toISOString(),
+        teamId: '',
+        teamName: '',
+        memberId: '',
+        memberName: '',
+        // sessionName is empty — `task:done_by_worker` is published from the
+        // pool layer which doesn't carry the worker's PTY session. The bridge
+        // uses `workItemId` (and falls back to `taskId`) to resolve the
+        // source WI; sessionName is informational. Empty matches the
+        // workitem:queued publish convention.
+        sessionName: '',
+        // The state machine just landed at done_by_worker. Carry both ends
+        // so any subscriber filtering on (previousValue, newValue) sees
+        // the canonical transition.
+        previousValue: 'running',
+        newValue: 'done_by_worker',
+        changedField: 'taskStatus',
+        // BRIDGE-1.1 hybrid extension. `workItemId` is mandatory for the
+        // bridge handler; the `taskId` fallback path is unused here because
+        // WorkItem itself does not carry a taskId (the bridge resolves the
+        // source WI by id alone via taskPool.findWorkItem).
+        workItemId: workItem.id,
+        missionId: workItem.missionId,
+        requestId: workItem.requestId,
+      });
+    } catch (err) {
+      this.logger.warn('task:done_by_worker publish threw', {
+        workItemId: workItem.id,
+        error: formatError(err),
+      });
+    }
+  }
+
+  /**
+   * F1-BRIDGE-1 helper: publish `task:rejected` after a successful
+   * `verifyItem` transition with verdict='rejected'. The
+   * {@link EventToWorkItemBridge} subscribes and either creates a retry
+   * WI (`retryCount < maxRetries`) or escalates to a TL review WI with
+   * `reviewReason='max_retries_exceeded'` at the cap.
+   *
+   * Mirrors {@link publishTaskDoneByWorker} for symmetry. Only the
+   * verdict='rejected' branch reaches this publisher — `verdict='verified'`
+   * does NOT publish (terminal-success path goes through
+   * {@link resolveBlockedDependents}, which is not a bridge trigger).
+   */
+  private publishTaskRejected(workItem: WorkItem): void {
+    if (!this.eventBus) {
+      this.logger.debug('No EventBus wired — skipping task:rejected publish', {
+        workItemId: workItem.id,
+      });
+      return;
+    }
+    try {
+      this.eventBus.publish({
+        id: `task:rejected:${workItem.id}`,
+        type: 'task:rejected',
+        timestamp: new Date().toISOString(),
+        teamId: '',
+        teamName: '',
+        memberId: '',
+        memberName: '',
+        sessionName: '',
+        previousValue: 'done_by_worker',
+        newValue: 'rejected',
+        changedField: 'taskStatus',
+        workItemId: workItem.id,
+        missionId: workItem.missionId,
+        requestId: workItem.requestId,
+      });
+    } catch (err) {
+      this.logger.warn('task:rejected publish threw', {
+        workItemId: workItem.id,
+        error: formatError(err),
+      });
+    }
+  }
+
+  /**
+   * Publish a terminal-success lifecycle event (`task:done` from
+   * {@link completeSimpleItem}, `task:verified` from {@link verifyItem}).
+   *
+   * **Why this exists.** Both event types were declared in `EVENT_TYPES`,
+   * listed as CRITICAL, and consumed by five subscribers (KR auto-measure,
+   * request cascade, auto-learning, milestone notification, the orc's and
+   * TL's standing subscriptions) — but nothing ever published them. The
+   * pool only emitted `task:done_by_worker` / `task:rejected` /
+   * `task:cancelled`, so `measurementSource: 'task_completion'` KRs never
+   * moved and `team:all_tasks_done` could never be derived.
+   *
+   * Mirrors {@link publishTaskDoneByWorker}: empty `sessionName` (system
+   * event, bypasses the per-session debounce), deterministic id keyed on
+   * the WI so a replay collapses, and a swallowed publisher error so the
+   * committed transition is never rolled back.
+   *
+   * @param type - `'task:done'` or `'task:verified'`
+   * @param workItem - The WI snapshot AFTER the transition committed
+   * @param previousStatus - The status it transitioned from
+   */
+  private publishTaskTerminalSuccess(
+    type: 'task:done' | 'task:verified',
+    workItem: WorkItem,
+    previousStatus: WorkItemStatus,
+  ): void {
+    if (!this.eventBus) {
+      this.logger.debug(`No EventBus wired — skipping ${type} publish`, {
+        workItemId: workItem.id,
+      });
+      return;
+    }
+    const leadReport = leadReportOf(workItem);
+    try {
+      this.eventBus.publish({
+        id: `${type}:${workItem.id}`,
+        type,
+        timestamp: new Date().toISOString(),
+        teamId: '',
+        teamName: '',
+        memberId: '',
+        memberName: '',
+        sessionName: '',
+        previousValue: previousStatus,
+        newValue: workItem.status,
+        changedField: 'taskStatus',
+        workItemId: workItem.id,
+        missionId: workItem.missionId,
+        requestId: workItem.requestId,
+        // #926: the envelope stays system-level (empty sessionName/team, so
+        // the per-session debounce and the session-keyed listeners are not
+        // engaged), but the notification must still say who finished what.
+        // `target` is never used for subscription matching.
+        ...(workItem.target ? { target: workItem.target } : {}),
+        workItemTitle: workItem.title,
+        // crewly#1371: the team lead reports this to the owner; the orchestrator's notice is informational.
+        ...(leadReport ? { orchestratorNote: orchestratorNote(leadReport) } : {}),
+      });
+    } catch (err) {
+      this.logger.warn(`${type} publish threw`, {
+        workItemId: workItem.id,
+        error: formatError(err),
+      });
+    }
+  }
+
+  /**
+   * Publish `task:blocked` / `task:failed` when a running WorkItem is blocked
+   * or failed by {@link blockItem} / {@link failItem} (#842).
+   *
+   * Both events were declared, and subscribed to by every team lead (filtered
+   * by its teamId), the orchestrator, and the EventToWorkItemBridge's blocked
+   * handler, but nothing published them: a worker's block or failure reached
+   * nobody in a structured way. The event carries the target's real team so
+   * the team lead's subscription matches; `sessionName` stays empty like the
+   * other pool events (system event, no per-session debounce). Never throws:
+   * the transition has already committed.
+   *
+   * @param type - `'task:blocked'` or `'task:failed'`
+   * @param workItem - The WorkItem after the transition
+   * @param previousStatus - The status it left
+   * @param reason - Why (block reason / failure text)
+   */
+  private async publishTaskStopped(
+    type: 'task:blocked' | 'task:failed',
+    workItem: WorkItem,
+    previousStatus: WorkItemStatus,
+    reason: string | undefined,
+  ): Promise<void> {
+    if (!this.eventBus) return;
+    let team: Awaited<ReturnType<SessionTeamResolver>> = null;
+    if (workItem.target && this.sessionTeamResolver) {
+      team = await this.sessionTeamResolver(workItem.target).catch(() => null);
+    }
+    try {
+      this.eventBus.publish({
+        // Unique per publish: the same item can be blocked again after it
+        // was unblocked, and each block is news for its lead.
+        id: `${type}:${workItem.id}:${Date.now()}`,
+        type,
+        timestamp: new Date().toISOString(),
+        teamId: team?.teamId ?? '',
+        teamName: team?.teamName ?? '',
+        memberId: team?.memberId ?? '',
+        memberName: team?.memberName ?? '',
+        sessionName: '',
+        previousValue: previousStatus,
+        newValue: reason ? `${workItem.status}: ${reason}` : workItem.status,
+        changedField: 'taskStatus',
+        workItemId: workItem.id,
+        missionId: workItem.missionId,
+        requestId: workItem.requestId,
+        // Named in the notification like task:verified (#926).
+        ...(workItem.target ? { target: workItem.target } : {}),
+        workItemTitle: workItem.title,
+      });
+    } catch (err) {
+      this.logger.warn(`${type} publish threw`, { workItemId: workItem.id, error: formatError(err) });
+    }
+  }
+
+  /**
+   * Publish `task:cancelled` whenever a WorkItem transitions to the
+   * cancelled status via {@link updateItemStatus} or {@link transitionStatus}.
+   *
+   * **Why this exists.** 2026-05-09 dogfood: 4 child WIs of a Slack-
+   * originated Request all landed in `cancelled` (orc-not-in-health-map
+   * loop, fixed in #531) but the Request stayed in `ready` for hours.
+   * `cascadeRequestStatus` only fires from V3DataService's task
+   * handlers, which are wired to the retired `v3:task_*` events
+   * (`mission-executor.service.ts:152` v1-cleanup comment) — so out-of-
+   * band cancellations never reached cascade. The heartbeat sweep
+   * eventually caught it (#533), but with up-to-30-min latency that
+   * showed up as a misleading "0/4 in every bucket" ping in the user's
+   * Slack thread.
+   *
+   * Publishing `task:cancelled` lets `RequestCascadeSubscriber` close
+   * the Request within seconds of the last child cancelling, instead
+   * of waiting for the heartbeat catch.
+   *
+   * Mirrors {@link publishTaskDoneByWorker} / {@link publishTaskRejected}
+   * so the EventBus surface stays uniform.
+   *
+   * @param workItem - The WI snapshot AFTER the cancelled transition committed
+   * @param previousStatus - The status it transitioned from (for the event payload)
+   */
+  private publishTaskCancelled(
+    workItem: WorkItem,
+    previousStatus: WorkItemStatus,
+  ): void {
+    if (!this.eventBus) {
+      this.logger.debug('No EventBus wired — skipping task:cancelled publish', {
+        workItemId: workItem.id,
+      });
+      return;
+    }
+    try {
+      this.eventBus.publish({
+        id: `task:cancelled:${workItem.id}`,
+        type: 'task:cancelled',
+        timestamp: new Date().toISOString(),
+        teamId: '',
+        teamName: '',
+        memberId: '',
+        memberName: '',
+        sessionName: '',
+        previousValue: previousStatus,
+        newValue: 'cancelled',
+        changedField: 'taskStatus',
+        workItemId: workItem.id,
+        missionId: workItem.missionId,
+        requestId: workItem.requestId,
+      });
+    } catch (err) {
+      this.logger.warn('task:cancelled publish threw', {
+        workItemId: workItem.id,
+        error: formatError(err),
+      });
+    }
+  }
+
+  /**
+   * Claims the next available WorkItem from the pool for an agent.
+   *
+   * Selection strategy: FIFO among matching unclaimed 'queued' items.
+   * If a target filter is provided, only items targeting that agent are considered.
+   *
+   * @param agentId - Agent session name claiming the item
+   * @param filters - Optional filters to narrow which items to consider
+   * @returns The claimed work item and claim object, or null if nothing available
+   */
+  async claimFromPool(
+    agentId: string,
+    filters?: PoolFilters,
+  ): Promise<ClaimResult | null> {
+    if (!agentId || typeof agentId !== 'string') {
+      throw new Error('agentId is required and must be a non-empty string');
+    }
+
+    return this.withClaimLock(async () => {
+      // Agent-liveness gate — see {@link isAgentActive} field doc for full
+      // rationale. Reject before doing any pool work if the requesting
+      // agent's session isn't alive; the reconciler's wake-rule will
+      // spawn it and the agent will re-attempt the claim once registered.
+      if (this.isAgentActive) {
+        const alive = await this.isAgentActive(agentId).catch(() => false);
+        if (!alive) {
+          this.logger.info('claimFromPool refused — agent session not active', { agentId });
+          return null;
+        }
+      }
+
+      // Team budget gate — refuse new work for an over-budget team. Throws a
+      // typed error (reason: 'team_budget_exceeded') so the REST controller
+      // can answer 429 with the reason instead of a misleading 404. Fail-open
+      // on gate errors (the gate itself already swallows ledger failures).
+      const budgetGate = this.teamBudgetGate;
+      if (budgetGate) {
+        const budget = await budgetGate.checkForSession(agentId).catch(() => null);
+        if (budget && !budget.allowed) {
+          this.logger.info('claimFromPool refused — team budget exceeded', {
+            agentId,
+            teamId: budget.teamId,
+            detail: budget.detail,
+          });
+          throw new TeamBudgetExceededError(budget);
+        }
+      }
+
+      // Check if agent already has an active claim
+      const existingClaim = await this.storage.findActiveClaimByAgent(agentId);
+      if (existingClaim) {
+        // Issue #513 — Steve 2026-05-15. Previously this returned
+        // null, which the controller mapped to 404 "No available
+        // WorkItem matching filters". That was misleading: the caller
+        // DOES have a WorkItem (the one they already claimed), they
+        // just couldn't see it without grepping pool.json. Return the
+        // held claim + its WorkItem with `alreadyHeld: true` so the
+        // skill / agent can recognize the situation.
+        this.logger.info('Agent already has an active claim — returning existing', {
+          agentId,
+          existingClaimId: existingClaim.id,
+          existingWorkItemId: existingClaim.workItemId,
+        });
+        const heldWorkItem = await this.storage.findWorkItem(existingClaim.workItemId);
+        if (!heldWorkItem) {
+          // Held claim exists but WI is missing — orphan state. Best we
+          // can do is fall through to the empty-pool null so the agent
+          // doesn't think they own a phantom item. Log so we notice.
+          this.logger.warn('Orphan claim — claim exists but WorkItem missing', {
+            agentId,
+            existingClaimId: existingClaim.id,
+            existingWorkItemId: existingClaim.workItemId,
+          });
+          return null;
+        }
+        return { workItem: heldWorkItem, claim: existingClaim, alreadyHeld: true };
+      }
+
+      const workItems = await this.storage.getWorkItems();
+      const claims = await this.storage.getClaims();
+
+      // Set of work item IDs that have active claims
+      const claimedIds = new Set(
+        claims
+          .filter((c) => c.status === 'active')
+          .map((c) => c.workItemId),
+      );
+
+      // Hygiene #3 — target-respect gate. Before this filter, claimFromPool
+      // would FIFO-pick the oldest queued+unclaimed item regardless of
+      // its existing `target` field, then unconditionally rewrite
+      // `wi.target = agentId` in the transitionStatus mutator. That
+      // produced the target-rotation bug observed in the 5/9 wave (WIs
+      // rotating through Quinn → Sam, Leo → Quinn, etc.).
+      //
+      // After this filter:
+      //   - WIs with an explicit target are claimable ONLY by that target.
+      //   - WIs with no target (broadcast pool) remain claimable by any agent.
+      // The defensive identity check in the transitionStatus mutator
+      // below ensures we never accidentally overwrite an existing target
+      // even if a future code path bypasses this filter.
+      const targetRespectingCandidates = workItems
+        .filter((wi) => wi.status === 'queued' && !claimedIds.has(wi.id))
+        .filter((wi) => !wi.target || wi.target === agentId);
+
+      // Claim order: FIFO, or the ticket policy's order + lock when wired.
+      const candidates = await this.orderClaimCandidates(
+        agentId,
+        targetRespectingCandidates.filter((wi) => matchesFilters(wi, filters)),
+      );
+
+      if (candidates.length === 0) {
+        return null;
+      }
+
+      const selected = candidates[0];
+
+      // TRANS-2: route the queued → running flip through the guarded
+      // transitionStatus helper so internal callers are subject to the
+      // same V3 actor-role + state-machine gates as external callers.
+      // `startedAt` is set automatically by transitionStatus when
+      // newStatus === 'running'; the mutator carries the agent target.
+      //
+      // Hygiene #3 — target-respect (defensive). The candidate filter
+      // above already excludes WIs whose target ≠ agentId, so the only
+      // remaining cases here are (a) wi.target === agentId (no-op assign)
+      // and (b) wi.target === undefined (broadcast claim). Either way we
+      // refuse to overwrite a non-matching existing target.
+      const claimedItem = await this.transitionStatus(
+        selected.id,
+        'running',
+        'system',
+        (wi) => {
+          if (!wi.target) {
+            // Broadcast claim: record that this target is an incidental
+            // claim stamp, not a deliberate assignment, so releaseBack
+            // returns the item to the broadcast pool instead of binding
+            // it to this agent forever.
+            wi.target = agentId;
+            wi.targetSource = 'claim';
+          }
+          // else: target already === agentId per the filter; leave as-is.
+        },
+      );
+
+      if (!claimedItem) {
+        this.logger.warn('Failed to update WorkItem during claim', { workItemId: selected.id });
+        return null;
+      }
+
+      // Create the claim
+      const claimInput: CreateClaimInput = {
+        workItemId: selected.id,
+        agentId,
+      };
+      const claim = createTaskClaim(claimInput);
+      await this.storage.addClaim(claim);
+      await this.storage.flush();
+
+      this.logger.info('WorkItem claimed', {
+        workItemId: selected.id,
+        agentId,
+        claimId: claim.id,
+        title: selected.title,
+      });
+      await this.noteTicketSelfClaim(claimedItem, agentId);
+      this.notifyClaimed(claimedItem, agentId);
+
+      return {
+        workItem: claimedItem,
+        claim,
+      };
+    });
+  }
+
+  /**
+   * Claims a specific WorkItem by ID for an agent.
+   * Used by AgentAutoClaimService for score-based selection where the caller
+   * already identified the best item (not FIFO).
+   *
+   * @param agentId - Agent session name claiming the item
+   * @param workItemId - The specific WorkItem to claim
+   * @returns The claimed work item and claim, or null if unavailable
+   */
+  async claimSpecificItem(agentId: string, workItemId: string): Promise<ClaimResult | null> {
+    if (!agentId || typeof agentId !== 'string') {
+      throw new Error('agentId is required and must be a non-empty string');
+    }
+
+    return this.withClaimLock(async () => {
+      // Agent-liveness gate — same rationale as claimFromPool.
+      if (this.isAgentActive) {
+        const alive = await this.isAgentActive(agentId).catch(() => false);
+        if (!alive) {
+          this.logger.info('claimSpecificItem refused — agent session not active', {
+            agentId,
+            workItemId,
+          });
+          return null;
+        }
+      }
+
+      const existingClaim = await this.storage.findActiveClaimByAgent(agentId);
+      if (existingClaim) return null;
+
+      const workItem = await this.storage.findWorkItem(workItemId);
+      if (!workItem || workItem.status !== 'queued') return null;
+
+      // Hygiene #3 — target-respect gate. Refuse to claim a WI whose
+      // existing target is set to a different agent. This prevents the
+      // claimSpecificItem path (used by AgentAutoClaimService for
+      // score-based selection) from rotating target onto an idle agent
+      // when another agent is the actual target. Same rule as
+      // claimFromPool: target=undefined (broadcast) is claimable by any
+      // agent; target=agentId is claimable only by that agent.
+      if (workItem.target && workItem.target !== agentId) {
+        this.logger.debug('claimSpecificItem refused — target mismatch', {
+          workItemId,
+          existingTarget: workItem.target,
+          requestingAgent: agentId,
+        });
+        return null;
+      }
+
+      const claims = await this.storage.getClaims();
+      if (claims.some((c) => c.workItemId === workItemId && c.status === 'active')) return null;
+
+      // Ticket lock (Phase 3): same rule as claimFromPool's ordering.
+      if (!workItem.target && this.ticketClaimPolicy) {
+        const allowed = await this.orderClaimCandidates(agentId, [workItem]);
+        if (allowed.length === 0) {
+          this.logger.debug('claimSpecificItem refused — ticket lock', { workItemId, agentId });
+          return null;
+        }
+      }
+
+      // TRANS-2: route the queued → running flip through transitionStatus
+      // (mirrors claimFromPool — same V3 + state-machine gates).
+      // Hygiene #3 defensive: only assign target when it's currently
+      // undefined; never overwrite an existing target.
+      const claimedItem = await this.transitionStatus(
+        workItemId,
+        'running',
+        'system',
+        (wi) => {
+          if (!wi.target) {
+            // Broadcast claim — see claimFromPool: this is a claim stamp,
+            // not an assignment.
+            wi.target = agentId;
+            wi.targetSource = 'claim';
+          }
+        },
+      );
+      if (!claimedItem) return null;
+
+      const claimInput: CreateClaimInput = { workItemId, agentId };
+      const claim = createTaskClaim(claimInput);
+      await this.storage.addClaim(claim);
+      await this.storage.flush();
+
+      this.logger.info('WorkItem claimed (specific)', { workItemId, agentId, claimId: claim.id });
+      await this.noteTicketSelfClaim(claimedItem, agentId);
+      this.notifyClaimed(claimedItem, agentId);
+
+      return { workItem: claimedItem, claim };
+    });
+  }
+
+  /**
+   * Releases a claimed WorkItem back to the pool.
+   *
+   * The item's status reverts to 'queued' and the claim is marked 'released'.
+   *
+   * A release is an ADMINISTRATIVE event, not a failure. Two invariants
+   * follow, and both were violated before 2026-08-21:
+   *
+   * 1. **`target` is preserved.** A release says "this attempt ended", not
+   *    "this work no longer belongs to that agent". Clearing it silently
+   *    destroyed a deliberate assignment — and because the wake gate admits
+   *    a worker only when a queued/blocked WI carries `target === their
+   *    session`, it also made the assigned worker unwakeable for their own
+   *    work (`wake_gate_no_pool_work`). The sibling failure path,
+   *    {@link requeueAfterFailure}, already keeps `target` on the far
+   *    stronger grounds of an actual failure; there is no coherent reading
+   *    in which a lease lapse un-assigns work that a failure would not.
+   *    Genuine un-assignment is still possible, but it must be asked for by
+   *    name via `options.unassign` — never inferred from a lease expiring.
+   *
+   *    One carve-out, and it is not an exception to the rule so much as a
+   *    sharpening of it: `claimFromPool` stamps `target` on a *broadcast*
+   *    item to record who picked it up. That stamp is not an assignment,
+   *    and it is dropped on release (`targetSource === 'claim'`) so the
+   *    item returns to the broadcast pool. Preserving it would let one
+   *    claim permanently bind unassigned work to a single agent — and if
+   *    that agent died, only a dead session could ever re-claim it.
+   *
+   * 2. **`retryCount` is untouched.** That counter means failures only (see
+   *    {@link WorkItem.retryCount}); consumers branch on
+   *    `retryCount < maxRetries` to decide retry-in-place vs terminal-and-
+   *    escalate. Charging a retry for lease churn drove live work to 3/3
+   *    with zero failures. Release churn is counted separately in
+   *    {@link WorkItem.releaseCount}, which nothing branches on.
+   *
+   * @param workItemId - ID of the work item to release
+   * @param reason - Why the item is being released
+   * @param options - Release options
+   * @param options.unassign - When true, ALSO clear `target`, returning the
+   *   item to the unassigned pool. Opt-in only, for the case where a caller
+   *   genuinely means "someone else should take this". Defaults to false.
+   * @throws Error if work item not found, or its status is not
+   *   'running' or 'blocked'
+   *
+   * @example
+   * ```typescript
+   * // Lease lapsed / claim revoked — the owner keeps the work.
+   * await pool.releaseBack(id, 'claim revoked: grace exceeded');
+   *
+   * // Deliberate hand-back — anyone may pick this up.
+   * await pool.releaseBack(id, 'agent declined', { unassign: true });
+   * ```
+   */
+  async releaseBack(
+    workItemId: string,
+    reason: string,
+    options: ReleaseBackOptions = {},
+  ): Promise<void> {
+    const workItem = await this.storage.findWorkItem(workItemId);
+    if (!workItem) {
+      throw new Error(`WorkItem not found: ${workItemId}`);
+    }
+    if (workItem.status !== 'running' && workItem.status !== 'blocked') {
+      throw new Error(
+        `Cannot release WorkItem: status must be 'running' or 'blocked', got '${workItem.status}'`,
+      );
+    }
+
+    // Find and release the active claim
+    const claim = await this.storage.findActiveClaimByWorkItem(workItemId);
+    if (claim) {
+      await this.storage.updateClaim(claim.id, (c) => {
+        c.status = 'released';
+        c.endedAt = new Date().toISOString();
+        c.endReason = reason;
+      });
+    }
+
+    // TRANS-2: route the (running|blocked) → queued flip through the
+    // guarded transitionStatus helper. The state-machine entry for
+    // `running → queued` is a TRANS-2 addition, gated to system/TL/orc;
+    // `blocked → queued` was already TL/orc/system-gated by TRANS-1.
+    // Side-effect mutations (startedAt clear, opt-in target clear,
+    // releaseCount bump) move into the atomic mutator.
+    //
+    // `target` survives every release; only an explicit `unassign` clears
+    // it. `retryCount` is NOT touched here — a release is not a failure —
+    // and release churn is recorded in `releaseCount` instead.
+    const unassign = options.unassign === true;
+    await this.transitionStatus(workItemId, 'queued', 'system', (wi) => {
+      wi.startedAt = undefined;
+      // Drop the target only when the caller explicitly asked, or when the
+      // target was never an assignment in the first place — a broadcast
+      // item stamped by whoever happened to claim it belongs back in the
+      // broadcast pool, not bound to that agent.
+      if (unassign || wi.targetSource === 'claim') {
+        wi.target = undefined;
+        wi.targetSource = undefined;
+      }
+      wi.releaseCount = (wi.releaseCount ?? 0) + 1;
+      // A timed block's `until` is spent once the item is back in the queue,
+      // whether the time passed or someone unblocked it earlier.
+      if (wi.metadata && WORK_ITEM_BLOCKED_UNTIL_KEY in wi.metadata) {
+        const metadata: Record<string, unknown> = { ...wi.metadata };
+        delete metadata[WORK_ITEM_BLOCKED_UNTIL_KEY];
+        wi.metadata = metadata;
+      }
+    });
+
+    await this.storage.flush();
+    this.logger.info('WorkItem released back to pool', {
+      workItemId,
+      reason,
+      claimId: claim?.id,
+      unassigned: unassign,
+    });
+  }
+
+  /**
+   * Decide whether a WorkItem requires TL verification before reaching a
+   * terminal-success status.
+   *
+   * Default policy (VERIF-1):
+   *   - `delegate` items default to *requires verification* — a worker
+   *     marking their own delegated work as "done" should produce
+   *     `done_by_worker` and wake the TL for sign-off.
+   *   - All other types (`cron_run`, `notify`, `reconcile`, `check`,
+   *     `confirm`, `review`, ...) default to simple completion (`done`).
+   *   - Bridge-auto maintenance items (`metadata.autoCreated`) and
+   *     trigger-fired check-ins (`triggerId`) complete as `done` too —
+   *     nothing reviews them (#813).
+   *
+   * The default is overridable via `wi.metadata.requiresVerification`:
+   *   - `true`  — force verification path even for non-delegate types
+   *   - `false` — skip verification even for delegate types (this is the
+   *     F-H affordance REVIEW-1 needs: review WIs are themselves the
+   *     verification step, so they must NOT loop back to TL self-verify)
+   *
+   * @param wi - The WorkItem under inspection
+   * @returns true when the verification path should fire
+   */
+  private requiresVerification(wi: WorkItem): boolean {
+    const metaFlag = (wi.metadata as { requiresVerification?: boolean } | undefined)?.requiresVerification;
+    if (metaFlag === true) return true;
+    if (metaFlag === false) return false;
+    // #813: bridge-auto maintenance items get no review item (the bridge
+    // re-scans on its own tick), so parking them in done_by_worker only
+    // stranded them until the TTL auto-verified them. Complete them as done.
+    if (wi.metadata?.['autoCreated'] === true) return false;
+    // #813: a trigger-fired item (schedule-followup / watch-for-event) is a
+    // check-in the agent set for itself, created as `delegate` by default.
+    // Nothing reviewed them — 123 of 293 verified items in the live pool on
+    // 2026-09-26 were these, verified with no review item. Complete as done.
+    if (wi.triggerId) return false;
+    return wi.type === 'delegate';
+  }
+
+  /**
+   * Explicitly block a running WorkItem (the agent's `/block`, e.g. "waiting
+   * on the owner").
+   *
+   * The item becomes terminal-until-unblocked:
+   * - status `running → blocked`, with `blockedReason` and
+   *   `blockSource: 'explicit'` written atomically with the flip;
+   * - the active claim is released (`blocked: <reason>`), which frees the
+   *   agent's claim slot and leaves no lease for the reconciler to expire,
+   *   revoke and redeliver;
+   * - the reconciler never re-queues an explicitly blocked item (see
+   *   `detectRecoverableWorkItems` / `detectDependencyResolvedWorkItems`).
+   *
+   * Unblocking is explicit: {@link releaseBack} (POST
+   * `/task-pool/release/:id`, the release-claim skill) or any
+   * `blocked → queued` transition puts it back to `queued` and clears the
+   * marker. `target` is kept, so it returns to the same agent.
+   *
+   * Before this (2026-09-25, WI 92327d6d) `/block` kept the claim, and the
+   * reconciler flipped the item `blocked → queued` (`reconciler_requeue`)
+   * as soon as it saw the agent active, so it was re-claimed and
+   * re-dispatched every few minutes.
+   *
+   * @param workItemId - The running WorkItem to block
+   * @param options.agentId - Who blocked it (recorded in metadata)
+   * @param options.reason - Why (persisted on `blockedReason`)
+   * @param options.until - ISO 8601 time at which the block lifts on its own:
+   *   the reconciler returns the item to `queued` for the same target once it
+   *   has passed (block-task `until`, for work that can only proceed at a
+   *   known time). Without it the block waits for an explicit unblock.
+   * @throws Error if not found, the item is not `running` (state machine), or `until` does not parse
+   */
+  async blockItem(
+    workItemId: string,
+    options: { agentId: string; reason?: string; until?: string },
+  ): Promise<void> {
+    const reason = options.reason && options.reason.trim().length > 0 ? options.reason : undefined;
+    const until = options.until && options.until.trim().length > 0 ? options.until : undefined;
+    if (until !== undefined && !Number.isFinite(Date.parse(until))) {
+      throw new Error(`Invalid until for WorkItem ${workItemId}: '${until}' is not an ISO 8601 date-time`);
+    }
+    const updated = await this.transitionStatus(
+      workItemId,
+      'blocked',
+      'system',
+      (wi) => {
+        wi.blockSource = WORK_ITEM_BLOCK_SOURCES.EXPLICIT;
+        const metadata: Record<string, unknown> = {
+          ...(wi.metadata ?? {}),
+          blockedBy: options.agentId,
+          blockedAt: new Date().toISOString(),
+        };
+        // A block without `until` must not inherit one from an earlier block.
+        if (until) metadata[WORK_ITEM_BLOCKED_UNTIL_KEY] = until;
+        else delete metadata[WORK_ITEM_BLOCKED_UNTIL_KEY];
+        wi.metadata = metadata;
+      },
+      reason,
+    );
+    if (!updated) {
+      throw new Error(`WorkItem not found: ${workItemId}`);
+    }
+    await this.releaseClaim(workItemId, reason ? `blocked: ${reason}` : 'blocked');
+    await this.storage.flush();
+    this.logger.info(
+      until
+        ? 'WorkItem explicitly blocked (claim released; returns to queued when its until time passes)'
+        : 'WorkItem explicitly blocked (claim released; stays blocked until unblocked)',
+      {
+        workItemId,
+        agentId: options.agentId,
+        reason,
+        until,
+      },
+    );
+    await this.publishTaskStopped('task:blocked', updated, 'running', reason);
+    // The owner thread this work came from hears that it is blocked (work
+    // from a ticket or a trigger has its own place and says nothing there).
+    const origin = originOfWorkItem(updated);
+    if (!origin || origin.kind === 'owner') reportOwnerThreadBlocking(updated.target ?? options.agentId, {
+      kind: 'work_blocked',
+      ...(reason ? { reason } : {}),
+      ...(origin?.kind === 'owner' && origin.slackChannelId
+        ? { thread: { slackChannelId: origin.slackChannelId, ...(origin.threadTs ? { threadTs: origin.threadTs } : {}) } }
+        : {}),
+    });
+  }
+
+  /**
+   * Release the active claim on a WorkItem, if it has one.
+   *
+   * Shared by `completeSimpleItem` and `submitForVerification` because both
+   * represent the worker handing the item back to the system.
+   *
+   * Also public for callers that must drive a terminal transition
+   * themselves rather than through {@link failItem}. The SLA orphan-close
+   * path is the live example: it targets `cancelled`, `failed` OR
+   * `rejected` depending on the origin status, so `failItem` — which always
+   * transitions to `failed` — cannot serve it. Such callers MUST call this,
+   * otherwise the claim stays `active` against a terminal WorkItem and
+   * quietly wedges the claiming agent. The mechanism is not an error, which
+   * is what makes it hard to spot: {@link claimFromPool} checks
+   * `findActiveClaimByAgent` BEFORE it scans the pool, and short-circuits by
+   * returning the held claim with `alreadyHeld: true` (issue #513). So the
+   * agent is handed the same terminal item on every poll and never sees the
+   * queued work waiting for them, until the lease/grace ladder revokes it.
+   *
+   * Idempotent: a no-op when no active claim exists.
+   *
+   * @param workItemId - WorkItem whose claim should be released
+   * @param endReason - Reason recorded on the claim (`completed`,
+   *   `submitted_for_verification`, `sla escalation timeout ...`) for
+   *   auditability
+   */
+  async releaseClaim(workItemId: string, endReason: string): Promise<void> {
+    const claim = await this.storage.findActiveClaimByWorkItem(workItemId);
+    if (!claim) return;
+    await this.storage.updateClaim(claim.id, (c) => {
+      c.status = 'released';
+      c.endedAt = new Date().toISOString();
+      c.endReason = endReason;
+    });
+  }
+
+  /**
+   * Worker reports a delegated WorkItem as done and submits it for TL
+   * verification.
+   *
+   * Transitions `running → done_by_worker` via {@link transitionStatus},
+   * which enforces the V3 actor-role gate (`'agent'` is allowed; any
+   * other role throws). The active claim is released as
+   * `submitted_for_verification` so the TL queue is the only thing
+   * blocking forward progress.
+   *
+   * Used by the `completeItem` facade for `delegate`-type items and any
+   * item whose `metadata.requiresVerification === true`.
+   *
+   * @param workItemId - WorkItem id
+   * @param actorRole - Role of the caller (`'agent'` for normal worker
+   *   submissions; passed through to `isTransitionPermitted`)
+   * @param result - Optional result payload to attach to the WorkItem
+   * @returns The updated WorkItem, or `null` if the WI was deleted
+   *   between the find and the update (race window)
+   * @throws When the WorkItem is missing, the transition is invalid, or
+   *   the actor is not permitted to perform `running → done_by_worker`.
+   */
+  async submitForVerification(
+    workItemId: string,
+    actorRole: TransitionActorInput,
+    result?: Record<string, unknown>,
+  ): Promise<WorkItem | null> {
+    await this.releaseClaim(workItemId, 'submitted_for_verification');
+    const updated = await this.transitionStatus(
+      workItemId,
+      'done_by_worker',
+      actorRole,
+      (wi) => {
+        if (result) wi.result = result;
+      },
+    );
+    await this.storage.flush();
+    this.logger.info('WorkItem submitted for verification', {
+      workItemId,
+      actorRole,
+      // BRIDGE-1 turns this into a real `task:done_by_worker` event below
+      // (F1-BRIDGE-1). The log line is preserved as a wake signal for any
+      // tail-based TL-watching subscriber that still greps it.
+      tlWakeRequested: true,
+    });
+    // F1-BRIDGE-1: publish AFTER the storage flush so any subscriber that
+    // re-reads via taskPool.findWorkItem sees the committed `done_by_worker`
+    // status. `updated` is null only on race-window deletion — skip the
+    // publish in that case (no source WI for the bridge to resolve).
+    if (updated) {
+      this.publishTaskDoneByWorker(updated);
+    }
+    return updated;
+  }
+
+  /**
+   * Worker (or system) marks a non-delegated WorkItem as fully done.
+   *
+   * Transitions `running → done` via {@link transitionStatus}. Used by
+   * the `completeItem` facade for `cron_run`, `notify`, `reconcile`,
+   * `check`, `confirm`, `review` types — anything whose lifecycle does
+   * NOT include a TL verification step.
+   *
+   * The Reconciler service is the only system-actor caller and uses
+   * `actorRole='system'`, which bypasses the actor check while still
+   * respecting the state-machine legality check.
+   *
+   * @param workItemId - WorkItem id
+   * @param actorRole - Role of the caller (`'agent'`, `'system'`, etc.)
+   * @param result - Optional result payload to attach
+   * @returns The updated WorkItem, or `null` if the WI was deleted
+   *   between the find and the update (race window)
+   * @throws When the WorkItem is missing, the transition is invalid, or
+   *   the actor is not permitted to perform `running → done`.
+   */
+  async completeSimpleItem(
+    workItemId: string,
+    actorRole: TransitionActorInput,
+    result?: Record<string, unknown>,
+  ): Promise<WorkItem | null> {
+    // #813: completing a review item renders a verdict on its source. Check
+    // that this caller may render it BEFORE the review item itself is marked
+    // done — otherwise a refused verdict leaves a "done" review and a source
+    // that nobody reviewed.
+    const verdictPlan = await this.planReviewVerdict(workItemId, actorRole, result);
+    await this.releaseClaim(workItemId, 'completed');
+    const updated = await this.transitionStatus(
+      workItemId,
+      'done',
+      actorRole,
+      (wi) => {
+        if (result) wi.result = result;
+      },
+    );
+
+    // Steve 2026-05-15 dogfood: TL Verify WIs were completing (status=done)
+    // but the SOURCE work item they were verifying stayed stuck in
+    // `done_by_worker` forever. `resolveBlockedDependents` only treats
+    // `done|verified` as terminal-success, so blocked dependents of the
+    // SOURCE (e.g. an Execute waiting on a Plan in a Plan/Execute/Review
+    // chain) were never unblocked.
+    //
+    // Concrete repro: WI 12d7e988 (Plan) — done_by_worker; verify WI
+    // 12d7e988:verify:12d7e988 — done; Execute 722da42f — blocked for 41+
+    // min waiting on the Plan that was already verified.
+    //
+    // When a verify WI completes (metadata.verifyOf points at its source),
+    // propagate the verdict to the source via verifyItem so the source
+    // moves done_by_worker → verified AND its own dependents unblock.
+    // #813: the verdict is rendered AS THE CALLER who completed the review
+    // item (it used to be 'system', which let anyone's completion certify
+    // the source). {@link planReviewVerdict} already checked the caller.
+    if (verdictPlan) {
+      try {
+        await this.verifyItem(
+          verdictPlan.sourceId,
+          verdictPlan.reviewer,
+          verdictPlan.verdict,
+          verdictPlan.verdict === 'rejected' ? verdictPlan.feedback : undefined,
+        );
+        this.logger.info('Verify WI complete → propagated to source', {
+          verifyWorkItemId: workItemId,
+          sourceWorkItemId: verdictPlan.sourceId,
+          verdict: verdictPlan.verdict,
+          reviewer: describeTransitionActor(verdictPlan.reviewer),
+        });
+      } catch (err) {
+        // Propagation is best-effort — a failed propagate must NOT roll
+        // back the verify WI's own completion.
+        this.logger.warn('Verify-to-source propagation failed (non-fatal)', {
+          verifyWorkItemId: workItemId,
+          sourceWorkItemId: verdictPlan.sourceId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Promote any blocked dependents whose deps are now all satisfied.
+    await this.resolveBlockedDependents(workItemId);
+    await this.storage.flush();
+    this.logger.info('WorkItem completed', { workItemId, actorRole });
+    // Terminal-success signal for KR auto-measure / cascade / learning
+    // subscribers — see {@link publishTaskTerminalSuccess}.
+    if (updated) {
+      this.publishTaskTerminalSuccess('task:done', updated, 'running');
+    }
+    return updated;
+  }
+
+  /**
+   * The verdict a review item's completion would render on its source, after
+   * checking that the completing caller may render it (#813).
+   *
+   * A review item carries `metadata.verifyOf` = the source WorkItem id. The
+   * caller completes the review as its assignee (`agent` role) or as the
+   * orchestrator; on the source it acts as the REVIEWER, so the verdict is
+   * checked as `team_lead`/`orchestrator` with the caller's session — the
+   * reviewer rule then decides by identity, not by the claimed role.
+   *
+   * @param workItemId - The item being completed
+   * @param actorInput - The caller completing it
+   * @param result - The completion result (`verdict: 'rejected'` sends it back)
+   * @returns The planned verdict, or null when this item reviews nothing that
+   *   is still awaiting review
+   * @throws ForbiddenTransitionError when the caller may not render the verdict
+   */
+  private async planReviewVerdict(
+    workItemId: string,
+    actorInput: TransitionActorInput,
+    result?: Record<string, unknown>,
+  ): Promise<{ sourceId: string; verdict: 'verified' | 'rejected'; reviewer: TransitionActor; feedback?: string } | null> {
+    const reviewItem = await this.storage.findWorkItem(workItemId);
+    const verifyOf =
+      reviewItem?.metadata && typeof reviewItem.metadata.verifyOf === 'string'
+        ? reviewItem.metadata.verifyOf
+        : undefined;
+    if (!verifyOf) return null;
+    const source = await this.storage.findWorkItem(verifyOf);
+    if (!source || source.status !== 'done_by_worker') return null;
+
+    // Ticket loop Phase 3: a reviewer can send work back by completing the
+    // review with `verdict: 'rejected'` (+ feedback).
+    const verdict: 'verified' | 'rejected' = result?.verdict === 'rejected' ? 'rejected' : 'verified';
+    const feedback =
+      typeof result?.feedback === 'string' && result.feedback.trim()
+        ? result.feedback.trim()
+        : typeof result?.summary === 'string'
+          ? result.summary
+          : undefined;
+    const reviewer = TaskPoolService.reviewerActorFor(actorInput);
+    // The review item's assignee is the reviewer of record for its source.
+    await this.assertTransitionPermitted(source, verdict, reviewer, reviewItem?.target);
+    // Persist the reviewer of record so the verdict below (and any later
+    // audit) sees the same identity this check just accepted.
+    if (reviewItem?.target && !getWorkItemReviewer(source)) {
+      await this.storage.updateWorkItem(verifyOf, (wi) => {
+        wi.metadata = { ...(wi.metadata ?? {}), [WORK_ITEM_REVIEWER_KEY]: reviewItem.target };
+      });
+    }
+    return { sourceId: verifyOf, verdict, reviewer, ...(feedback ? { feedback } : {}) };
+  }
+
+  /**
+   * Map the caller of a review item's completion to the actor that renders
+   * the verdict on the source. `agent` → `team_lead` (it is reviewing, not
+   * working); every other role is kept. A missing actor stays missing, so it
+   * is refused.
+   *
+   * @param actorInput - The completing caller
+   * @returns The reviewer actor (or undefined → refused by the gate)
+   */
+  private static reviewerActorFor(actorInput: TransitionActorInput): TransitionActor {
+    const actor = normalizeTransitionActor(actorInput);
+    if (!actor) return actorInput as unknown as TransitionActor;
+    return {
+      ...actor,
+      role: actor.role === 'agent' ? 'team_lead' : actor.role,
+      via: actor.via ?? 'review-item-completion',
+    };
+  }
+
+  /**
+   * Run the closed permission gate for one transition and throw on refusal.
+   *
+   * For the verdict edges, an item that predates reviewer stamping gets its
+   * reviewer from its review item (`<id>:verify:<id>`, targeted at the
+   * reviewer when the bridge created it), so a lead can still review items
+   * that were in flight when #813 shipped.
+   *
+   * @param item - The WorkItem as it is now
+   * @param to - Target status
+   * @param actorInput - The caller
+   * @param reviewerHint - Reviewer of record when the caller already knows it
+   *   (the target of the review item being completed)
+   * @throws ForbiddenTransitionError when refused
+   */
+  private async assertTransitionPermitted(
+    item: WorkItem,
+    to: WorkItemStatus,
+    actorInput: TransitionActorInput,
+    reviewerHint?: string,
+  ): Promise<void> {
+    let subject: Pick<WorkItem, 'status' | 'target' | 'metadata'> = item;
+    if (VERDICT_TRANSITIONS.has(`${item.status}→${to}`) && !getWorkItemReviewer(item)) {
+      const reviewer =
+        reviewerHint ?? (await this.storage.findWorkItem(`${item.id}:verify:${item.id}`))?.target;
+      if (reviewer) {
+        subject = { ...item, metadata: { ...(item.metadata ?? {}), [WORK_ITEM_REVIEWER_KEY]: reviewer } };
+      }
+    }
+    const decision = checkTransitionPermission(subject, to, actorInput);
+    if (!decision.allowed) {
+      const actor = normalizeTransitionActor(actorInput);
+      this.logger.warn('Refused WorkItem transition', {
+        workItemId: item.id,
+        from: item.status,
+        to,
+        actor: describeTransitionActor(actor),
+        reason: decision.reason,
+      });
+      throw new ForbiddenTransitionError(item.id, item.status, to, actor, decision);
+    }
+  }
+
+  /**
+   * Stamp a review-escalation marker on a `done_by_worker` item (#813).
+   *
+   * The marker is what lets the next reviewer in the chain render the verdict
+   * (the orchestrator after {@link REVIEW_ESCALATED_TO_ORC_KEY}), and it
+   * makes each escalation fire once even across a backend restart — the
+   * reconciler used to dedupe in memory only. Status is not touched.
+   *
+   * @param workItemId - The item under review
+   * @param key - Metadata key to stamp (the orc or owner escalation key)
+   * @param at - Timestamp to record (defaults to now)
+   * @returns True when stamped, false when the item is gone or no longer awaiting review
+   */
+  async stampReviewEscalation(workItemId: string, key: string, at: string = new Date().toISOString()): Promise<boolean> {
+    const item = await this.storage.findWorkItem(workItemId);
+    if (!item || item.status !== 'done_by_worker') return false;
+    const ok = await this.storage.updateWorkItem(workItemId, (wi) => {
+      wi.metadata = { ...(wi.metadata ?? {}), [key]: at };
+    });
+    return !!ok;
+  }
+
+  /**
+   * TL records a verdict on a WorkItem in `done_by_worker` status.
+   *
+   * `verified` advances to terminal success and unblocks dependents;
+   * `rejected` parks the item until the TL re-queues it (which TRANS-1
+   * gates to TL/orchestrator/system actors). Worker-actor calls throw
+   * automatically via {@link transitionStatus}'s permission gate — we
+   * do NOT need to add an explicit role check here, the matrix in
+   * `TRANSITION_PERMISSIONS` handles it.
+   *
+   * @param workItemId - WorkItem id (must currently be `done_by_worker`)
+   * @param actorRole - Role of the caller (`'team_lead'` or `'orchestrator'`
+   *   for verify/reject; worker calls throw)
+   * @param verdict - `'verified'` or `'rejected'`
+   * @param comment - Optional reviewer comment recorded in `wi.error`
+   *   (the field is reused — the WorkItem schema does not yet have a
+   *   dedicated `verifierComment` slot; keeping this on `error` lets
+   *   downstream UIs render TL feedback alongside failure causes)
+   * @returns The updated WorkItem, or `null` on race-window deletion
+   * @throws When the WorkItem is missing, the verdict is invalid, the
+   *   transition is illegal, or the actor is not permitted to verify.
+   */
+  async verifyItem(
+    workItemId: string,
+    actorRole: TransitionActorInput,
+    verdict: 'verified' | 'rejected',
+    comment?: string,
+  ): Promise<WorkItem | null> {
+    if (verdict !== 'verified' && verdict !== 'rejected') {
+      throw new Error(
+        `Invalid verdict: "${verdict}". Must be "verified" or "rejected".`,
+      );
+    }
+    const updated = await this.transitionStatus(
+      workItemId,
+      verdict,
+      actorRole,
+      (wi) => {
+        if (comment) wi.error = comment;
+        // #813: record WHO rendered the verdict, so reports can show that a
+        // verified item was reviewed and by whom.
+        const by = normalizeTransitionActor(actorRole);
+        wi.metadata = {
+          ...(wi.metadata ?? {}),
+          reviewedBy: by?.session ?? by?.role,
+          reviewedByRole: by?.role,
+          reviewedAt: new Date().toISOString(),
+        };
+      },
+    );
+    if (verdict === 'verified') {
+      await this.resolveBlockedDependents(workItemId);
+      await this.closeRejectedParentOfRetry(workItemId);
+    }
+    // #819: a verdict rendered THROUGH this method directly (POST /verdict,
+    // or an escalation's owner resolution) never completes the tracking
+    // `<id>:verify:<id>` review item — only the normal "TL completes their
+    // review WorkItem" path does that (via completeSimpleItem's own call
+    // into verifyItem). Left alone, that review item sits open in the
+    // reviewer's queue forever even though its source is already decided.
+    // No-op when the review item was already closed by that normal path
+    // (its status is already terminal by the time we get here).
+    await this.closeReviewItemAfterDirectVerdict(workItemId);
+    await this.storage.flush();
+    this.logger.info('WorkItem verdict recorded', { workItemId, verdict, actorRole });
+    // F1-BRIDGE-1: the `rejected` branch publishes task:rejected so the
+    // bridge can retry-or-escalate. The `verified` branch publishes
+    // task:verified (terminal success) for the KR auto-measure / cascade /
+    // learning subscribers — see {@link publishTaskTerminalSuccess}. Skip
+    // both on race-window deletion.
+    if (updated) {
+      if (verdict === 'rejected') {
+        this.publishTaskRejected(updated);
+      } else {
+        this.publishTaskTerminalSuccess('task:verified', updated, 'done_by_worker');
+      }
+    }
+    return updated;
+  }
+
+  /**
+   * CREW-403: once a retry is verified, make sure the `rejected` parent it
+   * replaced is marked as dealt with.
+   *
+   * `rejected` only has a `→ queued` edge, so the parent can never be
+   * verified itself; its disposition (`succeeded_by` the retry) is what tells
+   * the escalation paths to leave it alone. The bridge stamps that when it
+   * creates the retry, but the stamp is best-effort. This re-applies it
+   * (idempotent: an existing disposition wins) so a lost stamp cannot leave a
+   * parent whose work is done sitting undisposed and escalating to the
+   * orchestrator, who cannot render a verdict on it.
+   *
+   * @param workItemId - The WorkItem that was just verified
+   */
+  private async closeRejectedParentOfRetry(workItemId: string): Promise<void> {
+    try {
+      const wi = await this.storage.findWorkItem(workItemId);
+      const parentId = wi?.metadata?.['sourceWorkItemId'];
+      if (!wi || typeof parentId !== 'string' || !workItemId.startsWith(`${parentId}:retry:`)) return;
+      await this.disposeFailedWorkItem(parentId, {
+        reason: `retry ${workItemId} verified`,
+        successorWorkItemId: workItemId,
+      });
+    } catch (err) {
+      this.logger.warn('Failed to close rejected parent after retry verified (non-fatal)', {
+        workItemId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Close the review item tracking a source WorkItem's verification, once
+   * the verdict has been rendered directly on the source (#819) — e.g. via
+   * `POST /verdict`, or the owner resolving an escalation — rather than by
+   * completing the review item itself. Without this, `<id>:verify:<id>`
+   * sits open in the reviewer's queue forever, even though its source has
+   * already been verified or rejected.
+   *
+   * A review item still `running` (claimed by its reviewer) is completed the
+   * same way a reviewer's own completion would ({@link completeSimpleItem});
+   * `planReviewVerdict` is a safe no-op there because the source is no
+   * longer `done_by_worker`, so this can never recurse back into
+   * {@link verifyItem}. A review item never claimed (`queued`/`blocked`/
+   * `scheduled`) is cancelled instead, since `→done` requires `running`.
+   * Already-terminal or missing review items are left alone.
+   *
+   * Best-effort: any failure here is logged, never thrown — the real verdict
+   * on the source has already been recorded, and that must not be
+   * jeopardized by a failure to tidy up a secondary tracking item.
+   *
+   * @param sourceId - The WorkItem whose verdict was just rendered
+   */
+  private async closeReviewItemAfterDirectVerdict(sourceId: string): Promise<void> {
+    const reviewId = `${sourceId}:verify:${sourceId}`;
+    try {
+      const reviewItem = await this.storage.findWorkItem(reviewId);
+      if (!reviewItem || TERMINAL_WORK_ITEM_STATUSES.has(reviewItem.status)) return;
+      if (reviewItem.status === 'running') {
+        await this.completeSimpleItem(reviewId, { role: 'system', via: 'verifyItem:auto-close-review' }, {
+          summary: 'Auto-closed: the verdict was rendered directly on the source it reviews.',
+        });
+      } else {
+        await this.transitionStatus(
+          reviewId,
+          'cancelled',
+          { role: 'system', via: 'verifyItem:auto-close-review' },
+          (wi) => {
+            wi.metadata = {
+              ...(wi.metadata ?? {}),
+              autoClosedReason: 'verdict rendered directly on the source it reviews',
+            };
+          },
+        );
+        await this.storage.flush();
+      }
+    } catch (err) {
+      this.logger.warn('Failed to auto-close review item after a direct verdict (non-fatal)', {
+        sourceId,
+        reviewId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Completion facade — picks the verification path for the caller.
+   *
+   * Reads the WorkItem, applies the {@link requiresVerification} policy, and
+   * dispatches to either {@link submitForVerification} (delegate items /
+   * explicit opt-in) or {@link completeSimpleItem} (everything else).
+   *
+   * #813: the caller's actor is REQUIRED. It used to be hard-coded `'agent'`
+   * with no identity, so a review item's completion could not tell its
+   * reviewer from anyone else. Controllers resolve it server-side (see
+   * `resolveTransitionActor` in the task-pool controller).
+   *
+   * A completion from the item's own agent is never lost to claim churn: if
+   * the item is `queued` because that agent's claim was revoked or it was
+   * released back (or it never claimed it — e.g. it worked it from a batch
+   * reminder), the item is resumed (`queued → running`) and the completion
+   * proceeds normally. A completion from anyone else on a queued item still
+   * fails the transition (409). See {@link resumeOwnQueuedItemForCompletion}.
+   *
+   * @param workItemId - WorkItem id
+   * @param result - Optional result payload
+   * @param actor - Who is completing it (role + session)
+   * @throws When the WorkItem is missing or the underlying transition
+   *   is rejected (invalid state, forbidden actor, not the reviewer).
+   */
+  async completeItem(
+    workItemId: string,
+    result: Record<string, unknown> | undefined,
+    actor: TransitionActorInput,
+  ): Promise<void> {
+    let workItem = await this.storage.findWorkItem(workItemId);
+    if (!workItem) {
+      throw new Error(`WorkItem not found: ${workItemId}`);
+    }
+    if (workItem.status === 'queued') {
+      workItem = (await this.resumeOwnQueuedItemForCompletion(workItem, actor)) ?? workItem;
+    } else if (workItem.status === 'blocked') {
+      workItem = (await this.resumeOwnBlockedItemForCompletion(workItem, actor)) ?? workItem;
+    }
+    if (this.requiresVerification(workItem)) {
+      await this.submitForVerification(workItemId, actor, result);
+    } else {
+      await this.completeSimpleItem(workItemId, actor, result);
+    }
+  }
+
+  /**
+   * Puts a `queued` WorkItem back to `running` when its own agent reports it
+   * complete, so the completion lands instead of failing `queued → done*`
+   * with a 409.
+   *
+   * "Its own agent" is the item's `target`, or — for a broadcast item whose
+   * claim stamp was dropped on release — the holder of its most recent claim.
+   * Anyone else gets `null` and the caller's transition fails as before.
+   *
+   * The 2026-09-29 loop this closes (WI f34f09b0, CE-19): Vera's claim was
+   * grace-revoked while she worked, the item went back to `queued`, her
+   * `complete` got 409, and AutoClaim re-claimed the finished item for her a
+   * minute later — `running` for an idle agent, with the work already done.
+   *
+   * @param workItem - The queued WorkItem
+   * @param actorInput - Who is completing it
+   * @returns The resumed (running) WorkItem, or null when the caller is not
+   *   its agent or it is no longer queued
+   */
+  private async resumeOwnQueuedItemForCompletion(
+    workItem: WorkItem,
+    actorInput: TransitionActorInput,
+  ): Promise<WorkItem | null> {
+    const session = normalizeTransitionActor(actorInput)?.session;
+    if (!session) return null;
+    const owner = workItem.target ?? (await this.latestClaimHolder(workItem.id));
+    if (owner !== session) return null;
+
+    return this.withClaimLock(async () => {
+      const current = await this.storage.findWorkItem(workItem.id);
+      // Raced with a claim (only its own agent can claim a targeted item):
+      // complete it from wherever it is now.
+      if (!current || current.status !== 'queued') return current ?? null;
+      const resumed = await this.transitionStatus(
+        workItem.id,
+        'running',
+        { role: 'system', session, via: 'completeItem:resume-own-queued' },
+        (wi) => {
+          wi.metadata = {
+            ...(wi.metadata ?? {}),
+            completedWhileQueuedAt: new Date().toISOString(),
+          };
+        },
+      );
+      this.logger.info('Completion from the item\'s own agent landed while it was queued — resumed to finish it', {
+        workItemId: workItem.id,
+        agentId: session,
+      });
+      return resumed;
+    });
+  }
+
+  /**
+   * Puts a `blocked` WorkItem back to `running` when the agent that worked it
+   * reports it complete, so the completion lands instead of failing
+   * `blocked → done*` with a 409.
+   *
+   * CE-232 (CREW-439): Vera reported `[BLOCKED]` on her own running item
+   * (`blockItem`, which releases the claim), then finished the work and her
+   * `POST /task-pool/complete` was refused — there is no `blocked → done`
+   * transition and, unlike `queued`, no rescue. Only the item's owner gets
+   * one: the holder of its latest claim. A general `blocked → done` for anyone
+   * is deliberately not added. A `waiting_on_human` park (the reconciler
+   * resumes it itself) and a dependency block (never claimed, so it has no
+   * claim holder) are left alone.
+   *
+   * @param workItem - The blocked WorkItem
+   * @param actorInput - Who is completing it
+   * @returns The resumed (running) WorkItem, or null when the caller is not
+   *   the item's claim holder, the block is a human-wait park, or it is no
+   *   longer blocked
+   */
+  private async resumeOwnBlockedItemForCompletion(
+    workItem: WorkItem,
+    actorInput: TransitionActorInput,
+  ): Promise<WorkItem | null> {
+    if (workItem.blockSource === WORK_ITEM_BLOCK_SOURCES.WAITING_ON_HUMAN) return null;
+    const session = normalizeTransitionActor(actorInput)?.session;
+    if (!session) return null;
+    if ((await this.latestClaimHolder(workItem.id)) !== session) return null;
+
+    return this.withClaimLock(async () => {
+      const current = await this.storage.findWorkItem(workItem.id);
+      if (!current || current.status !== 'blocked') return current ?? null;
+      const resumed = await this.transitionStatus(
+        workItem.id,
+        'running',
+        { role: 'system', session, via: 'completeItem:resume-own-blocked' },
+        (wi) => {
+          wi.blockedReason = undefined;
+          wi.blockSource = undefined;
+          const metadata: Record<string, unknown> = {
+            ...(wi.metadata ?? {}),
+            completedWhileBlockedAt: new Date().toISOString(),
+          };
+          // A timed block's `until` is spent once the holder finishes the
+          // item; a done item must not carry a wait it no longer has.
+          delete metadata[WORK_ITEM_BLOCKED_UNTIL_KEY];
+          wi.metadata = metadata;
+        },
+      );
+      this.logger.info('Completion from the item\'s claim holder landed while it was blocked — resumed to finish it', {
+        workItemId: workItem.id,
+        agentId: session,
+      });
+      return resumed;
+    });
+  }
+
+  /**
+   * The agent that held the most recent claim on a WorkItem, if any.
+   *
+   * @param workItemId - WorkItem id
+   * @returns Agent session of the latest claim, or undefined
+   */
+  private async latestClaimHolder(workItemId: string): Promise<string | undefined> {
+    const claims = (await this.storage.getClaims()).filter((c) => c.workItemId === workItemId);
+    if (claims.length === 0) return undefined;
+    const latest = claims.reduce((a, b) =>
+      new Date(b.claimedAt).getTime() >= new Date(a.claimedAt).getTime() ? b : a,
+    );
+    return latest.agentId;
+  }
+
+  /**
+   * Scans blocked WorkItems that list `completedId` in their `dependsOn` and
+   * promotes each to `queued` if every one of their deps has reached terminal
+   * success (`done` or `verified`). Idempotent and safe to call on any terminal
+   * success transition.
+   *
+   * Serialized via the claim mutex — a concurrent claimFromPool call must not
+   * observe a half-promoted item.
+   */
+  async resolveBlockedDependents(completedId: string): Promise<void> {
+    await this.withClaimLock(async () => {
+      const items = await this.storage.getWorkItems();
+      const terminalSuccess = new Set<string>(
+        items
+          .filter((wi) => wi.status === 'done' || wi.status === 'verified')
+          .map((wi) => wi.id),
+      );
+
+      const candidates = items.filter(
+        (wi) =>
+          wi.status === 'blocked' &&
+          // An explicit block waits for an explicit unblock, not for deps.
+          !isExplicitlyBlocked(wi) &&
+          Array.isArray(wi.dependsOn) &&
+          wi.dependsOn.includes(completedId),
+      );
+
+      for (const candidate of candidates) {
+        const allSatisfied = (candidate.dependsOn ?? []).every((depId) =>
+          terminalSuccess.has(depId),
+        );
+        if (!allSatisfied) continue;
+
+        // TRANS-2: route the blocked → queued promotion through
+        // transitionStatus. The 'system' actor matches both the V3
+        // permission gate (blocked→queued requires TL/orc/system) and
+        // the existing intent — dependency resolution is server-side
+        // bookkeeping, not a user-initiated action.
+        await this.transitionStatus(candidate.id, 'queued', 'system');
+        this.logger.info('WorkItem unblocked — all deps satisfied', {
+          workItemId: candidate.id,
+          via: completedId,
+        });
+      }
+    });
+  }
+
+  /**
+   * Marks a work item as failed.
+   *
+   * @param workItemId - ID of the work item
+   * @param error - Error description
+   * @throws Error if work item not found or not in 'running' status
+   */
+  async failItem(workItemId: string, error: string): Promise<void> {
+    const workItem = await this.storage.findWorkItem(workItemId);
+    if (!workItem) {
+      throw new Error(`WorkItem not found: ${workItemId}`);
+    }
+    if (workItem.status !== 'running') {
+      throw new Error(
+        `Cannot fail WorkItem: status must be 'running', got '${workItem.status}'`,
+      );
+    }
+
+    // Release the claim
+    const claim = await this.storage.findActiveClaimByWorkItem(workItemId);
+    if (claim) {
+      await this.storage.updateClaim(claim.id, (c) => {
+        c.status = 'released';
+        c.endedAt = new Date().toISOString();
+        c.endReason = `failed: ${error}`;
+      });
+    }
+
+    // TRANS-2: route the running → failed flip through transitionStatus.
+    // `completedAt` is set automatically when newStatus === 'failed'; the
+    // mutator only needs to attach the error description.
+    const failed = await this.transitionStatus(workItemId, 'failed', 'system', (wi) => {
+      wi.error = error;
+    });
+
+    await this.storage.flush();
+    this.logger.info('WorkItem failed', { workItemId, error });
+    if (failed) await this.publishTaskStopped('task:failed', failed, 'running', error);
+  }
+
+  /**
+   * Cancel a WorkItem that is currently `queued` or `blocked` (i.e. has
+   * NOT been claimed yet).
+   *
+   * Closes the 2026-05-25 #609 incident: a fallback delegate WI targeted
+   * at `crewly-orc` got stuck `queued` and kept re-dispatching every
+   * minute. The available APIs were either inappropriate (`fail` requires
+   * `running`, `complete` requires `running`) or destructive (`DELETE
+   * /api/task-pool/:id?force=1` is a hard delete with no audit trail).
+   * This method provides the clean `queued → cancelled` transition with
+   * a reason captured in `cancelReason` for the activity timeline.
+   *
+   * @param workItemId - Target WI id
+   * @param reason     - Human-readable explanation; persisted on
+   *                     `cancelReason` and surfaces in the UI badge.
+   * @param options    - `supersededBy`: id(s) of the WorkItem(s) that now
+   *                     carry this work. Stamped on `metadata.supersededBy`
+   *                     so the Request's completion check follows the
+   *                     replacement instead of counting this item.
+   * @throws if the WI doesn't exist, has an active claim, or is in a
+   *         non-cancellable terminal state.
+   */
+  async cancelQueued(
+    workItemId: string,
+    reason: string,
+    options: { supersededBy?: string[]; cancelledBy?: string } = {},
+  ): Promise<void> {
+    const workItem = await this.storage.findWorkItem(workItemId);
+    if (!workItem) {
+      throw new Error(`WorkItem not found: ${workItemId}`);
+    }
+    if (workItem.status !== 'queued' && workItem.status !== 'blocked' && workItem.status !== 'scheduled') {
+      throw new Error(
+        `cancelQueued: WorkItem status must be 'queued', 'blocked', or 'scheduled' (got '${workItem.status}'). Use a status-appropriate API for other states — e.g. failItem for running, or DELETE for terminal-state cleanup.`,
+      );
+    }
+    const activeClaim = await this.storage.findActiveClaimByWorkItem(workItemId);
+    if (activeClaim) {
+      // Defensive: queued items shouldn't have active claims, but if
+      // some race produced one (e.g. claim got revoked but not cleaned
+      // up), release it cleanly before flipping to cancelled.
+      await this.storage.updateClaim(activeClaim.id, (c) => {
+        c.status = 'released';
+        c.endedAt = new Date().toISOString();
+        c.endReason = `cancelQueued: ${reason}`;
+      });
+    }
+    const supersededBy = (options.supersededBy ?? []).filter((id) => id && id !== workItemId);
+    const cancelledBy = options.cancelledBy?.trim();
+    const stampSuccessor = supersededBy.length > 0 || cancelledBy
+      ? (wi: WorkItem) => {
+          wi.metadata = {
+            ...(wi.metadata ?? {}),
+            ...(supersededBy.length > 0 ? { [SUPERSEDED_BY_METADATA_KEY]: supersededBy } : {}),
+            ...(cancelledBy ? { [OPEN_ITEMS_CONSTANTS.CANCELLED_BY_METADATA_KEY]: cancelledBy } : {}),
+          };
+        }
+      : undefined;
+    await this.transitionStatus(workItemId, 'cancelled', 'system', stampSuccessor, reason);
+    await this.storage.flush();
+    this.logger.info('WorkItem cancelled (queued → cancelled)', {
+      workItemId,
+      reason,
+      previousStatus: workItem.status,
+      ...(supersededBy.length > 0 ? { supersededBy } : {}),
+    });
+  }
+
+  /**
+   * Requeue a failed WorkItem back to `queued` for another attempt.
+   *
+   * Path: `failed → queued` (legal in WORK_ITEM_TRANSITIONS but previously
+   * unused — the system never auto-retried, every failure was terminal).
+   * Increments `retryCount`, clears `startedAt`, preserves `target` so
+   * the same agent gets a second shot, and records the previous error
+   * on the WI's metadata for postmortem visibility.
+   *
+   * Caller must have ALREADY confirmed `retryCount < maxRetries` — this
+   * method does NOT enforce the cap, on the assumption that the caller
+   * (v3-data.onTaskFailed) handles the exhausted-retries branch with
+   * escalation to ORC.
+   *
+   * @param workItemId - The failed WI to retry
+   * @param reason     - Why the previous attempt failed (recorded on
+   *   metadata.lastFailureReason; surfaces in the activity timeline)
+   * @throws if the WI doesn't exist or isn't in `failed` status
+   */
+  async requeueAfterFailure(workItemId: string, reason: string): Promise<void> {
+    const workItem = await this.storage.findWorkItem(workItemId);
+    if (!workItem) {
+      throw new Error(`WorkItem not found: ${workItemId}`);
+    }
+    if (workItem.status !== 'failed') {
+      throw new Error(
+        `Cannot requeue WorkItem after failure: status must be 'failed', got '${workItem.status}'`,
+      );
+    }
+
+    await this.transitionStatus(workItemId, 'queued', 'system', (wi) => {
+      wi.retryCount += 1;
+      wi.startedAt = undefined;
+      wi.completedAt = undefined;
+      // Keep `target` — the original agent should get the retry.
+      // APPEND to failureHistory so postmortems see all attempts, not
+      // just the most recent. `lastFailureReason` / `lastFailureAt`
+      // are retained for back-compat with dashboards that already
+      // read those scalar fields. Cap history at 10 entries so a
+      // pathological retry loop can't bloat the metadata indefinitely.
+      const now = new Date().toISOString();
+      const priorHistory = (wi.metadata?.failureHistory as Array<Record<string, unknown>>) ?? [];
+      wi.metadata = {
+        ...(wi.metadata ?? {}),
+        failureHistory: [
+          ...priorHistory,
+          { at: now, reason, retryAttempt: wi.retryCount },
+        ].slice(-10),
+        lastFailureReason: reason,
+        lastFailureAt: now,
+        retryAttempt: wi.retryCount,
+        // TTL anchor (see getTtlAnchorAt). The age-based expiry rules must
+        // measure this retry's window from HERE, not from the original
+        // `createdAt` — otherwise a WorkItem that failed after the 24h TTL is
+        // TTL-cancelled on the next reconciler pass, silently destroying the
+        // retry we just granted. `createdAt` is deliberately left untouched so
+        // it keeps meaning "when this work was first asked for".
+        [LAST_REQUEUED_AT_METADATA_KEY]: now,
+      };
+      // A disposition describes how a PAST failure was dealt with. This item
+      // is back in play, so any existing stamp is history and must not be
+      // allowed to outlive the failure it described — otherwise the
+      // safety-net rule would read a stale stamp and skip the item the next
+      // time it strands. See DISPOSITION_METADATA_KEY.
+      delete wi.metadata[DISPOSITION_METADATA_KEY];
+      // Clear the error field so a successful retry doesn't surface a
+      // stale error message; the metadata above keeps the history.
+      wi.error = undefined;
+    });
+
+    await this.storage.flush();
+    this.logger.info('WorkItem requeued after failure', {
+      workItemId,
+      retryCount: workItem.retryCount + 1,
+      maxRetries: workItem.maxRetries,
+      reason,
+    });
+  }
+
+  /**
+   * Decide and record how a stranded WorkItem is dealt with — the single
+   * funnel every `rejected`/`failed` writer must route through.
+   *
+   * `rejected` and `failed` are the only two statuses that are neither
+   * terminal nor able to reach a terminal state: their sole outbound edge is
+   * `→ queued`. An item parked in either is finished as far as every consumer
+   * is concerned (see `SLA_TERMINAL_WORK_ITEM_STATUSES`) and unfinished as far
+   * as the state machine is concerned, and until this funnel existed nothing
+   * owned closing that gap. Items written there by a path that did not itself
+   * arrange a successor simply stopped, permanently and — since PR #733
+   * correctly stopped the pruning rules emitting illegal corrections for them
+   * — silently.
+   *
+   * Exactly one of three things happens, and the choice is recorded rather
+   * than left to be re-derived later by scanning other WorkItems:
+   *
+   * 1. **retried in place** — `failed` with retry budget left. The item goes
+   *    back on the queue via {@link requeueAfterFailure}, which bumps
+   *    `retryCount`. Deliberately NOT stamped: the item has left the stranding
+   *    statuses under its own power, and a stamp would be a claim about a
+   *    failure that is no longer the current one.
+   * 2. **succeeded by another item** — the caller already created a successor
+   *    (the `EventToWorkItemBridge` retry/escalation WorkItem). Stamped with
+   *    its id.
+   * 3. **terminal** — budget spent, or a status with no retry path. Stamped,
+   *    and escalated so a human or the orchestrator renders the verdict. This
+   *    is the "deliberate terminal state with an audit record" case: the item
+   *    stays in `rejected`/`failed` by design, because the alternative —
+   *    adding `→ cancelled` edges — would re-open the illegal-correction
+   *    surface #733 closed and turn a deliberate decision into a 24h default.
+   *
+   * Idempotent and re-entrant: an already-disposed item is returned unchanged,
+   * so concurrent reconciler passes converge and the safety-net rule cannot
+   * fire twice on the same strand. Terminating: the only branch that repeats
+   * is (1), and it bumps `retryCount`, so it can run at most `maxRetries`
+   * times before (3) becomes the only reachable outcome.
+   *
+   * @param workItemId - The stranded WorkItem.
+   * @param options    - `reason` is carried into the audit record and the
+   *                     escalation. `actor` defaults to `'system'`.
+   *                     `successorWorkItemId` selects outcome (2) when the
+   *                     caller owns a real successor.
+   * @returns The recorded disposition, or `null` when there was nothing to do
+   *          (item missing, or not in a stranding status).
+   *
+   * @example
+   * ```typescript
+   * await pool.disposeFailedWorkItem(wi.id, { reason: 'SLA escalation timeout' });
+   * ```
+   */
+  async disposeFailedWorkItem(
+    workItemId: string,
+    options: {
+      reason: string;
+      actor?: WorkItemOwner;
+      successorWorkItemId?: string;
+    },
+  ): Promise<WorkItemDisposition | null> {
+    const { reason, actor = 'system', successorWorkItemId } = options;
+    const workItem = await this.storage.findWorkItem(workItemId);
+    if (!workItem) return null;
+
+    // Only the stranding statuses need a disposition. Anything else is either
+    // still in play or already strictly terminal.
+    if (!DISPOSITION_REQUIRED_STATUSES.has(workItem.status)) return null;
+
+    // Idempotency: the stamp IS the key. Two passes converge here.
+    const existing = getWorkItemDisposition(workItem);
+    if (existing) return existing;
+
+    const now = new Date().toISOString();
+
+    // (2) The caller owns a real successor — record it and stop.
+    if (successorWorkItemId) {
+      return this.stampDisposition(workItemId, {
+        kind: 'succeeded_by',
+        at: now,
+        by: actor,
+        reason,
+        successorWorkItemId,
+      });
+    }
+
+    // (1) Retry in place. Only `failed` has a retry path — `rejected` reaches
+    // `queued` too, but re-running work a reviewer rejected without a fresh
+    // verdict would re-execute exactly what was turned down.
+    // `retryCount` is FAILURES ONLY — this branch is load-bearing on that
+    // semantic, not incidentally coupled to it. Reading a churn-inflated count
+    // here would send work that never failed straight to `terminal`.
+    //
+    // That is an invariant rather than an assumption as of #739: `releaseBack`
+    // used to bump `retryCount` on every lease lapse, so a worker who simply
+    // stopped heartbeating was charged a failure. Release churn now goes to
+    // {@link WorkItem.releaseCount}, which nothing branches on. Keep it that
+    // way — if a future change makes anything other than a failure move
+    // `retryCount`, this branch silently starts terminating live work, and a
+    // second counter here would hide that rather than surface it.
+    if (workItem.status === 'failed' && workItem.retryCount < workItem.maxRetries) {
+      await this.requeueAfterFailure(workItemId, reason);
+      this.logger.info('Stranded WorkItem retried in place', {
+        workItemId,
+        retryCount: workItem.retryCount + 1,
+        maxRetries: workItem.maxRetries,
+        reason,
+      });
+      // Not stamped — see the doc comment. The item is queued again, and the
+      // requeue itself is the audit record (metadata.failureHistory).
+      return {
+        kind: 'retried_in_place',
+        at: now,
+        by: actor,
+        reason,
+      };
+    }
+
+    // (3) Terminal. Escalate for the verdict, then stamp — in that order, so a
+    // failed escalation cannot leave a stamp claiming an escalation happened.
+    let escalationId: string | undefined;
+    try {
+      const { EscalationRouterService } = await import(
+        '../v3/escalation-router.service.js'
+      );
+      escalationId =
+        (await EscalationRouterService.getInstance().escalateFailedWorkItem(
+          workItem,
+          reason,
+        )) ?? undefined;
+    } catch (err) {
+      // Best-effort, matching every other escalation call site: a messaging
+      // blip must not leave the item stranded a second time. The stamp is
+      // still written, without an escalationId, so the gap is visible in the
+      // audit record rather than hidden by a retry loop.
+      this.logger.warn('escalateFailedWorkItem threw during disposition (non-fatal)', {
+        workItemId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    return this.stampDisposition(workItemId, {
+      kind: 'terminal',
+      at: now,
+      by: actor,
+      reason,
+      escalationId,
+    });
+  }
+
+  /**
+   * Persist a disposition record onto a WorkItem's metadata.
+   *
+   * Writes metadata only — no status transition — so it is safe to call on an
+   * item whose status has no legal outbound edge, which is precisely the
+   * situation a `terminal` disposition describes.
+   *
+   * @param workItemId  - WorkItem to stamp.
+   * @param disposition - The record to write.
+   * @returns The disposition as written.
+   */
+  private async stampDisposition(
+    workItemId: string,
+    disposition: WorkItemDisposition,
+  ): Promise<WorkItemDisposition> {
+    const workItem = await this.storage.findWorkItem(workItemId);
+    if (workItem) {
+      workItem.metadata = {
+        ...(workItem.metadata ?? {}),
+        [DISPOSITION_METADATA_KEY]: disposition,
+      };
+      await this.storage.flush();
+    }
+    this.logger.info('WorkItem disposition recorded', {
+      workItemId,
+      kind: disposition.kind,
+      successorWorkItemId: disposition.successorWorkItemId,
+      escalationId: disposition.escalationId,
+      reason: disposition.reason,
+    });
+    return disposition;
+  }
+
+  // -----------------------------------------------------------------------
+  // Claim Lifecycle (delegated to ClaimService)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Processes a heartbeat from an agent for their active claim.
+   *
+   * @param claimId - The claim ID
+   * @param agentId - The agent sending the heartbeat
+   * @returns HeartbeatResult
+   */
+  async heartbeat(claimId: string, agentId: string): Promise<HeartbeatResult> {
+    const result = await this.claimService.heartbeat(claimId, agentId);
+    if (result.success) {
+      await this.storage.flush();
+    }
+    return result;
+  }
+
+  /**
+   * Renews a claim's lease because its holder was seen working (Reconciler
+   * liveness renewal — see {@link ClaimService.renewLease}).
+   *
+   * @param claimId - The claim ID
+   * @returns True when the claim was renewed
+   */
+  async renewClaim(claimId: string): Promise<boolean> {
+    const renewed = await this.claimService.renewLease(claimId);
+    if (renewed) await this.storage.flush();
+    return renewed !== undefined;
+  }
+
+  /**
+   * Extends the lease on a claim.
+   *
+   * @param claimId - The claim ID
+   * @param agentId - The agent requesting extension
+   * @returns ExtendLeaseResult
+   */
+  async extendLease(claimId: string, agentId: string): Promise<ExtendLeaseResult> {
+    const result = await this.claimService.extendLease(claimId, agentId);
+    if (result.success) {
+      await this.storage.flush();
+    }
+    return result;
+  }
+
+  /**
+   * Scans for expired claims (for Reconciler use).
+   *
+   * @param now - Current timestamp in ms
+   * @returns Summary of expiring and grace-exceeded claims
+   */
+  async scanExpiredClaims(now?: number): Promise<ExpiredClaimsSummary> {
+    return this.claimService.scanExpiredClaims(now);
+  }
+
+  /**
+   * Agents that look HUNG — they keep claiming work but never heartbeat, so
+   * their claims are repeatedly grace-revoked. Powers the `/health`
+   * orchestrator-liveness signal ("up but stalled") and hung-session recovery.
+   *
+   * @param threshold - Minimum consecutive grace-revokes to count as hung.
+   * @returns Agent ids that currently look hung.
+   */
+  getHungAgents(threshold?: number): string[] {
+    return this.claimService.getHungAgents(threshold);
+  }
+
+  /**
+   * Clear an agent's hung state after a recovery (session restart), so the
+   * restarted session is not immediately re-flagged before it can heartbeat.
+   *
+   * @param agentId - The agent/session id to clear.
+   */
+  clearHungState(agentId: string): void {
+    this.claimService.clearGraceRevokes(agentId);
+  }
+
+  /**
+   * Revokes a claim and releases the work item back to the pool.
+   * Used by the Reconciler when a claim's grace period is exceeded.
+   *
+   * @param claimId - The claim to revoke
+   * @param reason - Reason for revocation
+   */
+  async revokeAndRelease(claimId: string, reason: string): Promise<void> {
+    const claim = await this.claimService.getClaimById(claimId);
+    if (!claim) {
+      throw new Error(`Claim not found: ${claimId}`);
+    }
+
+    await this.claimService.revoke(claimId, reason);
+
+    // Release work item back to pool if it's still running
+    const workItem = await this.storage.findWorkItem(claim.workItemId);
+    if (workItem && workItem.status === 'running') {
+      await this.releaseBack(claim.workItemId, `claim revoked: ${reason}`);
+    }
+
+    this.logger.info('Claim revoked and work item released', {
+      claimId,
+      workItemId: claim.workItemId,
+      reason,
+    });
+  }
+
+  /**
+   * Exposes the underlying ClaimService for advanced operations.
+   *
+   * @returns The ClaimService instance
+   */
+  getClaimService(): ClaimService {
+    return this.claimService;
+  }
+
+  // -----------------------------------------------------------------------
+  // Pool Status & Queries
+  // -----------------------------------------------------------------------
+
+  /**
+   * Returns a snapshot of pool statistics.
+   *
+   * @returns Pool statistics including counts and avg wait time
+   */
+  async getPoolStatus(): Promise<PoolSnapshot> {
+    const workItems = await this.storage.getWorkItems();
+    const claims = await this.storage.getClaims();
+
+    const activeClaimIds = new Set(
+      claims.filter((c) => c.status === 'active').map((c) => c.workItemId),
+    );
+
+    const available = workItems.filter(
+      (wi) => wi.status === 'queued' && !activeClaimIds.has(wi.id),
+    ).length;
+
+    const claimed = activeClaimIds.size;
+
+    // Average wait time: for items that have been claimed (have startedAt),
+    // compute time from createdAt to startedAt
+    const waitTimes: number[] = [];
+    for (const wi of workItems) {
+      if (wi.startedAt) {
+        const wait =
+          new Date(wi.startedAt).getTime() - new Date(wi.createdAt).getTime();
+        if (wait >= 0) waitTimes.push(wait);
+      }
+    }
+    const avgWaitTimeMs =
+      waitTimes.length > 0
+        ? Math.round(waitTimes.reduce((a, b) => a + b, 0) / waitTimes.length)
+        : 0;
+
+    // Breakdowns
+    const byType: Record<string, number> = {};
+    const byStatus: Record<string, number> = {};
+    for (const wi of workItems) {
+      byType[wi.type] = (byType[wi.type] ?? 0) + 1;
+      byStatus[wi.status] = (byStatus[wi.status] ?? 0) + 1;
+    }
+
+    return {
+      total: workItems.length,
+      available,
+      claimed,
+      avgWaitTimeMs,
+      byType,
+      byStatus,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Returns all available (unclaimed, queued) work items.
+   *
+   * @param filters - Optional filters
+   * @returns Array of available WorkItems
+   */
+  async getAvailableItems(filters?: PoolFilters): Promise<WorkItem[]> {
+    const workItems = await this.storage.getWorkItems();
+    const claims = await this.storage.getClaims();
+
+    const activeClaimIds = new Set(
+      claims.filter((c) => c.status === 'active').map((c) => c.workItemId),
+    );
+
+    return workItems
+      .filter((wi) => wi.status === 'queued' && !activeClaimIds.has(wi.id))
+      .filter((wi) => matchesFilters(wi, filters))
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+  }
+
+  /**
+   * Returns all work items in the pool (all statuses).
+   *
+   * @returns Array of all WorkItems
+   */
+  async getAllItems(): Promise<WorkItem[]> {
+    return this.storage.getWorkItems();
+  }
+
+  /**
+   * Find a WorkItem by id without mutating it.
+   *
+   * Public read accessor used by callers that need to inspect a
+   * specific item — for example REVIEW-1's reentrancy lock checks the
+   * status of a Mission's `pendingReviewWorkItemId` to decide whether
+   * to clear the lock. Returns `null` (not `undefined`) so callers can
+   * use a uniform null-fallthrough idiom shared with
+   * `getWorkItemSnapshot` and `transitionStatus`.
+   *
+   * @param workItemId - WorkItem id to look up
+   * @returns The WorkItem, or `null` if no item has that id
+   */
+  async findWorkItem(workItemId: string): Promise<WorkItem | null> {
+    return (await this.storage.findWorkItem(workItemId)) ?? null;
+  }
+
+  /**
+   * Stores worker-supplied structured output on a WorkItem.
+   *
+   * Replaces the v1 `<taskId>.output.json` filesystem store with an
+   * in-pool field (see {@link WorkItem.output}). Used by the worker
+   * `complete-task` flow and read back by the TL `verify-output` skill.
+   *
+   * @param workItemId - WorkItem id to attach output to
+   * @param output - Arbitrary task-specific output object
+   * @returns The updated WorkItem, or null if not found
+   */
+  async setOutput(
+    workItemId: string,
+    output: Record<string, unknown>,
+  ): Promise<WorkItem | null> {
+    const ok = await this.storage.updateWorkItem(workItemId, (wi) => {
+      wi.output = output;
+    });
+    if (!ok) return null;
+    return (await this.storage.findWorkItem(workItemId)) ?? null;
+  }
+
+  /**
+   * Shallow-merge keys into a WorkItem's metadata (no status change).
+   *
+   * @param workItemId - WorkItem id
+   * @param patch - Keys to set on `metadata`
+   * @returns The updated WorkItem, or null if not found
+   */
+  async mergeItemMetadata(workItemId: string, patch: Record<string, unknown>): Promise<WorkItem | null> {
+    const ok = await this.storage.updateWorkItem(workItemId, (wi) => {
+      wi.metadata = { ...(wi.metadata ?? {}), ...patch };
+    });
+    if (!ok) return null;
+    await this.storage.flush();
+    return (await this.storage.findWorkItem(workItemId)) ?? null;
+  }
+
+  /**
+   * Replace the `blockedReason` of a blocked WorkItem (no status change): a
+   * held follow-up whose due time moved (crewly#1360).
+   *
+   * @param workItemId - WorkItem id
+   * @param reason - The new reason
+   * @returns The updated WorkItem, or null when not found or not blocked
+   */
+  async setBlockedReason(workItemId: string, reason: string): Promise<WorkItem | null> {
+    const current = await this.storage.findWorkItem(workItemId);
+    if (!current || current.status !== 'blocked') return null;
+    const ok = await this.storage.updateWorkItem(workItemId, (wi) => {
+      wi.blockedReason = reason;
+    });
+    if (!ok) return null;
+    await this.storage.flush();
+    return (await this.storage.findWorkItem(workItemId)) ?? null;
+  }
+
+  /**
+   * Re-point a queued WorkItem at another agent (its target went stale).
+   * Only `queued` items move: running work belongs to whoever holds it.
+   *
+   * @param workItemId - WorkItem id
+   * @param target - New target session
+   * @param reason - Why (kept in metadata.retargetedFrom / retargetReason)
+   * @returns The updated item, or null when not found / not queued
+   */
+  async retargetQueuedItem(workItemId: string, target: string, reason: string): Promise<WorkItem | null> {
+    const current = await this.storage.findWorkItem(workItemId);
+    if (!current || current.status !== 'queued') return null;
+    const from = current.target;
+    const ok = await this.storage.updateWorkItem(workItemId, (wi) => {
+      wi.target = target;
+      wi.metadata = { ...(wi.metadata ?? {}), retargetedFrom: from, retargetReason: reason };
+    });
+    if (!ok) return null;
+    await this.storage.flush();
+    this.logger.info('Queued WorkItem retargeted', { workItemId, from, to: target, reason });
+    return (await this.storage.findWorkItem(workItemId)) ?? null;
+  }
+
+  /**
+   * Unassign every queued, unclaimed WorkItem whose target is one of these
+   * sessions (their team was paused — specs/2026-10-04-team-pause.md). The
+   * item goes back to the unassigned pool, where the untargeted router picks
+   * a decider that is not paused. Running and claimed items are left alone.
+   *
+   * @param sessions - Session names of the paused team's members
+   * @param reason - Why (stored on the item and logged)
+   * @returns Ids of the items unassigned
+   */
+  async unassignQueuedForSessions(sessions: ReadonlySet<string>, reason: string): Promise<string[]> {
+    const claims = await this.storage.getClaims();
+    const claimed = new Set(claims.filter((c) => c.status === 'active').map((c) => c.workItemId));
+    const ids: string[] = [];
+    for (const wi of await this.storage.getWorkItems()) {
+      if (wi.status !== 'queued' || !wi.target || !sessions.has(wi.target) || claimed.has(wi.id)) continue;
+      const from = wi.target;
+      const ok = await this.storage.updateWorkItem(wi.id, (item) => {
+        item.target = undefined;
+        item.targetSource = undefined;
+        item.metadata = {
+          ...(item.metadata ?? {}),
+          [TEAM_PAUSE_CONSTANTS.UNASSIGNED_METADATA_KEY]: { from, reason, at: new Date().toISOString() },
+        };
+      });
+      if (!ok) continue;
+      ids.push(wi.id);
+      this.logger.info('Queued WorkItem unassigned (its team is paused)', { workItemId: wi.id, from, reason });
+    }
+    if (ids.length > 0) await this.storage.flush();
+    return ids;
+  }
+
+  /**
+   * Records an auditor quality score on a WorkItem.
+   *
+   * Backs `POST /api/tasks/score` (auditor `score-task` skill). The score
+   * lives under `metadata.qualityScore` with the scorer and timestamp next
+   * to it, so it survives the regular WorkItem update path and needs no
+   * separate persistence.
+   *
+   * @param workItemId - WorkItem id to score
+   * @param qualityScore - Score in the 0–100 range (validated by the caller)
+   * @param scoredBy - Session/member name of the scorer
+   * @returns The updated WorkItem, or null if not found
+   */
+  async scoreItem(
+    workItemId: string,
+    qualityScore: number,
+    scoredBy: string,
+  ): Promise<WorkItem | null> {
+    const ok = await this.storage.updateWorkItem(workItemId, (wi) => {
+      const existing = (wi.metadata && typeof wi.metadata === 'object' ? wi.metadata : {}) as Record<
+        string,
+        unknown
+      >;
+      wi.metadata = {
+        ...existing,
+        qualityScore,
+        qualityScoredBy: scoredBy,
+        qualityScoredAt: new Date().toISOString(),
+      };
+    });
+    if (!ok) return null;
+    this.logger.info('WorkItem quality scored', { workItemId, qualityScore, scoredBy });
+    return (await this.storage.findWorkItem(workItemId)) ?? null;
+  }
+
+  /**
+   * Reassigns a WorkItem to a different target agent.
+   *
+   * Replaces the v1 `/task-management/handoff` filesystem reassign with a
+   * direct `target` field update on the WorkItem.
+   *
+   * Allowed transitions:
+   *   - `target` must be a non-empty string
+   *   - WI must not be in a terminal state (done/cancelled/failed-final)
+   *
+   * @param workItemId - WorkItem to reassign
+   * @param newTarget  - Session name of the new target agent
+   * @param fromAgent  - Session name of the agent handing off (for audit)
+   * @param reason     - Human-readable reason recorded as a working-note
+   * @returns The updated WorkItem, or null if not found
+   */
+  async handoff(
+    workItemId: string,
+    newTarget: string,
+    fromAgent: string,
+    reason: string,
+  ): Promise<WorkItem | null> {
+    if (!newTarget || newTarget.trim() === '') {
+      throw new Error('handoff: newTarget is required');
+    }
+    const wi = await this.storage.findWorkItem(workItemId);
+    if (!wi) return null;
+    if (wi.status === 'done' || wi.status === 'cancelled') {
+      throw new Error(`handoff refused: WorkItem ${workItemId} is in terminal state '${wi.status}'`);
+    }
+
+    const handoffNote = `[HANDOFF] ${fromAgent} → ${newTarget}: ${reason || '(no reason)'}`;
+    await this.storage.updateWorkItem(workItemId, (item) => {
+      item.target = newTarget;
+      // An explicit handoff is a deliberate assignment: it must survive a
+      // later release.
+      item.targetSource = 'assigned';
+      const existing = (item.metadata && typeof item.metadata === 'object' ? item.metadata : {}) as Record<
+        string,
+        unknown
+      >;
+      const notes = Array.isArray(existing.notes) ? (existing.notes as string[]) : [];
+      notes.push(`${new Date().toISOString()} ${handoffNote}`);
+      item.metadata = { ...existing, notes };
+    });
+    this.logger.info('WorkItem handoff', { workItemId, fromAgent, newTarget });
+    return (await this.storage.findWorkItem(workItemId)) ?? null;
+  }
+
+  /**
+   * Set one top-level metadata key on a WorkItem. Never changes its status
+   * (this is not a transition), so it needs no actor. Used by the worktree
+   * service to record `metadata.worktree` (#814).
+   *
+   * @param workItemId - WorkItem id
+   * @param key - Metadata key
+   * @param value - New value (replaces the old one)
+   * @returns The updated WorkItem, or null when it does not exist
+   */
+  async patchMetadata(workItemId: string, key: string, value: unknown): Promise<WorkItem | null> {
+    const ok = await this.storage.updateWorkItem(workItemId, (wi) => {
+      const existing = (wi.metadata && typeof wi.metadata === 'object' ? wi.metadata : {}) as Record<string, unknown>;
+      wi.metadata = { ...existing, [key]: value };
+    });
+    if (!ok) return null;
+    return (await this.storage.findWorkItem(workItemId)) ?? null;
+  }
+
+  /**
+   * Appends a working-state note to a WorkItem's metadata.notes array.
+   *
+   * Replaces v1 `/task-management/sync` and `/task-management/save-working-notes`,
+   * both of which appended progress notes to the `.md` task body. With v1
+   * retired, notes live on the WorkItem itself under `metadata.notes[]`.
+   *
+   * @param workItemId - WorkItem id
+   * @param author - Session name of note author
+   * @param note - Note content (free-form)
+   * @returns The updated WorkItem, or null if not found
+   */
+  async appendNote(
+    workItemId: string,
+    author: string,
+    note: string,
+  ): Promise<WorkItem | null> {
+    if (!note || note.trim() === '') {
+      throw new Error('appendNote: note is required');
+    }
+    const ok = await this.storage.updateWorkItem(workItemId, (wi) => {
+      const existing = (wi.metadata && typeof wi.metadata === 'object' ? wi.metadata : {}) as Record<
+        string,
+        unknown
+      >;
+      const notes = Array.isArray(existing.notes) ? (existing.notes as string[]) : [];
+      notes.push(`${new Date().toISOString()} [${author}] ${note}`);
+      wi.metadata = { ...existing, notes };
+    });
+    if (!ok) return null;
+    return (await this.storage.findWorkItem(workItemId)) ?? null;
+  }
+
+  /**
+   * Removes a WorkItem from the pool entirely.
+   * Used for purging old completed/cancelled items.
+   *
+   * @param workItemId - ID of the item to remove
+   */
+  async removeItem(workItemId: string): Promise<void> {
+    await this.storage.removeWorkItem(workItemId);
+  }
+
+  // -------------------------------------------------------------------------
+  // P1 1ffffb84(a) — Bulk-DELETE stale WorkItems
+  // -------------------------------------------------------------------------
+
+  /**
+   * Public delete API used by the bulk-cleanup script and the new
+   * `DELETE /api/task-pool/:id` HTTP endpoint (P1 umbrella WI 1ffffb84
+   * component a, Steve directive 2026-05-06: just-DELETE-not-backfill).
+   *
+   * Three guarantees over {@link removeItem}:
+   *   1. Idempotent — `not_found` is a no-op return, not a throw.
+   *   2. Claim-safety — refuses claimed delete unless `opts.force`.
+   *   3. Audit log — single info-level log per removal.
+   *
+   * Force path also revokes the orphaned claim (status='revoked',
+   * endedAt, endReason).
+   */
+  async removeFromPool(
+    workItemId: string,
+    opts: { force?: boolean } = {},
+  ): Promise<RemoveFromPoolResult> {
+    const wi = await this.storage.findWorkItem(workItemId);
+    if (!wi) {
+      this.logger.debug('removeFromPool: item not found (idempotent)', { workItemId });
+      return { removed: false, reason: 'not_found' };
+    }
+
+    const activeClaim = await this.storage.findActiveClaimByWorkItem(workItemId);
+    const hadActiveClaim = !!activeClaim;
+
+    if (hadActiveClaim && activeClaim && !opts.force) {
+      this.logger.warn('removeFromPool refused: active claim exists', {
+        workItemId,
+        claimId: activeClaim.id,
+        claimedBy: activeClaim.agentId,
+      });
+      throw new WorkItemClaimedError({
+        workItemId,
+        claimId: activeClaim.id,
+        claimedBy: activeClaim.agentId,
+      });
+    }
+
+    const removed = await this.storage.removeWorkItem(workItemId);
+
+    if (hadActiveClaim && activeClaim) {
+      await this.storage.updateClaim(activeClaim.id, (c) => {
+        c.status = 'revoked';
+        c.endedAt = new Date().toISOString();
+        c.endReason = `WorkItem deleted via removeFromPool (force=${opts.force === true})`;
+      });
+    }
+
+    this.logger.info('removeFromPool: WorkItem removed', {
+      workItemId,
+      status: wi.status,
+      target: wi.target,
+      force: opts.force === true,
+      hadActiveClaim,
+    });
+
+    return {
+      removed: removed === true,
+      workItem: wi,
+      hadActiveClaim,
+    };
+  }
+
+  /**
+   * Forces an immediate flush of pool data to disk.
+   * Called during graceful shutdown to prevent data loss.
+   */
+  async flush(): Promise<void> {
+    await this.storage.flush();
+  }
+
+  /**
+   * Returns all active/expiring claims.
+   * Used by the Reconciler to check lease health.
+   *
+   * @returns Array of active/expiring TaskClaims
+   */
+  async getActiveClaims(): Promise<TaskClaim[]> {
+    return this.claimService.getActiveClaims();
+  }
+
+  /**
+   * Updates a work item's status directly.
+   * Used by the Reconciler for corrections (e.g., stuck → blocked).
+   *
+   * Reconciler invocations pass through `actorRole='system'` (default) which
+   * bypasses the per-role gate at {@link isTransitionPermitted} but still
+   * enforces the state-machine via {@link isValidWorkItemTransition}. Other
+   * callers MUST supply the actor's role so TRANS-1 V3 enforcement applies.
+   *
+   * @param workItemId - The work item ID
+   * @param newStatus - The target status
+   * @param actorRole - Role of the caller (defaults to `'system'` for Reconciler)
+   * @throws Error if work item not found
+   * @throws Error if transition is invalid (state machine — see WORK_ITEM_TRANSITIONS)
+   * @throws Error if actor is not permitted (role check — see TRANSITION_PERMISSIONS)
+   */
+  async updateItemStatus(
+    workItemId: string,
+    newStatus: WorkItemStatus,
+    actorRole: TransitionActorInput,
+    /**
+     * Optional human-readable reason. Persisted on:
+     *   - `WorkItem.cancelReason` when `newStatus === 'cancelled'`
+     *   - `WorkItem.blockedReason` when `newStatus === 'blocked'` (Steve
+     *     2026-05-15 dogfood — UI showed Blocked badge with no
+     *     explanation)
+     *   - Ignored for other status transitions.
+     */
+    reason?: string,
+    /**
+     * Optional `WorkItem.blockSource` to set atomically with a transition
+     * INTO `blocked` (the waiting_on_human rule passes
+     * WORK_ITEM_BLOCK_SOURCES.WAITING_ON_HUMAN, #815). Ignored otherwise.
+     */
+    blockSource?: WorkItemBlockSource,
+  ): Promise<void> {
+    const items = await this.storage.getWorkItems();
+    const item = items.find((wi) => wi.id === workItemId);
+
+    if (!item) {
+      throw new Error(`WorkItem not found: ${workItemId}`);
+    }
+
+    // Idempotent same-state no-op: the reconciler's stale-pickup rule
+    // and the SLA close path can both race to apply the same terminal
+    // status. Silently no-op here instead of throwing or logging a
+    // misleading "transitioned cancelled → cancelled" entry. (Steve
+    // 2026-05-15 dogfood — see the duplicate "Work item status
+    // updated from cancelled to cancelled" rows in
+    // crewly-2026-05-15.log around 15:48:56 / 16:05:55.)
+    if (item.status === newStatus) {
+      this.logger.debug('Skipped idempotent same-state status update', {
+        workItemId,
+        status: newStatus,
+        actorRole,
+      });
+      return;
+    }
+
+    if (!isValidWorkItemTransition(item.status, newStatus)) {
+      throw new Error(
+        `Invalid status transition for WorkItem ${workItemId}: ${item.status} → ${newStatus}`,
+      );
+    }
+
+    // TRANS-1 V3 + #813: closed, item-aware permission gate. No role bypasses it.
+    await this.assertTransitionPermitted(item, newStatus, actorRole);
+
+    // Capture pre-write status. See transitionStatus's identical block
+    // for the writeup — storage.updateWorkItem mutates in place, so
+    // reading item.status after the write yields newStatus and the
+    // "Work item status updated" log reads like "X → X" for every
+    // valid transition.
+    const fromStatus = item.status;
+
+    await this.storage.updateWorkItem(workItemId, (wi) => {
+      wi.status = newStatus;
+      wi.statusChangedAt = new Date().toISOString();
+      // P1 1ffffb84 component (b): mirror the transitionStatus
+      // atomic-timestamp contract so the older updateItemStatus path
+      // never produces a status↔completedAt mismatch either. See
+      // transitionStatus below for the full root-cause writeup
+      // (b7840fe8 partial-write bug).
+      if (newStatus === 'running') {
+        wi.startedAt = new Date().toISOString();
+        wi.completedAt = undefined;
+      } else if (newStatus === 'done' || newStatus === 'failed') {
+        wi.completedAt = new Date().toISOString();
+      } else {
+        wi.completedAt = undefined;
+      }
+      // Persist the cancellation reason atomically with the status
+      // flip so the activity timeline always has the explanation
+      // alongside the terminal state. Only set on transitions INTO
+      // cancelled — leaving the field untouched on non-cancel paths
+      // preserves any earlier value (e.g. requeued after a manual
+      // cancel-then-revive flow).
+      if (newStatus === 'cancelled' && typeof reason === 'string' && reason.length > 0) {
+        wi.cancelReason = reason;
+      }
+      // Mirror for blocked transitions (Steve 2026-05-15 dogfood): the
+      // UI showed `Blocked` badge with an empty activity timeline.
+      // Sources include reconciler agent-inactive correction, mission
+      // executor dependency-blocked creation (not via this path),
+      // explicit blockItem.
+      if (newStatus === 'blocked' && typeof reason === 'string' && reason.length > 0) {
+        wi.blockedReason = reason;
+      }
+      if (newStatus === 'blocked' && blockSource) {
+        wi.blockSource = blockSource;
+      }
+      // Ticket loop Phase 3: an agent picks its own unblocked work back up
+      // before new work, so remember that this item was blocked.
+      if (fromStatus === 'blocked' && newStatus === 'queued') {
+        wi.metadata = { ...(wi.metadata ?? {}), unblockedAt: new Date().toISOString() };
+      }
+      // An explicit-block marker lives exactly as long as the block.
+      if (fromStatus === 'blocked' && newStatus !== 'blocked') {
+        wi.blockSource = undefined;
+      }
+    });
+
+    this.logger.info('Work item status updated', {
+      workItemId,
+      from: fromStatus,
+      to: newStatus,
+      actorRole,
+      ...(newStatus === 'cancelled' && reason ? { reason } : {}),
+      ...(newStatus === 'blocked' && reason ? { reason } : {}),
+    });
+
+    // Cascade signal — let RequestCascadeSubscriber close the parent
+    // Request without waiting for the heartbeat catch. See
+    // {@link publishTaskCancelled} for the full bug writeup.
+    if (newStatus === 'cancelled') {
+      const post = await this.storage.findWorkItem(workItemId);
+      if (post) this.publishTaskCancelled(post, fromStatus);
+    }
+  }
+
+  /**
+   * Public guarded transition helper — TRANS-1's canonical entrypoint.
+   *
+   * Routes any externally-initiated WorkItem status change through the
+   * combined state-machine + actor-role gates. Designed as the public API
+   * VERIF-1 will call from `submitForVerification` / `verifyItem`, and as
+   * the recommended path for any future caller that previously reached
+   * for `storage.updateWorkItem` to flip status.
+   *
+   * Differences vs {@link updateItemStatus}:
+   *   - Requires `actorRole` explicitly (no default) — forces the caller to
+   *     decide the trust posture rather than silently inheriting `'system'`.
+   *   - Accepts an optional `mutator` so callers can carry additional field
+   *     updates (e.g. `result`, `error`, `completedAt`) atomically with the
+   *     status flip — preventing races between status update and metadata
+   *     attachment that direct `storage.updateWorkItem` callers risked.
+   *
+   * @param workItemId - The work item ID
+   * @param newStatus - The target status
+   * @param actorRole - Role of the caller (REQUIRED; pass `'system'` for trusted server-internal paths)
+   * @param mutator - Optional additional WorkItem field updates applied atomically with the status change
+   * @returns The updated WorkItem after the transition
+   * @throws Error if work item not found
+   * @throws Error if transition is invalid (state machine)
+   * @throws Error if actor is not permitted (role check)
+   *
+   * @example
+   * ```typescript
+   * // VERIF-1 worker submitting for verification
+   * await pool.transitionStatus(wiId, 'done_by_worker', 'agent', (wi) => {
+   *   wi.result = output;
+   * });
+   *
+   * // VERIF-1 TL verifying
+   * await pool.transitionStatus(wiId, 'verified', 'team_lead');
+   *
+   * // VERIF-1 TL rejecting (allowed for TL only)
+   * await pool.transitionStatus(wiId, 'rejected', 'team_lead', (wi) => {
+   *   wi.error = 'Did not meet acceptance criteria';
+   * });
+   * ```
+   */
+  async transitionStatus(
+    workItemId: string,
+    newStatus: WorkItemStatus,
+    actorRole: TransitionActorInput,
+    mutator?: (wi: WorkItem) => void,
+    /**
+     * Optional human-readable reason. Routed by target status:
+     *   - `cancelled` → persisted on `WorkItem.cancelReason`
+     *   - `blocked`   → persisted on `WorkItem.blockedReason`
+     *     (Steve 2026-05-15 dogfood)
+     *   - other       → ignored
+     * Applied BEFORE the caller's mutator runs so the mutator may
+     * override if needed. Surfaces in the activity timeline so the
+     * Blocked/Cancelled badges aren't opaque ("WorkItem was X.").
+     * Parameter name retained as `cancelReason` for source compat;
+     * effectively a generic transition reason.
+     */
+    cancelReason?: string,
+  ): Promise<WorkItem | null> {
+    const item = await this.storage.findWorkItem(workItemId);
+    if (!item) {
+      throw new Error(`WorkItem not found: ${workItemId}`);
+    }
+
+    // Idempotent same-state no-op (matches updateItemStatus behavior).
+    // Return the current item so callers chaining on the result don't
+    // see a spurious null. Steve 2026-05-15.
+    if (item.status === newStatus) {
+      this.logger.debug('Skipped idempotent same-state transition', {
+        workItemId,
+        status: newStatus,
+        actorRole,
+      });
+      return item;
+    }
+
+    if (!isValidWorkItemTransition(item.status, newStatus)) {
+      throw new Error(
+        `Invalid status transition for WorkItem ${workItemId}: ${item.status} → ${newStatus}`,
+      );
+    }
+
+    await this.assertTransitionPermitted(item, newStatus, actorRole);
+
+    // Capture the pre-write status into a local. `storage.updateWorkItem`
+    // mutates the same in-memory object that `findWorkItem` returned, so
+    // reading `item.status` AFTER the write yields the new value — which
+    // makes the "transitioned X → Y" log read like "Y → Y" and hides the
+    // real `previousValue` on the task:cancelled EventBus payload.
+    // (Steve 2026-05-15 dogfood: `from:cancelled, to:cancelled` showing
+    // for transitions that were actually `queued → cancelled`.)
+    const fromStatus = item.status;
+
+    const ok = await this.storage.updateWorkItem(workItemId, (wi) => {
+      wi.status = newStatus;
+      // When the item stopped (cancelled, blocked, re-queued) for usage
+      // attribution, which has no other end for an item without completedAt.
+      wi.statusChangedAt = new Date().toISOString();
+      // Atomic timestamp side-effects enforce the invariant
+      // `completedAt is set IFF status ∈ {done, failed, verified,
+      // done_by_worker, rejected}`.
+      //
+      // P1 1ffffb84 component (b): the prior code only SET completedAt
+      // on terminal transitions; non-terminal landings (queued, running,
+      // blocked, scheduled, proposed, accepted, escalated, cancelled)
+      // inherited a stale completedAt from a prior terminal trip via
+      //   - `rejected → queued` (TL re-queue)
+      //   - `failed → queued`  (BRIDGE-1 retry)
+      //   - `running → queued` (releaseBack abandon path)
+      // WorkItem b7840fe8 reproduced the bug — status=queued AND
+      // completedAt=2026-05-06T00:47:59Z AND retryCount=1 AND no
+      // startedAt/target, which is the exact fingerprint of a
+      // `failed → queued` retry leaving stale completedAt. The else
+      // branch below closes the gap atomically with the status flip.
+      if (newStatus === 'running') {
+        wi.startedAt = new Date().toISOString();
+        // Resuming work — clear stale completedAt from a prior failed/
+        // rejected attempt so a re-claim never carries forward a
+        // completion timestamp from an earlier terminal trip.
+        wi.completedAt = undefined;
+      } else if (
+        newStatus === 'done' ||
+        newStatus === 'failed' ||
+        newStatus === 'verified' ||
+        newStatus === 'done_by_worker' ||
+        newStatus === 'rejected'
+      ) {
+        wi.completedAt = new Date().toISOString();
+      } else {
+        // Non-terminal-with-result landings: clear completedAt so the
+        // invariant holds. (`cancelled` is technically terminal but
+        // historically never carried completedAt — preserving that
+        // shape here to keep the change minimal; the `cancelled`
+        // semantics are out of scope.)
+        wi.completedAt = undefined;
+      }
+      // Apply cancelReason BEFORE the user-supplied mutator so the
+      // mutator wins if the caller wants to override (rare). The
+      // parameter is named `cancelReason` for source-compat but is
+      // routed to cancelReason OR blockedReason based on newStatus
+      // (Steve 2026-05-15).
+      if (newStatus === 'cancelled' && typeof cancelReason === 'string' && cancelReason.length > 0) {
+        wi.cancelReason = cancelReason;
+      }
+      if (newStatus === 'blocked' && typeof cancelReason === 'string' && cancelReason.length > 0) {
+        wi.blockedReason = cancelReason;
+      }
+      // Ticket loop Phase 3: an agent picks its own unblocked work back up
+      // before new work, so remember that this item was blocked.
+      if (fromStatus === 'blocked' && newStatus === 'queued') {
+        wi.metadata = { ...(wi.metadata ?? {}), unblockedAt: new Date().toISOString() };
+      }
+      // An explicit-block marker lives exactly as long as the block.
+      if (fromStatus === 'blocked' && newStatus !== 'blocked') {
+        wi.blockSource = undefined;
+      }
+      if (mutator) mutator(wi);
+    });
+
+    if (!ok) {
+      // Race window: someone else removed the WorkItem between findWorkItem
+      // and updateWorkItem. Surface as null so callers can distinguish from
+      // a thrown invalid-transition / forbidden-transition error.
+      return null;
+    }
+
+    this.logger.info('WorkItem transitioned', {
+      workItemId,
+      from: fromStatus,
+      to: newStatus,
+      actorRole,
+    });
+
+    // Return the post-update WorkItem snapshot so callers can chain on the
+    // resolved value rather than re-fetching. Coerce `undefined` (item
+    // removed during the race window) to `null` to match the declared
+    // return type.
+    const post = (await this.storage.findWorkItem(workItemId)) ?? null;
+
+    // Cascade signal — let RequestCascadeSubscriber close the parent
+    // Request without waiting for the heartbeat catch. See
+    // {@link publishTaskCancelled} for the full bug writeup.
+    if (newStatus === 'cancelled' && post) {
+      this.publishTaskCancelled(post, fromStatus);
+    }
+
+    return post;
+  }
+
+  /**
+   * Update token usage and cost on a WorkItem.
+   * Called after task completion when token data is available from TokenUsageService.
+   *
+   * @param workItemId - The work item ID
+   * @param inputTokens - Number of input tokens consumed
+   * @param outputTokens - Number of output tokens generated
+   * @param cost - Total cost in USD
+   * @returns True if the update was applied, false if WorkItem not found
+   */
+  async updateTokenUsage(
+    workItemId: string,
+    inputTokens: number,
+    outputTokens: number,
+    cost: number,
+  ): Promise<boolean> {
+    const workItem = await this.storage.findWorkItem(workItemId);
+    if (!workItem) return false;
+
+    await this.storage.updateWorkItem(workItemId, (wi) => {
+      wi.inputTokens = inputTokens;
+      wi.outputTokens = outputTokens;
+      wi.cost = cost;
+    });
+
+    await this.storage.flush();
+    this.logger.debug('WorkItem token usage updated', {
+      workItemId,
+      inputTokens,
+      outputTokens,
+      cost,
+    });
+    return true;
+  }
+
+  /**
+   * Marks a claim as 'expiring' (lease expired, within grace period).
+   * Used by the Reconciler fast loop.
+   *
+   * @param claimId - The claim ID to mark
+   */
+  async markClaimExpiring(claimId: string): Promise<void> {
+    await this.claimService.markExpiring([claimId]);
+  }
+
+  // -----------------------------------------------------------------------
+  // Lifecycle
+  // -----------------------------------------------------------------------
+
+  /**
+   * Graceful shutdown — flush pending writes.
+   */
+  async destroy(): Promise<void> {
+    await this.storage.destroy();
+  }
+
+  /**
+   * Exposes underlying storage for advanced operations (e.g., Reconciler).
+   *
+   * @returns The PoolStorage instance
+   */
+  getStorage(): PoolStorage {
+    return this.storage;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Checks whether a work item matches the given filters.
+ *
+ * @param wi - WorkItem to check
+ * @param filters - Optional filters
+ * @returns True if item passes all filter criteria
+ */
+function matchesFilters(wi: WorkItem, filters?: PoolFilters): boolean {
+  if (!filters) return true;
+  if (filters.types && !filters.types.includes(wi.type)) return false;
+  if (filters.owner && wi.owner !== filters.owner) return false;
+  if (filters.target && wi.target !== filters.target) return false;
+  if (filters.missionId && wi.missionId !== filters.missionId) return false;
+  return true;
+}
+
+/**
+ * The chat conversation a Slack thread belongs to: its team-channel room,
+ * else the agent DM it mirrors. Lazy imports keep the pool free of Slack
+ * dependencies until a delegation names a thread.
+ *
+ * @param slackChannelId - Slack conversation id
+ * @param _threadTs - Thread root ts (the mapping is per channel)
+ * @returns Conversation id, or null
+ */
+/** A chat-v2 message id (UUID). */
+const CHAT_MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** `<chat conversation id>:<chat thread id>` — both UUIDs. */
+const CHAT_CONVERSATION_THREAD_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+/**
+ * Default {@link TaskPoolService.chatMessageThreadLookup}: the Slack thread a
+ * chat message was mirrored from or to (its thread root, else itself).
+ *
+ * @param messageId - chat-v2 message id
+ * @returns Slack thread + the chat conversation, or null when it has no Slack place
+ */
+async function defaultChatMessageThread(messageId: string): Promise<{ slackChannelId: string; threadTs: string; conversationId: string } | null> {
+  try {
+    const { getChatV2Service } = await import('../chat-v2/chat-v2.singleton.js');
+    const msg = getChatV2Service().getMessageForBridge(messageId);
+    const meta = (msg?.metadata ?? {}) as Record<string, unknown>;
+    const slackChannelId = typeof meta.slackChannelId === 'string' ? meta.slackChannelId : null;
+    const threadTs = [meta.slackThreadTs, meta.slackTs].find((v): v is string => typeof v === 'string' && v.length > 0) ?? null;
+    if (!msg || !slackChannelId || !threadTs) return null;
+    return { slackChannelId, threadTs, conversationId: msg.channelId };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The Slack thread key of a turn origin, when it has one.
+ *
+ * @param turn - Turn origin
+ * @returns `<channel>:<ts>`, or undefined
+ */
+function turnThreadKey(turn: TurnOrigin | undefined): string | undefined {
+  if (!turn) return undefined;
+  return turn.slackThreadKey ?? (turn.slackChannelId && turn.slackThreadTs ? formatSlackThreadKey(turn.slackChannelId, turn.slackThreadTs) : undefined);
+}
+
+/**
+ * Default {@link TaskPoolService.ownerAskedAtLookup}: the newest owner message
+ * in the place (its Slack thread's chat rows, else the conversation's rows).
+ * null when the place is not in the chat store.
+ *
+ * @param origin - Explicit owner origin
+ * @returns Epoch ms, or null
+ */
+async function defaultOwnerAskedAt(origin: Extract<WorkItemOrigin, { kind: 'owner' }>): Promise<number | null> {
+  try {
+    const { peekChatV2Service } = await import('../chat-v2/chat-v2.singleton.js');
+    const chat = peekChatV2Service();
+    if (!chat) return null;
+    const conversationId = origin.conversationId ?? (origin.slackChannelId ? await defaultSlackThreadConversation(origin.slackChannelId, origin.threadTs ?? '') : null);
+    if (!conversationId) return null;
+    const rootId = origin.threadTs ? chat.findSlackThreadRoot(conversationId, origin.threadTs)?.id ?? null : origin.chatThreadId ?? null;
+    if (rootId) {
+      const owner = chat.listThreadForBridge(conversationId, rootId).filter((m) => m.senderType === 'user');
+      if (owner.length) return Math.max(...owner.map((m) => m.createdAt));
+      return null;
+    }
+    return chat.getChannelActivity(conversationId)?.lastOwnerMessageAt ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function defaultSlackThreadConversation(slackChannelId: string, _threadTs: string): Promise<string | null> {
+  try {
+    const [{ getSlackTeamChannelService }, { getSlackAgentDmService }] = await Promise.all([
+      import('../slack/slack-team-channel.service.js'),
+      import('../slack/slack-agent-dm.service.js'),
+    ]);
+    return (
+      getSlackTeamChannelService()?.findBySlackChannelId(slackChannelId)?.chatChannelId ??
+      getSlackAgentDmService()?.findBySlackChannelId(slackChannelId)?.chatChannelId ??
+      null
+    );
+  } catch {
+    return null;
+  }
+}

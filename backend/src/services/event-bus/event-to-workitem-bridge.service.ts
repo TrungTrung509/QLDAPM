@@ -1,0 +1,1254 @@
+/**
+ * EventToWorkItemBridge
+ *
+ * Subscribes to autonomy-relevant events on the EventBus and creates the
+ * appropriate WorkItem(s) so the autonomy chain advances without an explicit
+ * Trigger Engine (Arch Veto V5 — `.crewly/tmp/autonomy-doc-review-arch-2026-04-26.md`).
+ *
+ * Subscribed events (all `CRITICAL_EVENT_TYPES`):
+ *   - `task:done_by_worker`  → verification WI for TL
+ *   - `task:rejected`        → retry WI (or escalation review WI at retry cap)
+ *   - `task:blocked`         → review WI (`reviewReason: 'task_blocked'`)
+ *   - `team:all_tasks_done`  → emit `mission:review_due` (if mission active)
+ *   - `mission:review_due`   → review WI mirroring REVIEW-1's id pattern
+ *   - `mission:stale`        → review WI (`reviewReason: 'no_active_work'`)
+ *   - `mission:replanned`    → review WI (`reviewReason: 'scheduled_review'`)
+ *
+ * Idempotency contract (Arch Veto V1):
+ *   Every auto-created WorkItem carries a deterministic `id` and a documentary
+ *   `metadata.idempotencyKey === id`. The real dedup gate is
+ *   `TaskPoolService.addToPool` which short-circuits on duplicate id. So a
+ *   replayed event fires the bridge handler again, the bridge re-builds the
+ *   same id, and addToPool's existing dedup is the safety net — no separate
+ *   idempotency store needed.
+ *
+ * Retry cap (Arch Veto V2):
+ *   `task:rejected` increments `retryCount` on the new retry WI. At
+ *   `sourceWI.retryCount >= DEFAULT_MAX_RETRIES` (3) the bridge escalates to
+ *   a review WI for the TL with `reviewReason: 'max_retries_exceeded'` and
+ *   does NOT enqueue another retry. Retry WIs target the original worker;
+ *   escalation WIs target the team lead resolved via `pickTeamLead()`.
+ *
+ * Status mutations (Arch Veto V3):
+ *   The bridge does NOT mutate status directly — every state change goes
+ *   through `TaskPoolService.transitionStatus()` (the canonical guarded
+ *   entrypoint TRANS-1 shipped). Search guard (see PR body for full grep
+ *   command — kept out of the doc comment so the grep doesn't false-positive
+ *   on its own description).
+ *
+ * Team-lead resolution (Arch Veto V4):
+ *   `pickTeamLead()` may return `null`. The bridge throws
+ *   {@link BridgeTeamLeadResolutionError} on null — no silent fallback to
+ *   the executor session.
+ *
+ * No parallel scheduler entity (Arch Veto V5):
+ *   The bridge is a pure event listener. It does NOT subclass anything called
+ *   "Trigger", does NOT create one, does NOT register with a TriggerEngine.
+ *   See PR body for the grep guard command.
+ *
+ * Cron-recursion block (Arch Vetos V6 / V9):
+ *   When the bridge derives a new WI from a source WI whose
+ *   `metadata.triggerSource === 'cron'`, the new WI's triggerSource is
+ *   demoted to `'event'` (cron sessions cannot beget more cron jobs). Any
+ *   call to {@link assertNoCronFromCron} from a cron-source WI throws
+ *   {@link CronRecursionError}. The retry path tags `triggerSource: 'event'`
+ *   directly so demotion is the default rather than the exceptional path.
+ *
+ * @module services/event-bus/event-to-workitem-bridge
+ */
+
+import { LoggerService, type ComponentLogger } from '../core/logger.service.js';
+import { StorageService } from '../core/storage.service.js';
+import { TaskPoolService } from '../task-pool/task-pool.service.js';
+import { pickTeamLead } from '../../utils/team.utils.js';
+import { MEMBER_MODEL_DEFAULT_CONSTANTS, ORCHESTRATOR_SESSION_NAME } from '../../constants.js';
+import { defaultModelForMember } from '../../utils/member-default-model.utils.js';
+import { formatError } from '../../utils/format-error.js';
+import { describeDecisionsForReviewer, describeEvidenceForReviewer } from '../task-pool/completion-evidence.service.js';
+import {
+  type WorkItem,
+  type WorkItemType,
+  type WorkItemOwner,
+  DEFAULT_MAX_RETRIES,
+  REVIEW_ESCALATED_TO_OWNER_KEY,
+  blockedUntilOf,
+} from '../../types/v2/work-item.types.js';
+import { isMissionExecutable, type Mission } from '../../types/v2/mission.types.js';
+import { getMissionPath } from '../v3/mission-paths.js';
+import { safeReadJson } from '../../utils/file-io.utils.js';
+import type { Team } from '../../types/index.js';
+import type { AgentEvent, EventType } from '../../types/event-bus.types.js';
+import {
+  isReviewReason,
+  type ReviewReason,
+} from '../../types/review-reason.types.js';
+import type {
+  EventBusService,
+  InProcessUnsubscribe,
+} from './event-bus.service.js';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Why the owner is asked to review work the orchestrator did itself. */
+const ORC_OWN_WORK_REVIEW_REASON =
+  'The orchestrator did this work itself and has no separate reviewer; it cannot verify its own work.';
+
+/**
+ * Event types the bridge subscribes to. Listed in the same order as the
+ * dispatch table to make the start() registration easy to audit.
+ */
+export const BRIDGE_SUBSCRIBED_EVENTS: readonly EventType[] = [
+  'task:done_by_worker',
+  'task:rejected',
+  'task:blocked',
+  'team:all_tasks_done',
+  'mission:review_due',
+  'mission:stale',
+  'mission:replanned',
+] as const;
+
+/**
+ * Vocabulary for `metadata.triggerSource` — what kind of impulse caused
+ * this WorkItem to exist. Bridge-created WIs always tag with `'event'`;
+ * cron-fired WIs are demoted to `'event'` to satisfy V6/V9.
+ */
+export type WorkItemAutoSource = 'event' | 'cron' | 'manual';
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/** Heading of the rejection-feedback block a retry brief opens with. */
+const REJECTION_FEEDBACK_HEADING = '## Rejection feedback (attempt ';
+/** Heading that separates the feedback block from the original brief. */
+const ORIGINAL_BRIEF_HEADING = '## Original brief';
+
+/**
+ * Remove a feedback block a previous retry put in front of a brief, so a
+ * repeated rejection shows only the latest feedback instead of stacking.
+ *
+ * @param text - A description or brief, possibly already carrying a block
+ * @returns The original brief with any leading feedback block removed
+ */
+function stripRejectionFeedback(text: string): string {
+  if (!text.startsWith(REJECTION_FEEDBACK_HEADING)) return text;
+  const marker = `\n${ORIGINAL_BRIEF_HEADING}\n\n`;
+  const at = text.indexOf(marker);
+  return at === -1 ? text : text.slice(at + marker.length);
+}
+
+/**
+ * Put the reviewer's rejection feedback ABOVE the original brief, clearly
+ * delimited, so the worker reads what to change before the unchanged ask.
+ * Replaces (never appends to) feedback from an earlier rejection.
+ *
+ * @param brief - The source WorkItem's description or briefMarkdown
+ * @param feedback - The reviewer's comment (stored on the source's `error`)
+ * @param attempt - The retry attempt number being created
+ * @returns The new brief; `brief` unchanged (minus stale feedback) when there is none
+ */
+export function withRejectionFeedback(
+  brief: string | undefined,
+  feedback: string | undefined,
+  attempt: number,
+): string | undefined {
+  const base = brief === undefined ? undefined : stripRejectionFeedback(brief);
+  const note = feedback?.trim();
+  if (!note) return base;
+  const head = `${REJECTION_FEEDBACK_HEADING}${attempt})\n\n${note}`;
+  return base ? `${head}\n\n---\n${ORIGINAL_BRIEF_HEADING}\n\n${base}` : head;
+}
+
+/**
+ * Thrown when a cron-sourced WorkItem attempts to create another cron-recurring
+ * WorkItem. Encoded as a named error so tests + observability can distinguish
+ * the recursion guard from generic bridge errors.
+ */
+export class CronRecursionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CronRecursionError';
+  }
+}
+
+/**
+ * Thrown when the bridge cannot resolve a Team Lead session for a team that
+ * needs an escalation/verification WorkItem. Per Arch Veto V4 the bridge
+ * MUST NOT silently fall back to the executor session — losing visibility
+ * on a stalled escalation is worse than failing loudly.
+ */
+export class BridgeTeamLeadResolutionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BridgeTeamLeadResolutionError';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Day-bucket cycle key used by mission cadence handlers. */
+function todayCycleKey(now: Date = new Date()): string {
+  return now.toISOString().slice(0, 10);
+}
+
+/**
+ * V6 / V9 guard: throw if a cron-sourced WI tries to create another cron job.
+ *
+ * @param sourceWI - WI being reacted to
+ * @param attemptedAction - Short label for the action that would create cron
+ * @throws CronRecursionError when sourceWI.metadata.triggerSource === 'cron'
+ */
+export function assertNoCronFromCron(
+  sourceWI: WorkItem,
+  attemptedAction: string,
+): void {
+  const triggerSource = sourceWI.metadata?.['triggerSource'];
+  if (triggerSource === 'cron') {
+    throw new CronRecursionError(
+      `Refusing ${attemptedAction}: source WorkItem ${sourceWI.id} has triggerSource='cron'. ` +
+        `Cron-fired sessions cannot create new cron / recurring schedules.`,
+    );
+  }
+}
+
+/**
+ * Derive the trigger source for a downstream WI. Defaults to `'event'`. If the
+ * source WI was cron-fired, the downstream WI is demoted to `'event'` (V6 / V9).
+ *
+ * @param sourceWI - Optional source WorkItem
+ * @returns The triggerSource value to tag on the new WorkItem
+ */
+function inheritedTriggerSource(sourceWI?: WorkItem | null): WorkItemAutoSource {
+  const tag = sourceWI?.metadata?.['triggerSource'];
+  if (tag === 'cron') return 'event'; // demote
+  if (tag === 'manual') return 'manual';
+  return 'event';
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+/**
+ * Optional dependency injection container so tests can supply fakes for the
+ * mission loader and team resolver without touching the real fs / storage.
+ *
+ * Production wiring uses the singletons from {@link StorageService} and
+ * {@link TaskPoolService} via the loader / resolver helpers in
+ * {@link EventToWorkItemBridge.boot}.
+ */
+export interface BridgeDependencies {
+  /** Live event bus instance. */
+  eventBus: EventBusService;
+  /** TaskPool for read-back + addToPool. */
+  taskPool: TaskPoolService;
+  /** Loads a mission by id. Returns null if missing. */
+  loadMission: (missionId: string) => Promise<Mission | null>;
+  /** Loads a team by id. Returns null if missing. */
+  loadTeam: (teamId: string) => Promise<Team | null>;
+  /**
+   * Loads every team — used to find a worker's team from its session when
+   * the WorkItem carries no `metadata.teamId` (ticket loop Phase 3). Optional
+   * so older callers keep the orchestrator fallback.
+   */
+  loadTeams?: () => Promise<Team[]>;
+  /**
+   * Asks the owner to review a finished item that has no other reviewer: the
+   * orchestrator did the work itself and the gate refuses self-review. The
+   * bridge stamps {@link REVIEW_ESCALATED_TO_OWNER_KEY} before calling it.
+   * Optional: without it the item is only stamped and the owner receipt
+   * lists it.
+   */
+  escalateReviewToOwner?: (wi: WorkItem) => Promise<void>;
+  /** Optional logger override (defaults to component logger). */
+  logger?: ComponentLogger;
+}
+
+/**
+ * EventToWorkItemBridge — the BRIDGE-1 deliverable.
+ *
+ * Wired in `backend/src/index.ts` via {@link EventToWorkItemBridge.boot}; tests
+ * construct via the {@link EventToWorkItemBridge} constructor directly with
+ * fake dependencies.
+ *
+ * @example
+ * ```typescript
+ * const bridge = EventToWorkItemBridge.boot(eventBus);
+ * bridge.start();
+ * // … later, on shutdown:
+ * bridge.stop();
+ * ```
+ */
+export class EventToWorkItemBridge {
+  private readonly eventBus: EventBusService;
+  private readonly taskPool: TaskPoolService;
+  private readonly loadMission: (missionId: string) => Promise<Mission | null>;
+  private readonly loadTeam: (teamId: string) => Promise<Team | null>;
+  private readonly loadTeams: (() => Promise<Team[]>) | null;
+  /** Owner review escalation for work with no other reviewer (null = stamp only). */
+  private readonly escalateReviewToOwner: ((wi: WorkItem) => Promise<void>) | null;
+  private readonly logger: ComponentLogger;
+  private unsubscribers: InProcessUnsubscribe[] = [];
+  private started = false;
+  /**
+   * In-flight async handler invocations. Test code calls
+   * {@link flushPending} to await every in-flight dispatch deterministically.
+   * Production code never reads this — handlers continue running off the
+   * event loop with their own try/catch.
+   */
+  private pendingDispatches: Set<Promise<void>> = new Set();
+
+  constructor(deps: BridgeDependencies) {
+    this.eventBus = deps.eventBus;
+    this.taskPool = deps.taskPool;
+    this.loadMission = deps.loadMission;
+    this.loadTeam = deps.loadTeam;
+    this.loadTeams = deps.loadTeams ?? null;
+    this.escalateReviewToOwner = deps.escalateReviewToOwner ?? null;
+    this.logger =
+      deps.logger ?? LoggerService.getInstance().createComponentLogger('EventToWorkItemBridge');
+  }
+
+  /**
+   * Production wiring helper — constructs a bridge from singletons.
+   *
+   * Tests should use the constructor directly with fake `loadMission` /
+   * `loadTeam` rather than reaching for `boot`.
+   *
+   * @param eventBus - The live event bus
+   * @returns A bridge instance ready to `start()`
+   */
+  static boot(eventBus: EventBusService): EventToWorkItemBridge {
+    const taskPool = TaskPoolService.getInstance();
+    const storage = StorageService.getInstance();
+    return new EventToWorkItemBridge({
+      eventBus,
+      taskPool,
+      loadMission: async (missionId: string) => {
+        // Missions live as flat JSON under the shared missions dir (see
+        // `mission-paths.ts`). This used to probe a non-existent
+        // `storage.getMissionById`, which always resolved null — so every
+        // mission:* handler was a silent no-op in production.
+        try {
+          const mission = await safeReadJson<Mission | null>(getMissionPath(missionId), null);
+          return mission ?? null;
+        } catch {
+          return null;
+        }
+      },
+      loadTeam: async (teamId: string) => {
+        const teams = await storage.getTeams();
+        return teams.find((t) => t.id === teamId) ?? null;
+      },
+      loadTeams: () => storage.getTeams(),
+      escalateReviewToOwner: async (wi: WorkItem) => {
+        const { EscalationRouterService } = await import('../v3/escalation-router.service.js');
+        await EscalationRouterService.getInstance().escalateUnreviewedToOwner(
+          {
+            id: wi.id,
+            title: wi.title,
+            type: wi.type,
+            target: wi.target ?? null,
+            retryCount: wi.retryCount ?? 0,
+            maxRetries: wi.maxRetries ?? DEFAULT_MAX_RETRIES,
+            error: wi.error ?? null,
+            requestId: wi.requestId ?? null,
+            missionId: wi.missionId ?? null,
+            parentWorkItemId: wi.parentWorkItemId ?? null,
+          },
+          0,
+          { reason: ORC_OWN_WORK_REVIEW_REASON },
+        );
+      },
+    });
+  }
+
+  /**
+   * Subscribe to all bridge events. Idempotent — calling twice is a no-op.
+   *
+   * Each handler is wrapped so that a thrown error inside a single event
+   * dispatch is logged but does NOT propagate to `EventBus.publish()`. The
+   * EventBus itself also isolates handler errors (see
+   * `dispatchInProcess`); the inner try/catch belt-and-braces against the
+   * particular case where a handler returns a non-Promise that subsequently
+   * throws on access (rare but observed in jest fake-timer setups).
+   */
+  start(): void {
+    if (this.started) return;
+    this.started = true;
+
+    this.unsubscribers.push(
+      this.eventBus.onInProcess('task:done_by_worker', (e) =>
+        this.safeDispatch('task:done_by_worker', e, this.handleTaskDoneByWorker),
+      ),
+      this.eventBus.onInProcess('task:rejected', (e) =>
+        this.safeDispatch('task:rejected', e, this.handleTaskRejected),
+      ),
+      this.eventBus.onInProcess('task:blocked', (e) =>
+        this.safeDispatch('task:blocked', e, this.handleTaskBlocked),
+      ),
+      this.eventBus.onInProcess('team:all_tasks_done', (e) =>
+        this.safeDispatch('team:all_tasks_done', e, this.handleTeamAllTasksDone),
+      ),
+      this.eventBus.onInProcess('mission:review_due', (e) =>
+        this.safeDispatch('mission:review_due', e, this.handleMissionReviewDue),
+      ),
+      this.eventBus.onInProcess('mission:stale', (e) =>
+        this.safeDispatch('mission:stale', e, this.handleMissionStale),
+      ),
+      this.eventBus.onInProcess('mission:replanned', (e) =>
+        this.safeDispatch('mission:replanned', e, this.handleMissionReplanned),
+      ),
+    );
+
+    this.logger.info('EventToWorkItemBridge subscribed', {
+      eventTypes: BRIDGE_SUBSCRIBED_EVENTS,
+    });
+  }
+
+  /**
+   * Wait for every in-flight handler dispatch to settle. Test affordance —
+   * production code does not need this; the EventBus + safeDispatch already
+   * isolate handler errors. Tests use it to assert deterministically that
+   * `addToPool` has been called by the time the expectation runs, even
+   * though `EventBus.publish` is synchronous and bridge handlers are async.
+   *
+   * Calling more than once is safe — pending dispatches are removed as they
+   * settle, so a second call is effectively a no-op when nothing is in flight.
+   */
+  async flushPending(): Promise<void> {
+    while (this.pendingDispatches.size > 0) {
+      // Snapshot the current pending set; new entries added by handlers (e.g.
+      // bridge re-emitting `mission:review_due` from `team:all_tasks_done`)
+      // will appear in the next loop iteration.
+      const inFlight = Array.from(this.pendingDispatches);
+      await Promise.allSettled(inFlight);
+    }
+  }
+
+  /**
+   * Detach every subscription. Safe to call multiple times.
+   */
+  stop(): void {
+    for (const unsubscribe of this.unsubscribers) {
+      try {
+        unsubscribe();
+      } catch (err) {
+        this.logger.warn('Bridge unsubscribe threw', { error: formatError(err) });
+      }
+    }
+    this.unsubscribers = [];
+    this.started = false;
+    this.logger.info('EventToWorkItemBridge stopped');
+  }
+
+  // -------------------------------------------------------------------------
+  // Event handlers — each returns a Promise so onInProcess can attach .catch()
+  // -------------------------------------------------------------------------
+
+  /**
+   * `task:done_by_worker` → create a verification WI for the team lead.
+   *
+   * Idempotency: `${sourceWI.id}:verify:${sourceWI.id}` (one verify WI per task done).
+   * V4: throws if no TL resolvable.
+   */
+  private handleTaskDoneByWorker = async (event: AgentEvent): Promise<void> => {
+    const sourceWI = await this.resolveSourceWorkItem(event);
+    if (!sourceWI) {
+      this.logger.warn('task:done_by_worker missing source WorkItem', {
+        eventId: event.id,
+        workItemId: event.workItemId,
+        taskId: event.taskId,
+      });
+      return;
+    }
+
+    // Two kinds of "done" need no human-grade verification, and each verify
+    // WI is a full orchestrator wake-up (dispatch → poll → review → complete):
+    //   - cron_run: the schedule itself re-runs the check; verifying every
+    //     15-minute tick doubled the orc's turn count on steamfun-ops (2026-09-16).
+    //   - bridge-auto maintenance (wiki drain/migrate/cleanup): the bridge
+    //     re-scans on its own tick and re-creates work if anything is left.
+    // #813: only when nobody asked for a gate. An item that explicitly
+    // requires verification is reviewed like any other — skipping it used to
+    // leave it in done_by_worker until the TTL auto-verified it.
+    if (
+      (sourceWI.type === 'cron_run' || sourceWI.metadata?.['autoCreated'] === true) &&
+      sourceWI.metadata?.['requiresVerification'] !== true
+    ) {
+      this.logger.debug('Skipping verification WI (cron run or auto-created maintenance)', {
+        sourceWorkItemId: sourceWI.id,
+        type: sourceWI.type,
+        autoCreated: sourceWI.metadata?.['autoCreated'] === true,
+      });
+      return;
+    }
+
+    // Do NOT create a verification WI for a WI that is itself a verification/review.
+    // A verify WI is a task; when the team lead completes it, it re-emits
+    // task:done_by_worker — without this guard each verify spawns another verify
+    // (verify-of-verify), an infinite cascade that floods the orchestrator and
+    // starves real work (members such as the Builder never get spawned).
+    if (
+      sourceWI.type === 'review' ||
+      sourceWI.metadata?.['verifyOf'] ||
+      String(sourceWI.id).includes(':verify:')
+    ) {
+      this.logger.debug('Skipping verification WI for a verification/review source (no verify-of-verify)', {
+        sourceWorkItemId: sourceWI.id,
+        type: sourceWI.type,
+      });
+      return;
+    }
+
+    // Ticket loop Phase 3 — review goes to the worker's own lead (its parent,
+    // else the team's lead), never to someone reviewing their own work, and
+    // no longer to the orchestrator by default: 82 of 82 review items in a
+    // week landed on crewly-orc because worker items carry no teamId.
+    //
+    // #813: with no separate lead the ORCHESTRATOR reviews it. This used to
+    // call verifyItem(system, 'verified') — the worker's own report became
+    // "verified" with nobody looking. The review item's target is the
+    // reviewer of record: the transition gate reads it to decide who may
+    // render the verdict.
+    const reviewer = (await this.resolveReviewer(sourceWI)) ?? ORCHESTRATOR_SESSION_NAME;
+    if (reviewer === ORCHESTRATOR_SESSION_NAME) {
+      this.logger.info('No separate lead — the orchestrator reviews this work', {
+        sourceWorkItemId: sourceWI.id,
+        worker: sourceWI.target,
+        requestId: sourceWI.requestId,
+      });
+    }
+    if (reviewer === sourceWI.target) {
+      // The orchestrator did this work itself and leads no team with another
+      // lead in it: the fallback reviewer is the worker. A review item
+      // targeted at it is refused by the gate as self_review on every
+      // attempt and redelivered every 5 min (2026-10-26, WorkItem 599125f5:
+      // the orc cancelled the review by hand). The chain's last step is the
+      // owner (#813), so the review goes there now instead of after the TTL.
+      await this.routeOwnWorkReviewToOwner(sourceWI);
+      return;
+    }
+    const target = reviewer;
+    const verifyId = `${sourceWI.id}:verify:${sourceWI.id}`;
+
+    const verifyWI: WorkItem = this.buildAutoWorkItem({
+      id: verifyId,
+      type: 'review',
+      owner: 'team_lead',
+      target,
+      title: `Verify: ${sourceWI.title}`,
+      description:
+        `Worker ${sourceWI.target ?? '(unknown)'} reported done on ${sourceWI.id}. Verify the deliverable.\n` +
+        // #1314: an accept records what the reviewer checked, per entry.
+        `Accept: complete this item with output {"checks":[{"entry":<evidence index, or null for a direct look>,"did":"<what you did and saw>","outcome":"pass"}]} — ` +
+        `at least one check must name a worker evidence entry when there is any. Send it back: complete it with ` +
+        `output {"verdict":"rejected","feedback":"<what is wrong>"} — the worker gets a retry with your feedback.` +
+        // #873: the reviewer reads the evidence first.
+        `\n${describeEvidenceForReviewer(sourceWI.output)}` +
+        // #875: the worker's decisions, roads not taken and assumptions.
+        (describeDecisionsForReviewer(sourceWI.output) ? `\n${describeDecisionsForReviewer(sourceWI.output)}` : '') +
+        (sourceWI.requestId ? `\nIt belongs to ticket ${sourceWI.requestId}: ticket-check --ticket ${sourceWI.requestId} shows its acceptance criteria.` : '') +
+        (typeof sourceWI.metadata?.['reviewerNote'] === 'string' ? `\n${sourceWI.metadata['reviewerNote']}` : ''),
+      sourceWI,
+      missionId: sourceWI.missionId,
+      requestId: sourceWI.requestId,
+      retryCount: 0,
+      extraMetadata: {
+        idempotencyKey: verifyId, // V1 (per-handler)
+        sourceWorkItemId: sourceWI.id,
+        verifyOf: sourceWI.id,
+      },
+    });
+
+    await this.taskPool.addToPool(verifyWI);
+    this.logger.info('Verification WorkItem created', {
+      sourceWorkItemId: sourceWI.id,
+      verifyWorkItemId: verifyId,
+      target,
+    });
+  };
+
+  /**
+   * `task:rejected` → retry WI (cap at DEFAULT_MAX_RETRIES) or escalation review WI.
+   *
+   * - retryCount < cap → retry WI assigned to original worker, retryCount + 1
+   * - retryCount >= cap → review WI for TL with reviewReason='max_retries_exceeded'
+   *
+   * Idempotency:
+   *   - retry path: `${sourceWI.id}:retry:${retryAttempt}`
+   *   - escalation: `${sourceWI.id}:review:max_retries`
+   */
+  private handleTaskRejected = async (event: AgentEvent): Promise<void> => {
+    const sourceWI = await this.resolveSourceWorkItem(event);
+    if (!sourceWI) {
+      this.logger.warn('task:rejected missing source WorkItem', { eventId: event.id });
+      return;
+    }
+
+    const cap = sourceWI.maxRetries > 0 ? sourceWI.maxRetries : DEFAULT_MAX_RETRIES;
+    // Shown to the reviewer (escalation text now, or the next Verify item via
+    // the retry's metadata) when a worker on the default Sonnet keeps getting
+    // the same task sent back.
+    const upgradeHint = await this.modelUpgradeHint(sourceWI).catch(() => null);
+
+    if (sourceWI.retryCount >= cap) {
+      // V2 escalation path
+      const escalationId = `${sourceWI.id}:review:max_retries`;
+      const target = await this.resolveTeamLeadSession(sourceWI);
+      const reason: ReviewReason = 'max_retries_exceeded';
+      // 1-line cheap guard against silent typo drift (Sam's reminder)
+      if (!isReviewReason(reason)) {
+        throw new Error(`BRIDGE-1: invalid reviewReason ${String(reason)}`);
+      }
+
+      const escalationWI = this.buildAutoWorkItem({
+        id: escalationId,
+        type: 'review',
+        owner: 'team_lead',
+        target,
+        title: `Escalation: ${sourceWI.title} rejected ${sourceWI.retryCount}x`,
+        description:
+          `Source WorkItem ${sourceWI.id} has been rejected ${sourceWI.retryCount} times ` +
+          `(cap = ${cap}). TL must re-scope, reassign, or cancel.` +
+          (upgradeHint ? `\n${upgradeHint}` : ''),
+        sourceWI,
+        missionId: sourceWI.missionId,
+        requestId: sourceWI.requestId,
+        retryCount: 0,
+        extraMetadata: {
+          idempotencyKey: escalationId, // V1 (per-handler)
+          sourceWorkItemId: sourceWI.id,
+          reviewReason: reason,
+          escalatedRetryCount: sourceWI.retryCount,
+        },
+      });
+      await this.taskPool.addToPool(escalationWI);
+      this.logger.info('Retry cap reached — escalation WorkItem created', {
+        sourceWorkItemId: sourceWI.id,
+        escalationWorkItemId: escalationId,
+        retryCount: sourceWI.retryCount,
+        cap,
+      });
+      // The review WI is a real successor: a TL picks the work up from there.
+      await this.recordSuccessor(
+        sourceWI.id,
+        escalationId,
+        `retry cap ${cap} reached — escalated for review`,
+      );
+      return;
+    }
+
+    // Retry path
+    const retryAttempt = sourceWI.retryCount + 1;
+    const retryId = `${sourceWI.id}:retry:${retryAttempt}`;
+
+    const retryWI = this.buildAutoWorkItem({
+      id: retryId,
+      type: sourceWI.type,
+      owner: sourceWI.owner,
+      target: sourceWI.target,
+      title: `Retry ${retryAttempt}/${cap}: ${sourceWI.title}`,
+      // The reviewer's verdict comment lands on the source's `error`; without
+      // it the retry is the same brief again and the worker repeats itself.
+      description: withRejectionFeedback(sourceWI.description, sourceWI.error, retryAttempt),
+      briefMarkdown: sourceWI.briefMarkdown === undefined
+        ? undefined
+        : withRejectionFeedback(sourceWI.briefMarkdown, sourceWI.error, retryAttempt),
+      sourceWI,
+      missionId: sourceWI.missionId,
+      requestId: sourceWI.requestId,
+      retryCount: retryAttempt,
+      extraMetadata: {
+        idempotencyKey: retryId, // V1 (per-handler)
+        sourceWorkItemId: sourceWI.id,
+        retryAttempt,
+        // CREW-403: a retry replaces work a reviewer already rejected, so it
+        // must go back through review. `requiresVerification()` only defaults
+        // to true for `delegate` items; a `project_task` source relied on its
+        // own metadata flag, which this factory does not copy, so its retry
+        // completed as `done` and no Verify item was ever created.
+        requiresVerification: true,
+        ...(upgradeHint ? { reviewerNote: upgradeHint } : {}),
+      },
+    });
+    await this.taskPool.addToPool(retryWI);
+    this.logger.info('Retry WorkItem created', {
+      sourceWorkItemId: sourceWI.id,
+      retryWorkItemId: retryId,
+      retryAttempt,
+      cap,
+    });
+    // Record on the SOURCE that this retry is its successor. The source stays
+    // in `rejected` — whose only outbound edge is `→ queued`, so it can never
+    // reach a terminal state — and without this stamp the only way to know it
+    // was dealt with is to scan for a child, which is exactly the inference
+    // that made the 469a3a21 rule wrong in both directions. It also converts
+    // every silent failure above (source lookup empty, addToPool no-op on an
+    // id collision) into a visibly UNDISPOSED source that the reconciler's
+    // safety net will pick up, instead of a strand nobody can see.
+    await this.recordSuccessor(sourceWI.id, retryId, `retry ${retryAttempt}/${cap}`);
+  };
+
+  /**
+   * Stamp a source WorkItem with the successor that now carries its work.
+   *
+   * The bridge never mutates status (see the class doc comment) and this keeps
+   * that invariant: `disposeFailedWorkItem` with a `successorWorkItemId`
+   * writes metadata only, no transition. Best-effort — the successor WI is
+   * already in the pool by this point, so failing to stamp must not undo real
+   * work. An unstamped source simply looks undisposed, and the reconciler's
+   * safety net will reconcile it.
+   *
+   * @param sourceWorkItemId - The `rejected` item being succeeded.
+   * @param successorId      - The WorkItem now carrying the work.
+   * @param reason           - Audit-trail justification.
+   */
+  private recordSuccessor = async (
+    sourceWorkItemId: string,
+    successorId: string,
+    reason: string,
+  ): Promise<void> => {
+    try {
+      await this.taskPool.disposeFailedWorkItem(sourceWorkItemId, {
+        reason,
+        successorWorkItemId: successorId,
+      });
+    } catch (err) {
+      this.logger.warn('Failed to stamp successor on source WorkItem (non-fatal)', {
+        sourceWorkItemId,
+        successorId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  /**
+   * `task:blocked` → review WI for TL with `reviewReason='task_blocked'`.
+   *
+   * Idempotency: `${sourceWI.id}:review:blocked` (one review per blocked WI).
+   *
+   * A block with an `until` time is a planned wait, not a problem: the item
+   * returns to its agent when the time passes, so the lead has nothing to
+   * unblock or re-scope and is not woken for it (CREW-893).
+   */
+  private handleTaskBlocked = async (event: AgentEvent): Promise<void> => {
+    const sourceWI = await this.resolveSourceWorkItem(event);
+    if (!sourceWI) {
+      this.logger.warn('task:blocked missing source WorkItem', { eventId: event.id });
+      return;
+    }
+    const until = blockedUntilOf(sourceWI);
+    if (until !== null) {
+      this.logger.info('Blocked until a known time — no review for the lead', {
+        sourceWorkItemId: sourceWI.id,
+        until: new Date(until).toISOString(),
+      });
+      return;
+    }
+
+    const blockedId = `${sourceWI.id}:review:blocked`;
+    const target = await this.resolveTeamLeadSession(sourceWI);
+    const reason: ReviewReason = 'task_blocked';
+    if (!isReviewReason(reason)) {
+      throw new Error(`BRIDGE-1: invalid reviewReason ${String(reason)}`);
+    }
+
+    const reviewWI = this.buildAutoWorkItem({
+      id: blockedId,
+      type: 'review',
+      owner: 'team_lead',
+      target,
+      title: `Blocked: ${sourceWI.title}`,
+      description: `Source WorkItem ${sourceWI.id} entered 'blocked' status. TL must unblock or re-scope.`,
+      sourceWI,
+      missionId: sourceWI.missionId,
+      requestId: sourceWI.requestId,
+      retryCount: 0,
+      extraMetadata: {
+        idempotencyKey: blockedId, // V1 (per-handler)
+        sourceWorkItemId: sourceWI.id,
+        reviewReason: reason,
+      },
+    });
+    await this.taskPool.addToPool(reviewWI);
+    this.logger.info('Blocked-task review WorkItem created', {
+      sourceWorkItemId: sourceWI.id,
+      reviewWorkItemId: blockedId,
+      target,
+    });
+  };
+
+  /**
+   * `team:all_tasks_done` → emit `mission:review_due` if mission is active.
+   *
+   * The downstream `mission:review_due` handler then creates the actual
+   * review WorkItem. We split the emission from the WI-creation so the
+   * existing REVIEW-1 sweep path and BRIDGE-1's event-driven path converge
+   * on the same idempotency key (REVIEW-1 uses `${missionId}:review:${YYYY-MM-DD}`;
+   * BRIDGE-1's mission:review_due handler uses the same).
+   */
+  private handleTeamAllTasksDone = async (event: AgentEvent): Promise<void> => {
+    if (!event.missionId) {
+      this.logger.debug('team:all_tasks_done without missionId — ignoring', {
+        eventId: event.id,
+      });
+      return;
+    }
+    const mission = await this.loadMission(event.missionId);
+    if (!mission) {
+      this.logger.warn('team:all_tasks_done references unknown mission', {
+        missionId: event.missionId,
+      });
+      return;
+    }
+    if (!isMissionExecutable(mission)) {
+      this.logger.debug('team:all_tasks_done for non-executable mission — skipping emit', {
+        missionId: mission.id,
+        status: mission.status,
+        approval: mission.approval?.state,
+      });
+      return;
+    }
+
+    // Re-emit as mission:review_due so the downstream handler creates the WI.
+    // This preserves the deterministic-id contract — the downstream handler
+    // is the single point that creates review WIs for missions.
+    this.eventBus.publish({
+      id: `${mission.id}:emit:review_due:${todayCycleKey()}`,
+      type: 'mission:review_due',
+      timestamp: new Date().toISOString(),
+      teamId: mission.ownerTeamId,
+      teamName: '',
+      memberId: '',
+      memberName: '',
+      sessionName: '',
+      previousValue: '',
+      newValue: 'review_due',
+      changedField: 'taskStatus',
+      missionId: mission.id,
+    });
+    this.logger.info('Emitted mission:review_due for active mission', {
+      missionId: mission.id,
+    });
+  };
+
+  /**
+   * `mission:review_due` → review WI mirroring REVIEW-1's id pattern.
+   * Idempotency: `${missionId}:review:${YYYY-MM-DD}` — same as REVIEW-1.
+   */
+  private handleMissionReviewDue = async (event: AgentEvent): Promise<void> => {
+    if (!event.missionId) return;
+    const mission = await this.loadMission(event.missionId);
+    if (!mission || !this.isExecutable(mission, 'mission:review_due')) return;
+
+    const cycleId = todayCycleKey();
+    const id = `${mission.id}:review:${cycleId}`;
+    const target = await this.resolveTeamLeadSessionForMission(mission);
+    const reason: ReviewReason = 'scheduled_review';
+
+    const reviewWI = this.buildAutoWorkItem({
+      id,
+      type: 'review',
+      owner: 'team_lead',
+      target,
+      title: `Mission review — ${mission.objective.slice(0, 60)}`,
+      description: `Event-driven mission review (cycle ${cycleId}). Reason: ${reason}.`,
+      sourceWI: null,
+      missionId: mission.id,
+      requestId: undefined,
+      retryCount: 0,
+      extraMetadata: {
+        idempotencyKey: id, // V1 (per-handler) — id matches REVIEW-1's pattern
+        reviewReason: reason,
+        reviewCycleId: cycleId,
+        triggerEventId: event.id,
+      },
+    });
+    await this.taskPool.addToPool(reviewWI);
+    this.logger.info('Mission review WorkItem created (event-driven)', {
+      missionId: mission.id,
+      workItemId: id,
+    });
+  };
+
+  /**
+   * `mission:stale` → review WI with `reviewReason='no_active_work'`.
+   * Idempotency: `${missionId}:review:stale:${YYYY-MM-DD}`.
+   */
+  private handleMissionStale = async (event: AgentEvent): Promise<void> => {
+    if (!event.missionId) return;
+    const mission = await this.loadMission(event.missionId);
+    if (!mission || !this.isExecutable(mission, 'mission:stale')) return;
+
+    const cycleId = todayCycleKey();
+    const id = `${mission.id}:review:stale:${cycleId}`;
+    const target = await this.resolveTeamLeadSessionForMission(mission);
+    const reason: ReviewReason = 'no_active_work';
+
+    const reviewWI = this.buildAutoWorkItem({
+      id,
+      type: 'review',
+      owner: 'team_lead',
+      target,
+      title: `Stale mission — ${mission.objective.slice(0, 60)}`,
+      description: `Mission ${mission.id} flagged stale on ${cycleId}.`,
+      sourceWI: null,
+      missionId: mission.id,
+      requestId: undefined,
+      retryCount: 0,
+      extraMetadata: {
+        idempotencyKey: id, // V1 (per-handler)
+        reviewReason: reason,
+        reviewCycleId: cycleId,
+      },
+    });
+    await this.taskPool.addToPool(reviewWI);
+  };
+
+  /**
+   * `mission:replanned` → review WI tied to the replan event id.
+   * Idempotency: `${missionId}:review:replan:${eventId}`.
+   */
+  private handleMissionReplanned = async (event: AgentEvent): Promise<void> => {
+    if (!event.missionId) return;
+    const mission = await this.loadMission(event.missionId);
+    if (!mission || !this.isExecutable(mission, 'mission:replanned')) return;
+
+    const id = `${mission.id}:review:replan:${event.id}`;
+    const target = await this.resolveTeamLeadSessionForMission(mission);
+    const reason: ReviewReason = 'scheduled_review';
+
+    const reviewWI = this.buildAutoWorkItem({
+      id,
+      type: 'review',
+      owner: 'team_lead',
+      target,
+      title: `Mission replanned — ${mission.objective.slice(0, 60)}`,
+      description: `Mission ${mission.id} replanned (event ${event.id}). TL acknowledge.`,
+      sourceWI: null,
+      missionId: mission.id,
+      requestId: undefined,
+      retryCount: 0,
+      extraMetadata: {
+        idempotencyKey: id, // V1 (per-handler)
+        reviewReason: reason,
+        triggerEventId: event.id,
+      },
+    });
+    await this.taskPool.addToPool(reviewWI);
+  };
+
+  // -------------------------------------------------------------------------
+  // Internal helpers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Approval/status gate shared by every mission:* handler. A paused,
+   * terminal, or not-yet-approved cascade child must not receive review
+   * WorkItems — see {@link isMissionExecutable}.
+   */
+  private isExecutable(mission: Mission, eventType: EventType): boolean {
+    if (isMissionExecutable(mission)) return true;
+    this.logger.debug(`${eventType} for non-executable mission — skipping`, {
+      missionId: mission.id,
+      status: mission.status,
+      approval: mission.approval?.state,
+    });
+    return false;
+  }
+
+  /**
+   * Build an auto-created WorkItem with all the BRIDGE-1 metadata invariants
+   * filled in (deterministic id, idempotencyKey === id, triggerSource derived
+   * from source WI, parent linkage). Pulls every shared field through one
+   * factory so each handler stays declarative and the V1 grep guard
+   * (`grep -c "idempotencyKey:" backend/src/services/event-bus/event-to-workitem-bridge.service.ts`
+   * ≥ 6) holds without litter.
+   */
+  private buildAutoWorkItem(args: {
+    id: string;
+    type: WorkItemType;
+    owner: WorkItemOwner;
+    target: string | undefined;
+    title: string;
+    description?: string;
+    briefMarkdown?: string;
+    sourceWI: WorkItem | null;
+    missionId?: string;
+    requestId?: string;
+    retryCount: number;
+    extraMetadata: Record<string, unknown>;
+  }): WorkItem {
+    const triggerSource = inheritedTriggerSource(args.sourceWI);
+    const now = new Date().toISOString();
+    return {
+      id: args.id,
+      type: args.type,
+      owner: args.owner,
+      target: args.target,
+      title: args.title,
+      description: args.description,
+      briefMarkdown: args.briefMarkdown,
+      status: 'queued',
+      createdAt: now,
+      retryCount: args.retryCount,
+      maxRetries: DEFAULT_MAX_RETRIES,
+      requestId: args.requestId,
+      missionId: args.missionId,
+      parentWorkItemId: args.sourceWI?.id,
+      inputTokens: 0,
+      outputTokens: 0,
+      cost: 0,
+      metadata: {
+        // V1 idempotency + V6 triggerSource invariants are enforced HERE in the
+        // factory and ALSO declared per-handler in `extraMetadata` so the
+        // audit grep (`grep -c "idempotencyKey:" event-to-workitem-bridge.service.ts`)
+        // shows one line per handler. Spread order keeps the per-handler
+        // declaration as the source of truth — factory only fills if the
+        // handler omitted (defensive default).
+        triggerSource, // V6 — never 'cron' for bridge-created WIs
+        ...args.extraMetadata,
+      },
+    };
+  }
+
+  /**
+   * Resolve the source WorkItem from an event. Prefers `event.workItemId`
+   * (BRIDGE-1.1 explicit field), falls back to `event.taskId` for events
+   * whose publishers haven't been migrated yet.
+   *
+   * @param event - The event being handled
+   * @returns The source WorkItem, or null when nothing matches
+   */
+  private async resolveSourceWorkItem(event: AgentEvent): Promise<WorkItem | null> {
+    const id = event.workItemId ?? event.taskId;
+    if (!id) return null;
+    return this.taskPool.findWorkItem(id);
+  }
+
+  /**
+   * Resolve the team-lead session for a source WI's owning team.
+   * Throws {@link BridgeTeamLeadResolutionError} if no TL is resolvable —
+   * Arch Veto V4 forbids silently falling back to the executor.
+   */
+  private async resolveTeamLeadSession(sourceWI: WorkItem): Promise<string> {
+    const teamId = (sourceWI.metadata?.['teamId'] as string | undefined) ?? null;
+    if (!teamId) {
+      // Phase 3: find the worker's team from its session before giving up.
+      const byWorker = await this.teamOfWorker(sourceWI.target);
+      const lead = byWorker ? pickTeamLead(byWorker) : null;
+      if (lead?.sessionName) return lead.sessionName;
+      // No team metadata on the WI — last-resort orchestrator routing keeps
+      // the escalation visible. We log a warn so this surface is auditable
+      // when a team-aware producer arrives.
+      this.logger.warn('Source WI missing metadata.teamId — routing escalation to orchestrator', {
+        sourceWorkItemId: sourceWI.id,
+      });
+      return ORCHESTRATOR_SESSION_NAME;
+    }
+    const team = await this.loadTeam(teamId);
+    if (!team) {
+      throw new BridgeTeamLeadResolutionError(
+        `BRIDGE-1: cannot resolve team ${teamId} for source WorkItem ${sourceWI.id}`,
+      );
+    }
+    const lead = pickTeamLead(team);
+    if (!lead) {
+      throw new BridgeTeamLeadResolutionError(
+        `BRIDGE-1: cannot resolve team lead for team ${teamId} on source WorkItem ${sourceWI.id}`,
+      );
+    }
+    if (!lead.sessionName) {
+      throw new BridgeTeamLeadResolutionError(
+        `BRIDGE-1: team lead for team ${teamId} has no sessionName (member ${lead.id})`,
+      );
+    }
+    return lead.sessionName;
+  }
+
+  /**
+   * The team a worker session belongs to, when teams can be listed.
+   *
+   * @param session - Worker session (the WorkItem's target)
+   * @returns The team, or null
+   */
+  private async teamOfWorker(session: string | undefined): Promise<Team | null> {
+    if (!session || !this.loadTeams) return null;
+    try {
+      const teams = await this.loadTeams();
+      return teams.find((t) => (t.members ?? []).some((m) => m.sessionName === session)) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Who reviews a worker's finished item (ticket loop Phase 3): the worker's
+   * parent member, else its team's lead — as long as that is someone other
+   * than the worker. `metadata.teamId` wins when present; otherwise the team
+   * is found from the worker's session.
+   *
+   * @param sourceWI - The finished item
+   * @returns The reviewer's session, or null when there is no separate reviewer
+   */
+  private async resolveReviewer(sourceWI: WorkItem): Promise<string | null> {
+    const worker = sourceWI.target;
+    const teamId = (sourceWI.metadata?.['teamId'] as string | undefined) ?? null;
+    const team = teamId ? await this.loadTeam(teamId) : await this.teamOfWorker(worker);
+    if (!team) {
+      if (teamId) {
+        throw new BridgeTeamLeadResolutionError(
+          `BRIDGE-1: cannot resolve team ${teamId} for source WorkItem ${sourceWI.id}`,
+        );
+      }
+      // No team known: keep the old orchestrator route only when teams cannot
+      // be listed (older wiring); with teams listed, a worker in no team has
+      // no lead to review it.
+      return this.loadTeams ? null : ORCHESTRATOR_SESSION_NAME;
+    }
+    const members = team.members ?? [];
+    const self = members.find((m) => m.sessionName === worker);
+    const parent = self?.parentMemberId ? members.find((m) => m.id === self.parentMemberId) : undefined;
+    const candidates = [parent, pickTeamLead(team)];
+    for (const c of candidates) {
+      if (c?.sessionName && c.sessionName !== worker) return c.sessionName;
+    }
+    return null;
+  }
+
+  /**
+   * Route the review of work the orchestrator did itself to the owner: stamp
+   * the item as owner-escalated (the owner receipt lists it; the orchestrator
+   * stays refused as self-reviewer) and raise the pending escalation whose
+   * resolution renders the owner's verdict. Best-effort: a failed escalation
+   * is logged, the stamp alone still keeps the item visible.
+   *
+   * @param sourceWI - The finished item whose worker is its own fallback reviewer
+   */
+  private async routeOwnWorkReviewToOwner(sourceWI: WorkItem): Promise<void> {
+    this.logger.info('Worker has no separate reviewer (the orchestrator did the work) — review goes to the owner', {
+      sourceWorkItemId: sourceWI.id,
+      worker: sourceWI.target,
+      requestId: sourceWI.requestId,
+    });
+    try {
+      const stamped = await this.taskPool.stampReviewEscalation(sourceWI.id, REVIEW_ESCALATED_TO_OWNER_KEY);
+      if (!stamped) {
+        this.logger.warn('Could not stamp the owner review escalation (item no longer awaiting review?)', {
+          sourceWorkItemId: sourceWI.id,
+        });
+        return;
+      }
+      await this.escalateReviewToOwner?.(sourceWI);
+    } catch (err) {
+      this.logger.warn('Owner review escalation failed (non-fatal)', {
+        sourceWorkItemId: sourceWI.id,
+        error: formatError(err),
+      });
+    }
+  }
+
+  /**
+   * The line that tells the reviewer a worker on the default Sonnet model was
+   * sent back repeatedly for the same task, so the reviewer can propose an
+   * Opus upgrade to the owner. Nothing is changed automatically.
+   *
+   * @param sourceWI - The rejected item (its `retryCount` + 1 = rejections so far)
+   * @returns The hint, or null when fewer rejections, no member found, or the
+   *   worker is not on the reviewed-member default
+   */
+  private async modelUpgradeHint(sourceWI: WorkItem): Promise<string | null> {
+    const rejections = (sourceWI.retryCount ?? 0) + 1;
+    if (rejections < MEMBER_MODEL_DEFAULT_CONSTANTS.UPGRADE_HINT_AFTER_REJECTIONS) return null;
+    const worker = sourceWI.target;
+    if (!worker) return null;
+    const teamId = (sourceWI.metadata?.['teamId'] as string | undefined) ?? null;
+    const team = teamId ? await this.loadTeam(teamId) : await this.teamOfWorker(worker);
+    const member = team?.members?.find((m) => m.sessionName === worker);
+    if (!team || !member) return null;
+    const model = defaultModelForMember(team, member);
+    if (!model) return null;
+    const label = model.toLowerCase() === 'sonnet' ? 'Sonnet' : model;
+    const name = member.name || worker;
+    return (
+      `${name} runs on ${label} and was sent back twice for this. If the gap is capability rather than ` +
+      `missing information, propose to the owner (in your own words, one line) to move ${name} to Opus; ` +
+      `only change it after the owner says yes.`
+    );
+  }
+
+  /**
+   * Resolve TL for a mission. Same V4 fail-fast contract as
+   * {@link resolveTeamLeadSession} but keyed on `mission.ownerTeamId`.
+   */
+  private async resolveTeamLeadSessionForMission(mission: Mission): Promise<string> {
+    if (mission.ownerId) {
+      // Owner is a member id; we don't load members directly here. If the
+      // ownerId is set we trust it as a session name fallback would lose data
+      // — but `pickTeamLead` is the canonical resolver, so we still consult it.
+    }
+    const team = await this.loadTeam(mission.ownerTeamId);
+    if (!team) {
+      throw new BridgeTeamLeadResolutionError(
+        `BRIDGE-1: cannot resolve owner team ${mission.ownerTeamId} for mission ${mission.id}`,
+      );
+    }
+    const lead = pickTeamLead(team);
+    if (!lead) {
+      throw new BridgeTeamLeadResolutionError(
+        `BRIDGE-1: cannot resolve team lead for owner team ${mission.ownerTeamId} on mission ${mission.id}`,
+      );
+    }
+    if (!lead.sessionName) {
+      throw new BridgeTeamLeadResolutionError(
+        `BRIDGE-1: team lead for owner team ${mission.ownerTeamId} has no sessionName (member ${lead.id})`,
+      );
+    }
+    return lead.sessionName;
+  }
+
+  /**
+   * Wrap a handler so a thrown error is caught at the bridge boundary instead
+   * of bubbling into EventBus.dispatchInProcess. Errors from handlers
+   * shouldn't crash the publisher — they should be observable via logs and
+   * — for tests — rethrowable from a deterministic spy point.
+   */
+  private safeDispatch(
+    eventType: EventType,
+    event: AgentEvent,
+    handler: (event: AgentEvent) => Promise<void>,
+  ): Promise<void> {
+    const dispatch = (async () => {
+      try {
+        await handler.call(this, event);
+      } catch (err) {
+        this.logger.error('Bridge handler threw', {
+          eventType,
+          eventId: event.id,
+          error: formatError(err),
+        });
+        // Re-raise CronRecursionError + V4 errors so test spies + audit log
+        // surface them. EventBus.dispatchInProcess catches them harmlessly.
+        if (err instanceof CronRecursionError || err instanceof BridgeTeamLeadResolutionError) {
+          throw err;
+        }
+      }
+    })();
+    this.pendingDispatches.add(dispatch);
+    // Always remove from the in-flight set when the promise settles, regardless
+    // of fulfilled/rejected outcome, so flushPending() drains cleanly.
+    dispatch.finally(() => {
+      this.pendingDispatches.delete(dispatch);
+    }).catch(() => {
+      // Suppress unhandled-rejection warning — flushPending callers see the
+      // outcome via Promise.allSettled, and the handler's logger.error has
+      // already recorded the throw.
+    });
+    return dispatch;
+  }
+}

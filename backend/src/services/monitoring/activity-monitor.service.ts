@@ -1,0 +1,1239 @@
+import { StorageService } from '../core/storage.service.js';
+import { getSessionBackendSync, createSessionBackend, type ISessionBackend } from '../session/index.js';
+import { LoggerService, ComponentLogger } from '../core/logger.service.js';
+import { AgentHeartbeatService } from '../agent/agent-heartbeat.service.js';
+import { writeFile, readFile, rename, unlink } from 'fs/promises';
+import { join } from 'path';
+import { existsSync } from 'fs';
+import { getCrewlyHomePath } from '../core/crewly-home.utils.js';
+import { CREWLY_CONSTANTS, CONTINUATION_CONSTANTS, AGENT_IDENTITY_CONSTANTS, PTY_CONSTANTS, ACTIVITY_MONITOR_CONSTANTS, ANTIGRAVITY_STUCK_COMMAND_CONSTANTS, AGENT_ATTENTION_CONSTANTS, RUNTIME_TYPES, type WorkingStatus } from '../../constants.js';
+import { stripAnsiCodes } from '../../utils/terminal-output.utils.js';
+import { PtyActivityTrackerService } from '../agent/pty-activity-tracker.service.js';
+import type { EventBusService } from '../event-bus/event-bus.service.js';
+import type { AgentEvent } from '../../types/event-bus.types.js';
+import { TokenUsageService } from '../monitoring/token-usage.service.js';
+import { parseRuntimeTokens } from '../monitoring/runtime-token-parser.service.js';
+import { getSettingsService } from '../settings/settings.service.js';
+import { computeAgentAttention, declineKeystrokes, BACKGROUND_AGENT_EVIDENCE, type AttentionResult } from './agent-attention.js';
+import type { AgentRegistrationService } from '../agent/agent-registration.service.js';
+import { markWaiting, clearWaiting, getWaiting } from './agent-attention-registry.js';
+import { EscalationRouterService } from '../v3/escalation-router.service.js';
+import { effectiveRuntimeType } from '../runtime-fallback/effective-runtime.js';
+import { AntigravityStuckCommandDetector } from '../agent/antigravity-stuck-command.js';
+
+/**
+ * Team Working Status File Structure
+ * Tracks ONLY workingStatus (idle vs in_progress) based on terminal activity
+ * agentStatus is now managed by AgentHeartbeatService via MCP calls
+ */
+export interface TeamWorkingStatusFile {
+  /** Orchestrator working status */
+  orchestrator: {
+    sessionName: string;
+    workingStatus: WorkingStatus;
+    lastActivityCheck: string;
+    updatedAt: string;
+  };
+  /** Team member working statuses indexed by sessionName */
+  teamMembers: Record<string, {
+    sessionName: string;
+    teamMemberId: string;
+    workingStatus: WorkingStatus;
+    lastActivityCheck: string;
+    updatedAt: string;
+  }>;
+  /** File metadata */
+  metadata: {
+    lastUpdated: string;
+    version: string;
+  };
+}
+
+/**
+ * Told about a workingStatus change the moment a poll observes it.
+ *
+ * Unlike the `agent:busy` event — held back until the agent has been busy
+ * for MIN_BUSY_DURATION_MS and so never published for a turn shorter than
+ * one poll interval — this fires on every observed change.
+ */
+export type WorkingStatusListener = (sessionName: string, status: WorkingStatus, previous: WorkingStatus | null) => void;
+
+/**
+ * Activity Monitor Service - NEW ARCHITECTURE
+ *
+ * Responsibilities:
+ * - Track ONLY workingStatus (idle vs in_progress) based on terminal activity
+ * - Create and manage teamWorkingStatus.json file
+ * - Integrate with AgentHeartbeatService for stale agent detection
+ * - Remove ALL agentStatus management (now owned by AgentHeartbeatService)
+ *
+ * Key Changes:
+ * - No more agentStatus updates to teams.json
+ * - Simple activity detection: output changed = in_progress, else = idle
+ * - Integration with stale detection (30-minute threshold)
+ * - Separate teamWorkingStatus.json file for working statuses
+ */
+export class ActivityMonitorService {
+  private static instance: ActivityMonitorService;
+  private logger: ComponentLogger;
+  private storageService: StorageService;
+  private _sessionBackend: ISessionBackend | null = null;
+  private agentHeartbeatService: AgentHeartbeatService;
+  private intervalId: NodeJS.Timeout | null = null;
+  private readonly POLLING_INTERVAL = ACTIVITY_MONITOR_CONSTANTS.POLLING_INTERVAL_MS;
+  private lastTerminalOutputs: Map<string, string> = new Map();
+  private readonly MAX_OUTPUT_SIZE = 512; // 512 bytes max per output
+  private readonly ACTIVITY_CHECK_TIMEOUT = 6000; // 6 second timeout per check
+  private lastCleanup: number = Date.now();
+  private crewlyHome: string;
+  private teamWorkingStatusFile: string;
+  private eventBusService: EventBusService | null = null;
+  private agentRegistrationService: AgentRegistrationService | null = null;
+  /** Sessions whose prompt the harness declined, by poll time (ms). */
+  private selfAnsweredAt = new Map<string, number>();
+  /** Tracks when each session entered in_progress (epoch ms) */
+  private stuckCommandDetector: AntigravityStuckCommandDetector;
+  private busyTransitionTimestamps: Map<string, number> = new Map();
+  /** Tracks which sessions have had their agent:busy event emitted */
+  private busyEventEmitted: Set<string> = new Set();
+  /** Latest workingStatus seen per session, from the most recent poll (in memory) */
+  private observedStatus: Map<string, WorkingStatus> = new Map();
+  /** Callbacks told about every observed workingStatus change, undelayed */
+  private statusListeners: Set<WorkingStatusListener> = new Set();
+  /** Tracks last recorded token counts per session to avoid duplicate recording */
+  private lastRecordedTokens: Map<string, { input: number; output: number }> = new Map();
+  /** Cached tokenTracking setting, refreshed periodically to avoid async reads in hot path */
+  private tokenTrackingEnabled = false;
+  private tokenTrackingLastCheck = 0;
+  /**
+   * Set once the waiting_on_human escalations left open by the previous run
+   * have been checked against this run's first full poll (#851).
+   */
+  private openWaitingEscalationsReconciled = false;
+  /**
+   * Whether the runtime itself reports the session mid-turn (hooks /
+   * transcript). A silent screen is not idle while it says so: long tool
+   * calls print nothing (2026-10-02, Eve; specs/2026-10-02-restart-busy-and-resume.md).
+   */
+  private runtimeTurnCheck: ((sessionName: string) => boolean) | null = null;
+
+  /**
+   * Install the runtime turn check consulted before calling a silent agent idle.
+   *
+   * @param check - Returns true while the runtime reports a turn in progress; null removes it
+   */
+  setRuntimeTurnCheck(check: ((sessionName: string) => boolean) | null): void {
+    this.runtimeTurnCheck = check;
+  }
+
+  /**
+   * Whether the runtime says the session is mid-turn (never throws).
+   *
+   * @param sessionName - Session
+   * @returns True when the runtime reports a turn in progress
+   */
+  private isRuntimeMidTurn(sessionName: string): boolean {
+    if (!this.runtimeTurnCheck) return false;
+    try {
+      return this.runtimeTurnCheck(sessionName);
+    } catch {
+      return false;
+    }
+  }
+
+  private constructor() {
+    this.logger = LoggerService.getInstance().createComponentLogger('ActivityMonitor');
+    this.stuckCommandDetector = new AntigravityStuckCommandDetector({ logger: this.logger });
+    this.storageService = StorageService.getInstance();
+    this.agentHeartbeatService = AgentHeartbeatService.getInstance();
+    this.crewlyHome = getCrewlyHomePath();
+    this.teamWorkingStatusFile = join(this.crewlyHome, 'teamWorkingStatus.json');
+  }
+
+  /**
+   * Get the session backend, lazily initializing if needed.
+   */
+  private async getBackend(): Promise<ISessionBackend> {
+    if (!this._sessionBackend) {
+      this._sessionBackend = getSessionBackendSync();
+      if (!this._sessionBackend) {
+        this._sessionBackend = await createSessionBackend('pty');
+      }
+    }
+    return this._sessionBackend;
+  }
+
+  public static getInstance(): ActivityMonitorService {
+    if (!ActivityMonitorService.instance) {
+      ActivityMonitorService.instance = new ActivityMonitorService();
+    }
+    return ActivityMonitorService.instance;
+  }
+
+  /**
+   * Inject the EventBusService for direct event publishing on status transitions.
+   *
+   * @param service - The EventBusService instance
+   */
+  /**
+   * Inject the registration service used to tell an agent what the harness
+   * did about a prompt it answered on the agent's behalf (queued until the
+   * agent is idle, like any other message).
+   *
+   * @param service - Agent registration service
+   */
+  setAgentRegistrationService(service: AgentRegistrationService): void {
+    this.agentRegistrationService = service;
+  }
+
+  setEventBusService(service: EventBusService): void {
+    this.eventBusService = service;
+  }
+
+  /**
+   * Build an AgentEvent for a working status transition.
+   *
+   * @param type - The event type ('agent:busy' or 'agent:idle')
+   * @param timestamp - ISO timestamp for the event
+   * @param identity - Agent identity fields (team/member/session)
+   * @param previousValue - The previous working status
+   * @param newValue - The new working status
+   * @returns A fully-formed AgentEvent
+   */
+  private buildAgentEvent(
+    type: AgentEvent['type'],
+    timestamp: string,
+    identity: { teamId: string; teamName: string; memberId: string; memberName: string; sessionName: string },
+    previousValue: string,
+    newValue: string,
+  ): AgentEvent {
+    return {
+      id: crypto.randomUUID(),
+      type,
+      timestamp,
+      teamId: identity.teamId,
+      teamName: identity.teamName,
+      memberId: identity.memberId,
+      memberName: identity.memberName,
+      sessionName: identity.sessionName,
+      previousValue,
+      newValue,
+      changedField: 'workingStatus',
+    } as AgentEvent;
+  }
+
+  /**
+   * Subscribe to observed workingStatus changes (idle ↔ in_progress).
+   *
+   * @param listener - Called with the session, its new status and the previous one
+   * @returns Unsubscribe function
+   */
+  onWorkingStatusChange(listener: WorkingStatusListener): () => void {
+    this.statusListeners.add(listener);
+    return () => {
+      this.statusListeners.delete(listener);
+    };
+  }
+
+  /**
+   * The workingStatus the latest poll saw for a session, from memory.
+   *
+   * @param sessionName - Agent session
+   * @returns The status, or null when no poll has looked at it yet
+   */
+  getObservedWorkingStatus(sessionName: string): WorkingStatus | null {
+    return this.observedStatus.get(sessionName) ?? null;
+  }
+
+  /**
+   * Remember what a poll saw and tell listeners when it is a change.
+   *
+   * @param sessionName - Agent session
+   * @param status - Status observed now
+   * @param previous - Status recorded before this poll (null when none)
+   */
+  private observeStatus(sessionName: string, status: WorkingStatus, previous: WorkingStatus | null): void {
+    this.observedStatus.set(sessionName, status);
+    if (previous === status) return;
+    for (const listener of this.statusListeners) {
+      try {
+        listener(sessionName, status, previous);
+      } catch (error) {
+        this.logger.debug('Working status listener threw', {
+          sessionName,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  /**
+   * Handle duration-gated event emission for a session status transition.
+   * Suppresses spurious idle→busy→idle cycles by requiring a minimum
+   * busy duration (MIN_BUSY_DURATION_MS) before emitting events.
+   *
+   * @param key - Unique key for tracking (e.g. 'orchestrator' or session name)
+   * @param newStatus - The new working status
+   * @param previousStatus - The previous working status
+   * @param statusChanged - Whether the status actually changed this poll
+   * @param identity - Agent identity fields for building the event
+   * @param now - ISO timestamp for the event
+   */
+  private handleDurationGatedEmission(
+    key: string,
+    newStatus: WorkingStatus,
+    previousStatus: WorkingStatus,
+    statusChanged: boolean,
+    identity: { teamId: string; teamName: string; memberId: string; memberName: string; sessionName: string },
+    now: string,
+  ): void {
+    if (statusChanged && newStatus === 'in_progress') {
+      if (!this.busyTransitionTimestamps.has(key)) {
+        this.busyTransitionTimestamps.set(key, Date.now());
+      }
+    }
+
+    if (statusChanged) {
+      const busyStart = this.busyTransitionTimestamps.get(key);
+      const elapsed = busyStart != null ? Date.now() - busyStart : 0;
+
+      if (newStatus === 'in_progress') {
+        if (elapsed >= PTY_CONSTANTS.MIN_BUSY_DURATION_MS && !this.busyEventEmitted.has(key) && this.eventBusService) {
+          this.busyEventEmitted.add(key);
+          this.eventBusService.publish(this.buildAgentEvent('agent:busy', now, identity, previousStatus, newStatus));
+        }
+      } else {
+        if (elapsed >= PTY_CONSTANTS.MIN_BUSY_DURATION_MS && this.busyEventEmitted.has(key) && this.eventBusService) {
+          // Generic event (back-compat for fleet dashboards / auto-claim / etc.)
+          this.eventBusService.publish(this.buildAgentEvent('agent:idle', now, identity, previousStatus, newStatus));
+          // 2026-05-20 follow-up: the in-process busy guard above (`busyEventEmitted`)
+          // guarantees we only reach this branch when the agent was actually
+          // observed busy first — so this transition is unambiguously
+          // post-task. Emit the precise variant so peer-watch triggers
+          // can filter on it without being woken by registration-idle.
+          this.eventBusService.publish(this.buildAgentEvent('agent:idle_after_task', now, identity, previousStatus, newStatus));
+        }
+        this.busyTransitionTimestamps.delete(key);
+        this.busyEventEmitted.delete(key);
+      }
+    } else if (newStatus === 'in_progress' && !this.busyEventEmitted.has(key)) {
+      // Still in_progress across polls — seed timestamp if missing (service restart)
+      // and check if deferred busy event can now be emitted
+      if (!this.busyTransitionTimestamps.has(key)) {
+        this.busyTransitionTimestamps.set(key, Date.now());
+      }
+      const busyStart = this.busyTransitionTimestamps.get(key)!;
+      if (Date.now() - busyStart >= PTY_CONSTANTS.MIN_BUSY_DURATION_MS && this.eventBusService) {
+        this.busyEventEmitted.add(key);
+        this.eventBusService.publish(this.buildAgentEvent('agent:busy', now, identity, 'idle', 'in_progress'));
+      }
+    }
+  }
+
+  /**
+   * Compute the waiting_on_human verdict for one agent and act on a change.
+   *
+   * Entering the state: records it in the attention registry (read by the
+   * reconciler), publishes `agent:waiting_on_human`, and opens an
+   * escalation in the owner's queue (GET /api/escalations, which
+   * crewly-mobile polls, plus a Slack notice). Leaving it: the reverse.
+   * Screen text is never logged, only rule names.
+   *
+   * @param backend - Session backend to read screen and title from
+   * @param identity - Agent identity for the event
+   * @param now - ISO timestamp of this poll
+   * @returns The attention verdict for this poll (its evidence tells the
+   *   caller about background agents), or null when the screen could not be read
+   */
+  private async evaluateAttention(
+    backend: ISessionBackend,
+    identity: { teamId: string; teamName: string; memberId: string; memberName: string; sessionName: string },
+    now: string,
+  ): Promise<AttentionResult | null> {
+    try {
+      const screen = backend.captureOutput(identity.sessionName, AGENT_ATTENTION_CONSTANTS.CAPTURE_LINES);
+      const title = backend.getTerminalTitle?.(identity.sessionName) ?? '';
+      const result = computeAgentAttention({ screen, title });
+      if (result.verdict !== 'waiting_on_human' || !result.kind) {
+        await this.clearAttention(identity.sessionName, identity, now);
+        return result;
+      }
+      if (result.selfAnswer && this.selfAnswerPrompt(backend, identity.sessionName, screen, result, now)) {
+        return result;
+      }
+      const isNew = markWaiting({
+        sessionName: identity.sessionName,
+        kind: result.kind,
+        since: now,
+        evidence: result.evidence,
+        ...(result.titleLabel ? { titleLabel: result.titleLabel } : {}),
+      });
+      if (!isNew) return result;
+      this.logger.warn('Agent is waiting on a human (blocked on a prompt)', {
+        sessionName: identity.sessionName,
+        kind: result.kind,
+        evidence: result.evidence,
+        linesExamined: result.linesExamined,
+      });
+      this.eventBusService?.publish(
+        this.buildAgentEvent('agent:waiting_on_human', now, identity, 'working', `waiting_on_human:${result.kind}`),
+      );
+      await EscalationRouterService.getInstance().recordAgentWaitingOnHuman({
+        sessionName: identity.sessionName,
+        kind: result.kind,
+        evidence: result.evidence,
+        ...(result.titleLabel ? { titleLabel: result.titleLabel } : {}),
+      });
+      return result;
+    } catch (error) {
+      this.logger.warn('waiting_on_human evaluation failed (non-fatal)', {
+        sessionName: identity.sessionName,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Answer a prompt the harness knows how to answer, instead of waiting for
+   * a human who is not at this machine.
+   *
+   * Today that is Claude Code's "Dangerous rm operation" prompt, which bypass
+   * mode does not skip: the harness moves the selector to "No" and confirms
+   * (nothing is deleted), then queues a message telling the agent to re-run
+   * with absolute paths. The decline is remembered per session; while the
+   * screen is still being redrawn the caller skips the usual escalation, and
+   * if the prompt is still there after `RETRY_AFTER_MS` the escalation to the
+   * owner proceeds as before.
+   *
+   * @param backend - Session backend holding the agent's PTY
+   * @param sessionName - Agent session
+   * @param screen - The captured screen the verdict was computed from
+   * @param result - The waiting_on_human verdict with `selfAnswer` set
+   * @param now - ISO timestamp of this poll
+   * @returns true when the caller should not escalate on this poll
+   */
+  private selfAnswerPrompt(
+    backend: ISessionBackend,
+    sessionName: string,
+    screen: string,
+    result: AttentionResult,
+    now: string,
+  ): boolean {
+    const nowMs = Date.parse(now);
+    const declinedAt = this.selfAnsweredAt.get(sessionName);
+    if (declinedAt !== undefined) {
+      if (nowMs - declinedAt < AGENT_ATTENTION_CONSTANTS.SELF_ANSWER.RETRY_AFTER_MS) return true;
+      this.selfAnsweredAt.delete(sessionName);
+      this.logger.warn('Self-answered prompt is still on screen; escalating to the owner', {
+        sessionName,
+        kind: result.kind,
+        evidence: result.evidence,
+      });
+      return false;
+    }
+    const keys = declineKeystrokes(screen);
+    const session = backend.getSession(sessionName);
+    if (!keys || !session) return false;
+    session.write(keys);
+    this.selfAnsweredAt.set(sessionName, nowMs);
+    this.logger.info('Declined a prompt on the agent\'s behalf (no human at this machine)', {
+      sessionName,
+      kind: result.kind,
+      evidence: result.evidence,
+    });
+    if (this.agentRegistrationService) {
+      void this.agentRegistrationService
+        .sendMessageToAgent(sessionName, AGENT_ATTENTION_CONSTANTS.SELF_ANSWER.DANGEROUS_RM_MESSAGE)
+        .catch((error: unknown) => {
+          this.logger.warn('Could not tell the agent about the declined prompt', {
+            sessionName,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+    }
+    return true;
+  }
+
+  /**
+   * Leave the waiting_on_human state for a session, if it was in it.
+   *
+   * `!cleared` also covers "the registry never knew this session was
+   * waiting": the normal case for an agent that was never blocked, and also
+   * the case right after a restart when the owner answered the prompt while
+   * the backend was down. The escalation such a restart leaves open is closed
+   * by {@link reconcileOpenWaitingEscalations}, once per run, rather than by
+   * reading the escalation list on every poll of every agent here (#851).
+   *
+   * @param sessionName - Agent session
+   * @param identity - Agent identity for the event
+   * @param now - ISO timestamp of this poll
+   */
+  private async clearAttention(
+    sessionName: string,
+    identity: { teamId: string; teamName: string; memberId: string; memberName: string; sessionName: string },
+    now: string,
+  ): Promise<void> {
+    this.selfAnsweredAt.delete(sessionName);
+    const cleared = clearWaiting(sessionName);
+    if (!cleared) return;
+    this.logger.info('Agent is no longer waiting on a human', { sessionName, kind: cleared.kind, since: cleared.since });
+    this.eventBusService?.publish(
+      this.buildAgentEvent('agent:waiting_resolved', now, identity, `waiting_on_human:${cleared.kind}`, 'resolved'),
+    );
+    try {
+      await EscalationRouterService.getInstance().resolveAgentWaitingOnHuman(sessionName);
+    } catch (error) {
+      this.logger.warn('Could not close waiting_on_human escalation (non-fatal)', {
+        sessionName,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Close the `agent_waiting_on_human` escalations that are still open from
+   * before a restart although the prompt is gone.
+   *
+   * The attention registry is in memory. When the owner answers a prompt while
+   * the backend is down, the registry comes back empty, so `clearAttention`
+   * finds nothing to clear and never closes the durable escalation; it stayed
+   * in the owner's queue (GET /api/escalations, crewly-mobile) indefinitely
+   * (#851). This runs once, after the first poll of this run has re-learned
+   * every live prompt: an open escalation whose session that poll checked and
+   * found not waiting, or whose session no longer belongs to any member, is
+   * resolved. Escalations for sessions the poll could not check stay open and
+   * are retried on the next poll. Reading the escalation list once per run
+   * keeps the per-poll path free of storage reads.
+   *
+   * @param attentionChecked - Sessions whose attention state this poll established
+   * @param memberSessions - Every session bound to a team member
+   */
+  private async reconcileOpenWaitingEscalations(
+    attentionChecked: ReadonlySet<string>,
+    memberSessions: ReadonlySet<string>,
+  ): Promise<void> {
+    try {
+      const router = EscalationRouterService.getInstance();
+      const open = (await router.listPending()).filter((e) => e.source === 'agent_waiting_on_human');
+      const sessions = new Set<string>();
+      for (const e of open) {
+        const sessionName = e.details?.['sessionName'];
+        if (typeof sessionName === 'string' && sessionName) sessions.add(sessionName);
+      }
+      let resolved = 0;
+      let unchecked = 0;
+      for (const sessionName of sessions) {
+        if (getWaiting(sessionName)) continue;
+        if (!attentionChecked.has(sessionName) && memberSessions.has(sessionName)) {
+          unchecked += 1;
+          continue;
+        }
+        resolved += await router.resolveAgentWaitingOnHuman(sessionName);
+      }
+      if (unchecked === 0) this.openWaitingEscalationsReconciled = true;
+      if (open.length > 0) {
+        this.logger.info('Checked waiting_on_human escalations left open by the previous run', {
+          open: open.length,
+          resolved,
+          stillWaiting: [...sessions].filter((s) => getWaiting(s)).length,
+          unchecked,
+        });
+      }
+    } catch (error) {
+      this.logger.warn('Could not check open waiting_on_human escalations (will retry next poll)', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  public startPolling(): void {
+    if (this.intervalId) {
+      this.logger.warn('Activity monitoring already running');
+      return;
+    }
+
+    this.logger.info(`Starting activity monitoring with ${this.POLLING_INTERVAL / 1000}s intervals (workingStatus only)`);
+    
+    // Run immediately first
+    this.performActivityCheck();
+    
+    // Set up recurring polling
+    this.intervalId = setInterval(() => {
+      this.performActivityCheck();
+    }, this.POLLING_INTERVAL);
+  }
+
+  public stopPolling(): void {
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+      this.logger.info('Activity monitoring stopped');
+    }
+  }
+
+  private async performActivityCheck(): Promise<void> {
+    try {
+      // Add timeout protection for entire activity check
+      await Promise.race([
+        this.performActivityCheckInternal(),
+        new Promise<void>((_, reject) => 
+          setTimeout(() => reject(new Error('Activity check timeout')), this.ACTIVITY_CHECK_TIMEOUT)
+        )
+      ]);
+      
+      // Perform periodic cleanup
+      this.performPeriodicCleanup();
+      
+    } catch (error) {
+      this.logger.error('Error during activity check', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  /**
+   * NEW ARCHITECTURE: Simplified activity checking
+   *
+   * This method now:
+   * 1. Detects stale agents via AgentHeartbeatService (30-minute threshold)
+   * 2. Checks terminal activity for working status (ONLY)
+   * 3. Updates teamWorkingStatus.json (separate from teams.json)
+   * 4. Removes ALL agentStatus logic (handled by AgentHeartbeatService)
+   */
+  private async performActivityCheckInternal(): Promise<void> {
+    const now = new Date().toISOString();
+
+    try {
+      // Step 1: Detect stale agents and mark dead ones as inactive
+      const staleThreshold = CONTINUATION_CONSTANTS.DETECTION.STALE_THRESHOLD_MINUTES;
+      const staleAgents = await this.agentHeartbeatService.detectStaleAgents(staleThreshold);
+      if (staleAgents.length > 0) {
+        this.logger.debug('Detected stale agents for potential inactivity', {
+          staleAgents,
+          thresholdMinutes: staleThreshold
+        });
+
+        // Batch-check stale agents and mark dead ones as inactive.
+        // We read teams ONCE, update all dead members in memory, and save
+        // each modified team ONCE — instead of calling updateAgentStatus()
+        // per agent which does a full getTeams()+saveTeam() each time,
+        // flooding the libuv thread pool with I/O.
+        try {
+          const backend = await this.getBackend();
+          const heartbeats = await this.agentHeartbeatService.getAllAgentHeartbeats();
+
+          // Collect dead session names first
+          const deadSessions = new Set<string>();
+          for (const agentId of staleAgents) {
+            let sessionName: string | undefined;
+            if (agentId === 'orchestrator') {
+              sessionName = heartbeats.orchestrator?.sessionName;
+            } else {
+              sessionName = heartbeats.teamMembers[agentId]?.sessionName;
+            }
+            if (!sessionName) continue;
+
+            // Skip orchestrator — its lifecycle is managed by OrchestratorHeartbeatMonitor,
+            // not the activity monitor. In-process runtimes (crewly-agent) have no PTY
+            // session, so sessionExists() would falsely return false.
+            if (agentId === AGENT_IDENTITY_CONSTANTS.ORCHESTRATOR.ID) {
+              this.logger.debug('Skipping orchestrator stale check (managed by OrchestratorHeartbeatMonitor)', {
+                sessionName,
+              });
+              continue;
+            }
+
+            const sessionAlive = backend.sessionExists(sessionName);
+            if (!sessionAlive) {
+              this.logger.debug('Marking stale agent as inactive (session dead)', {
+                agentId,
+                sessionName
+              });
+              deadSessions.add(sessionName);
+              // Update heartbeat file so detectStaleAgents stops re-detecting this agent
+              await this.agentHeartbeatService.updateAgentHeartbeat(
+                sessionName,
+                agentId,
+                CREWLY_CONSTANTS.AGENT_STATUSES.INACTIVE
+              );
+            }
+          }
+
+          // Batch-update team members: read teams once, save each modified team once
+          if (deadSessions.size > 0) {
+            const teams = await this.storageService.getTeams();
+            const modifiedTeams = new Set<string>();
+
+            for (const team of teams) {
+              for (const member of team.members || []) {
+                if (deadSessions.has(member.sessionName)) {
+                  member.agentStatus = CREWLY_CONSTANTS.AGENT_STATUSES.INACTIVE as any;
+                  member.updatedAt = new Date().toISOString();
+                  modifiedTeams.add(team.id);
+                }
+              }
+            }
+
+            // Save each modified team once (sequentially to avoid lock contention)
+            for (const team of teams) {
+              if (modifiedTeams.has(team.id)) {
+                await this.storageService.saveTeam(team);
+              }
+            }
+          }
+        } catch (cleanupError) {
+          this.logger.error('Error during stale agent cleanup', {
+            error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          });
+        }
+      }
+
+      // Step 2: Load current working status file
+      const workingStatusData = await this.loadTeamWorkingStatusFile();
+      let hasChanges = false;
+
+      // Step 3: Check orchestrator working status
+      const backend = await this.getBackend();
+      const orchestratorRunning = await Promise.race([
+        Promise.resolve(backend.sessionExists(CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME)),
+        new Promise<boolean>((_, reject) =>
+          setTimeout(() => reject(new Error('Orchestrator check timeout')), 1000)
+        )
+      ]).catch(() => false);
+
+      if (orchestratorRunning) {
+        const orchestratorOutput = await this.getTerminalOutput(CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME);
+        const previousOutput = this.lastTerminalOutputs.get('orchestrator') || '';
+        const outputChanged = orchestratorOutput !== previousOutput && orchestratorOutput.trim() !== '';
+
+        // Bridge to PtyActivityTracker so idle/heartbeat checks detect activity
+        // even when no WebSocket clients are connected
+        if (outputChanged) {
+          PtyActivityTrackerService.getInstance().recordActivity(CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME);
+        }
+
+        const orchMidTurn = this.isRuntimeMidTurn(CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME);
+        let newWorkingStatus: WorkingStatus = outputChanged || orchMidTurn ? 'in_progress' : 'idle';
+        const orchKey = 'orchestrator';
+        const previousStatus = workingStatusData.orchestrator.workingStatus;
+
+        // Auto-reset: if in_progress for longer than MAX_IN_PROGRESS_MS, force idle.
+        // Prevents workingStatus from getting stuck due to continuous terminal output
+        // (spinners, TUI re-renders, long-running tool calls). Not while the
+        // runtime reports a turn: that verdict expires on its own, and a
+        // forced idle mid-turn settled the agent's work every 15 min (PR #1013).
+        if (newWorkingStatus === 'in_progress' && !orchMidTurn) {
+          let busySince = this.busyTransitionTimestamps.get(orchKey);
+          if (!busySince) {
+            // Seed timestamp when status is already in_progress but no transition was
+            // observed (e.g. service restart with pre-existing in_progress in the file).
+            // Use updatedAt from the file if available, otherwise fall back to now.
+            const fileUpdatedAt = Date.parse(workingStatusData.orchestrator.updatedAt);
+            busySince = (previousStatus === 'in_progress' && !isNaN(fileUpdatedAt)) ? fileUpdatedAt : Date.now();
+            this.busyTransitionTimestamps.set(orchKey, busySince);
+          }
+          if ((Date.now() - busySince) > ACTIVITY_MONITOR_CONSTANTS.MAX_IN_PROGRESS_MS) {
+            this.logger.info('Auto-resetting orchestrator workingStatus from in_progress to idle (exceeded max duration)', {
+              durationMs: Date.now() - busySince,
+              maxMs: ACTIVITY_MONITOR_CONSTANTS.MAX_IN_PROGRESS_MS,
+            });
+            newWorkingStatus = 'idle';
+          }
+        }
+
+        const statusChanged = previousStatus !== newWorkingStatus;
+        this.observeStatus(CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME, newWorkingStatus, previousStatus);
+
+        if (statusChanged) {
+          workingStatusData.orchestrator.workingStatus = newWorkingStatus;
+          workingStatusData.orchestrator.lastActivityCheck = now;
+          workingStatusData.orchestrator.updatedAt = now;
+          hasChanges = true;
+
+          this.logger.info('Orchestrator working status updated', {
+            sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+            newWorkingStatus,
+            outputChanged
+          });
+        }
+
+        this.handleDurationGatedEmission(orchKey, newWorkingStatus, previousStatus, statusChanged, {
+          teamId: 'orchestrator',
+          teamName: 'Orchestrator',
+          memberId: AGENT_IDENTITY_CONSTANTS.ORCHESTRATOR.ID,
+          memberName: 'Orchestrator',
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+        }, now);
+
+        this.lastTerminalOutputs.set('orchestrator', orchestratorOutput);
+
+        // Track orchestrator PTY token usage (same as team members)
+        this.tryRecordPtyTokenUsage(
+          CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          orchestratorOutput,
+          'claude-code'
+        );
+      } else {
+        // Orchestrator not running, set to idle
+        this.observeStatus(CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME, 'idle', workingStatusData.orchestrator.workingStatus);
+        if (workingStatusData.orchestrator.workingStatus !== 'idle') {
+          workingStatusData.orchestrator.workingStatus = 'idle';
+          workingStatusData.orchestrator.lastActivityCheck = now;
+          workingStatusData.orchestrator.updatedAt = now;
+          hasChanges = true;
+        }
+      }
+
+      // Step 4: Check team member working statuses
+      const teams = await this.storageService.getTeams();
+      // Sessions whose waiting_on_human state this pass established (#851).
+      const attentionChecked = new Set<string>();
+
+      for (const team of teams) {
+        for (const member of team.members) {
+          if (member.sessionName) {
+            try {
+              // Check if session exists
+              const sessionExists = await Promise.race([
+                Promise.resolve(backend.sessionExists(member.sessionName)),
+                new Promise<boolean>((_, reject) =>
+                  setTimeout(() => reject(new Error('Session check timeout')), 500)
+                )
+              ]).catch(() => false);
+
+              if (!sessionExists) {
+                // Session doesn't exist, set to idle
+                const memberKey = member.sessionName;
+                this.observeStatus(memberKey, 'idle', workingStatusData.teamMembers[memberKey]?.workingStatus ?? null);
+                if (!workingStatusData.teamMembers[memberKey]) {
+                  workingStatusData.teamMembers[memberKey] = {
+                    sessionName: member.sessionName,
+                    teamMemberId: member.id,
+                    workingStatus: 'idle',
+                    lastActivityCheck: now,
+                    updatedAt: now
+                  };
+                  hasChanges = true;
+                } else if (workingStatusData.teamMembers[memberKey].workingStatus !== 'idle') {
+                  workingStatusData.teamMembers[memberKey].workingStatus = 'idle';
+                  workingStatusData.teamMembers[memberKey].lastActivityCheck = now;
+                  workingStatusData.teamMembers[memberKey].updatedAt = now;
+                  hasChanges = true;
+                }
+
+                this.lastTerminalOutputs.delete(memberKey);
+                this.busyTransitionTimestamps.delete(memberKey);
+                this.busyEventEmitted.delete(memberKey);
+                await this.clearAttention(member.sessionName, {
+                  teamId: team.id, teamName: team.name, memberId: member.id, memberName: member.name, sessionName: member.sessionName,
+                }, now);
+                attentionChecked.add(member.sessionName);
+                continue;
+              }
+
+              // waiting_on_human (#815): is the agent blocked on a prompt? The same
+              // screen read says whether a background (fork) agent is still running.
+              const attention = await this.evaluateAttention(backend, {
+                teamId: team.id, teamName: team.name, memberId: member.id, memberName: member.name, sessionName: member.sessionName,
+              }, now);
+              attentionChecked.add(member.sessionName);
+              const backgroundWork = attention?.evidence.includes(BACKGROUND_AGENT_EVIDENCE) ?? false;
+
+              // Antigravity can hang on a finished "Running command..." spinner: Escape un-sticks it.
+              if (effectiveRuntimeType(member.sessionName, member.runtimeType ?? '') === RUNTIME_TYPES.ANTIGRAVITY_CLI) {
+                this.checkStuckAntigravityCommand(backend, member.sessionName);
+              }
+
+              // Get terminal output and check for activity
+              const currentOutput = await this.getTerminalOutput(member.sessionName);
+              const previousOutput = this.lastTerminalOutputs.get(member.sessionName) || '';
+              let outputChanged = currentOutput !== previousOutput && currentOutput.trim() !== '';
+
+              // Gemini CLI TUI re-renders in place, so bottom-N line comparison
+              // often shows no change even while the agent is actively working.
+              // Fall back to raw PTY activity timestamp as an additional signal.
+              if (!outputChanged && effectiveRuntimeType(member.sessionName, member.runtimeType ?? '') === RUNTIME_TYPES.GEMINI_CLI) {
+                const tracker = PtyActivityTrackerService.getInstance();
+                const idleMs = tracker.getIdleTimeMs(member.sessionName);
+                if (idleMs > 0 && idleMs < ACTIVITY_MONITOR_CONSTANTS.POLLING_INTERVAL_MS) {
+                  outputChanged = true;
+                }
+              }
+
+              // A silent screen mid-turn (long tool call, long tool input) is not idle,
+              // and neither is a prompt with a background (fork) agent still running:
+              // the runtime reports no turn then, but stopping the agent kills the fork.
+              const memberMidTurn = this.isRuntimeMidTurn(member.sessionName);
+              let newWorkingStatus: WorkingStatus = outputChanged || memberMidTurn || backgroundWork ? 'in_progress' : 'idle';
+
+              // Auto-reset: if in_progress for longer than MAX_IN_PROGRESS_MS, force idle
+              // (never while the runtime reports a turn — see the orchestrator branch —
+              // or a background agent is running; a long render is not a stuck spinner)
+              const memberKey = member.sessionName;
+              if (newWorkingStatus === 'in_progress' && !memberMidTurn && !backgroundWork) {
+                let busySince = this.busyTransitionTimestamps.get(memberKey);
+                if (!busySince) {
+                  // Seed timestamp when status is already in_progress but no transition was
+                  // observed (e.g. service restart with pre-existing in_progress in the file).
+                  const existingEntry = workingStatusData.teamMembers[memberKey];
+                  const fileUpdatedAt = existingEntry ? Date.parse(existingEntry.updatedAt) : NaN;
+                  const previousMemberStatus = existingEntry?.workingStatus;
+                  busySince = (previousMemberStatus === 'in_progress' && !isNaN(fileUpdatedAt)) ? fileUpdatedAt : Date.now();
+                  this.busyTransitionTimestamps.set(memberKey, busySince);
+                }
+                if ((Date.now() - busySince) > ACTIVITY_MONITOR_CONSTANTS.MAX_IN_PROGRESS_MS) {
+                  this.logger.info('Auto-resetting member workingStatus from in_progress to idle (exceeded max duration)', {
+                    sessionName: member.sessionName,
+                    durationMs: Date.now() - busySince,
+                    maxMs: ACTIVITY_MONITOR_CONSTANTS.MAX_IN_PROGRESS_MS,
+                  });
+                  newWorkingStatus = 'idle';
+                }
+              }
+
+              this.observeStatus(memberKey, newWorkingStatus, workingStatusData.teamMembers[memberKey]?.workingStatus ?? null);
+
+              // Update working status if changed
+              if (!workingStatusData.teamMembers[memberKey]) {
+                workingStatusData.teamMembers[memberKey] = {
+                  sessionName: member.sessionName,
+                  teamMemberId: member.id,
+                  workingStatus: newWorkingStatus,
+                  lastActivityCheck: now,
+                  updatedAt: now
+                };
+                hasChanges = true;
+              } else {
+                const previousMemberStatus = workingStatusData.teamMembers[memberKey].workingStatus;
+                const memberStatusChanged = previousMemberStatus !== newWorkingStatus;
+
+                if (memberStatusChanged) {
+                  workingStatusData.teamMembers[memberKey].workingStatus = newWorkingStatus;
+                  workingStatusData.teamMembers[memberKey].lastActivityCheck = now;
+                  workingStatusData.teamMembers[memberKey].updatedAt = now;
+                  hasChanges = true;
+
+                  this.logger.info('Team member working status updated', {
+                    teamId: team.id,
+                    memberId: member.id,
+                    memberName: member.name,
+                    sessionName: member.sessionName,
+                    newWorkingStatus,
+                    outputChanged
+                  });
+                }
+
+                this.handleDurationGatedEmission(memberKey, newWorkingStatus, previousMemberStatus, memberStatusChanged, {
+                  teamId: team.id,
+                  teamName: team.name,
+                  memberId: member.id,
+                  memberName: member.name,
+                  sessionName: member.sessionName,
+                }, now);
+              }
+
+              this.lastTerminalOutputs.set(member.sessionName, currentOutput);
+
+              // Token usage tracking: parse PTY output for token data from CLI runtimes
+              this.tryRecordPtyTokenUsage(
+                member.sessionName,
+                currentOutput,
+                effectiveRuntimeType(member.sessionName, member.runtimeType ?? '') as 'claude-code' | 'gemini-cli' | 'codex-cli' | undefined
+              );
+
+            } catch (error) {
+              this.logger.error('Error checking member working status', {
+                teamId: team.id,
+                memberId: member.id,
+                memberName: member.name,
+                sessionName: member.sessionName,
+                error: error instanceof Error ? error.message : String(error)
+              });
+            }
+          }
+        }
+      }
+
+      // Step 4b: once per run, close waiting_on_human escalations the previous
+      // run left open for prompts that are no longer on screen (#851).
+      if (!this.openWaitingEscalationsReconciled) {
+        const memberSessions = new Set<string>();
+        for (const team of teams) {
+          for (const member of team.members) if (member.sessionName) memberSessions.add(member.sessionName);
+        }
+        await this.reconcileOpenWaitingEscalations(attentionChecked, memberSessions);
+      }
+
+      // Step 5: Save changes if any
+      if (hasChanges) {
+        workingStatusData.metadata.lastUpdated = now;
+        await this.saveTeamWorkingStatusFile(workingStatusData);
+        this.logger.debug('Updated teamWorkingStatus.json with activity changes');
+      }
+
+    } catch (error) {
+      this.logger.error('Error during activity check', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  /**
+   * Load teamWorkingStatus.json file with proper initialization
+   */
+  private async loadTeamWorkingStatusFile(): Promise<TeamWorkingStatusFile> {
+    try {
+      if (!existsSync(this.teamWorkingStatusFile)) {
+        const defaultData = this.createDefaultTeamWorkingStatusFile();
+        await this.saveTeamWorkingStatusFile(defaultData);
+        this.logger.info('Created new teamWorkingStatus.json file');
+        return defaultData;
+      }
+
+      const content = await readFile(this.teamWorkingStatusFile, 'utf-8');
+      const data = JSON.parse(content) as TeamWorkingStatusFile;
+
+      // Validate structure
+      if (!data.orchestrator || !data.teamMembers || !data.metadata) {
+        this.logger.warn('Invalid teamWorkingStatus.json structure, reinitializing');
+        const defaultData = this.createDefaultTeamWorkingStatusFile();
+        await this.saveTeamWorkingStatusFile(defaultData);
+        return defaultData;
+      }
+
+      return data;
+    } catch (error) {
+      this.logger.error('Failed to load teamWorkingStatus.json, creating new file', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+      const defaultData = this.createDefaultTeamWorkingStatusFile();
+      await this.saveTeamWorkingStatusFile(defaultData);
+      return defaultData;
+    }
+  }
+
+  /**
+   * Save teamWorkingStatus.json file with atomic write
+   */
+  private async saveTeamWorkingStatusFile(data: TeamWorkingStatusFile): Promise<void> {
+    const content = JSON.stringify(data, null, 2);
+    const tempFile = `${this.teamWorkingStatusFile}.tmp`;
+
+    try {
+      // Write to temp file first, then rename (atomic operation)
+      await writeFile(tempFile, content, 'utf-8');
+      await rename(tempFile, this.teamWorkingStatusFile);
+    } catch (error) {
+      // Clean up temp file if something went wrong
+      try {
+        await unlink(tempFile);
+      } catch {}
+      throw error;
+    }
+  }
+
+  /**
+   * Create default teamWorkingStatus.json structure
+   */
+  private createDefaultTeamWorkingStatusFile(): TeamWorkingStatusFile {
+    const now = new Date().toISOString();
+    return {
+      orchestrator: {
+        sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+        workingStatus: 'idle',
+        lastActivityCheck: now,
+        updatedAt: now
+      },
+      teamMembers: {},
+      metadata: {
+        lastUpdated: now,
+        version: '1.0.0'
+      }
+    };
+  }
+
+  /**
+   * Cleanup old terminal outputs and perform garbage collection
+   */
+  private performPeriodicCleanup(): void {
+    const now = Date.now();
+
+    // Clean up every 2 minutes
+    if (now - this.lastCleanup > 2 * 60 * 1000) {
+      // Limit the size of lastTerminalOutputs Map to prevent memory leaks
+      if (this.lastTerminalOutputs.size > 50) {
+        const entries = Array.from(this.lastTerminalOutputs.entries());
+        this.lastTerminalOutputs.clear();
+
+        // Keep only the most recent 25 entries
+        const recentEntries = entries.slice(-25);
+        for (const [key, value] of recentEntries) {
+          this.lastTerminalOutputs.set(key, value);
+        }
+      }
+
+      this.lastCleanup = now;
+
+      // Force garbage collection if available
+      if (global.gc) {
+        global.gc();
+        this.logger.debug('Performed periodic cleanup with garbage collection', {
+          mapSize: this.lastTerminalOutputs.size
+        });
+      } else {
+        this.logger.debug('Performed periodic cleanup', {
+          mapSize: this.lastTerminalOutputs.size
+        });
+      }
+    }
+  }
+
+  /**
+   * Attempt to parse and record token usage from PTY terminal output.
+   *
+   * Only records when token tracking is enabled in settings and when the
+   * parsed token counts differ from the last recorded values (to avoid
+   * duplicate recording from the same output being captured multiple times).
+   *
+   * @param sessionName - Agent session name
+   * @param output - Captured terminal output
+   * @param runtimeType - Runtime type hint for parser selection
+   */
+  private tryRecordPtyTokenUsage(
+    sessionName: string,
+    output: string,
+    runtimeType?: 'claude-code' | 'gemini-cli' | 'codex-cli'
+  ): void {
+    // Skip non-PTY runtimes (crewly-agent records via SDK, not PTY output),
+    // and Codex: its exact per-call usage comes from the rollout files
+    // (CodexRolloutSyncService) — parsing the TUI too would count it twice.
+    if (!runtimeType || runtimeType === ('crewly-agent' as string) || runtimeType === 'codex-cli') return;
+
+    try {
+      // Refresh cached tokenTracking setting every 60 seconds
+      const now = Date.now();
+      if (now - this.tokenTrackingLastCheck > 60_000) {
+        this.tokenTrackingLastCheck = now;
+        getSettingsService().getSettings().then(s => {
+          this.tokenTrackingEnabled = s.general.tokenTracking ?? false;
+        }).catch(() => { /* ignore */ });
+      }
+      if (!this.tokenTrackingEnabled) return;
+
+      const parsed = parseRuntimeTokens(output, runtimeType);
+      if (!parsed) return;
+
+      // Dedup: skip if we already recorded these exact counts for this session
+      const last = this.lastRecordedTokens.get(sessionName);
+      if (last && last.input === parsed.inputTokens && last.output === parsed.outputTokens) {
+        return;
+      }
+
+      // Record delta if we have a previous reading, otherwise record full amount
+      const deltaInput = last ? Math.max(0, parsed.inputTokens - last.input) : parsed.inputTokens;
+      const deltaOutput = last ? Math.max(0, parsed.outputTokens - last.output) : parsed.outputTokens;
+
+      if (deltaInput > 0 || deltaOutput > 0) {
+        const model = parsed.model ?? `${runtimeType}-default`;
+        TokenUsageService.getInstance().recordUsage(
+          sessionName,
+          sessionName,
+          deltaInput,
+          deltaOutput,
+          model
+        );
+        this.lastRecordedTokens.set(sessionName, {
+          input: parsed.inputTokens,
+          output: parsed.outputTokens,
+        });
+      }
+    } catch {
+      // Non-critical — don't let token parsing errors affect activity monitoring
+    }
+  }
+
+  /**
+   * Send Escape to an antigravity session stuck on a finished "Running command..." spinner.
+   *
+   * @param backend - Session backend
+   * @param sessionName - Antigravity session
+   */
+  private checkStuckAntigravityCommand(backend: ISessionBackend, sessionName: string): void {
+    try {
+      const session = backend.getSession(sessionName);
+      if (!session) return;
+      const screen = stripAnsiCodes(backend.captureOutput(sessionName, ANTIGRAVITY_STUCK_COMMAND_CONSTANTS.SCREEN_LINES));
+      this.stuckCommandDetector.observe(sessionName, {
+        screen,
+        shellPid: session.pid ?? null,
+        sendEscape: () => session.write('\x1b'),
+      });
+    } catch (error) {
+      this.logger.debug('Stuck antigravity command check failed', { sessionName, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  /**
+   * Get terminal output with size limits for activity detection
+   */
+  private async getTerminalOutput(sessionName: string): Promise<string> {
+    try {
+      const backend = await this.getBackend();
+      const output = await Promise.race([
+        Promise.resolve(backend.captureOutput(sessionName, 5)), // 5 lines only
+        new Promise<string>((_, reject) =>
+          setTimeout(() => reject(new Error('Capture timeout')), 500)
+        )
+      ]);
+
+      // Strip ANSI escape codes so TUI re-renders (spinners, cursor
+      // repositioning) don't register as meaningful output changes.
+      const cleaned = stripAnsiCodes(output).trim();
+
+      // Limit output size to prevent memory issues
+      return cleaned.length > this.MAX_OUTPUT_SIZE
+        ? cleaned.substring(cleaned.length - this.MAX_OUTPUT_SIZE)
+        : cleaned;
+    } catch (error) {
+      return '';
+    }
+  }
+
+  public isRunning(): boolean {
+    return this.intervalId !== null;
+  }
+
+  public getPollingInterval(): number {
+    return this.POLLING_INTERVAL;
+  }
+
+  /**
+   * Get current team working status data
+   * Useful for external services that need to check working statuses
+   */
+  public async getTeamWorkingStatus(): Promise<TeamWorkingStatusFile> {
+    return await this.loadTeamWorkingStatusFile();
+  }
+
+  /**
+   * Get working status for a specific session
+   */
+  public async getWorkingStatusForSession(sessionName: string): Promise<WorkingStatus | null> {
+    try {
+      const data = await this.loadTeamWorkingStatusFile();
+
+      if (sessionName === CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME) {
+        return data.orchestrator.workingStatus;
+      }
+
+      return data.teamMembers[sessionName]?.workingStatus || null;
+    } catch (error) {
+      this.logger.error('Failed to get working status for session', {
+        sessionName,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return null;
+    }
+  }
+}

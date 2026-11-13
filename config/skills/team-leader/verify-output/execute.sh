@@ -1,0 +1,380 @@
+#!/bin/bash
+# Verify a completed task's output against the team's verification pipeline.
+# Reads the task output and runs verification steps based on the team template.
+#
+# Supports two modes:
+# 1. Explicit checks: pass checks[] array directly (legacy behavior)
+# 2. Template pipeline: pass templateId to load verification steps from template
+#
+# When templateId is provided and checks is empty, pipeline steps are loaded
+# from the template API and executed according to the passPolicy.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../_common/lib.sh"
+
+INPUT=$(read_json_input "${1:-}")
+[ -z "$INPUT" ] && error_exit "Usage: execute.sh '{\"workItemId\":\"...\",\"workerId\":\"...\",\"teamId\":\"...\",\"projectPath\":\"...\",\"templateId\":\"dev-fullstack\",\"checks\":[...]}'"
+
+# `taskId` is accepted as a backwards-compat alias for `workItemId`. The
+# v1 filesystem-based `taskPath` input is no longer accepted — fetch the
+# WorkItem via `GET /api/task-pool/items/:id` instead. See spec
+# 2026-05-06-task-management-v1-deprecation.md.
+WORK_ITEM_ID=$(printf '%s' "$INPUT" | jq -r '.workItemId // .taskId // empty')
+TASK_ID="$WORK_ITEM_ID"
+WORKER_ID=$(printf '%s' "$INPUT" | jq -r '.workerId // empty')
+TEAM_ID=$(printf '%s' "$INPUT" | jq -r '.teamId // empty')
+PROJECT_PATH=$(printf '%s' "$INPUT" | jq -r '.projectPath // empty')
+TEMPLATE_ID=$(printf '%s' "$INPUT" | jq -r '.templateId // empty')
+CHECKLIST_PATH=$(printf '%s' "$INPUT" | jq -r '.checklistPath // empty')
+CHECKS=$(printf '%s' "$INPUT" | jq -c '.checks // []')
+
+require_param "workItemId (or taskId)" "$WORK_ITEM_ID"
+
+# Fetch the WorkItem (brief, output) in a single call.
+TASK_OUTPUT=""
+WI_DATA=$(api_call GET "/task-pool/items/${WORK_ITEM_ID}" 2>/dev/null || echo '{}')
+WI_BRIEF=$(echo "$WI_DATA" | jq -r '.data.briefMarkdown // empty' 2>/dev/null || true)
+WI_OUTPUT_RAW=$(echo "$WI_DATA" | jq -c '.data.output // empty' 2>/dev/null || true)
+
+# Evidence first (#873). The worker's completion carries an evidence block
+# (artifacts that exist, commands with exit codes, or blocked steps), stored
+# at output.evidence. Read it before anything else, and flag an item that was
+# marked done WITHOUT evidence — possible only with CREWLY_EVIDENCE_MODE=warn
+# or on an item completed before #1312 — so it is not verified on its summary alone.
+WI_FOUND=$(echo "$WI_DATA" | jq -r 'if (.data // null) != null then "yes" else "no" end' 2>/dev/null || echo "no")
+WI_EVIDENCE=$(echo "$WI_DATA" | jq -c 'if (.data.output.evidence | type) == "array" then .data.output.evidence else [] end' 2>/dev/null || echo '[]')
+# The worker's decision record (#875): decisions, options not taken, assumptions.
+# Shown to the reviewer as `record`; null when the worker sent none.
+WI_RECORD=$(echo "$WI_DATA" | jq -c '.data.output | {decisions, notTaken, assumptions} | with_entries(select(.value != null)) | if length == 0 then null else . end' 2>/dev/null || echo 'null')
+[ -z "$WI_RECORD" ] && WI_RECORD=null
+EVIDENCE_WARNING=""
+if [ "$WI_FOUND" = "yes" ]; then
+  if [ "$(printf '%s' "$WI_EVIDENCE" | jq 'length')" = "0" ]; then
+    EVIDENCE_WARNING="No completion evidence: this WorkItem was marked done without artifacts or commands (accepted only in evidence warn mode). Do not verify on the summary alone — check the work directly, or send it back asking for evidence."
+  else
+    BLOCKED_STEPS=$(printf '%s' "$WI_EVIDENCE" | jq -r '[.[] | select(.type == "blocked") | "\(.step): \(.reason)"] | join("; ")')
+    if [ -n "$BLOCKED_STEPS" ]; then
+      EVIDENCE_WARNING="The worker reported blocked steps (the item is blocked, not done): ${BLOCKED_STEPS}"
+    fi
+  fi
+fi
+
+# Compose `TASK_OUTPUT` for content-scan checks. Prefer worker-supplied
+# structured output, falling back to the brief if no output was set.
+if [ -n "$WI_OUTPUT_RAW" ] && [ "$WI_OUTPUT_RAW" != "null" ] && [ "$WI_OUTPUT_RAW" != "" ]; then
+  TASK_OUTPUT="$WI_OUTPUT_RAW"
+elif [ -n "$WI_BRIEF" ]; then
+  TASK_OUTPUT="$WI_BRIEF"
+fi
+
+# Defaults. A pre-approved checklist or a template pipeline (below) may
+# override these — they must NOT be reset after checklist loading, or the
+# checklist's passPolicy is silently discarded.
+PASS_POLICY="all"
+MAX_RETRIES=2
+
+# =============================================================================
+# Pre-approved checklist loading (from design-checklist skill)
+# =============================================================================
+
+# If checklistPath is provided, load pre-approved checklist items as checks.
+# This takes priority over template pipeline and inline checks.
+if [ -n "$CHECKLIST_PATH" ] && [ -f "$CHECKLIST_PATH" ]; then
+  CHECKLIST_DATA=$(cat "$CHECKLIST_PATH" 2>/dev/null || echo '{}')
+  CHECKLIST_STATUS=$(echo "$CHECKLIST_DATA" | jq -r '.status // "unknown"' 2>/dev/null || true)
+
+  if [ "$CHECKLIST_STATUS" = "approved" ]; then
+    # Convert checklist items to verification checks.
+    # NOTE: `(.command // empty)` inside an object constructor makes jq drop
+    # the WHOLE item when the key is absent, so every checklist item without
+    # both `command` and `pattern` used to vanish. Use `// null` instead —
+    # the consumers below read fields with `// empty`, so null is harmless.
+    CHECKS=$(echo "$CHECKLIST_DATA" | jq -c '
+      [.items[] | {
+        name: .id,
+        type: .type,
+        command: (.command // null),
+        pattern: (.pattern // null),
+        description: .description,
+        critical: (.critical // false)
+      }]
+    ' 2>/dev/null || echo '[]')
+
+    PASS_POLICY=$(echo "$CHECKLIST_DATA" | jq -r '.passPolicy // "critical_only"' 2>/dev/null || echo "critical_only")
+  else
+    echo '{"error":"Checklist exists but is not approved (status: '"$CHECKLIST_STATUS"'). Approve first via POST /api/checklists/'$TASK_ID'/approve"}' >&2
+    # Fall through to template/inline checks
+  fi
+
+# If no checklistPath but taskId, try to find checklist automatically
+elif [ -n "$TASK_ID" ] && [ -n "$PROJECT_PATH" ]; then
+  AUTO_CHECKLIST="${PROJECT_PATH}/.crewly/tasks/checklist-${TASK_ID}.json"
+  if [ -f "$AUTO_CHECKLIST" ]; then
+    CHECKLIST_STATUS=$(jq -r '.status // "unknown"' "$AUTO_CHECKLIST" 2>/dev/null || true)
+    if [ "$CHECKLIST_STATUS" = "approved" ]; then
+      CHECKS=$(jq -c '[.items[] | {name: .id, type: .type, command: (.command // null), pattern: (.pattern // null), description: .description, critical: (.critical // false)}]' "$AUTO_CHECKLIST" 2>/dev/null || echo '[]')
+      PASS_POLICY=$(jq -r '.passPolicy // "critical_only"' "$AUTO_CHECKLIST" 2>/dev/null || echo "critical_only")
+    fi
+  fi
+fi
+
+# =============================================================================
+# Pipeline loading: convert template pipeline steps to checks
+# =============================================================================
+
+CHECK_COUNT=$(echo "$CHECKS" | jq 'length')
+
+if [ "$CHECK_COUNT" = "0" ] && [ -n "$TEMPLATE_ID" ]; then
+  # Load pipeline from template API
+  TEMPLATE_DATA=$(api_call GET "/templates/${TEMPLATE_ID}" 2>/dev/null || echo '{}')
+  TEMPLATE_SUCCESS=$(echo "$TEMPLATE_DATA" | jq -r '.success // false' 2>/dev/null || echo "false")
+
+  if [ "$TEMPLATE_SUCCESS" = "true" ]; then
+    PIPELINE=$(echo "$TEMPLATE_DATA" | jq -c '.data.verificationPipeline // {}' 2>/dev/null || echo '{}')
+    PASS_POLICY=$(echo "$PIPELINE" | jq -r '.passPolicy // "all"')
+    MAX_RETRIES=$(echo "$PIPELINE" | jq -r '.maxRetries // 2')
+    STEPS=$(echo "$PIPELINE" | jq -c '.steps // []')
+    STEP_COUNT=$(echo "$STEPS" | jq 'length')
+
+    # Convert pipeline steps to checks format
+    CHECKS="[]"
+    for i in $(seq 0 $((STEP_COUNT - 1))); do
+      STEP_ID=$(echo "$STEPS" | jq -r ".[$i].id // \"step-${i}\"")
+      STEP_NAME=$(echo "$STEPS" | jq -r ".[$i].name // \"Step ${i}\"")
+      STEP_METHOD=$(echo "$STEPS" | jq -r ".[$i].method // \"manual_review\"")
+      STEP_CRITICAL=$(echo "$STEPS" | jq -r ".[$i].critical // false")
+      STEP_CONFIG=$(echo "$STEPS" | jq -c ".[$i].config // {}")
+
+      case "$STEP_METHOD" in
+        quality_gates)
+          # Map quality gates to command checks using the gates config
+          GATES=$(echo "$STEP_CONFIG" | jq -r '.gates // [] | .[]' 2>/dev/null || true)
+          if [ -n "$GATES" ] && [ -n "$PROJECT_PATH" ]; then
+            for GATE in $GATES; do
+              GATE_CMD=""
+              case "$GATE" in
+                typecheck) GATE_CMD="npm run typecheck 2>&1 || npx tsc --noEmit 2>&1" ;;
+                tests)     GATE_CMD="npm test 2>&1" ;;
+                build)     GATE_CMD="npm run build 2>&1" ;;
+                lint)      GATE_CMD="npm run lint 2>&1" ;;
+              esac
+              if [ -n "$GATE_CMD" ]; then
+                CHECKS=$(echo "$CHECKS" | jq \
+                  --arg name "${STEP_ID}-${GATE}" \
+                  --arg command "$GATE_CMD" \
+                  --arg critical "$STEP_CRITICAL" \
+                  '. + [{name: $name, command: $command, type: "command", critical: ($critical == "true")}]')
+              fi
+            done
+          else
+            # No gates specified — default to build check
+            CHECKS=$(echo "$CHECKS" | jq \
+              --arg name "$STEP_ID" \
+              --arg command "npm run build 2>&1" \
+              --arg critical "$STEP_CRITICAL" \
+              '. + [{name: $name, command: $command, type: "command", critical: ($critical == "true")}]')
+          fi
+          ;;
+        e2e_test)
+          # Map to e2e test command
+          FRAMEWORK=$(echo "$STEP_CONFIG" | jq -r '.framework // "playwright"')
+          TEST_DIR=$(echo "$STEP_CONFIG" | jq -r '.testDir // "tests/e2e"')
+          CHECKS=$(echo "$CHECKS" | jq \
+            --arg name "$STEP_ID" \
+            --arg command "npx ${FRAMEWORK} test ${TEST_DIR} 2>&1" \
+            --arg critical "$STEP_CRITICAL" \
+            '. + [{name: $name, command: $command, type: "command", critical: ($critical == "true")}]')
+          ;;
+        code_review|screenshot_review|gemini_vision|content_check|fact_check|source_verify|data_validate|browser_test|custom_script|manual_review)
+          # These methods require TL judgment — record as manual review steps
+          CHECKS=$(echo "$CHECKS" | jq \
+            --arg name "$STEP_ID" \
+            --arg desc "$STEP_NAME" \
+            --arg method "$STEP_METHOD" \
+            --arg critical "$STEP_CRITICAL" \
+            '. + [{name: $name, type: "manual", method: $method, description: $desc, critical: ($critical == "true")}]')
+          ;;
+        *)
+          # Unknown method — skip
+          CHECKS=$(echo "$CHECKS" | jq \
+            --arg name "$STEP_ID" \
+            --arg method "$STEP_METHOD" \
+            --arg critical "$STEP_CRITICAL" \
+            '. + [{name: $name, type: "skip", method: $method, critical: ($critical == "true")}]')
+          ;;
+      esac
+    done
+
+    CHECK_COUNT=$(echo "$CHECKS" | jq 'length')
+  fi
+fi
+
+# =============================================================================
+# Run verification checks
+# =============================================================================
+
+RESULTS="[]"
+TOTAL_PASSED=0
+TOTAL_FAILED=0
+CRITICAL_PASSED=0
+CRITICAL_FAILED=0
+FAILED_STEPS="[]"
+
+if [ "$CHECK_COUNT" = "0" ]; then
+  # No checks at all — report a pass-through verification
+  RESULTS=$(jq -n '[{
+    "name": "manual-review",
+    "passed": true,
+    "critical": false,
+    "message": "No automated checks configured. Task output available for manual review."
+  }]')
+  TOTAL_PASSED=1
+else
+  for i in $(seq 0 $((CHECK_COUNT - 1))); do
+    CHECK_NAME=$(echo "$CHECKS" | jq -r ".[$i].name // \"check-${i}\"")
+    CHECK_CMD=$(echo "$CHECKS" | jq -r ".[$i].command // empty")
+    CHECK_TYPE=$(echo "$CHECKS" | jq -r ".[$i].type // \"command\"")
+    CHECK_CRITICAL=$(echo "$CHECKS" | jq -r ".[$i].critical // false")
+
+    if [ "$CHECK_TYPE" = "command" ] && [ -n "$CHECK_CMD" ] && [ -n "$PROJECT_PATH" ]; then
+      # Execute the verification command in the project directory
+      CHECK_OUTPUT=""
+      CHECK_PASSED=true
+      CHECK_OUTPUT=$(cd "$PROJECT_PATH" && eval "$CHECK_CMD" 2>&1) || CHECK_PASSED=false
+
+      # Truncate output to avoid huge payloads
+      CHECK_OUTPUT=$(echo "$CHECK_OUTPUT" | tail -50)
+
+      if [ "$CHECK_PASSED" = "true" ]; then
+        TOTAL_PASSED=$((TOTAL_PASSED + 1))
+        [ "$CHECK_CRITICAL" = "true" ] && CRITICAL_PASSED=$((CRITICAL_PASSED + 1))
+      else
+        TOTAL_FAILED=$((TOTAL_FAILED + 1))
+        [ "$CHECK_CRITICAL" = "true" ] && CRITICAL_FAILED=$((CRITICAL_FAILED + 1))
+        FAILED_STEPS=$(echo "$FAILED_STEPS" | jq --arg name "$CHECK_NAME" '. + [$name]')
+      fi
+
+      RESULTS=$(echo "$RESULTS" | jq \
+        --arg name "$CHECK_NAME" \
+        --arg passed "$CHECK_PASSED" \
+        --arg output "$CHECK_OUTPUT" \
+        --arg critical "$CHECK_CRITICAL" \
+        '. + [{name: $name, passed: ($passed == "true"), critical: ($critical == "true"), output: $output}]')
+    elif [ "$CHECK_TYPE" = "content-scan" ]; then
+      # Content-based verification (check task output contains expected patterns)
+      CHECK_PATTERN=$(echo "$CHECKS" | jq -r ".[$i].pattern // empty")
+      if [ -n "$CHECK_PATTERN" ] && [ -n "$TASK_OUTPUT" ]; then
+        if echo "$TASK_OUTPUT" | grep -qiE "$CHECK_PATTERN"; then
+          TOTAL_PASSED=$((TOTAL_PASSED + 1))
+          [ "$CHECK_CRITICAL" = "true" ] && CRITICAL_PASSED=$((CRITICAL_PASSED + 1))
+          RESULTS=$(echo "$RESULTS" | jq --arg name "$CHECK_NAME" --arg critical "$CHECK_CRITICAL" \
+            '. + [{name: $name, passed: true, critical: ($critical == "true"), output: "Pattern found"}]')
+        else
+          TOTAL_FAILED=$((TOTAL_FAILED + 1))
+          [ "$CHECK_CRITICAL" = "true" ] && CRITICAL_FAILED=$((CRITICAL_FAILED + 1))
+          FAILED_STEPS=$(echo "$FAILED_STEPS" | jq --arg name "$CHECK_NAME" '. + [$name]')
+          RESULTS=$(echo "$RESULTS" | jq --arg name "$CHECK_NAME" --arg critical "$CHECK_CRITICAL" \
+            '. + [{name: $name, passed: false, critical: ($critical == "true"), output: "Pattern not found"}]')
+        fi
+      else
+        TOTAL_PASSED=$((TOTAL_PASSED + 1))
+        [ "$CHECK_CRITICAL" = "true" ] && CRITICAL_PASSED=$((CRITICAL_PASSED + 1))
+        RESULTS=$(echo "$RESULTS" | jq --arg name "$CHECK_NAME" --arg critical "$CHECK_CRITICAL" \
+          '. + [{name: $name, passed: true, critical: ($critical == "true"), output: "Skipped (no pattern or output)"}]')
+      fi
+    elif [ "$CHECK_TYPE" = "manual" ]; then
+      # Manual review steps — require TL judgment, auto-pass with note
+      CHECK_METHOD=$(echo "$CHECKS" | jq -r ".[$i].method // \"manual_review\"")
+      CHECK_DESC=$(echo "$CHECKS" | jq -r ".[$i].description // \"Manual review required\"")
+      TOTAL_PASSED=$((TOTAL_PASSED + 1))
+      [ "$CHECK_CRITICAL" = "true" ] && CRITICAL_PASSED=$((CRITICAL_PASSED + 1))
+      RESULTS=$(echo "$RESULTS" | jq \
+        --arg name "$CHECK_NAME" \
+        --arg method "$CHECK_METHOD" \
+        --arg desc "$CHECK_DESC" \
+        --arg critical "$CHECK_CRITICAL" \
+        '. + [{name: $name, passed: true, critical: ($critical == "true"), output: ("Requires TL judgment: " + $desc), method: $method, requiresReview: true}]')
+    else
+      # Unknown check type — skip
+      RESULTS=$(echo "$RESULTS" | jq --arg name "$CHECK_NAME" --arg type "$CHECK_TYPE" --arg critical "$CHECK_CRITICAL" \
+        '. + [{name: $name, passed: true, critical: ($critical == "true"), output: ("Skipped: unknown check type " + $type)}]')
+      TOTAL_PASSED=$((TOTAL_PASSED + 1))
+      [ "$CHECK_CRITICAL" = "true" ] && CRITICAL_PASSED=$((CRITICAL_PASSED + 1))
+    fi
+  done
+fi
+
+# =============================================================================
+# Calculate pass/fail based on passPolicy
+# =============================================================================
+
+TOTAL_CHECKS=$((TOTAL_PASSED + TOTAL_FAILED))
+if [ "$TOTAL_CHECKS" -gt 0 ]; then
+  SCORE=$(echo "scale=0; $TOTAL_PASSED * 100 / $TOTAL_CHECKS" | bc)
+else
+  SCORE=100
+fi
+
+# Determine overall pass based on passPolicy
+case "$PASS_POLICY" in
+  critical_only)
+    # Only critical steps must pass
+    PASSED=$( [ "$CRITICAL_FAILED" -eq 0 ] && echo "true" || echo "false" )
+    ;;
+  majority)
+    # >50% of total checks must pass
+    HALF=$(echo "scale=0; $TOTAL_CHECKS / 2" | bc)
+    PASSED=$( [ "$TOTAL_PASSED" -gt "$HALF" ] && echo "true" || echo "false" )
+    ;;
+  all|*)
+    # All checks must pass (default)
+    PASSED=$( [ "$TOTAL_FAILED" -eq 0 ] && echo "true" || echo "false" )
+    ;;
+esac
+
+# Build feedback message
+if [ "$PASSED" = "true" ]; then
+  FEEDBACK="Verification passed (${TOTAL_PASSED}/${TOTAL_CHECKS} checks, policy: ${PASS_POLICY})."
+else
+  FEEDBACK="Verification failed: ${TOTAL_FAILED}/${TOTAL_CHECKS} checks failed (policy: ${PASS_POLICY})."
+fi
+
+# The evidence finding leads the feedback.
+if [ -n "$EVIDENCE_WARNING" ]; then
+  FEEDBACK="${EVIDENCE_WARNING} ${FEEDBACK}"
+fi
+
+# Check if any results require manual TL review
+REQUIRES_REVIEW=$(echo "$RESULTS" | jq '[.[] | select(.requiresReview == true)] | length')
+if [ "$REQUIRES_REVIEW" -gt 0 ]; then
+  FEEDBACK="${FEEDBACK} ${REQUIRES_REVIEW} step(s) require Team Leader review."
+fi
+
+jq -n \
+  --argjson evidence "$WI_EVIDENCE" \
+  --arg evidenceWarning "$EVIDENCE_WARNING" \
+  --argjson record "$WI_RECORD" \
+  --arg passed "$PASSED" \
+  --arg score "$SCORE" \
+  --arg feedback "$FEEDBACK" \
+  --arg passPolicy "$PASS_POLICY" \
+  --argjson failedSteps "$FAILED_STEPS" \
+  --argjson results "$RESULTS" \
+  --arg taskId "$TASK_ID" \
+  --arg workerId "$WORKER_ID" \
+  --arg templateId "$TEMPLATE_ID" \
+  '{
+    evidence: ($evidence | to_entries | map(.value + {index: .key})),
+    acceptWith: "complete-task with \"verdict\":\"verified\" and \"checks\":[{\"entry\":<evidence index, or null for a direct look>,\"did\":\"<what you did and saw>\",\"outcome\":\"pass\"}] (#1314)",
+    evidenceWarning: (if $evidenceWarning != "" then $evidenceWarning else null end),
+    record: $record,
+    passed: ($passed == "true"),
+    score: ($score | tonumber),
+    feedback: $feedback,
+    passPolicy: $passPolicy,
+    failedSteps: $failedSteps,
+    results: $results,
+    taskId: $taskId,
+    workerId: $workerId,
+    templateId: $templateId
+  }'

@@ -1,0 +1,249 @@
+import { execFile } from 'child_process';
+import { createServer, Server, IncomingMessage, ServerResponse } from 'http';
+import { AddressInfo } from 'net';
+import { join } from 'path';
+
+/**
+ * Behavioural tests for the team-leader `delegate-task` skill's
+ * record-before-delivery ordering (WI 65578471).
+ *
+ * The skill previously created its WorkItem only AFTER delivery succeeded,
+ * so a delivery failure exited with no record anywhere — not in the pool,
+ * not targeted, nothing for a reconciler or a human to find. Every other
+ * orphan class in this system left a WorkItem behind; this one left the
+ * intent with no system of record at all.
+ *
+ * These run the real `execute.sh` against a stub API captured on a random
+ * port (the skill honours `CREWLY_API_URL`), so they assert observable call
+ * ordering rather than mirroring the implementation.
+ */
+
+const SKILL = join(__dirname, '..', 'execute.sh');
+
+interface Captured {
+  method: string;
+  path: string;
+  body: unknown;
+}
+
+let server: Server;
+let baseUrl: string;
+let captured: Captured[];
+/** When true the stub fails every delivery attempt. */
+let failDelivery = false;
+/** Extra fields of the stub's /task-pool/add `data`. */
+let addExtra: Record<string, unknown> = {};
+
+/**
+ * Runs the skill with the stub API wired in.
+ *
+ * @param args - CLI arguments for execute.sh
+ * @returns exit code and stdout/stderr
+ */
+function runSkill(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    // stdin is closed right away: with no --task the skill reads the brief
+    // from stdin, and an open pipe would wait forever.
+    const child = execFile(
+      'bash',
+      [SKILL, ...args],
+      { env: { ...process.env, CREWLY_API_URL: baseUrl }, timeout: 60_000 },
+      (err, stdout, stderr) => {
+        const code = err && typeof (err as { code?: number }).code === 'number' ? (err as { code: number }).code : 0;
+        resolve({ code, stdout, stderr });
+      },
+    );
+    child.stdin?.end();
+  });
+}
+
+beforeAll((done) => {
+  server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c) => chunks.push(c as Buffer));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      let body: unknown = raw;
+      try { body = raw ? JSON.parse(raw) : {}; } catch { /* keep raw */ }
+      const path = req.url ?? '';
+      captured.push({ method: req.method ?? '', path, body });
+
+      if (path.includes('/terminal/') && path.includes('/deliver')) {
+        if (failDelivery) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'worker offline' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+        return;
+      }
+      if (path.includes('/task-pool/add')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data: { id: 'wi-created-1', ...addExtra } }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, data: {} }));
+    });
+  });
+  server.listen(0, '127.0.0.1', () => {
+    baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
+    done();
+  });
+});
+
+afterAll((done) => { server.close(() => done()); });
+
+beforeEach(() => { captured = []; failDelivery = false; addExtra = {}; });
+
+/** Index of the first captured call whose path matches, or -1. */
+const indexOf = (needle: string): number =>
+  captured.findIndex((c) => c.path.includes(needle));
+
+describe('delegate-task record-before-delivery (WI 65578471)', () => {
+  const args = ['--to', 'worker-1', '--task', 'do the thing', '--project', '/tmp/proj'];
+
+  it('creates the WorkItem BEFORE attempting delivery', async () => {
+    await runSkill(args);
+
+    const add = indexOf('/task-pool/add');
+    const deliver = indexOf('/deliver');
+    expect(add).toBeGreaterThanOrEqual(0);
+    expect(deliver).toBeGreaterThanOrEqual(0);
+    expect(add).toBeLessThan(deliver);
+  });
+
+  it('still creates the WorkItem when delivery fails', async () => {
+    failDelivery = true;
+    await runSkill(args);
+
+    // The regression: previously the pool-add never ran on this path, so
+    // the intended work had no record anywhere.
+    expect(indexOf('/task-pool/add')).toBeGreaterThanOrEqual(0);
+  });
+
+  it('marks the undelivered WorkItem explicitly rather than leaving it to look normal', async () => {
+    failDelivery = true;
+    await runSkill(args);
+
+    const note = captured.find((c) => c.path.includes('/notes'));
+    expect(note).toBeDefined();
+    expect(JSON.stringify(note?.body)).toContain('[UNDELIVERED]');
+  });
+
+  it('still fails loudly on a delivery failure, and names the WorkItem it left behind', async () => {
+    failDelivery = true;
+    const { code, stdout } = await runSkill(args);
+
+    // Creating the record must not soften the failure into a success.
+    expect(code).not.toBe(0);
+    expect(stdout).toContain('Failed to deliver');
+    expect(stdout).toContain('wi-created-1');
+  });
+
+  it('targets the WorkItem at the intended worker so it stays recoverable', async () => {
+    failDelivery = true;
+    await runSkill(args);
+
+    const add = captured.find((c) => c.path.includes('/task-pool/add'));
+    expect((add?.body as { target?: string })?.target).toBe('worker-1');
+  });
+
+  it('does not annotate anything on the happy path', async () => {
+    await runSkill(args);
+    expect(captured.find((c) => c.path.includes('/notes'))).toBeUndefined();
+  });
+});
+
+describe('delegate-task hands the WorkItem over with its id (fresh conversation, single delivery)', () => {
+  const args = ['--to', 'worker-1', '--task', 'do the thing', '--project', '/tmp/proj'];
+
+  it('flags the WorkItem as delivered directly so the queued push holds off', async () => {
+    await runSkill(args);
+    const add = captured.find((c) => c.path.includes('/task-pool/add'));
+    expect((add?.body as { metadata?: Record<string, unknown> })?.metadata?.directDelivery).toBe(true);
+  });
+
+  it('sends the workItemId with the delivery and names it in the text', async () => {
+    await runSkill(args);
+    const deliver = captured.find((c) => c.path.includes('/deliver'));
+    const body = deliver?.body as { workItemId?: string; message?: string };
+    expect(body.workItemId).toBe('wi-created-1');
+    expect(body.message).toContain('WorkItem wi-created-1');
+    expect(body.message).not.toContain('<your WorkItem id>');
+  });
+
+  it('carries the workItemId on the force fallback too', async () => {
+    failDelivery = true;
+    await runSkill(args);
+    const delivers = captured.filter((c) => c.path.includes('/deliver'));
+    expect(delivers.length).toBeGreaterThanOrEqual(2);
+    for (const d of delivers) expect((d.body as { workItemId?: string }).workItemId).toBe('wi-created-1');
+  });
+});
+
+describe('delegate-task owner thread + no member fits (crewly#1083)', () => {
+  const base = ['--to', 'worker-1', '--task', 'Goal: x. Outcome: y. Eval: z.', '--project', '/tmp/proj'];
+
+  it('--thread sends the owner thread key on the WorkItem metadata', async () => {
+    await runSkill([...base, '--thread', 'C0THINK:1790000000.000100']);
+    const add = captured.find((c) => c.path.includes('/task-pool/add'));
+    expect((add?.body as { metadata?: { ownerThread?: string } }).metadata?.ownerThread).toBe('C0THINK:1790000000.000100');
+  });
+
+  it('omits ownerThread when --thread is not given', async () => {
+    await runSkill(base);
+    const add = captured.find((c) => c.path.includes('/task-pool/add'));
+    expect((add?.body as { metadata?: Record<string, unknown> }).metadata).not.toHaveProperty('ownerThread');
+  });
+
+  it('--force-after-answer sets forceAfterAnswer on the WorkItem metadata, and is absent without it (CREW-878)', async () => {
+    await runSkill([...base, '--thread', 'C0THINK:1790000000.000100', '--force-after-answer']);
+    await runSkill([...base, '--thread', 'C0THINK:1790000000.000100']);
+    const adds = captured.filter((c) => c.path.includes('/task-pool/add')).map((c) => (c.body as { metadata: Record<string, unknown> }).metadata);
+    expect(adds).toHaveLength(2);
+    expect(adds[0].forceAfterAnswer).toBe(true);
+    expect(adds[1]).not.toHaveProperty('forceAfterAnswer');
+  });
+
+  it('--conversation sends the owner conversation id on the WorkItem metadata (crewly#1357)', async () => {
+    await runSkill([...base, '--conversation', 'room-video']);
+    const add = captured.find((c) => c.path.includes('/task-pool/add'));
+    expect((add?.body as { metadata?: { ownerConversation?: string } }).metadata?.ownerConversation).toBe('room-video');
+    await runSkill(base);
+    const plain = captured.filter((c) => c.path.includes('/task-pool/add')).pop();
+    expect((plain?.body as { metadata?: Record<string, unknown> }).metadata).not.toHaveProperty('ownerConversation');
+  });
+
+  it('appends the backend\'s result-route note (the result goes to the delegator) to the delivered brief (crewly#1357)', async () => {
+    addExtra = { resultRoute: { to: 'tl-1', note: 'Ella delegated this on their own initiative; the owner did not ask for it in any thread. Do not post it to the owner.' } };
+    await runSkill(base);
+    const deliver = captured.find((c) => c.path.includes('/deliver'));
+    expect(String((deliver?.body as { message?: string }).message)).toContain('Do not post it to the owner.');
+  });
+
+  it('appends the backend\'s owner-thread note to the delivered brief', async () => {
+    addExtra = { ownerThread: { key: 'C0THINK:1790000000.000100', note: 'The owner asked for this in Slack thread [SLACK-THREAD:C0THINK:1790000000.000100]. Post your progress and your result there yourself.' } };
+    await runSkill(base);
+    const deliver = captured.find((c) => c.path.includes('/deliver'));
+    expect(String((deliver?.body as { message?: string }).message)).toContain('[SLACK-THREAD:C0THINK:1790000000.000100]');
+  });
+
+  it('--no-member-fits records the kept work and delivers nothing', async () => {
+    const r = await runSkill(['--no-member-fits', 'needs the owner\'s Stripe login', '--task', 'Update billing settings', '--work-item', 'wi-9']);
+    expect(r.code).toBe(0);
+    const rec = captured.find((c) => c.path.includes('/teams/lead-self-work'));
+    expect(rec?.body).toEqual({ reason: "needs the owner's Stripe login", work: 'Update billing settings', workItemId: 'wi-9' });
+    const note = captured.find((c) => c.path.includes('/task-pool/items/wi-9/notes'));
+    expect(String((note?.body as { note?: string }).note)).toContain('[NO-MEMBER-FITS]');
+    expect(indexOf('/deliver')).toBe(-1);
+    expect(indexOf('/task-pool/add')).toBe(-1);
+  });
+
+  it('--no-member-fits without --task fails', async () => {
+    const r = await runSkill(['--no-member-fits', 'no access']);
+    expect(r.code).not.toBe(0);
+    expect(indexOf('/teams/lead-self-work')).toBe(-1);
+  });
+});

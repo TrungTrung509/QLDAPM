@@ -1,0 +1,47 @@
+{
+  "runtimes": {
+    "claude-code": {
+      "displayName": "Claude Code",
+      "initScript": "",
+      "welcomeMessage": "Welcome to Claude Code",
+      "timeout": 120000,
+      "description": "Anthropic's Claude Code CLI with advanced coding capabilities"
+    },
+    "gemini-cli": {
+      "displayName": "Gemini CLI",
+      "initScript": "",
+      "welcomeMessage": "GEMINI.md",
+      "timeout": 90000,
+      "description": "Google's Gemini AI CLI for code generation and analysis"
+    },
+    "codex-cli": {
+      "displayName": "OpenAI Codex",
+      "initScript": "",
+      "welcomeMessage": "OpenAI Codex",
+      "timeout": 90000,
+      "description": "OpenAI's Codex CLI for advanced code understanding"
+    },
+    "opencode-cli": {
+      "displayName": "OpenCode",
+      "initScript": "",
+      "welcomeMessage": "Ask anything",
+      "timeout": 90000,
+      "description": "OpenCode open-source TUI coding agent (opencode.ai), any provider/model"
+    },
+    "antigravity-cli": {
+      "displayName": "Antigravity CLI",
+      "initScript": "",
+      "welcomeMessage": "? for shortcuts",
+      "timeout": 90000,
+      "description": "Google Antigravity CLI (agy), run with a Gemini API key only"
+    },
+    "crewly-agent": {
+      "displayName": "Crewly Agent",
+      "initScript": "",
+      "welcomeMessage": "Crewly Agent Ready",
+      "timeout": 120000,
+      "description": "In-process AI SDK-based orchestrator agent with multi-model support"
+    }
+  },
+  "defaultRuntime": "claude-code"
+}

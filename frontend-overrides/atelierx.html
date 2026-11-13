@@ -1,0 +1,174 @@
+<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>AtelierX · Xưởng thời trang & Giám sát Token Agent</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f5f3ed;color:#243a38;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+header,footer{display:flex;align-items:center;justify-content:space-between;padding:12px 3%;gap:12px;border-bottom:1px solid #cccfc5;background:#fffdf6}
+header strong{font:bold 22px Georgia,serif;letter-spacing:-0.5px}
+header span{border-left:1px solid #b7b9ad;padding-left:14px;margin-left:12px;color:#526b61;font-size:13px}
+.header-actions{display:flex;align-items:center;gap:10px}
+#token-summary-btn{display:flex;align-items:center;gap:8px;background:#f1f5f0;border:1px solid #a3b899;border-radius:20px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s ease}
+#token-summary-btn:hover{background:#e2ece0;box-shadow:0 2px 6px rgba(0,0,0,.08)}
+#status{font-size:12px;color:#385046;background:#edf3ee;padding:5px 12px;border-radius:14px;font-weight:600}
+
+main{display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,30%);min-height:76vh}
+.floor{position:relative;background:radial-gradient(ellipse at 50% 60%,#e1eee5,#f2f2e9 76%);overflow:hidden}
+.floor svg{display:block;width:100%;height:100%;min-height:500px}
+.room{cursor:pointer;transition:filter .15s ease}
+.room:focus,.room:hover{outline:none;filter:brightness(1.08)}
+
+/* Token Indicator Badge on 3D SVG */
+.token-badge-svg{transition:transform .2s ease}
+.room:hover .token-badge-svg{transform:scale(1.12)}
+@keyframes pulse-red{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(1.25)}}
+.pulse-out{animation:pulse-red 1.4s infinite;transform-origin:center}
+
+aside{padding:22px 20px;background:#fffdf6;border-left:1px solid #cccfc5;display:flex;flex-direction:column;gap:14px;overflow-y:auto;max-height:calc(100vh - 120px)}
+h1{font:bold 24px Georgia,serif;margin:4px 0 10px;color:#1e322b}
+small{letter-spacing:.12em;text-transform:uppercase;color:#526b61;font-size:11px;font-weight:700}
+button{font:inherit;color:inherit;cursor:pointer;background:white;border:1px solid #c6cec2;border-radius:6px;padding:6px 12px;transition:all .15s ease}
+button:hover{background:#f4f6f1}
+nav{display:grid;gap:6px}
+nav button{text-align:left;background:#fcfdfa;border:1px solid #dfe5db;border-radius:8px;padding:8px 12px;display:flex;justify-content:space-between;align-items:center;transition:all .15s ease}
+nav button:hover{background:#edf3ea;border-color:#b4c5b0}
+nav button[aria-pressed=true]{background:#deeadf;border-color:#8eab97;box-shadow:inset 3px 0 0 #3a624f}
+
+#info{line-height:1.55;border-top:1px solid #d5d9ce;padding-top:14px;display:flex;flex-direction:column;gap:10px}
+.info-title{font-size:18px;font-weight:bold;margin:0;color:#1d322c}
+.info-role{font-size:12px;color:#596d62;text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+
+/* Token Box Details inside #info */
+.token-card{background:#ffffff;border:1px solid #ccd6c7;border-radius:10px;padding:12px 14px;box-shadow:0 2px 6px rgba(0,0,0,.04);margin-top:4px}
+.token-card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.token-card-title{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:#395045}
+.token-pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700}
+.token-pill.ok{background:#e7f5e8;color:#1e7e34;border:1px solid #a7dfb2}
+.token-pill.warn{background:#fff9e6;color:#b27b00;border:1px solid #ffd480}
+.token-pill.out{background:#fde8e8;color:#d32f2f;border:1px solid #f8b4b4;animation:blink 1.5s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.5}}
+
+.token-bar-bg{height:8px;background:#e5ebe3;border-radius:4px;overflow:hidden;margin:8px 0 10px}
+.token-bar-fill{height:100%;border-radius:4px;transition:width .4s ease}
+.token-bar-fill.ok{background:linear-gradient(90deg,#48bb78,#2e7d32)}
+.token-bar-fill.warn{background:linear-gradient(90deg,#ecc94b,#b7791f)}
+.token-bar-fill.out{background:linear-gradient(90deg,#f56565,#c53030)}
+
+.token-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px}
+.token-stat-item{background:#f8faf6;padding:7px 9px;border-radius:6px;border:1px solid #e2eae0}
+.token-stat-label{font-size:10px;color:#6b7e73;text-transform:uppercase;font-weight:600}
+.token-stat-val{font-weight:700;color:#1b2d28;margin-top:2px}
+.token-alert{margin-top:10px;padding:9px 12px;border-radius:6px;font-size:11.5px;line-height:1.45}
+.token-alert.out{background:#fef2f2;border-left:4px solid #ef4444;color:#991b1b}
+.token-alert.ok{background:#f0fdf4;border-left:4px solid #22c55e;color:#166534}
+
+footer{border-top:1px solid #cccfc5;font-size:12px;color:#526b61}
+
+/* Modal Quota 6 Agents */
+.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(20,30,25,.55);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;z-index:9999}
+.modal-overlay.open{display:flex}
+.modal-box{background:#fffdf8;width:90%;max-width:760px;border-radius:12px;border:1px solid #bcc7b6;box-shadow:0 12px 35px rgba(0,0,0,.18);overflow:hidden;max-height:88vh;display:flex;flex-direction:column}
+.modal-header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid #d8dfd4;background:#f6faf4}
+.modal-header h3{margin:0;font:bold 20px Georgia,serif;color:#1a2e28}
+.modal-close{background:none;border:none;font-size:22px;cursor:pointer;color:#586d63;padding:0 6px}
+.modal-body{padding:18px 20px;overflow-y:auto}
+.modal-tabs{display:flex;gap:8px;margin-bottom:14px}
+.modal-tab-btn{background:#edf2eb;border:1px solid #c9d6c5;border-radius:16px;padding:4px 12px;font-size:12px;font-weight:600}
+.modal-tab-btn.active{background:#304a40;color:#fff;border-color:#304a40}
+
+.token-table{width:100%;border-collapse:collapse;font-size:12px;text-align:left}
+.token-table th{background:#eef4ec;padding:9px 10px;border-bottom:2px solid #ccd8c8;font-weight:600;color:#33483f}
+.token-table td{padding:10px;border-bottom:1px solid #e3eae0;vertical-align:middle}
+.token-table tr:hover td{background:#f7faf5}
+
+.sim-switch{display:flex;align-items:center;gap:10px;margin-top:14px;padding:10px 14px;background:#f3f7f1;border-radius:8px;font-size:12px;border:1px solid #d1dfcf}
+
+@media(max-width:760px){
+  main{display:block}
+  .floor svg{height:55vh;min-height:320px}
+  aside{padding:14px;max-height:none}
+  nav{grid-template-columns:1fr 1fr}
+  header span{display:none}
+}
+</style>
+<style>.floor{background:radial-gradient(ellipse at center,#eaf6ff,#d8eefb)!important}#scene{touch-action:none}#scene rect[fill="url(#dots)"]{opacity:.14}.room:focus-visible{outline:2px solid #355d81}.room:hover{filter:brightness(1.05)}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}</style><style>h1,h2,header strong{font-family:"Times New Roman",serif!important;font-variant-ligatures:none;letter-spacing:0}#scene text{font-family:Arial,sans-serif}</style></head>
+<body>
+<header>
+  <div><strong>AtelierX</strong><span>Digital Fashion House · Quota Tracker</span></div>
+  <div class="header-actions">
+    <button id="token-summary-btn" title="Bấm để xem danh sách Quota chi tiết của 6 Agents">
+      <span id="token-summary-indicator">⚡ Đang tải token…</span>
+    </button>
+    <div id="status">Đang kết nối Crewly…</div>
+  </div>
+</header>
+
+<main>
+  <section class="floor">
+    <svg id="scene" viewBox="-550 -285 1100 710" role="group" aria-label="Sơ đồ xưởng thời trang tương tác">
+      <defs>
+        <pattern id="dots" width="17" height="17" patternUnits="userSpaceOnUse">
+          <circle cx="1" cy="1" r=".9" fill="#879b89" opacity=".28"/>
+        </pattern>
+        <filter id="shadow" x="-40%" y="-40%" width="180%" height="180%">
+          <feGaussianBlur stdDeviation="6"/>
+        </filter>
+      </defs>
+      <rect x="-1500" y="-1000" width="3000" height="2000" fill="url(#dots)"/>
+      <g id="world"></g>
+    </svg>
+  </section>
+
+  <aside>
+    <small>ATELIERX / STUDIO</small>
+    <h1>Xưởng thiết kế</h1>
+    <nav id="rooms"></nav>
+    <section id="info" aria-live="polite"></section>
+    <section id="task-flow" aria-live="polite"></section>
+  </aside>
+</main>
+
+<footer>
+  <span>Sơ đồ xưởng & Giám sát Token 6 Agent theo thời gian thực</span>
+  <div>
+    <button id="btn-open-token-modal">⚡ Bảng Quota 6 Agent</button>
+    <button id="minus" aria-label="Thu nhỏ">−</button>
+    <button id="reset">Toàn cảnh</button>
+    <button id="plus" aria-label="Phóng to">+</button>
+  </div>
+</footer>
+
+<!-- Modal Quota 6 Agents -->
+<div id="token-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h3 id="modal-title">⚡ Giám sát Token & Quota 6 Agents</h3>
+      <button class="modal-close" id="modal-close-btn" aria-label="Đóng">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-tabs">
+        <button class="modal-tab-btn active" data-filter="all">Tất cả (6)</button>
+        <button class="modal-tab-btn" data-filter="ok">🟢 Còn token</button>
+        <button class="modal-tab-btn" data-filter="out">🔴 Hết token</button>
+      </div>
+
+      <table class="token-table">
+        <thead>
+          <tr>
+            <th>Agent & Vai trò</th>
+            <th>Model</th>
+            <th>Trạng thái Token</th>
+            <th>Tiêu thụ</th>
+            <th>Hạn mức còn lại</th>
+          </tr>
+        </thead>
+        <tbody id="token-table-body">
+        </tbody>
+      </table>
+
+
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/assets/atelierx.js?v=task-flow-1"></script>
+</body>
+</html>

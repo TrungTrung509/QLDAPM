@@ -1,0 +1,527 @@
+/**
+ * GoogleWorkspaceTab Component
+ *
+ * The Google card on the Connections page. Crewly Cloud holds the grants;
+ * this card shows which Google accounts are connected and what each one may
+ * be used for, starts a consent for one product at a time, and disconnects.
+ *
+ * Two things shape it. Consent is **per product**: asking for Calendar must
+ * not put "read all your mail" on the consent screen, and an install that
+ * never touches mail or files stays out of Google's restricted scope tier.
+ * And a Crewly account may connect **several Google accounts** — until
+ * 2026-09-19 a second one silently overwrote the first.
+ *
+ * @module components/Settings/GoogleWorkspaceTab
+ */
+
+import React, { useState, useEffect, useCallback } from 'react';
+import { RefreshCw, Unlink, ExternalLink, Plus, Minus, Check, Star, ShieldAlert } from 'lucide-react';
+import { LoadingSpinner } from '@crewly/ui/LoadingSpinner';
+import { Button } from '@crewly/ui/Button';
+import { Card } from '@crewly/ui/Card';
+import { GrantSharingControl } from '../Connections/GrantSharingControl';
+import { usePeople } from '../../hooks/usePeople';
+import { cloudSupportsSharing, type GrantOwnership } from '../../services/people.service';
+import { Alert } from '@crewly/ui/Alert';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** A Google product that can be connected on its own. */
+export type GoogleProduct = 'gmail' | 'calendar' | 'drive';
+
+/** One connected Google account. */
+export interface GoogleConnection extends GrantOwnership {
+  email: string;
+  products: GoogleProduct[];
+  scopes: string[];
+  grantedAt: string;
+  isDefault: boolean;
+}
+
+/** `GET /api/google/status` payload. */
+interface GoogleWorkspaceStatus {
+  connected: boolean;
+  cloudConnected: boolean;
+  connections: GoogleConnection[];
+  email?: string;
+  scopes?: string[];
+  grantedAt?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const STATUS_URL = '/api/google/status';
+const CONNECT_URL_ENDPOINT = '/api/google/connect-url';
+const DISCONNECT_URL = '/api/google/disconnect';
+const DEFAULT_URL = '/api/google/default';
+
+/** Where Cloud sends the browser back after consent. */
+const RETURN_PATH = '/connections?platform=google-workspace';
+
+/** Query flag Cloud appends on return (`?google=connected` / `?google=error`). */
+const RETURN_FLAG_PARAM = 'google';
+
+/** What each product is, in the order the card lists them. */
+export const PRODUCT_META: { id: GoogleProduct; name: string; blurb: string; restricted: boolean }[] = [
+  { id: 'gmail', name: 'Gmail', blurb: 'Read your mail and send on your behalf', restricted: true },
+  { id: 'calendar', name: 'Calendar', blurb: 'Read your calendar and manage events', restricted: false },
+  {
+    id: 'drive',
+    name: 'Drive, Docs, Sheets & Slides',
+    blurb: 'Search and read your files, and create new ones',
+    restricted: true,
+  },
+];
+
+/** Human labels for the scope URLs Google grants. */
+const SCOPE_LABELS: Record<string, string> = {
+  'https://www.googleapis.com/auth/gmail.readonly': 'Read mail',
+  'https://www.googleapis.com/auth/gmail.send': 'Send mail',
+  'https://www.googleapis.com/auth/calendar.readonly': 'Read calendar',
+  'https://www.googleapis.com/auth/calendar.events': 'Manage events',
+  'https://www.googleapis.com/auth/drive.readonly': 'Read Drive, Docs, Sheets, Slides',
+  'https://www.googleapis.com/auth/drive.file': 'Create files (Docs, Sheets, Slides, uploads)',
+  'https://www.googleapis.com/auth/documents.readonly': 'Read Docs',
+};
+
+/**
+ * Turn Google scope URLs into short labels, dropping identity scopes.
+ *
+ * @param scopes - Scope URLs
+ * @returns Labels to show
+ */
+export function describeScopes(scopes: string[] | undefined): string[] {
+  return (scopes ?? []).map((s) => SCOPE_LABELS[s]).filter((s): s is string => !!s);
+}
+
+/**
+ * Build the connect-url request for one consent.
+ *
+ * @param origin - `window.location.origin`
+ * @param options - Products to request and the Google account to sign in as
+ * @returns The URL to fetch
+ *
+ * @example
+ * buildConnectRequest('https://x', { products: ['calendar'], loginHint: 'a@b.com' })
+ */
+export function buildConnectRequest(
+  origin: string,
+  options: { products?: GoogleProduct[]; loginHint?: string; chooseAccount?: boolean; replace?: boolean } = {},
+): string {
+  const params = new URLSearchParams({ returnUrl: `${origin}${RETURN_PATH}` });
+  if (options.products?.length) params.set('products', options.products.join(','));
+  if (options.replace) params.set('replace', '1');
+  // A hint preselects an account; the chooser is how a *new* one gets added,
+  // because Google otherwise reuses the session the browser is signed in to.
+  if (options.loginHint) params.set('loginHint', options.loginHint);
+  if (options.chooseAccount) params.set('chooseAccount', '1');
+  return `${CONNECT_URL_ENDPOINT}?${params.toString()}`;
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
+/**
+ * GoogleWorkspaceTab — connected Google accounts, per-product consent.
+ *
+ * States: loading → not signed in to Cloud (explain) → nothing connected
+ * (one button per product) → connected (per-account rows).
+ *
+ * @returns GoogleWorkspaceTab component
+ */
+export const GoogleWorkspaceTab: React.FC = () => {
+  const { people } = usePeople();
+  const [status, setStatus] = useState<GoogleWorkspaceStatus>({
+    connected: false,
+    cloudConnected: false,
+    connections: [],
+  });
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [addingAccount, setAddingAccount] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  /**
+   * Fetch the grant status from the backend.
+   */
+  const fetchStatus = useCallback(async () => {
+    try {
+      setError(null);
+      const res = await fetch(STATUS_URL);
+      const data = await res.json();
+      if (res.ok && data.success) {
+        const payload = data.data as GoogleWorkspaceStatus;
+        setStatus({ ...payload, connections: payload.connections ?? [] });
+      } else {
+        setStatus({ connected: false, cloudConnected: false, connections: [] });
+        setError(data.hint || data.message || data.error || 'Failed to fetch Google status');
+      }
+    } catch {
+      setStatus({ connected: false, cloudConnected: false, connections: [] });
+      setError('Failed to fetch Google status');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchStatus();
+    // Cloud lands back here with ?google=connected|error after consent.
+    try {
+      const flag = new URLSearchParams(window.location.search).get(RETURN_FLAG_PARAM);
+      if (flag === 'connected') setNotice('Google account connected.');
+      else if (flag === 'error') setError('Google connection failed. Please try again.');
+    } catch {
+      // window may be unavailable in tests; ignore
+    }
+  }, [fetchStatus]);
+
+  /**
+   * Start a consent for one product (and optionally one Google account).
+   *
+   * @param options - Products to ask for, and which account to sign in as
+   */
+  const startConnect = async (
+    options: { products?: GoogleProduct[]; loginHint?: string; chooseAccount?: boolean; replace?: boolean } = {},
+  ) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(buildConnectRequest(window.location.origin, options));
+      const data = await res.json();
+      if (!res.ok || !data.success || !data.data?.url) {
+        throw new Error(data.hint || data.message || data.error || 'Could not start Google sign-in');
+      }
+      window.location.href = data.data.url as string;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not start Google sign-in');
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Take one product away from an account.
+   *
+   * Google cannot strip a single scope from a live token, so this re-runs
+   * consent for the products that remain; the Cloud side then throws the old
+   * credential away. Removing the last one is a plain disconnect, because
+   * consenting to nothing is not a thing Google offers.
+   *
+   * @param connection - The account to narrow
+   * @param product - The product to drop
+   */
+  const handleRemoveProduct = async (connection: GoogleConnection, product: GoogleProduct) => {
+    const remaining = connection.products.filter((p) => p !== product);
+    const label = PRODUCT_META.find((p) => p.id === product)?.name ?? product;
+    if (remaining.length === 0) {
+      await handleDisconnect(connection.email);
+      return;
+    }
+    const keep = PRODUCT_META.filter((p) => remaining.includes(p.id))
+      .map((p) => p.name)
+      .join(' and ');
+    if (
+      !window.confirm(
+        `Remove ${label} from ${connection.email}?\n\n` +
+          `Google cannot drop one permission on its own, so you will be sent to ` +
+          `Google to approve ${keep} again. The old permission is revoked once that finishes.`,
+      )
+    ) {
+      return;
+    }
+    await startConnect({ products: remaining, loginHint: connection.email, replace: true });
+  };
+
+  /**
+   * Revoke one Google account's grant.
+   *
+   * @param email - The account to disconnect
+   */
+  const handleDisconnect = async (email: string) => {
+    if (!window.confirm(`Disconnect ${email}? Agents will lose every Google access granted by this account.`)) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`${DISCONNECT_URL}?account=${encodeURIComponent(email)}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.hint || data.message || data.error || 'Disconnect failed');
+      }
+      setNotice(null);
+      await fetchStatus();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to disconnect');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Choose which account answers a skill that names none.
+   *
+   * @param email - The account to make default
+   */
+  const handleMakeDefault = async (email: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(DEFAULT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.hint || data.message || data.error || 'Could not change the default account');
+      }
+      await fetchStatus();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not change the default account');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex justify-center py-16">
+        <LoadingSpinner text="Loading Google status..." />
+      </div>
+    );
+  }
+
+  const { connections } = status;
+
+  return (
+    <div className="space-y-6 max-w-3xl" data-testid="google-workspace-tab">
+      <div>
+        <h2 className="text-xl font-semibold">Google</h2>
+        <p className="text-sm text-text-secondary-dark mt-1">
+          Connect each Google service separately, and as many Google accounts as you need. Crewly Cloud keeps
+          the sign-in; content goes straight from Google to this instance.
+        </p>
+      </div>
+
+      {error && <Alert variant="error" onClose={() => setError(null)}>{error}</Alert>}
+      {notice && <Alert variant="success" onClose={() => setNotice(null)}>{notice}</Alert>}
+
+      {!status.cloudConnected ? (
+        <Alert variant="info">
+          Sign in to Crewly Cloud first (Settings → Cloud), then connect Google here.
+        </Alert>
+      ) : connections.length === 0 ? (
+        <Card padding="lg">
+          <h3 className="text-sm font-semibold text-text-secondary-dark uppercase tracking-wide mb-1">
+            Choose what agents may use
+          </h3>
+          <p className="text-sm text-text-secondary-dark mb-4">
+            Each one is a separate approval — connect only what you need, and add the others later.
+          </p>
+          <p className="text-sm text-text-secondary-dark mb-4">
+            Google will show a &ldquo;hasn&rsquo;t verified this app&rdquo; warning for any of these until Crewly passes
+            Google&rsquo;s review; choose <em>Advanced</em> to continue. Connecting fewer services does not remove it.
+          </p>
+          <div className="space-y-3">
+            {PRODUCT_META.map((product) => (
+              <div
+                key={product.id}
+                className="flex items-center justify-between gap-4 py-3 border-b border-border-dark last:border-0"
+              >
+                <div>
+                  <div className="text-sm font-medium flex items-center gap-2">
+                    {product.name}
+                    {product.restricted && (
+                      <span
+                        className="inline-flex items-center gap-1 text-xs text-text-secondary-dark"
+                        title="Google's most guarded tier. Connecting this one puts the app in scope for Google's paid annual security assessment; Calendar alone does not."
+                      >
+                        <ShieldAlert size={12} /> restricted
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-xs text-text-secondary-dark mt-0.5">{product.blurb}</div>
+                </div>
+                <Button
+                  variant="primary"
+                  icon={ExternalLink}
+                  disabled={busy}
+                  onClick={() => startConnect({ products: [product.id] })}
+                  data-testid={`google-connect-${product.id}`}
+                >
+                  Connect
+                </Button>
+              </div>
+            ))}
+          </div>
+        </Card>
+      ) : (
+        <div className="space-y-4">
+          {connections.map((connection) => (
+            <Card key={connection.email} padding="lg" data-testid={`google-account-${connection.email}`}>
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium flex items-center gap-2 flex-wrap">
+                    <span className="truncate">{connection.email}</span>
+                    {connection.isDefault && (
+                      <span
+                        className="inline-flex items-center gap-1 text-xs text-text-secondary-dark"
+                        title="Used when a skill or agent does not name an account."
+                      >
+                        <Star size={12} /> default
+                      </span>
+                    )}
+                  </div>
+                  {connection.products.length === 0 && (
+                    <div className="text-xs text-text-secondary-dark mt-1">
+                      Signed in, but no service connected yet
+                    </div>
+                  )}
+                  {connection.grantedAt && (
+                    <div className="text-xs text-text-secondary-dark mt-1">
+                      Connected {new Date(connection.grantedAt).toLocaleString()}
+                    </div>
+                  )}
+                  {/* Whose it is and who else may use it (issue #968). */}
+                  <div className="mt-2">
+                    <GrantSharingControl
+                      connector="google-workspace"
+                      email={connection.email}
+                      ownership={{ authorizedBy: connection.authorizedBy, sharing: connection.sharing }}
+                      cloudSupported={cloudSupportsSharing(connection)}
+                      people={people}
+                      testIdPrefix={`google-sharing-${connection.email}`}
+                    />
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {!connection.isDefault && (
+                    <Button variant="secondary" disabled={busy} onClick={() => handleMakeDefault(connection.email)}>
+                      Make default
+                    </Button>
+                  )}
+                  <Button
+                    variant="danger"
+                    icon={Unlink}
+                    disabled={busy}
+                    onClick={() => handleDisconnect(connection.email)}
+                  >
+                    Disconnect
+                  </Button>
+                </div>
+              </div>
+
+              {/* Every product, every time. Showing only the missing ones made
+                  an account that happened to have all three look exactly like
+                  the old all-in-one connector, with no way to give any of them
+                  back (owner, 2026-09-20). */}
+              <div className="mt-4 pt-3 border-t border-border-dark space-y-2">
+                {PRODUCT_META.map((product) => {
+                  const granted = connection.products.includes(product.id);
+                  return (
+                    <div key={product.id} className="flex items-center justify-between gap-4">
+                      <div className="min-w-0">
+                        <div className="text-sm flex items-center gap-2">
+                          <span>{product.name}</span>
+                          {granted ? (
+                            <span className="inline-flex items-center gap-1 text-xs text-green-400">
+                              <Check size={12} /> connected
+                            </span>
+                          ) : (
+                            <span className="text-xs text-text-secondary-dark">not connected</span>
+                          )}
+                          {product.restricted && (
+                            <span
+                              className="inline-flex items-center gap-1 text-xs text-text-secondary-dark"
+                              title="Google's most guarded tier. Connecting this one puts the app in scope for Google's paid annual security assessment; Calendar alone does not."
+                            >
+                              <ShieldAlert size={12} /> restricted
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs text-text-secondary-dark mt-0.5">{product.blurb}</div>
+                      </div>
+                      {granted ? (
+                        <Button
+                          variant="secondary"
+                          icon={Minus}
+                          disabled={busy}
+                          onClick={() => handleRemoveProduct(connection, product.id)}
+                          data-testid={`google-remove-${product.id}-${connection.email}`}
+                        >
+                          Remove
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="secondary"
+                          icon={Plus}
+                          disabled={busy}
+                          onClick={() => startConnect({ products: [product.id], loginHint: connection.email })}
+                          data-testid={`google-add-${product.id}-${connection.email}`}
+                        >
+                          Connect
+                        </Button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+          ))}
+
+          <div className="flex items-center gap-3">
+            <Button
+              variant="secondary"
+              icon={Plus}
+              disabled={busy}
+              onClick={() => setAddingAccount((v) => !v)}
+              data-testid="google-add-account"
+            >
+              Add another Google account
+            </Button>
+            <Button variant="secondary" onClick={fetchStatus} icon={RefreshCw} disabled={busy}>
+              Refresh
+            </Button>
+          </div>
+
+          {/* A second account starts one product at a time, like the first
+              one does. Going straight to consent with no product named asked
+              Google for all three, which is the all-in-one grant this whole
+              connector exists to avoid (owner, 2026-09-20). */}
+          {addingAccount && (
+            <Card padding="lg" data-testid="google-add-account-products">
+              <div className="text-sm font-medium">Which service should the new account start with?</div>
+              <p className="text-xs text-text-secondary-dark mt-1">
+                You will be asked to pick the Google account, then approve just this one service. Add the others to it
+                afterwards.
+              </p>
+              <div className="mt-3 flex items-center gap-2 flex-wrap">
+                {PRODUCT_META.map((product) => (
+                  <Button
+                    key={product.id}
+                    variant="secondary"
+                    icon={ExternalLink}
+                    disabled={busy}
+                    onClick={() => startConnect({ products: [product.id], chooseAccount: true })}
+                    data-testid={`google-add-account-${product.id}`}
+                  >
+                    {product.name}
+                  </Button>
+                ))}
+              </div>
+            </Card>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default GoogleWorkspaceTab;

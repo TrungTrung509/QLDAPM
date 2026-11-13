@@ -1,0 +1,456 @@
+import { spawn, ChildProcess } from 'child_process';
+import chalk from 'chalk';
+import open from 'open';
+import axios from 'axios';
+import * as path from 'path';
+import * as fs from 'fs';
+import * as os from 'os';
+import { fileURLToPath } from 'url';
+import {
+  ORCHESTRATOR_SETUP_TIMEOUT,
+  DEFAULT_WEB_PORT,
+  API_ENDPOINTS,
+  CREWLY_HOME_DIR,
+  PROCESS_EXIT_CODES,
+  SERVER_CONSTANTS,
+  AUTO_UPDATE_CONSTANTS,
+} from '../constants.js';
+import { checkForUpdate, printUpdateNotification } from '../utils/version-check.js';
+import { selfInstallArgs } from '../utils/self-install.js';
+import { killZombieProcesses } from '../utils/process-cleanup.js';
+import { createChildShutdownHandler, resolveShutdownBudgetMs } from '../utils/safe-shutdown.js';
+import { shouldOpenDashboard, dashboardHint } from '../utils/open-dashboard.js';
+import { shouldRespawnBackend } from '../utils/backend-respawn.js';
+import { clearShutdownMarker, hasShutdownMarker, stopLegacySupervisor } from '../utils/shutdown-marker.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/**
+ * Finds the Crewly package root by walking up from a starting directory,
+ * looking for a package.json with `"name": "crewly"`.
+ *
+ * Works in both dev mode (cli/src/commands/) and compiled mode (dist/cli/cli/src/commands/).
+ *
+ * @param startDir - Directory to start searching from.
+ * @returns The absolute path to the package root directory.
+ * @throws Error if no matching package.json is found.
+ */
+function findPackageRoot(startDir: string): string {
+	let current = path.resolve(startDir);
+
+	while (true) {
+		const pkgPath = path.join(current, 'package.json');
+		if (fs.existsSync(pkgPath)) {
+			try {
+				const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+				if (pkg.name === 'crewly') {
+					return current;
+				}
+			} catch {
+				// Malformed package.json — keep searching
+			}
+		}
+
+		const parent = path.dirname(current);
+		if (parent === current) {
+			throw new Error(
+				'Could not find Crewly package root (no package.json with name "crewly" found in any parent directory)'
+			);
+		}
+		current = parent;
+	}
+}
+
+interface StartOptions {
+	port?: string;
+	browser?: boolean;
+	open?: boolean;
+	headless?: boolean;
+	autoUpgrade?: boolean;
+}
+
+export async function startCommand(options: StartOptions) {
+	const webPort = parseInt(options.port || DEFAULT_WEB_PORT.toString());
+	const headless = options.headless === true;
+	const openBrowser = shouldOpenDashboard({
+		headless,
+		open: options.open,
+		browser: options.browser,
+		env: process.env,
+		interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+	});
+
+	if (headless) {
+		console.log(chalk.blue('🚀 Starting Crewly in headless mode (API-only)...'));
+	} else {
+		console.log(chalk.blue('🚀 Starting Crewly...'));
+	}
+	console.log(chalk.gray(`Web Port: ${webPort}`));
+	if (headless) {
+		console.log(chalk.gray('Mode: headless (API-only, no frontend)'));
+	}
+
+	try {
+		// 1. Ensure ~/.crewly directory exists
+		await ensureCrewlyHome();
+
+		// A start is a start: drop the marker an earlier dashboard shutdown left.
+		clearShutdownMarker();
+
+		// 2. Check if services are already running
+		const alreadyRunning = await checkIfRunning(webPort);
+		if (alreadyRunning) {
+			console.log(chalk.yellow('⚠️  Crewly is already running'));
+			if (openBrowser) {
+				console.log(chalk.blue('🌐 Opening dashboard...'));
+				await open(`http://localhost:${webPort}`);
+			} else if (!headless) {
+				console.log(chalk.cyan(dashboardHint(webPort)));
+			}
+			return;
+		}
+
+		// 2b. Kill any zombie processes from previous runs
+		killZombieProcesses(webPort, (msg) => console.log(chalk.yellow(msg)));
+
+		// 3. Start backend server
+		console.log(chalk.blue('📡 Starting backend server...'));
+		const backendProcess = await startBackendServer(webPort, headless);
+
+		// 4. Wait for servers to be ready
+		console.log(chalk.blue('⏳ Waiting for servers to initialize...'));
+		await waitForServer(webPort);
+
+		// 5. Setup orchestrator session (non-blocking)
+		setupOrchestratorSessionAsync(webPort);
+
+		// 6. Open the dashboard only on explicit opt-in (otherwise a hint is printed below)
+		if (openBrowser) {
+			console.log(chalk.blue('🌐 Opening dashboard...'));
+			await open(`http://localhost:${webPort}`);
+		}
+
+		// Check if any agent skills are available (bundled or marketplace)
+		const projectRoot = findPackageRoot(__dirname);
+		const bundledSkillsDir = path.join(projectRoot, 'config', 'skills', 'agent');
+		const marketplaceSkillsDir = path.join(os.homedir(), '.crewly', 'marketplace', 'skills');
+		const hasBundledSkills = fs.existsSync(bundledSkillsDir) &&
+			fs.readdirSync(bundledSkillsDir).some(d => d !== '_common' && fs.statSync(path.join(bundledSkillsDir, d)).isDirectory());
+		const hasMarketplaceSkills = fs.existsSync(marketplaceSkillsDir) &&
+			fs.readdirSync(marketplaceSkillsDir).some(d => d !== '_common' && fs.statSync(path.join(marketplaceSkillsDir, d)).isDirectory());
+
+		if (!hasBundledSkills && !hasMarketplaceSkills) {
+			console.log(chalk.yellow('⚠  No agent skills installed. Run \'crewly install --all\' to get started.'));
+		}
+
+		console.log(chalk.green('✅ Crewly started successfully!'));
+		if (headless) {
+			console.log(chalk.cyan(`📡 API: http://localhost:${webPort}/api`));
+			console.log(chalk.cyan(`🏥 Health: http://localhost:${webPort}/health`));
+		} else {
+			console.log(chalk.cyan(`📊 ${dashboardHint(webPort)}`));
+		}
+		console.log(chalk.cyan(`⚡ WebSocket: ws://localhost:${webPort}`));
+		console.log(chalk.gray(`🎯 Orchestrator: Setting up in background...`));
+		console.log('');
+		console.log(chalk.yellow('Press Ctrl+C to stop all services'));
+
+		// Non-blocking version check
+		checkForUpdate().then(result => {
+			if (result.updateAvailable && result.latestVersion) {
+				if (options.autoUpgrade) {
+					console.log(chalk.blue('Auto-upgrading Crewly...'));
+					const upgradeChild = spawn('npm', selfInstallArgs('crewly@latest'), {
+						stdio: 'inherit',
+						shell: process.platform === 'win32',
+					});
+					upgradeChild.on('exit', (code: number | null) => {
+						if (code === 0) {
+							console.log(chalk.green('Crewly auto-upgraded successfully! Restart to use the new version.'));
+						} else {
+							console.error(chalk.red('Auto-upgrade failed. Run `crewly upgrade` manually.'));
+						}
+					});
+				} else {
+					printUpdateNotification(result.currentVersion, result.latestVersion);
+				}
+			}
+		}).catch(() => { /* silently ignore version check errors */ });
+
+		// 7. Monitor for shutdown signals and run restart loop.
+		// Use a mutable array so the shutdown handler always kills the current process.
+		const activeProcesses: ChildProcess[] = [backendProcess];
+		setupShutdownHandlers(activeProcesses);
+
+		// Restart loop: respawn backend when it exits with RESTART_REQUESTED
+		// (graceful restarts, including auto-update, which has just replaced
+		// the files under projectRoot — the respawn runs the new version), or
+		// once after an auto-update whose shutdown ended in a self-SIGKILL.
+		let currentBackend = backendProcess;
+		let markerRespawnUsed = false;
+		while (true) {
+			const exitCode = await waitForExit(currentBackend);
+
+			// The owner shut Crewly down from the dashboard: stay down, whatever
+			// relaunched us. An old-style supervisor script that relaunches on any
+			// exit is stopped here; the current one checks the marker itself.
+			if (hasShutdownMarker()) {
+				console.log(chalk.yellow('\nCrewly was shut down from the dashboard. Start it again with `crewly start` or the Crewly app.'));
+				stopLegacySupervisor();
+				process.exit(0);
+			}
+
+			const respawn = shouldRespawnBackend(exitCode, { markerRespawnUsed });
+
+			if (respawn) {
+				if (respawn === 'auto-update-marker') markerRespawnUsed = true;
+				console.log(chalk.blue(`🔄 Backend requested restart (${respawn}), respawning in 1.5s...`));
+				// Small delay to let OS reclaim the port
+				await new Promise((r) => setTimeout(r, 1500));
+
+				currentBackend = await startBackendServer(webPort, headless);
+				// Update the mutable reference so Ctrl+C kills the new process
+				activeProcesses[0] = currentBackend;
+
+				console.log(chalk.blue('⏳ Waiting for server to come back up...'));
+				await waitForServer(webPort);
+				console.log(chalk.green('✅ Backend restarted successfully'));
+				continue;
+			}
+
+			// Non-restart exit
+			console.log(chalk.yellow(`\nBackend process exited (code: ${exitCode})`));
+			break;
+		}
+
+		// Backend died permanently — exit CLI
+		process.exit(1);
+	} catch (error) {
+		console.error(
+			chalk.red('❌ Failed to start Crewly:'),
+			error instanceof Error ? error.message : error
+		);
+		process.exit(1);
+	}
+}
+
+async function setupOrchestratorSession(webPort: number): Promise<void> {
+	try {
+		// Call the backend API to setup orchestrator session
+		const response = await axios.post(
+			`http://localhost:${webPort}${API_ENDPOINTS.ORCHESTRATOR_SETUP}`,
+			{},
+			{
+				timeout: ORCHESTRATOR_SETUP_TIMEOUT
+			}
+		);
+
+		if (response.data.success) {
+			console.log(chalk.green('✅ Orchestrator session ready'));
+		} else {
+			console.log(
+				chalk.yellow(
+					`⚠️  Orchestrator setup warning: ${response.data.message || 'Unknown issue'}`
+				)
+			);
+		}
+	} catch (error) {
+		console.log(
+			chalk.yellow(
+				'⚠️  Could not setup orchestrator session - it will be created when needed'
+			)
+		);
+		console.log(
+			chalk.gray(`   Error: ${error instanceof Error ? error.message : 'Unknown error'}`)
+		);
+	}
+}
+
+/**
+ * Setup orchestrator session asynchronously (fire-and-forget)
+ * This allows the browser to open immediately while orchestrator initializes in background
+ */
+function setupOrchestratorSessionAsync(webPort: number): void {
+	// Don't await this - let it run in background
+	setupOrchestratorSession(webPort)
+		.then(() => {
+			// Success message already logged in setupOrchestratorSession
+		})
+		.catch((error) => {
+			// Error message already logged in setupOrchestratorSession
+			// Just ensure the process doesn't crash
+			console.log(chalk.gray('🎯 Orchestrator setup completed (check messages above)'));
+		});
+}
+
+async function ensureCrewlyHome(): Promise<void> {
+	const crewlyHome = path.join(os.homedir(), CREWLY_HOME_DIR);
+
+	if (!fs.existsSync(crewlyHome)) {
+		fs.mkdirSync(crewlyHome, { recursive: true });
+		console.log(chalk.green(`📁 Created Crewly home: ${crewlyHome}`));
+	}
+
+	// Create default config if it doesn't exist
+	const configPath = path.join(crewlyHome, 'config.env');
+	if (!fs.existsSync(configPath)) {
+		const defaultConfig = `WEB_PORT=${DEFAULT_WEB_PORT}
+CREWLY_HOME=${crewlyHome}
+DEFAULT_CHECK_INTERVAL=30
+AUTO_COMMIT_INTERVAL=30`;
+		fs.writeFileSync(configPath, defaultConfig);
+		console.log(chalk.green(`⚙️  Created default config: ${configPath}`));
+	}
+}
+
+async function checkIfRunning(port: number): Promise<boolean> {
+	try {
+		const response = await axios.get(`http://localhost:${port}/health`, { timeout: 2000 });
+		return response.status === 200;
+	} catch (error) {
+		return false;
+	}
+}
+
+/**
+ * Calculate the Node.js heap size based on available system memory.
+ *
+ * Allocates HEAP_MEMORY_RATIO (60%) of total RAM, clamped between
+ * MIN_HEAP_SIZE_MB and MAX_HEAP_SIZE_MB. Prevents OOM/swapping on
+ * low-RAM machines while still allowing generous heaps on large ones.
+ *
+ * @returns Heap size in megabytes
+ */
+export function calculateHeapSize(): number {
+	const totalMemMB = Math.floor(os.totalmem() / (1024 * 1024));
+	const dynamicHeap = Math.floor(totalMemMB * SERVER_CONSTANTS.HEAP_MEMORY_RATIO);
+	return Math.max(
+		SERVER_CONSTANTS.MIN_HEAP_SIZE_MB,
+		Math.min(SERVER_CONSTANTS.MAX_HEAP_SIZE_MB, dynamicHeap),
+	);
+}
+
+async function startBackendServer(webPort: number, headless = false): Promise<ChildProcess> {
+	// Get the project root directory — works in both dev and compiled mode
+	const projectRoot = findPackageRoot(__dirname);
+
+	const heapSize = calculateHeapSize();
+
+	const env = {
+		...process.env,
+		WEB_PORT: webPort.toString(),
+		NODE_ENV: process.env.NODE_ENV || 'development',
+		...(headless ? { CREWLY_HEADLESS: 'true' } : {}),
+		// Tells the backend a parent respawns it after RESTART_REQUESTED, so
+		// auto-update may install and restart (specs/auto-update.md).
+		[AUTO_UPDATE_CONSTANTS.SUPERVISOR_ENV_VAR]: AUTO_UPDATE_CONSTANTS.SUPERVISOR_CLI_START,
+	};
+
+	const backendProcess = spawn(
+		'node',
+		[
+			'--expose-gc',
+			`--max-old-space-size=${heapSize}`,
+			path.join(projectRoot, 'dist/backend/backend/src/index.js'),
+		],
+		{
+			env,
+			stdio: 'pipe',
+			detached: false,
+			cwd: projectRoot,
+		}
+	);
+
+	backendProcess.stdout?.on('data', (data) => {
+		const output = data.toString().trim();
+		if (output) {
+			console.log(chalk.gray(`[Backend] ${output}`));
+		}
+	});
+
+	backendProcess.stderr?.on('data', (data) => {
+		const output = data.toString().trim();
+		if (output) {
+			console.error(chalk.red(`[Backend Error] ${output}`));
+		}
+	});
+
+	backendProcess.on('error', (error) => {
+		console.error(chalk.red('Backend process error:'), error);
+	});
+
+	backendProcess.on('exit', (code, signal) => {
+		if (code !== 0 && code !== PROCESS_EXIT_CODES.RESTART_REQUESTED) {
+			console.error(
+				chalk.red(`Backend process exited with code ${code} (signal: ${signal})`)
+			);
+		}
+	});
+
+	return backendProcess;
+}
+
+/**
+ * Wait for a backend process to exit and return the exit code.
+ *
+ * @param proc - The child process to wait for
+ * @returns The exit code (or null if killed by signal)
+ */
+function waitForExit(proc: ChildProcess): Promise<number | null> {
+	return new Promise<number | null>((resolve) => {
+		proc.on('exit', (code) => resolve(code));
+	});
+}
+
+async function waitForServer(port: number, maxAttempts: number = 30): Promise<void> {
+	for (let i = 0; i < maxAttempts; i++) {
+		try {
+			await axios.get(`http://localhost:${port}/health`, { timeout: 1000 });
+			return;
+		} catch (error) {
+			if (i === maxAttempts - 1) {
+				throw new Error('Server failed to start within timeout');
+			}
+			await new Promise((resolve) => setTimeout(resolve, 1000));
+		}
+	}
+}
+
+/**
+ * Set up signal handlers for graceful shutdown.
+ * Uses a mutable array so the restart loop can update the active process.
+ *
+ * The parent must outlive its children long enough for them to shut down
+ * properly. The backend now drains in-flight agent turns before it stops
+ * (up to CREWLY_RESTART_DRAIN_MS, default 120s), so the SIGKILL escalation
+ * waits for the drain plus a margin instead of the old fixed 5s — which
+ * killed agents mid-turn on every restart (2026-09-24). A repeated signal is
+ * forwarded so the backend can skip the drain on request.
+ *
+ * @param activeProcesses - Mutable array of processes to kill on shutdown
+ */
+function setupShutdownHandlers(activeProcesses: ChildProcess[]): void {
+	const budgetMs = resolveShutdownBudgetMs(process.env);
+	const cleanup = createChildShutdownHandler(() => activeProcesses, {
+		budgetMs,
+		log: (message) => console.log(chalk.gray(message)),
+		exit: () => {
+			console.log(chalk.green('✅ Crewly stopped'));
+			process.exit(0);
+		},
+	});
+	let announced = false;
+	const onSignal = (): void => {
+		if (!announced) {
+			announced = true;
+			console.log(chalk.yellow('\n🛑 Shutting down Crewly...'));
+		}
+		cleanup();
+	};
+
+	process.on('SIGTERM', onSignal);
+	process.on('SIGINT', onSignal);
+	process.on('SIGUSR1', onSignal);
+	process.on('SIGUSR2', onSignal);
+}

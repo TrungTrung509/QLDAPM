@@ -1,0 +1,804 @@
+/**
+ * Tests for Cloud Controller
+ *
+ * @module controllers/cloud/cloud.controller.test
+ */
+
+import type { Request, Response, NextFunction } from 'express';
+import { connectToCloud, disconnectFromCloud, getCloudStatus, getCloudTemplates, validateCloudToken, refreshCloudToken, getDeviceId, verifyLicense, cloudSearch, mobilePair } from './cloud.controller.js';
+import { markOwner } from '../../middleware/caller-identity.testing.js';
+import { setCallerIdentity } from '../../middleware/caller-identity.middleware.js';
+
+// ---------------------------------------------------------------------------
+// Mocks
+// ---------------------------------------------------------------------------
+
+const mockVerifyJwt = jest.fn();
+const mockSignJwt = jest.fn();
+
+jest.mock('./cloud-google-auth.controller.js', () => ({
+  verifyJwt: (...args: unknown[]) => mockVerifyJwt(...args),
+  signJwt: (...args: unknown[]) => mockSignJwt(...args),
+}));
+
+jest.mock('../../services/core/logger.service.js', () => ({
+  LoggerService: {
+    getInstance: () => ({
+      createComponentLogger: () => ({
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn(),
+        debug: jest.fn(),
+      }),
+    }),
+  },
+}));
+
+const mockConnect = jest.fn();
+const mockConnectLocal = jest.fn();
+const mockDisconnect = jest.fn();
+const mockGetStatus = jest.fn();
+const mockGetTemplates = jest.fn();
+const mockIsConnected = jest.fn();
+const mockGetTier = jest.fn();
+const mockGetCloudUrl = jest.fn().mockReturnValue(null);
+
+jest.mock('../../services/cloud/cloud-client.service.js', () => ({
+  CloudClientService: {
+    getInstance: () => ({
+      connect: mockConnect,
+      connectLocal: mockConnectLocal,
+      disconnect: mockDisconnect,
+      getStatus: mockGetStatus,
+      getTemplates: mockGetTemplates,
+      isConnected: mockIsConnected,
+      getTier: mockGetTier,
+      getCloudUrl: (...a: unknown[]) => mockGetCloudUrl(...a),
+      getToken: jest.fn().mockReturnValue('test-token'),
+      setRefreshToken: jest.fn(),
+    }),
+  },
+}));
+
+const mockSyncStart = jest.fn();
+const mockSyncStop = jest.fn();
+const relayQueueHealth = {
+  queueId: null,
+  error: 'Queue registration failed: 429 {"success":false,"error":"quota_exceeded","limit":8,"current":8}',
+  failingSince: 1_000,
+  failures: 3,
+  nextAttemptAt: 2_000,
+};
+const mockSyncGetHealth = jest.fn(() => ({
+  state: 'syncing',
+  lastContactAt: 1_000,
+  startedAt: 1_000,
+  authRejected: false,
+  relayQueue: relayQueueHealth,
+}));
+
+jest.mock('../../services/cloud/cloud-sync.service.js', () => ({
+  CloudSyncService: {
+    getInstance: () => ({
+      start: mockSyncStart,
+      stop: mockSyncStop,
+      getHealth: mockSyncGetHealth,
+    }),
+  },
+}));
+
+const mockGetOrCreateIdentity = jest.fn().mockResolvedValue({
+  deviceId: 'test-device-uuid',
+  deviceName: 'test-hostname',
+});
+
+jest.mock('../../services/cloud/device-identity.service.js', () => ({
+  DeviceIdentityService: {
+    getInstance: () => ({
+      getOrCreateIdentity: mockGetOrCreateIdentity,
+    }),
+  },
+}));
+
+jest.mock('../../services/core/storage.service.js', () => ({
+  StorageService: {
+    getInstance: () => ({
+      getTeams: jest.fn().mockResolvedValue([
+        { id: 'team-1', name: 'Product', members: [{ agentStatus: 'active' }, { agentStatus: 'inactive' }] },
+        { id: 'team-2', name: 'Marketing', members: [{ agentStatus: 'active' }] },
+      ]),
+    }),
+  },
+}));
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Build a minimal mock Express Request. */
+function mockReq(overrides: Partial<Request> = {}): Request {
+  return {
+    params: {},
+    query: {},
+    body: {},
+    ...overrides,
+  } as unknown as Request;
+}
+
+/** Build a mock Express Response with chainable status/json. */
+function mockRes(): Response {
+  const res = {
+    status: jest.fn().mockReturnThis(),
+    json: jest.fn().mockReturnThis(),
+  };
+  return res as unknown as Response;
+}
+
+const mockNext: NextFunction = jest.fn();
+
+const originalFetch = global.fetch;
+const mockFetch = jest.fn().mockResolvedValue({
+  ok: true,
+  status: 200,
+  json: async () => ({ success: true }),
+}) as jest.Mock;
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('Cloud Controller', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    global.fetch = mockFetch as unknown as typeof fetch;
+  });
+
+  afterAll(() => {
+    global.fetch = originalFetch;
+  });
+
+  // ----- connectToCloud ---------------------------------------------------
+
+  describe('connectToCloud()', () => {
+    it('should connect locally when JWT verifies locally', async () => {
+      mockVerifyJwt.mockReturnValue({ sub: 'user-1', plan: 'pro' });
+
+      const req = mockReq({ body: { token: 'test-token', cloudUrl: 'https://cloud.test.com' } });
+      const res = mockRes();
+
+      await connectToCloud(req, res, mockNext);
+
+      // Local verification → connectLocal instead of connect
+      // 4th arg is refreshToken (undefined when not provided)
+      expect(mockConnectLocal).toHaveBeenCalledWith('https://cloud.test.com', 'test-token', 'pro', undefined);
+      expect(mockConnect).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: { tier: 'pro' },
+      });
+    });
+
+    it('should fall back to remote connect when local JWT verification fails', async () => {
+      // First call (verifyJwt in connectToCloud) → null → remote path
+      // Second call (verifyJwt in autoConnectRelay) → still null → relay skipped
+      mockVerifyJwt.mockReturnValue(null);
+      mockConnect.mockResolvedValue({ success: true, tier: 'pro' });
+
+      const req = mockReq({ body: { token: 'test-token', cloudUrl: 'https://cloud.test.com' } });
+      const res = mockRes();
+
+      await connectToCloud(req, res, mockNext);
+
+      // refreshToken is undefined when not provided in body
+      expect(mockConnect).toHaveBeenCalledWith('https://cloud.test.com', 'test-token', undefined);
+      expect(mockConnectLocal).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: { tier: 'pro' },
+      });
+    });
+
+    it('should use default cloud URL when not provided', async () => {
+      mockVerifyJwt.mockReturnValue(null);
+      mockConnect.mockResolvedValue({ success: true, tier: 'free' });
+
+      const req = mockReq({ body: { token: 'test-token' } });
+      const res = mockRes();
+
+      await connectToCloud(req, res, mockNext);
+
+      expect(mockConnect).toHaveBeenCalledWith(
+        expect.stringContaining('crewly'),
+        'test-token',
+        undefined,
+      );
+    });
+
+    it('should return 400 when token is missing', async () => {
+      const req = mockReq({ body: {} });
+      const res = mockRes();
+
+      await connectToCloud(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: false,
+          error: expect.stringContaining('token'),
+        }),
+      );
+    });
+
+    it('should return 401 on authentication failure', async () => {
+      mockVerifyJwt.mockReturnValue(null);
+      mockConnect.mockRejectedValue(new Error('Cloud authentication failed: 401 Unauthorized'));
+
+      const req = mockReq({ body: { token: 'bad-token' } });
+      const res = mockRes();
+
+      await connectToCloud(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+    });
+
+    it('should call next on unexpected error', async () => {
+      mockVerifyJwt.mockReturnValue(null);
+      const error = new Error('Network error');
+      mockConnect.mockRejectedValue(error);
+
+      const req = mockReq({ body: { token: 'test-token' } });
+      const res = mockRes();
+
+      await connectToCloud(req, res, mockNext);
+
+      expect(mockNext).toHaveBeenCalledWith(error);
+    });
+
+    it('should send cloud handshake with device metadata after connect', async () => {
+      mockVerifyJwt.mockReturnValue({ sub: 'user-1', plan: 'pro' });
+
+
+      const req = mockReq({ body: { token: 'test-token', cloudUrl: 'https://cloud.test.com' } });
+      const res = mockRes();
+
+      await connectToCloud(req, res, mockNext);
+
+      // Allow the async handshake to fire
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Handshake should be called via fetch (now uses /api/v1/relay/handshake)
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining('/api/v1/relay/handshake'),
+        expect.objectContaining({
+          method: 'POST',
+          headers: expect.objectContaining({
+            Authorization: 'Bearer test-token',
+          }),
+        }),
+      );
+
+      // Verify the payload structure
+      const callArgs = mockFetch.mock.calls.find(
+        (call: unknown[]) => typeof call[0] === 'string' && (call[0] as string).includes('/relay/handshake'),
+      );
+      expect(callArgs).toBeDefined();
+      const body = JSON.parse(callArgs![1].body);
+      expect(body.deviceId).toBe('test-device-uuid');
+      expect(body.deviceName).toBe('test-hostname');
+      expect(body.teams).toHaveLength(2);
+      expect(body.teams[0].name).toBe('Product');
+      expect(body.teams[0].memberCount).toBe(2);
+      expect(body.teams[0].activeAgents).toBe(1);
+      expect(body.timestamp).toBeDefined();
+    });
+
+    it('should not fail cloud connect if handshake fails', async () => {
+      mockVerifyJwt.mockReturnValue({ sub: 'user-1', plan: 'pro' });
+
+      mockFetch.mockRejectedValueOnce(new Error('Network timeout'));
+
+      const req = mockReq({ body: { token: 'test-token' } });
+      const res = mockRes();
+
+      await connectToCloud(req, res, mockNext);
+
+      // Cloud connect still returns success despite handshake failure
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    });
+
+    it('should start CloudSyncService after successful cloud connect', async () => {
+      mockVerifyJwt.mockReturnValue({ sub: 'user-1', plan: 'pro' });
+
+
+      const req = mockReq({ body: { token: 'test-token', cloudUrl: 'https://cloud.test.com' } });
+      const res = mockRes();
+
+      await connectToCloud(req, res, mockNext);
+
+      expect(mockSyncStart).toHaveBeenCalledWith({
+        cloudUrl: 'https://cloud.test.com',
+        token: 'test-token',
+        deviceId: 'test-device-uuid',
+        deviceName: 'test-hostname',
+      });
+    });
+
+    it('should not fail cloud connect if CloudSyncService.start throws', async () => {
+      mockVerifyJwt.mockReturnValue({ sub: 'user-1', plan: 'pro' });
+
+      mockSyncStart.mockImplementation(() => { throw new Error('Sync failed'); });
+
+      const req = mockReq({ body: { token: 'test-token' } });
+      const res = mockRes();
+
+      await connectToCloud(req, res, mockNext);
+
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    });
+  });
+
+  // ----- disconnectFromCloud ----------------------------------------------
+
+  describe('disconnectFromCloud()', () => {
+    it('should disconnect and return success', async () => {
+      const req = mockReq();
+      const res = mockRes();
+
+      await disconnectFromCloud(req, res, mockNext);
+
+      expect(mockDisconnect).toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith({ success: true });
+    });
+
+    it('should stop CloudSyncService on disconnect', async () => {
+      const req = mockReq();
+      const res = mockRes();
+
+      await disconnectFromCloud(req, res, mockNext);
+
+      expect(mockSyncStop).toHaveBeenCalled();
+    });
+  });
+
+  // ----- getCloudStatus ---------------------------------------------------
+
+  describe('getCloudStatus()', () => {
+    it('should return current status', async () => {
+      const status = {
+        connectionStatus: 'connected',
+        cloudUrl: 'https://cloud.test.com',
+        tier: 'pro',
+        lastSyncAt: '2026-03-07T00:00:00.000Z',
+      };
+      mockGetStatus.mockReturnValue(status);
+
+      const req = mockReq();
+      const res = mockRes();
+
+      await getCloudStatus(req, res, mockNext);
+
+      // STATUS-DISTINCTION invariant (2026-05-28 browser-relay fix): the cloud
+      // status is tagged transport: 'config-socket' so "cloud connected" can
+      // never be confused with "browser drivable" (which /api/browser/status
+      // reports as transport: 'cloud-relay-ws', drivable: proxy.isAvailable()).
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: { ...status, transport: 'config-socket', relayQueue: relayQueueHealth },
+      });
+    });
+
+    it('reports why relay queue registration is failing', async () => {
+      mockGetStatus.mockReturnValue({ connected: true });
+      const res = mockRes();
+
+      await getCloudStatus(mockReq(), res, mockNext);
+
+      const payload = (res.json as jest.Mock).mock.calls[0][0];
+      expect(payload.data.relayQueue.queueId).toBeNull();
+      expect(payload.data.relayQueue.error).toContain('quota_exceeded');
+      expect(payload.data.relayQueue.nextAttemptAt).toBe(2_000);
+    });
+
+    it('tags the config-socket transport so it is distinct from browser drivability', async () => {
+      mockGetStatus.mockReturnValue({
+        connectionStatus: 'connected',
+        cloudUrl: 'https://cloud.test.com',
+        tier: 'pro',
+        lastSyncAt: null,
+      });
+      const req = mockReq();
+      const res = mockRes();
+
+      await getCloudStatus(req, res, mockNext);
+
+      const payload = (res.json as jest.Mock).mock.calls[0][0];
+      expect(payload.data.transport).toBe('config-socket');
+      // It must NOT advertise a browser-drivable transport.
+      expect(payload.data.transport).not.toBe('cloud-relay-ws');
+      expect(payload.data.drivable).toBeUndefined();
+    });
+  });
+
+  // ----- getCloudTemplates ------------------------------------------------
+
+  describe('getCloudTemplates()', () => {
+    it('should return templates when connected', async () => {
+      mockIsConnected.mockReturnValue(true);
+      const templates = [{ id: '1', name: 'Template 1' }];
+      mockGetTemplates.mockResolvedValue(templates);
+
+      const req = mockReq();
+      const res = mockRes();
+
+      await getCloudTemplates(req, res, mockNext);
+
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: templates,
+      });
+    });
+
+    it('should return 403 when not connected', async () => {
+      mockIsConnected.mockReturnValue(false);
+
+      const req = mockReq();
+      const res = mockRes();
+
+      await getCloudTemplates(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: false,
+          error: expect.stringContaining('Not connected'),
+        }),
+      );
+    });
+
+    it('should call next on fetch error', async () => {
+      mockIsConnected.mockReturnValue(true);
+      const error = new Error('Fetch failed');
+      mockGetTemplates.mockRejectedValue(error);
+
+      const req = mockReq();
+      const res = mockRes();
+
+      await getCloudTemplates(req, res, mockNext);
+
+      expect(mockNext).toHaveBeenCalledWith(error);
+    });
+  });
+
+  // ----- validateCloudToken ------------------------------------------------
+
+  describe('validateCloudToken()', () => {
+    it('should return 401 when Authorization header is missing', async () => {
+      const req = mockReq({ headers: {} as any });
+      const res = mockRes();
+
+      await validateCloudToken(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ success: false, error: expect.stringContaining('Authorization') }),
+      );
+    });
+
+    it('should validate JWT locally and return user profile', async () => {
+      mockVerifyJwt.mockReturnValue({
+        sub: 'u1',
+        email: 'test@test.com',
+        name: 'Test User',
+        plan: 'pro',
+      });
+
+      const req = mockReq({ headers: { authorization: 'Bearer valid-jwt' } as any });
+      const res = mockRes();
+
+      await validateCloudToken(req, res, mockNext);
+
+      expect(mockVerifyJwt).toHaveBeenCalledWith('valid-jwt');
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: {
+          id: 'u1',
+          email: 'test@test.com',
+          displayName: 'Test User',
+          plan: 'pro',
+        },
+      });
+    });
+
+    it('should return 401 when JWT is invalid and no proxy configured', async () => {
+      mockVerifyJwt.mockReturnValue(null);
+      delete process.env['CREWLY_CLOUD_API_BASE'];
+
+      const req = mockReq({ headers: { authorization: 'Bearer invalid-jwt' } as any });
+      const res = mockRes();
+
+      await validateCloudToken(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ success: false, error: expect.stringContaining('Invalid or expired') }),
+      );
+    });
+
+    it('should proxy to cloud API when local verification fails and CREWLY_CLOUD_API_BASE is set', async () => {
+      mockVerifyJwt.mockReturnValue(null);
+      process.env['CREWLY_CLOUD_API_BASE'] = 'https://api.crewlyai.com/api';
+
+      const cloudResponse = { success: true, data: { id: 'u1', email: 'test@test.com', plan: 'pro' } };
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(cloudResponse),
+      });
+
+      const req = mockReq({ headers: { authorization: 'Bearer test-token' } as any });
+      const res = mockRes();
+
+      await validateCloudToken(req, res, mockNext);
+
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.stringContaining('/cloud/validate'),
+        expect.objectContaining({
+          method: 'POST',
+          headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
+        }),
+      );
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(res.json).toHaveBeenCalledWith(cloudResponse);
+
+      delete process.env['CREWLY_CLOUD_API_BASE'];
+    });
+  });
+
+  // ----- refreshCloudToken ------------------------------------------------
+
+  describe('refreshCloudToken()', () => {
+    it('should return 400 when refreshToken is missing', async () => {
+      const req = mockReq({ body: {} });
+      const res = mockRes();
+
+      await refreshCloudToken(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+    });
+
+    it('should return 401 when refresh token is invalid', async () => {
+      mockVerifyJwt.mockReturnValue(null);
+
+      const req = mockReq({ body: { refreshToken: 'bad-token' } });
+      const res = mockRes();
+
+      await refreshCloudToken(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+    });
+
+    it('should return 401 when token type is not refresh', async () => {
+      mockVerifyJwt.mockReturnValue({ sub: 'u1', type: 'access' });
+
+      const req = mockReq({ body: { refreshToken: 'access-token' } });
+      const res = mockRes();
+
+      await refreshCloudToken(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+    });
+
+    it('should issue new access token on valid refresh token', async () => {
+      mockVerifyJwt.mockReturnValue({ sub: 'u1', email: 'test@test.com', name: 'Test', plan: 'pro', type: 'refresh' });
+      mockSignJwt.mockReturnValue('new-access-token');
+
+      const req = mockReq({ body: { refreshToken: 'valid-refresh' } });
+      const res = mockRes();
+
+      await refreshCloudToken(req, res, mockNext);
+
+      expect(mockSignJwt).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sub: 'u1',
+          type: 'access',
+        }),
+      );
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: {
+          accessToken: 'new-access-token',
+          expiresIn: expect.any(Number),
+        },
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // getDeviceId
+  // -------------------------------------------------------------------------
+
+  describe('getDeviceId', () => {
+    it('should return deviceId and deviceName from DeviceIdentityService', async () => {
+      const req = mockReq();
+      const res = mockRes();
+
+      await getDeviceId(req, res, mockNext);
+
+      expect(mockGetOrCreateIdentity).toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: {
+          deviceId: 'test-device-uuid',
+          deviceName: 'test-hostname',
+        },
+      });
+    });
+
+    it('should call next on error', async () => {
+      mockGetOrCreateIdentity.mockRejectedValueOnce(new Error('disk error'));
+      const req = mockReq();
+      const res = mockRes();
+      const next = jest.fn();
+
+      await getDeviceId(req, res, next);
+
+      expect(next).toHaveBeenCalledWith(expect.any(Error));
+      expect(res.json).not.toHaveBeenCalled();
+    });
+  });
+
+  // ----- verifyLicense -----------------------------------------------------
+
+  describe('verifyLicense()', () => {
+    it('should return valid=true with pro features when connected as pro', async () => {
+      mockIsConnected.mockReturnValue(true);
+      mockGetTier.mockReturnValue('pro');
+
+      const req = mockReq();
+      const res = mockRes();
+
+      await verifyLicense(req, res, mockNext);
+
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: {
+          valid: true,
+          tier: 'pro',
+          features: ['basic_teams', 'premium_templates', 'cloud_relay', 'multi_device'],
+        },
+      });
+    });
+
+    it('should return valid=false with free features when disconnected', async () => {
+      mockIsConnected.mockReturnValue(false);
+      // When disconnected, tier is forced to 'free' regardless of getTier()
+      mockGetTier.mockReturnValue('pro');
+
+      const req = mockReq();
+      const res = mockRes();
+
+      await verifyLicense(req, res, mockNext);
+
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: {
+          valid: false,
+          tier: 'free',
+          features: ['basic_teams'],
+        },
+      });
+    });
+
+    it('should return enterprise features for enterprise tier', async () => {
+      mockIsConnected.mockReturnValue(true);
+      mockGetTier.mockReturnValue('enterprise');
+
+      const req = mockReq();
+      const res = mockRes();
+
+      await verifyLicense(req, res, mockNext);
+
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: {
+          valid: true,
+          tier: 'enterprise',
+          features: ['basic_teams', 'premium_templates', 'cloud_relay', 'multi_device', 'custom_templates', 'priority_support'],
+        },
+      });
+    });
+
+    it('should fall back to free features for unknown tier', async () => {
+      mockIsConnected.mockReturnValue(true);
+      mockGetTier.mockReturnValue('unknown-tier');
+
+      const req = mockReq();
+      const res = mockRes();
+
+      await verifyLicense(req, res, mockNext);
+
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: {
+          valid: true,
+          tier: 'unknown-tier',
+          features: ['basic_teams'],
+        },
+      });
+    });
+
+    it('should call next on unexpected error', async () => {
+      mockIsConnected.mockImplementation(() => { throw new Error('Unexpected'); });
+
+      const req = mockReq();
+      const res = mockRes();
+
+      await verifyLicense(req, res, mockNext);
+
+      expect(mockNext).toHaveBeenCalledWith(expect.any(Error));
+    });
+  });
+
+  // ----- credential isolation (specs/2026-10-04-agent-credential-isolation.md) ----
+
+  describe('cloudSearch() — agent web search through the backend', () => {
+    it('refuses a caller with no credential (401) and an unverified agent (403)', async () => {
+      const anon = mockRes();
+      await cloudSearch(mockReq({ headers: {}, body: { query: 'q' } } as Partial<Request>), anon);
+      expect(anon.status).toHaveBeenCalledWith(401);
+
+      const legacy = mockReq({ headers: {}, body: { query: 'q' } } as Partial<Request>);
+      setCallerIdentity(legacy, { kind: 'agent', via: 'legacy-header', session: 'ruth' } as never);
+      const res = mockRes();
+      await cloudSearch(legacy, res);
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('answers 503 when Cloud is not connected', async () => {
+      const res = mockRes();
+      await cloudSearch(markOwner(mockReq({ headers: {}, body: { query: 'q' } } as Partial<Request>)), res);
+      expect(res.status).toHaveBeenCalledWith(503);
+    });
+
+    it('calls Cloud with the backend token for a badge agent and returns Cloud\'s answer, never the token', async () => {
+      mockGetCloudUrl.mockReturnValue('https://api.crewlyai.com');
+      const searchFetch = jest.fn().mockResolvedValue({ status: 200, text: async () => JSON.stringify({ success: true, answer: 'a', sources: [] }) });
+      global.fetch = searchFetch as unknown as typeof fetch;
+      const req = mockReq({ headers: {}, body: { query: 'q', max_results: 3 } } as Partial<Request>);
+      setCallerIdentity(req, { kind: 'agent', via: 'agent-badge', session: 'ruth' } as never);
+      const res = mockRes();
+      await cloudSearch(req, res);
+      const [url, init] = searchFetch.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe('https://api.crewlyai.com/api/v1/search');
+      expect((init.headers as Record<string, string>).Authorization).toBe('Bearer test-token');
+      expect(JSON.parse(init.body as string)).toEqual({ query: 'q', max_results: 3 });
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(res.json).toHaveBeenCalledWith({ success: true, answer: 'a', sources: [] });
+      expect(JSON.stringify((res.json as jest.Mock).mock.calls)).not.toContain('test-token');
+      mockGetCloudUrl.mockReturnValue(null);
+    });
+
+    it('validates the query', async () => {
+      const res = mockRes();
+      await cloudSearch(markOwner(mockReq({ headers: {}, body: {} } as Partial<Request>)), res);
+      expect(res.status).toHaveBeenCalledWith(400);
+    });
+  });
+
+  describe('mobilePair() — hands out the Cloud session, so owner-only', () => {
+    it('refuses an agent with its badge (403) and an anonymous caller (401)', async () => {
+      const req = mockReq({ headers: {} } as Partial<Request>);
+      setCallerIdentity(req, { kind: 'agent', via: 'agent-badge', session: 'ruth' } as never);
+      const res = mockRes();
+      await mobilePair(req, res, mockNext);
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(JSON.stringify((res.json as jest.Mock).mock.calls)).not.toContain('test-token');
+
+      const anon = mockRes();
+      await mobilePair(mockReq({ headers: {} } as Partial<Request>), anon, mockNext);
+      expect(anon.status).toHaveBeenCalledWith(401);
+    });
+  });
+});
+

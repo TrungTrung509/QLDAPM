@@ -1,0 +1,283 @@
+/**
+ * Types for the Workspace Backup feature.
+ *
+ * A backup is a single `.tar.gz` archive containing a top-level
+ * `manifest.json` plus the captured `CREWLY_HOME` globals, each project's
+ * `.crewly/` tree, and (optionally) `chat.db`. See
+ * specs/2026-06-07-workspace-backup.md.
+ *
+ * @module services/backup/backup.types
+ */
+
+/** Manifest schema version — bump on any breaking layout/field change. */
+export const BACKUP_SCHEMA_VERSION = 1;
+
+/**
+ * Default exclude patterns applied to project source trees when
+ * `includeProjectFiles` is set. Patterns without a `/` match a path segment
+ * at any depth; patterns with a `/` match the project-relative POSIX path
+ * (`*` = one segment, `**` = any depth).
+ *
+ * `.git` is deliberately NOT excluded (history survives, pack files
+ * included); `.crewly` is captured separately under `projects/<id>/.crewly/`.
+ */
+export const DEFAULT_PROJECT_FILE_EXCLUDES: readonly string[] = ['node_modules', '.crewly', '.DS_Store'];
+
+/**
+ * Directory names never captured, at ANY depth of CREWLY_HOME or a project's
+ * `.crewly/`. `logs` covers `~/.crewly/logs/sessions/*.log` — the raw agent
+ * PTY transcripts, which held API keys and Slack tokens before #806 (and are
+ * still only redacted best-effort) — plus service/skill-setup logs; `sessions`
+ * covers per-agent runtime transcripts. Logs are machine-local noise, not
+ * workspace state: excluded rather than redacted.
+ */
+export const BACKUP_EXCLUDED_DIR_NAMES: readonly string[] = ['sessions', 'logs', '.orchestrator-state'];
+
+/**
+ * File-name suffixes never captured, at any depth: JSONL transcripts/event
+ * logs and stray `*.log` files outside a `logs/` directory (PTY output that
+ * landed elsewhere). Applies to CREWLY_HOME and each project's `.crewly/`,
+ * not to project source trees (`includeProjectFiles`), which are the user's
+ * own files.
+ */
+export const BACKUP_EXCLUDED_FILE_SUFFIXES: readonly string[] = ['.jsonl', '.log'];
+
+/** Shell history files never captured, at any depth (they held typed-in API keys). */
+export const BACKUP_EXCLUDED_FILE_NAMES: readonly string[] = ['.bash_history', '.zsh_history', '.sh_history', '.history'];
+
+/** Archive path prefix for a project's source files: `projects/<id>/files/`. */
+export const PROJECT_FILES_ARCHIVE_DIR = 'files';
+
+/** Above this estimated project-files size the CLI requires `--yes` (2 GiB). */
+export const PROJECT_FILES_SIZE_WARN_BYTES = 2 * 1024 * 1024 * 1024;
+
+/**
+ * Archive path of the Slack app credentials captured from CREWLY_HOME. Two
+ * instances holding the same credentials both answer the same Slack app,
+ * non-deterministically — restore warns about it and `skipSlack` leaves the
+ * file out (item 29).
+ */
+export const SLACK_CREDENTIALS_ARCHIVE_PATH = 'home/slack-credentials.json';
+
+/** A single captured file recorded in the manifest for integrity + listing. */
+export interface BackupFileEntry {
+  /** Path inside the archive, relative to the archive root. */
+  path: string;
+  /** SHA-256 of the file content (hex). */
+  sha256: string;
+  /** Size in bytes. */
+  bytes: number;
+}
+
+/** Git provenance for a captured project so restore can re-clone the source tree. */
+export interface BackupProjectGit {
+  /** `origin` remote URL, or null when not a git repo / no origin. */
+  remote: string | null;
+  /** HEAD commit sha, or null when unavailable. */
+  commit: string | null;
+}
+
+/** One project's captured `.crewly/` data + provenance. */
+export interface BackupProjectEntry {
+  /** Stable project id (from projects.json). */
+  id: string;
+  /** Human-readable project name. */
+  name: string;
+  /** Absolute path on the SOURCE machine (used for restore path-rewriting). */
+  sourcePath: string;
+  /** Git provenance for re-clone on restore. */
+  git: BackupProjectGit;
+  /** Captured `.crewly/` files under `projects/<id>/.crewly/` in the archive. */
+  files: BackupFileEntry[];
+  /**
+   * Project source files under `projects/<id>/files/` — present only when the
+   * archive was created with `includeProjectFiles`. Absent on older archives.
+   */
+  projectFiles?: BackupFileEntry[];
+  /** Total bytes of `projectFiles`, when captured. */
+  projectFilesBytes?: number;
+}
+
+/** chat.db capture record. */
+export interface BackupChatDb {
+  /** Whether chat.db was included (false when excluded or the native module is absent). */
+  included: boolean;
+  /** SHA-256 of the captured db, when included. */
+  sha256?: string;
+  /** Size in bytes, when included. */
+  bytes?: number;
+  /** Reason it was skipped, when not included. */
+  skippedReason?: string;
+}
+
+/** Encryption envelope descriptor. v1 archives are unencrypted on disk; Cloud adds SSE. */
+export interface BackupCrypto {
+  /** `none` for v1 local archives. `sse` once parked in the cloud. */
+  mode: 'none' | 'sse';
+}
+
+/** Top-level archive manifest. */
+export interface BackupManifest {
+  schemaVersion: number;
+  crewlyVersion: string;
+  /** ISO timestamp — the logical point-in-time of the snapshot. */
+  createdAt: string;
+  /** Source device id (observability only; NEVER restored). */
+  sourceDeviceId: string | null;
+  sourceDeviceName: string | null;
+  /** Source `CREWLY_HOME` absolute path — restore uses it for path rewriting. */
+  sourceHomePath: string;
+  /** Owner account (JWT `sub`/googleId). Null for local-only archives; stamped by Cloud on upload. */
+  ownerSub: string | null;
+  /** Captured CREWLY_HOME global files (relative to `home/` in the archive). */
+  global: BackupFileEntry[];
+  /** Captured per-project `.crewly/` data. */
+  projects: BackupProjectEntry[];
+  chatDb: BackupChatDb;
+  crypto: BackupCrypto;
+  /**
+   * True when each project's own source tree was captured under
+   * `projects/<id>/files/`. Absent/false on archives that only carry `.crewly/`.
+   */
+  includesProjectFiles?: boolean;
+  /** Exclude patterns that were applied to project files (when included). */
+  projectFileExcludes?: string[];
+}
+
+/** Options for building an archive. */
+export interface CreateBackupOptions {
+  /** Output archive path. Defaults to `CREWLY_HOME/backups/workspace-<ts>.tar.gz`. */
+  outPath?: string;
+  /** Exclude chat.db (smaller archive, avoids SQLite capture). Default false. */
+  excludeChatDb?: boolean;
+  /** Override CREWLY_HOME (tests). Defaults to getCrewlyHomePath(). */
+  homePath?: string;
+  /** ISO timestamp for the snapshot point. Defaults to caller-supplied now (no Date in lib). */
+  createdAt: string;
+  /** Owner sub to stamp (usually null locally; Cloud stamps on upload). */
+  ownerSub?: string | null;
+  /** Source device id/name for the manifest (observability). */
+  sourceDeviceId?: string | null;
+  sourceDeviceName?: string | null;
+  /** Also capture each project's own source tree (item 26). Default false. */
+  includeProjectFiles?: boolean;
+  /**
+   * Exclude patterns for project files. Replaces
+   * {@link DEFAULT_PROJECT_FILE_EXCLUDES} when given (callers that want to add
+   * to the defaults should spread them in).
+   */
+  projectFileExcludes?: string[];
+}
+
+/** Per-project size estimate produced before an archive is built. */
+export interface ProjectFilesEstimate {
+  id: string;
+  name: string;
+  path: string;
+  /** Bytes of regular files that would be captured after excludes. */
+  bytes: number;
+  /** Number of regular files that would be captured. */
+  fileCount: number;
+}
+
+/** Result of a successful archive build. */
+export interface CreateBackupResult {
+  archivePath: string;
+  manifest: BackupManifest;
+  /** Total uncompressed bytes captured (for quota/UX). */
+  totalBytes: number;
+}
+
+// ---------------------------------------------------------------------------
+// Restore (P1)
+// ---------------------------------------------------------------------------
+
+/** How to handle a target that already has overlapping data. */
+export type RestoreMode = 'abort' | 'overwrite';
+
+/** Options for restoring an archive onto this machine. */
+export interface RestoreOptions {
+  /** Archive (.tar.gz) to restore. */
+  archivePath: string;
+  /** Target CREWLY_HOME. Defaults to getCrewlyHomePath(). */
+  homePath?: string;
+  /** Conflict policy. Default 'abort'. */
+  mode?: RestoreMode;
+  /**
+   * Source→target absolute path remap for projects, e.g.
+   * `{ '/Users/alice/web': '/Users/bob/web' }`. When a source path isn't
+   * mapped, restore reuses it if it exists on the target, else records a
+   * warning and skips that project's `.crewly/` write.
+   */
+  pathMap?: Record<string, string>;
+  /** ISO timestamp used to name the pre-restore rollback snapshot. */
+  now: string;
+  /**
+   * Leave Slack credentials (`slack-credentials.json`) out of the restore so
+   * this instance does not answer the same Slack app as the source (item 29).
+   */
+  skipSlack?: boolean;
+}
+
+/** One project's restore plan entry. */
+export interface RestoreProjectPlan {
+  id: string;
+  name: string;
+  sourcePath: string;
+  /** Resolved target path (pathMap → existing sourcePath → null when unresolved). */
+  targetPath: string | null;
+  git: { remote: string | null; commit: string | null };
+  /** Whether the resolved target path currently exists on this machine. */
+  targetExists: boolean;
+  /** Number of project source files carried by the archive for this project (0 when none). */
+  projectFileCount: number;
+  /** Bytes of project source files carried by the archive for this project. */
+  projectFilesBytes: number;
+  /**
+   * True when the archive carries project files AND the target directory
+   * already holds something other than `.crewly/` — restoring would overwrite
+   * it, which requires mode='overwrite'.
+   */
+  targetNonEmpty: boolean;
+}
+
+/** Non-destructive restore plan (dry-run). */
+export interface RestorePlan {
+  /** False when mode='abort' and conflicts exist (apply would refuse). */
+  ok: boolean;
+  manifestCreatedAt: string;
+  sourceHomePath: string;
+  /**
+   * Stable ids present on BOTH the backup and this machine (would be
+   * overwritten). `projectFiles` lists project ids whose source files would
+   * land in a non-empty target directory.
+   */
+  conflicts: { teams: string[]; projects: string[]; projectFiles: string[] };
+  /** Whether the archive carries project source files. */
+  includesProjectFiles: boolean;
+  /** Whether the archive carries Slack app credentials (see SLACK_CREDENTIALS_ARCHIVE_PATH). */
+  hasSlackCredentials: boolean;
+  /** Whether Slack credentials will be left out (skipSlack requested and present). */
+  slackSkipped: boolean;
+  globalFileCount: number;
+  projects: RestoreProjectPlan[];
+  chatDbIncluded: boolean;
+  /** Things to regenerate (device identity) / discard (runtime/session). */
+  regenerated: string[];
+  discarded: string[];
+  warnings: string[];
+}
+
+/** Result of an applied restore. */
+export interface RestoreResult {
+  restoredGlobalFiles: number;
+  restoredProjects: number;
+  /** Project source files written (0 when the archive carried none). */
+  restoredProjectFiles: number;
+  /** True when Slack credentials were in the archive and left out (skipSlack). */
+  slackSkipped: boolean;
+  chatDbRestored: boolean;
+  /** Where the pre-restore snapshot of the current CREWLY_HOME was saved. */
+  rollbackSnapshotPath: string;
+  warnings: string[];
+}

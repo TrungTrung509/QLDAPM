@@ -1,0 +1,150 @@
+---
+name: SEO Ops
+description: "Search Console-driven SEO operations for any site: query patterns (low-CTR top-3, near-miss 4-20, rising queries, keyword cannibalization), per-URL report cards, pre-publish SEO/AEO checks, a gated programmatic-page queue, and a live-diff gate that stops agents from removing things from live pages. Use when auditing organic search, deciding what to rewrite, or before changing a live page. For writing posts use seo-blog-writer instead."
+version: 1.2.0
+category: productivity
+skillType: claude-skill
+author: Crewly
+license: MIT
+assignableRoles:
+  - marketing
+  - content-strategist
+  - generalist
+  - developer
+  - fullstack-dev
+triggers:
+  - seo report
+  - search console
+  - keyword cannibalization
+  - pre-publish seo check
+  - programmatic seo pages
+  - live page diff
+  - experiment metric
+  - url inspection
+tags:
+  - seo
+  - aeo
+  - search-console
+  - marketing
+  - content
+execution:
+  type: script
+  script:
+    file: execute.sh
+    interpreter: bash
+    timeoutMs: 120000
+---
+
+# SEO Ops
+
+Search Console-driven SEO operations for any site. One skill, one JSON config per site.
+Read-only against Google (scopes `webmasters.readonly`, optionally `analytics.readonly`); it never edits a site.
+
+## Setup (once per machine, one line)
+
+```bash
+export SEO_OPS_GOOGLE_CREDENTIALS=/path/to/service-account.json
+```
+
+Needs `python3` >= 3.8 and `openssl` (both preinstalled on macOS and most Linux). No pip installs.
+Then add the service account's email (`client_email` inside the JSON) as a **restricted** user in
+Search Console for your property (Settings -> Users and permissions), and enable the Search Console API
+for its Google Cloud project. For GA4, add it as Viewer on the property.
+
+Copy `seo-ops.config.example.json` next to your project and fill it in:
+
+| Key | Meaning |
+|-----|---------|
+| `siteUrl` | Site origin, e.g. `https://example.com` |
+| `gscProperty` | `sc-domain:example.com` or a URL-prefix property |
+| `ga4PropertyId` | GA4 property id (used by `page-report --ga4` and `metric --source ga4`; `--ga4` without it is an error) |
+| `ga4HostName` | Optional. Exact hostname (e.g. `crewlyai.com`); when set, `page-report --ga4` only counts sessions on that host. Use it when one GA4 property serves several hostnames. Unset = whole property |
+| `credentialsPath` | **Name of the env var** holding the key file path. Never the key, never a path |
+| `sitemapUrl` | Sitemap or sitemap index URL |
+| `exclusions.queries` / `exclusions.pages` | Regexes (case-insensitive) dropped from every report (brand terms, `site:` checks, admin paths) |
+| `publishMethod` | Free text shown to you after each command, e.g. "open a blog PR on <org>/web" |
+| `urlNormalize` | `{"stripScheme": true, "localePrefixes": ["en","zh"]}`: http/https and `/en/x` vs `/x` count as ONE page in cannibalization, page-report and the sitemap check. Set it on hreflang sites, otherwise locale variants show up as false cannibalization |
+| `inspectMax` | Optional, default 50. Most URLs `page-report --inspect` sends to the URL Inspection API per run (quota 2000/day, 600/min per property) |
+| `maxPagesPerDay` | Pattern-queue release limit (default 1) |
+| `thresholds`, `prepublish`, `liveDiff`, `patternQueue` | Optional tuning, see the example file |
+
+## Commands
+
+Run as `bash config/skills/agent/marketplace/seo-ops/execute.sh --config seo-ops.config.json <command> ...`
+or with a JSON argument: `execute.sh '{"command":"gsc-report","config":"seo-ops.config.json","days":28}'`.
+
+Exit codes: `0` ok, `1` gate failed / needs human approval, `2` setup or credentials problem, `3` permission problem,
+`4` partial result (some URLs or parts failed or were skipped over a cap; the JSON's `errors` says which).
+Every command prints **what it examined**. A check that examined nothing exits `1`; it never reports clean.
+
+Every JSON output (stdout of `metric` / `inspect --json`, and the `--json` files) carries `schemaVersion` (currently `1`;
+bumped only when a field is removed or changes meaning) and an `errors` list (`[{message, code, url?|part?}]`, empty when
+nothing failed). JSON output is never truncated: every row is included.
+
+### `gsc-report [--days 28] [--json out.json]`
+Search Console for the last N days (ending 3 days ago, vs the previous N). Four patterns, all computed in code:
+1. Top-3 position with CTR < 35% (and 100+ impressions): rewrite title/description.
+2. Positions 4-20 with 40+ impressions: add content and internal links.
+3. Fastest-rising queries (new ones flagged): topic candidates.
+4. **Keyword cannibalization**: a query served by 2+ pages (each with 10+ impressions). Pick the winner, point the others at it.
+
+### `page-report [--url U ... | --urls-file F] [--include REGEX] [--days 28] [--ga4] [--inspect] [--json out.json]`
+Report card per URL (default: every sitemap URL). Flags: not in sitemap; 0 impressions after 7 days (`no-impressions`: **does not mean unindexed**); average position > 20;
+top-5 with CTR < 5%. Pages under 7 days old get numbers only (Search Console lags 2-3 days). Age comes from sitemap `lastmod`; unknown age is reported, not guessed.
+`--inspect` asks Google (Search Console URL Inspection API, same read-only `webmasters.readonly` scope) about every URL with 0 impressions past the age threshold, and replaces the ambiguous `no-impressions` with:
+- `not-indexed`: verdict is not PASS; the message carries Google's `coverageState`. **The only verdict that may put a URL on a Request Indexing list.**
+- `indexed-no-impressions`: verdict PASS; message gives the last crawl date. The problem is ranking/demand: improve the page or its links, do NOT request indexing.
+- `canonical-mismatch` (on an inspected page): Google's canonical differs from the URL (compared after `urlNormalize`).
+
+Rule: only `not-indexed` pages go on a Request Indexing list. Quota: the API allows 2000 inspections/day and 600/min per property; `--inspect` stops at `inspectMax` (default 50) and prints `inspected: N ... M skipped over the cap` with the skipped URLs, never silently. Without `--inspect` no inspection request is sent.
+One URL whose inspection fails (a 429, a 403) gets an `inspect-failed` verdict and the run goes on; the exit code is then `4`. So is a run that skipped URLs over `inspectMax`.
+`--json out.json` also writes the report card as JSON (`schemaVersion`, `property`, `start`, `end`, `examined`, `flagged`, `pages[]` with `url`, `impressions`, `clicks`, `position`, `ageDays`, `inSitemap`, `verdicts[]`, plus `index`: `{status: "ok", verdict, coverageState, lastCrawlTime, googleCanonical}` when inspected, `{status: "error", error}` when that failed, `{status: "skipped", reason}` over the cap, `null` when not inspected; `skipped[]`, `errors[]`, plus `ga4[]` = every organic landing page `{path, url, sessions}` when `--ga4` ran), the same convention as `gsc-report --json`.
+`--ga4` needs `ga4PropertyId`. GA4 landing pages are paths without query strings; `url` is the same page as a Search Console URL (after `urlNormalize`), so the two join. Text mode prints the top 15; JSON has them all.
+
+### `prepublish-check (--url U | --file draft.html [--canonical-url U]) [--target "query"] [--brief]`
+SEO (title, description, canonical, h1/h2, body length, internal links, sitemap, structured data) and AEO
+(direct-answer opening, a figure early, primary-source link, question headings, dates, no "see above" wording).
+Warns when a "best / latest / comparison" page title lacks the current year. `FAIL` exits `1`; clear FAILs before publishing, judge WARNs.
+
+### `pattern-queue plan | next | status [--out DIR] [--json F]`
+Programmatic pages (template x variables) behind a **"should this page exist" gate**. Nothing is queued blindly.
+- **Demand gate**: queries matching the variable values (or their aliases) must reach `patternQueue.demand.minImpressions` over `demand.days`. Zero matched queries = skipped, reported as a count and reason. `seeds` bypass this gate only.
+- **Near-duplicate gate**: bound data is compared with the parent page and every already-accepted or released sibling; similarity >= `similarity.threshold` (default 0.90) is skipped with the score and the page it duplicates. Put label fields in `similarity.ignoreKeys`.
+- **Live data binding**: the template must contain `{{data.field}}` bindings and `dataSource` (a `url` or `command` template using `{variable}`) must return JSON. A template with no bindings is **rejected**; an unresolved binding **fails the render** and does not use up the day's slot.
+- `plan` prints the ranked build/skip list with a reason for every candidate. `next` releases at most `maxPagesPerDay` (default **1**) and **refuses** a second release the same day (before any network call). Locales count together as one page unless `localesCountTogether` is false. State lives in `patternQueue.statePath`.
+
+### `live-diff --url LIVE (--proposed-file F | --proposed-url U)`  (no config needed)
+The gate to run **before changing any live page**. Fetches the live HTML, compares with the proposed version and reports removed/added
+headings, tables, links and structured data (down to JSON-LD properties), plus text-length delta.
+**Anything REMOVED, or text shrinking more than `liveDiff.maxTextShrinkPct` (30%), exits `1` with "NEEDS HUMAN APPROVAL":
+stop and show the report to a person.** Pure additions and text edits pass. If either side parses to 0 elements it fails (nothing was compared).
+Tables are matched by header row, so updating cell values is an edit, deleting a table is a removal.
+
+### `metric --source gsc|ga4 --measure M --start YYYY-MM-DD --end YYYY-MM-DD [--by date|page|query] [--host H] [--page P] [--query Q] [--event NAME]`
+One metric over a date range, **as JSON on stdout** (`{schemaVersion, source, measure, by, start, end, filters, total, volume, days[] | rows[], errors[]}`).
+This is what experiment cards (`experiment-card`) measure the baseline and result with.
+- `gsc`: `clicks | impressions | ctr | position`, optionally for one `--page` URL and/or `--query` (`--page-match` / `--query-match exact|contains`).
+  `ctr` and `position` are impression-weighted; `volume` is impressions.
+- `ga4`: `sessions`, `events` (`--event generate_lead`, the inquiry-form submit) or `conversions` (GA4 key events; `--event NAME` for
+  one of them), optionally for one landing `--page` path (a full URL is reduced to its path, query string dropped);
+  `--channel` defaults to `Organic Search` (`all` = every channel). `ga4HostName` applies. No Search Console lag applies to GA4.
+- `--by date` (default): one entry per day in `days[]`, days with no data as 0. `--by page`: `rows[]` per page, each with `url`
+  (normalised with `urlNormalize`; for GA4 the landing path joined to the site's origin), so GSC and GA4 rows join on `url`.
+  `--by query` (gsc only): `rows[]` per query (Search Console leaves out anonymised queries).
+- `--host H`: only that hostname (gsc: page URLs on it, for `sc-domain:` properties with subdomains; ga4: overrides `ga4HostName`).
+- A failure still prints the JSON, with the reason in `errors`, and exits non-zero (`2` setup, `3` permission, `1` API error).
+- Search Console data lags 2-3 days: pick an `--end` at least 3 days ago.
+
+### `inspect (--url U ... | --urls-file F) [--json]`
+URL Inspection for exactly the URLs given, **no impression gate** (unlike `page-report --inspect`), up to `inspectMax` per run.
+Each URL gets `status` `ok` (with `verdict`, `coverageState`, `lastCrawlTime`, `googleCanonical` and the `verdicts[]` above),
+`error` (its own message; the run goes on to the next URL) or `skipped` (over `inspectMax`). `--json` prints
+`{schemaVersion, property, examined, inspected, failed, skipped, urls[], errors[]}` on stdout.
+Exit `0` when all were inspected, `4` when some failed or were skipped, the error's own code when every URL failed.
+
+## Rules for agents
+
+- Run `live-diff` before every edit to a published page; never override its exit code yourself.
+- Do not put keys, property ids of other customers, or site data in this skill's folder.
+- Missing/unauthorized credentials produce a one-screen fix message; follow it rather than retrying.
+- Publish through the site's own process (see `publishMethod`); this skill does not publish.

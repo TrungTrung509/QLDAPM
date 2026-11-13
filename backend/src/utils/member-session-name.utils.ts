@@ -1,0 +1,75 @@
+/**
+ * The deterministic session name a team member runs under.
+ *
+ * `member.sessionName` in storage is transient: the team controller sets
+ * it on start and clears it on stop/failure. Anything that needs a stable
+ * agent id while the agent is idle (Slack agent identities, rosters)
+ * derives it here with the same formula the controller uses.
+ *
+ * @module utils/member-session-name.utils
+ */
+
+/**
+ * Derive a member's session name: `<team-slug>-<member-slug>-<id[0:8]>`.
+ *
+ * @param teamName - The team's display name
+ * @param memberName - The member's display name
+ * @param memberId - The member's uuid
+ * @returns The session name the controller would assign on start
+ *
+ * @example
+ * deriveMemberSessionName('Think Tank', 'Sage', 'c1d2e3f4-...') // 'think-tank-sage-c1d2e3f4'
+ */
+export function deriveMemberSessionName(teamName: string, memberName: string, memberId: string): string {
+  const teamSlug = (teamName ?? '').toLowerCase().replace(/\s+/g, '-');
+  const memberSlug = (memberName ?? '').toLowerCase().replace(/\s+/g, '-');
+  return `${teamSlug}-${memberSlug}-${(memberId ?? '').substring(0, 8)}`;
+}
+
+/**
+ * A member's permanent agent id (its session name for life): the stored
+ * `agentId`, else — for a member saved before ids existed — the running
+ * session, else the derived name.
+ *
+ * @param teamName - The team's display name
+ * @param member - Member fields
+ * @returns The agent id
+ */
+export function memberAgentId(
+  teamName: string,
+  member: { agentId?: string; sessionName?: string; name: string; id: string },
+): string {
+  return member.agentId || member.sessionName || deriveMemberSessionName(teamName, member.name, member.id);
+}
+
+/**
+ * A member's stored session name when it has one, else its permanent agent id
+ * (else the derived one).
+ *
+ * @param teamName - The team's display name
+ * @param member - Member fields the derivation needs
+ * @returns A non-empty session name whenever the member has an id
+ */
+export function resolveMemberSessionName(
+  teamName: string,
+  member: { sessionName?: string; agentId?: string; name: string; id: string },
+): string {
+  return member.sessionName || member.agentId || deriveMemberSessionName(teamName, member.name, member.id);
+}
+
+/**
+ * A readable name from a member session name when the member is not on this
+ * machine ('edu-game-milo-13e8d3ca' → 'Milo'): owner-facing text never shows
+ * the raw session id.
+ *
+ * @param session - Session name
+ * @returns The member name, or the session unchanged when it has no member shape
+ *
+ * @example
+ * memberNameFromSession('edu-game-milo-13e8d3ca') // 'Milo'
+ */
+export function memberNameFromSession(session: string): string {
+  const m = /-([a-z][a-z0-9]*)-[0-9a-f]{8}$/i.exec(session ?? '');
+  if (!m) return session;
+  return m[1].charAt(0).toUpperCase() + m[1].slice(1);
+}

@@ -1,0 +1,2459 @@
+/**
+ * Crewly Agent Runner Service
+ *
+ * Core reasoning loop for the Crewly Agent runtime. Wraps Vercel AI SDK's
+ * generateText with conversation history management, context compaction,
+ * and structured result tracking.
+ *
+ * @module services/agent/crewly-agent/agent-runner.service
+ */
+
+import { streamText, generateText, stepCountIs, type ModelMessage, type LanguageModel } from 'ai';
+import { ModelManager } from './model-manager.js';
+import { CrewlyApiClient } from './api-client.js';
+import { createTools } from './tool-registry.js';
+import { connectAndLoadMcpTools } from './mcp-tool-bridge.js';
+import { ApprovalQueueService, type PendingApproval } from './approval-queue.service.js';
+import { OutputFilterService } from './output-filter.service.js';
+import { parseTextToolCalls, coerceArgs, resolveToolName, type TextToolCall, type SchemaLike } from './text-tool-calls.js';
+import { unverifiedDesktopWork } from './desktop-task.tool.js';
+import {
+  createSpawnSubagentTool,
+  createSubagentRegistry,
+  forwardChildToolCalls,
+  restrictToolsForSubagent,
+  type SubagentRegistry,
+  type SubagentReport,
+} from './subagent.js';
+import type { ToolDefinition, McpClientLike } from './types.js';
+import {
+  type CrewlyAgentConfig,
+  type ConversationState,
+  type AgentRunResult,
+  type IncompleteReason,
+  type ToolCallRecord,
+  type CompactionResult,
+  type ContextBudgetStatus,
+  type AuditEntry,
+  type SecurityPolicy,
+  type ToolCallbacks,
+  type ApprovalCheckResult,
+  type ToolSensitivity,
+  type AuditLogFilters,
+  type StreamingEventCallbacks,
+  CREWLY_AGENT_DEFAULTS,
+  WRITE_TOOLS,
+  MODEL_CONTEXT_WINDOWS,
+  resolveMaxOutputTokens,
+} from './types.js';
+import { SUMMARY_FALLBACK_PROMPT, shouldRequestSummaryFallback } from './reply-tool-calls.js';
+
+/**
+ * What a provider's finish reason means for the turn, and how to recover.
+ *
+ * `reason === null` is the only healthy outcome; everything else left work
+ * on the table. `recoverable` turns get `budget` more attempts, each
+ * prefixed with `nudge` so the model knows to carry on rather than restart.
+ */
+interface FinishOutcome {
+  reason: IncompleteReason | null;
+  detail: string;
+  recoverable: boolean;
+  budget: number;
+  nudge: string;
+}
+
+/** Nudge used when the model ran out of output tokens mid-answer. */
+const CONTINUE_NUDGE =
+  'Your previous message was cut off because it hit the output limit. Continue from exactly where you stopped. Do not repeat what you already wrote, and do not start over.';
+
+/** Nudge used after the provider ended a turn abnormally. */
+const RESUME_NUDGE =
+  'Your previous turn ended unexpectedly before the work was finished. Review what you had already done, then carry on and complete the task. Do not repeat completed steps.';
+
+/**
+ * Classify how a turn ended.
+ *
+ * @param finishReason - Raw provider finish reason
+ * @param steps - Steps the turn consumed
+ * @param maxSteps - The configured step ceiling
+ * @returns What it means and whether to retry
+ */
+export function classifyFinish(finishReason: string, steps: number, maxSteps: number): FinishOutcome {
+  const healthy: FinishOutcome = { reason: null, detail: '', recoverable: false, budget: 0, nudge: '' };
+
+  // Hitting the step ceiling is never a natural end, whatever the provider
+  // then reports — the loop was stopped from the outside mid-task.
+  if (steps >= maxSteps) {
+    return {
+      reason: 'steps-exhausted',
+      detail: `Stopped after the ${maxSteps}-step ceiling with work still outstanding.`,
+      recoverable: false,
+      budget: 0,
+      nudge: '',
+    };
+  }
+
+  switch (finishReason) {
+    case 'stop':
+    case 'tool-calls':
+      return healthy;
+    case 'length':
+      return {
+        reason: 'truncated',
+        detail: 'The model ran out of output tokens before finishing.',
+        recoverable: true,
+        budget: CREWLY_AGENT_DEFAULTS.MAX_CONTINUATIONS,
+        nudge: CONTINUE_NUDGE,
+      };
+    case 'content-filter':
+      return {
+        reason: 'content-filter',
+        detail: 'The provider refused to complete this turn on content grounds.',
+        recoverable: false,
+        budget: 0,
+        nudge: '',
+      };
+    default:
+      // 'other' | 'error' | 'unknown' | anything a provider invents.
+      return {
+        reason: 'abnormal-finish',
+        detail: `The provider ended the turn with "${finishReason}" before the work was finished.`,
+        recoverable: true,
+        budget: CREWLY_AGENT_DEFAULTS.MAX_ABNORMAL_RETRIES,
+        nudge: RESUME_NUDGE,
+      };
+  }
+}
+
+/**
+ * Fold a recovery attempt into the run it continues: text is appended (the
+ * model was told not to repeat itself), counters accumulate, and the newer
+ * finish reason wins.
+ *
+ * @param first - The run so far
+ * @param next - The continuation
+ * @returns The combined run
+ */
+export function mergeRuns(first: AgentRunResult, next: AgentRunResult): AgentRunResult {
+  const text = [first.text, next.text].map((t) => (t ?? '').trim()).filter(Boolean).join('\n\n');
+  return {
+    ...next,
+    text,
+    steps: first.steps + next.steps,
+    usage: {
+      input: first.usage.input + next.usage.input,
+      output: first.usage.output + next.usage.output,
+    },
+    toolCalls: [...first.toolCalls, ...next.toolCalls],
+    budgetWarning: next.budgetWarning ?? first.budgetWarning,
+    reasoning: next.reasoning ?? first.reasoning,
+  };
+}
+
+/**
+ * No-op stubs for OSS-internal services. In OSS these resolve to concrete
+ * implementations (tracing, memory flush, MCP client, Slack ID synth). The
+ * standalone runtime runs without those: tracing becomes a passthrough,
+ * context-flush extracts nothing, MCP is disabled unless an external
+ * implementation is injected via tool callbacks, and Slack thread keys
+ * fall back to a deterministic string format compatible with chat-v2.
+ */
+const TRACING_CONSTANTS = {
+  SPANS: { AGENT_RUN: 'agent.run' },
+} as const;
+
+interface TraceServiceLike {
+  withSpan<T>(name: string, options: Record<string, unknown>, fn: () => Promise<T>): Promise<T>;
+}
+
+const TracingService = {
+  getInstance(): TraceServiceLike {
+    return { withSpan: (_n, _o, fn) => fn() };
+  },
+};
+
+interface ContextFlushLike {
+  extract(input: string): string[];
+}
+
+const ContextFlushService = {
+  getInstance(): ContextFlushLike {
+    return { extract: () => [] };
+  },
+};
+
+/**
+ * Standalone has no concrete MCP client by default — tool callbacks can
+ * inject one via `ToolCallbacks.mcpClient` if needed. This class shim
+ * exists only so the rest of the file can `new McpClientService()`
+ * compile-clean; the resulting object is intentionally null-equivalent.
+ */
+class McpClientService implements McpClientLike {
+  connectAll(): Promise<Map<string, Error>> { return Promise.resolve(new Map()); }
+  listTools(): never[] { return []; }
+  callTool(): Promise<never> {
+    return Promise.reject(new Error('No MCP client wired in standalone runtime.'));
+  }
+  disconnectAll(): Promise<void> { return Promise.resolve(); }
+  getConnectedServers(): string[] { return []; }
+}
+
+/**
+ * Mirror of OSS chat-v2 `synthesizeSlackConversationId` — keep the wire
+ * format identical so per-conversation state keys match across runtimes.
+ */
+function synthesizeSlackConversationId(channelId: string, threadTs: string): string {
+  return `slack-${channelId}-${String(threadTs).replace('.', '-')}`;
+}
+
+/**
+ * Fingerprint a tool call for comparison: deterministic JSON of name + args.
+ */
+function toolCallFingerprint(toolName: string, args: Record<string, unknown>): string {
+  return JSON.stringify({ t: toolName, a: args });
+}
+
+/**
+ * Detects looping behavior in tool calls: consecutive identical calls or
+ * consecutive error responses from the same tool.
+ *
+ * Usage: create per-run, call `recordToolCall()` in onStepFinish, check `loopDetected`.
+ */
+export class ToolCallLoopDetector {
+  /** Consecutive identical tool call fingerprints */
+  private consecutiveIdentical = 0;
+  private lastFingerprint: string | null = null;
+  /** Consecutive error results from the same tool */
+  private consecutiveErrors = 0;
+  private lastErrorTool: string | null = null;
+  /** Whether a loop was detected */
+  loopDetected = false;
+  /** Human-readable reason when loop is detected */
+  loopReason = '';
+
+  constructor(
+    private readonly identicalThreshold: number = CREWLY_AGENT_DEFAULTS.LOOP_DETECTION_THRESHOLD,
+    private readonly errorThreshold: number = CREWLY_AGENT_DEFAULTS.ERROR_LOOP_THRESHOLD,
+  ) {}
+
+  /**
+   * Record a tool call and check for loop patterns.
+   *
+   * @param toolName - Name of the tool called
+   * @param args - Arguments passed to the tool
+   * @param result - Result returned by the tool
+   * @returns True if a loop was just detected on this call
+   */
+  recordToolCall(toolName: string, args: Record<string, unknown>, result: unknown): boolean {
+    if (this.loopDetected) return true;
+
+    // 1. Check consecutive identical calls
+    const fp = toolCallFingerprint(toolName, args);
+    if (fp === this.lastFingerprint) {
+      this.consecutiveIdentical++;
+    } else {
+      this.consecutiveIdentical = 1;
+      this.lastFingerprint = fp;
+    }
+
+    if (this.consecutiveIdentical >= this.identicalThreshold) {
+      this.loopDetected = true;
+      this.loopReason = `Identical tool call repeated ${this.consecutiveIdentical} times: ${toolName}(${JSON.stringify(args).slice(0, 120)})`;
+      return true;
+    }
+
+    // 2. Check consecutive error results (404, 4xx, 5xx, error strings)
+    if (this.isErrorResult(result)) {
+      if (toolName === this.lastErrorTool) {
+        this.consecutiveErrors++;
+      } else {
+        this.consecutiveErrors = 1;
+        this.lastErrorTool = toolName;
+      }
+      if (this.consecutiveErrors >= this.errorThreshold) {
+        this.loopDetected = true;
+        // Serialize objects properly — `String(obj)` yields "[object Object]"
+        // and loses the actual error. Mirror isErrorResult()'s serialization.
+        const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+        this.loopReason = `Tool "${toolName}" returned errors ${this.consecutiveErrors} consecutive times. Last result: ${resultStr.slice(0, 200)}`;
+        return true;
+      }
+    } else {
+      this.consecutiveErrors = 0;
+      this.lastErrorTool = null;
+    }
+
+    return false;
+  }
+
+  /**
+   * Check if a tool result looks like an error (404, HTTP error codes, error strings).
+   */
+  private isErrorResult(result: unknown): boolean {
+    if (result === null || result === undefined) return false;
+    const str = typeof result === 'string' ? result : JSON.stringify(result);
+    // Match common error patterns: HTTP 4xx/5xx, "error", "not found", "failed"
+    return /\b(404|403|500|502|503|4\d{2}|5\d{2})\b/.test(str)
+      || /\b(error|not\s*found|failed|refused|denied|timeout)\b/i.test(str);
+  }
+}
+
+/**
+ * Core agent runner that manages the AI SDK generateText loop.
+ *
+ * Responsibilities:
+ * - Maintains conversation history (messages array)
+ * - Calls generateText with tools and maxSteps for agentic behavior
+ * - Tracks token usage across invocations
+ * - Triggers context compaction when history grows too large
+ * - Serializes concurrent message handling
+ *
+ * @example
+ * ```typescript
+ * const runner = new AgentRunnerService(config);
+ * await runner.initialize();
+ * const result = await runner.run('Check all team statuses');
+ * ```
+ */
+/**
+ * Thrown when a single agent run exceeds its wall-clock budget.
+ *
+ * Distinct class (rather than a message-sniffed "timeout" string) because
+ * {@link AgentRunnerService.isRecoverableError} treats anything mentioning
+ * "timeout" as retryable. A hard-budget expiry is deliberately NOT retryable:
+ * the budget covers the whole run including retries, so re-entering the retry
+ * loop would multiply the very stall the budget exists to bound.
+ *
+ * @example
+ * ```typescript
+ * try { await runner.run(msg); }
+ * catch (e) { if (e instanceof AgentRunTimeoutError) recycleAgent(); }
+ * ```
+ */
+export class AgentRunTimeoutError extends Error {
+  /** Wall-clock budget that was exceeded, in milliseconds. */
+  readonly timeoutMs: number;
+
+  /**
+   * @param timeoutMs - The budget that was exceeded, in milliseconds
+   * @param modelId - Model the run was using, for operator diagnosis
+   */
+  constructor(timeoutMs: number, modelId: string) {
+    super(
+      `Agent run exceeded its ${timeoutMs}ms wall-clock budget (model: ${modelId}) `
+      + `and was hard-aborted. The model connection stalled without delivering a `
+      + `response — see CREWLY_AGENT_MESSAGE_TIMEOUT_MS to tune the budget.`,
+    );
+    this.name = 'AgentRunTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/** Function type for generateText — used for dependency injection in tests */
+type GenerateTextFn = (opts: Record<string, unknown>) => Promise<Record<string, unknown>>;
+
+export class AgentRunnerService {
+  private config: CrewlyAgentConfig;
+  private modelManager: ModelManager;
+  private apiClient: CrewlyApiClient;
+  private model: LanguageModel | null = null;
+  /**
+   * Per-conversation state map. Each Slack thread (or web chat
+   * conversation) gets its own `ConversationState` so the LLM
+   * context is isolated — messages from thread A never leak into
+   * the prompt when responding to thread B. The conversation key
+   * is the chat-v2 channel id (e.g. `slack-D0AC7-1777760999-956969`)
+   * derived from the inbound message's `[CHAT:xxx]` marker, the
+   * `[SLACK:channel:threadTs]` marker, or — if neither is present
+   * — the literal `__default__` for runtime cases like REPL or
+   * scheduled-check inputs that have no thread identity.
+   *
+   * 2026-05-15 fix per goal: "一个 Slack thread 代表一个 chat
+   * thread, 不同 Slack thread 之间不会串联在一起."
+   */
+  private conversationStates: Map<string, ConversationState> = new Map();
+  /**
+   * Active conversation key for the message currently being
+   * processed. `processQueue` sets this before each `executeRun`
+   * so the getter `this.state` resolves to the right per-thread
+   * state without every call site needing to know about the map.
+   */
+  private currentConversationKey: string = '__default__';
+  /**
+   * Effective system prompt — captured at construction time and
+   * applied to every fresh per-conversation state created on
+   * demand. Held on the instance so `getOrCreateState` doesn't
+   * need to recompute the eval-mode stripping logic.
+   */
+  private readonly effectiveSystemPrompt: string;
+  /**
+   * Soft cap on how many distinct conversation states we hold in
+   * memory. When exceeded, the least-recently-active state is
+   * evicted (its messages live on in chat-v2 SQLite so the next
+   * access can re-hydrate). Prevents unbounded growth when a busy
+   * agent participates in thousands of Slack threads over time.
+   */
+  private readonly MAX_LIVE_CONVERSATIONS = 100;
+
+  /**
+   * Backward-compatible getter: every existing `this.state.X`
+   * call site automatically routes to the active per-conversation
+   * state. Lazy-creates a fresh state on first access for a new
+   * conversation key.
+   */
+  private get state(): ConversationState {
+    return this.getOrCreateConversationState(this.currentConversationKey);
+  }
+
+  /**
+   * Look up or create the ConversationState for a given key.
+   * Evicts the least-recently-active state when the live-set
+   * size exceeds {@link MAX_LIVE_CONVERSATIONS}.
+   *
+   * @param key - Conversation key (chat-v2 channel id or `__default__`)
+   * @returns The per-conversation state object
+   */
+  private getOrCreateConversationState(key: string): ConversationState {
+    let s = this.conversationStates.get(key);
+    if (!s) {
+      s = {
+        messages: [],
+        systemPrompt: this.effectiveSystemPrompt,
+        totalTokens: { input: 0, output: 0 },
+        lastContextTokens: 0,
+        createdAt: new Date(),
+        lastActivityAt: new Date(),
+      };
+      this.conversationStates.set(key, s);
+
+      // LRU eviction — pop the oldest by `lastActivityAt`. Map
+      // preserves insertion order but we want recency, so scan
+      // once on overflow rather than maintain a separate index.
+      if (this.conversationStates.size > this.MAX_LIVE_CONVERSATIONS) {
+        let evictKey: string | null = null;
+        let evictedAt: number = Infinity;
+        for (const [k, v] of this.conversationStates) {
+          if (k === key) continue;
+          const t = v.lastActivityAt.getTime();
+          if (t < evictedAt) {
+            evictedAt = t;
+            evictKey = k;
+          }
+        }
+        if (evictKey !== null) this.conversationStates.delete(evictKey);
+      }
+    }
+    return s;
+  }
+
+  /**
+   * Test / introspection helper — number of active conversation
+   * states the runner currently holds. Surfaces in
+   * `getConversationStatus` for observability.
+   *
+   * @returns Number of live per-conversation states
+   */
+  public getConversationCount(): number {
+    return this.conversationStates.size;
+  }
+
+  private processing = false;
+  private messageQueue: Array<{ message: string; conversationId?: string; metadata?: Record<string, string>; resolve: (result: AgentRunResult) => void; reject: (error: Error) => void; options?: { abortSignal?: AbortSignal; streaming?: StreamingEventCallbacks } }> = [];
+  private auditLog: AuditEntry[] = [];
+  private securityPolicy: SecurityPolicy;
+  /** Current conversationId extracted from [CHAT:xxx] prefix */
+  private currentConversationId?: string;
+  /** Last known conversationId — used as fallback when a message has no explicit conversationId */
+  private lastKnownConversationId?: string;
+  /** Current Slack context (channelId + threadTs) for routing NOTIFY responses */
+  private currentSlackContext?: { channelId: string; threadTs?: string };
+  /** MCP client for external tool integration */
+  private mcpClient: McpClientService | null = null;
+  /** Cached MCP tool definitions loaded during initialization */
+  private mcpToolDefs: Record<string, ToolDefinition> = {};
+  /** Approval queue for tools requiring explicit approval (shared singleton) */
+  private approvalQueue: ApprovalQueueService = ApprovalQueueService.getInstance();
+  private tracing = TracingService.getInstance();
+  /** Guards against concurrent compaction — only one compaction at a time */
+  private compacting = false;
+  /** AbortController for the current run — allows external cancellation */
+  private currentRunAbort: AbortController | null = null;
+  /** Streaming event callbacks — set per run by the runtime service */
+  private streamingCallbacks: StreamingEventCallbacks = {};
+  /** Output filter for redacting API keys from agent responses */
+  private outputFilter: OutputFilterService = new OutputFilterService();
+  /** @internal Override for testing — replaces the AI SDK generateText call */
+  _generateTextFn: GenerateTextFn | null = null;
+  /** Children spawned by this runner (#1317): how many run now, how many ever */
+  private readonly subagentRegistry: SubagentRegistry = createSubagentRegistry();
+  /** What this runner reported when it is itself a sub-agent */
+  private subagentReport: SubagentReport | null = null;
+  /** Tokens spent by children since the last run result, folded into the next one */
+  private childUsage = { input: 0, output: 0, cachedInput: 0 };
+
+  /**
+   * Create a new AgentRunnerService.
+   *
+   * @param config - Agent configuration
+   * @param modelManager - Optional model manager instance (for testing)
+   * @param apiClient - Optional API client instance (for testing)
+   */
+  /**
+   * Rules about *how* to work that every role prompt gets, whatever the model.
+   *
+   * These exist because a weaker model fails in ways a strong one does not:
+   * it writes its tool call as prose (so nothing runs and the user sees
+   * markup), or it narrates a plan and stops without carrying it out. The
+   * runtime recovers from both, but saying so plainly costs a few tokens and
+   * prevents most of it. The wording deliberately never shows the markup
+   * syntax — describing it is what teaches a model to emit it.
+   */
+  private static readonly HARNESS_RULES = [
+    '## How to work',
+    '',
+    '- Call tools through the tool-calling mechanism. Never write a tool invocation as text: your text is shown to the user verbatim and executes nothing.',
+    '- Do the work in this turn. If you say you will do something, do it before you finish — a plan with no action is a failed turn.',
+    '- Act, then check. Run the tool, read the result, and continue from what it actually returned rather than from what you expected.',
+    '- If something blocks you, say what blocked you and what you tried. Never report work as done that you did not verify.',
+  ].join('\n');
+
+  constructor(
+    config: CrewlyAgentConfig,
+    modelManager?: ModelManager,
+    apiClient?: CrewlyApiClient,
+  ) {
+    this.config = config;
+    this.modelManager = modelManager || new ModelManager();
+    this.apiClient = apiClient || new CrewlyApiClient(
+      config.apiBaseUrl,
+      config.sessionName,
+    );
+    this.securityPolicy = { ...CREWLY_AGENT_DEFAULTS.SECURITY_POLICY };
+    // In eval mode, strip delegation-first instructions so agent implements directly
+    const rolePrompt = config.evalMode
+      ? AgentRunnerService.stripDelegationInstructions(config.systemPrompt)
+      : config.systemPrompt;
+    this.effectiveSystemPrompt = `${rolePrompt}\n\n${AgentRunnerService.HARNESS_RULES}`;
+    // Conversation states are lazy-created on first access via the
+    // `state` getter, so we don't need to seed `__default__` here.
+    // The first message processed will create whichever conversation
+    // it targets.
+  }
+
+  // ---------------------------------------------------------------------------
+  // Eval Mode: Delegation Stripping (P1)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Regex patterns that match TL delegation-first instructions in the system prompt.
+   * These cause the agent to delegate instead of implementing in eval sandboxes.
+   */
+  private static readonly DELEGATION_PATTERNS: RegExp[] = [
+    // "delegate 80% of execution tasks" and variants
+    /delegate\s+\d+%?\s+of\s+execution\s+tasks?/gi,
+    // "DELEGATION-FIRST PROTOCOL" sections
+    /DELEGATION-FIRST\s+PROTOCOL[^]*?(?=\n#{1,3}\s|\n---|\Z)/gm,
+    // "Only implement yourself when:" blocks
+    /\*\*Only implement yourself\*\*\s+when:[^]*?(?=\n#{1,3}\s|\n---|\n\n\*\*)/gm,
+    // "Your core loop on every task is:" delegation loop
+    /Your core loop on every task is:[^]*?(?=\n#{1,3}\s|\n---)/gm,
+    // "Target: delegate 70–80% of execution tasks"
+    /Target:\s*delegate\s+\d+[–-]\d+%\s+of\s+execution\s+tasks\.?/gi,
+    // Entire "Team Lead Delegation SOP" section
+    /#+\s*Team Lead Delegation SOP[^]*?(?=\n#{1,2}\s[^#]|\Z)/gm,
+    // "ANTI-PATTERNS" that tell TL not to implement
+    /These are ANTI-PATTERNS\.\s*The TL must avoid:[^]*?(?=\n#{1,3}\s|\n---)/gm,
+  ];
+
+  /**
+   * Eval-mode override instruction injected after stripping delegation instructions.
+   * Tells the agent to implement directly.
+   */
+  private static readonly EVAL_MODE_OVERRIDE = [
+    '',
+    '## Eval Mode Active',
+    '',
+    'You are running in evaluation mode. IMPORTANT behavioral overrides:',
+    '- **Implement directly** — Do NOT delegate tasks to workers. Write code yourself.',
+    '- **Create all output files** — If the task asks you to create a file, you MUST write it using write_file or edit_file.',
+    '- **Use standard tool names** — Use handle-failure, delegate-task, send-message for collaboration actions.',
+    '- **Materialize deliverables** — After gathering information, always produce the required output files before finishing.',
+    '- **Self-check before stopping** — Before you finish, verify: "Have I created every file/artifact the task requested?"',
+    '',
+  ].join('\n');
+
+  /**
+   * Strip delegation-first instructions from a system prompt for eval mode.
+   *
+   * Removes TL delegation SOP sections, delegation-first protocol blocks,
+   * and anti-pattern warnings that cause the agent to delegate instead of
+   * implementing. Injects an eval-mode override instruction.
+   *
+   * @param prompt - Original system prompt
+   * @returns Cleaned prompt with eval-mode overrides
+   */
+  static stripDelegationInstructions(prompt: string): string {
+    let cleaned = prompt;
+    for (const pattern of AgentRunnerService.DELEGATION_PATTERNS) {
+      cleaned = cleaned.replace(pattern, '');
+    }
+    // Remove consecutive blank lines left by stripping
+    cleaned = cleaned.replace(/\n{4,}/g, '\n\n\n');
+    // Inject eval mode override at the end
+    cleaned = cleaned.trimEnd() + '\n' + AgentRunnerService.EVAL_MODE_OVERRIDE;
+    return cleaned;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Post-Execution Deliverable Check (P0 - Stop Hook)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Patterns that indicate the task expects a file to be created.
+   * Matches phrases like "create health.controller.ts", "write team-health.json",
+   * "produce a report file", etc.
+   */
+  private static readonly FILE_CREATION_PATTERNS: RegExp[] = [
+    // Note: longer extensions (json, tsx, jsx, yaml) must come before shorter ones (js, ts) to avoid partial matches
+    /(?:create|write|produce|generate|build|implement)\s+(?:a\s+)?(?:file\s+(?:called|named)\s+)?[`"']?(\S+\.(?:tsx|jsx|json|yaml|yml|html|css|ts|js|md|txt))\b[`"']?/gi,
+    /(?:output|save|write)\s+(?:to|into)\s+[`"']?(\S+\.(?:tsx|jsx|json|yaml|yml|html|css|ts|js|md|txt))\b[`"']?/gi,
+    /[`"'](\S+\.(?:tsx|jsx|json|yaml|yml|html|css|ts|js|md|txt))[`"']\s+(?:file|should be created|must be created)/gi,
+    // Backtick-quoted file paths — commonly used in task prompts
+    /`(\S+\.(?:tsx|jsx|json|yaml|yml|html|css|ts|js|md|txt))`/gi,
+  ];
+
+  /**
+   * Extract expected output file names from the task prompt.
+   *
+   * Scans the message for file creation patterns and returns the
+   * list of file names the task expects to be produced.
+   *
+   * @param taskPrompt - The original task prompt/message
+   * @returns Array of expected file names (basename only)
+   */
+  static extractExpectedOutputFiles(taskPrompt: string): string[] {
+    const files = new Set<string>();
+    for (const pattern of AgentRunnerService.FILE_CREATION_PATTERNS) {
+      // Reset lastIndex for global regex
+      pattern.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(taskPrompt)) !== null) {
+        const fileName = match[1];
+        if (fileName && !fileName.includes('*') && fileName.length < 100) {
+          files.add(fileName);
+        }
+      }
+    }
+    return Array.from(files);
+  }
+
+  /**
+   * Check if the agent's tool calls produced the expected output files.
+   *
+   * Examines write_file and edit_file tool calls to see if the expected
+   * files were written. Returns the list of missing files.
+   *
+   * @param expectedFiles - File names expected to be created
+   * @param toolCalls     - Tool calls made during the run
+   * @returns Array of file names that were NOT written
+   */
+  static checkMissingDeliverables(
+    expectedFiles: string[],
+    toolCalls: ToolCallRecord[],
+  ): string[] {
+    if (expectedFiles.length === 0) return [];
+
+    // Collect all files written by write_file or edit_file tools
+    const writtenFiles = new Set<string>();
+    for (const tc of toolCalls) {
+      if (tc.toolName === 'write_file' || tc.toolName === 'edit_file') {
+        const filePath = (tc.args as Record<string, unknown>).file_path
+          ?? (tc.args as Record<string, unknown>).path
+          ?? '';
+        if (typeof filePath === 'string' && filePath) {
+          // Extract basename for comparison
+          const basename = filePath.split('/').pop() ?? filePath;
+          writtenFiles.add(basename);
+          writtenFiles.add(filePath); // Also add full path
+        }
+      }
+    }
+
+    return expectedFiles.filter((f) => {
+      const basename = f.split('/').pop() ?? f;
+      return !writtenFiles.has(f) && !writtenFiles.has(basename);
+    });
+  }
+
+  /**
+   * Initialize the agent runner by loading the model.
+   * Must be called before run().
+   *
+   * @throws Error if the model cannot be loaded
+   */
+  async initialize(): Promise<void> {
+    this.model = await this.modelManager.getModel(this.config.model);
+
+    // Connect to configured MCP servers and load their tools
+    if (this.config.mcpServers && Object.keys(this.config.mcpServers).length > 0) {
+      this.mcpClient = new McpClientService();
+      const { tools, errors } = await connectAndLoadMcpTools(
+        this.mcpClient,
+        this.config.mcpServers,
+        this.config.mcpSensitivityOverrides,
+      );
+      this.mcpToolDefs = tools;
+
+      if (errors.size > 0) {
+        for (const [name, error] of errors.entries()) {
+          // Log but don't fail — partial MCP availability is acceptable
+          console.warn(`MCP server "${name}" failed to connect: ${error.message}`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Run the agent with a new user message.
+   *
+   * Messages are queued and processed serially to prevent concurrent
+   * generateText calls which would corrupt conversation state.
+   *
+   * @param message - User/system message to process
+   * @param conversationId - Optional conversation ID for routing
+   * @param metadata - Optional metadata (Slack context, etc.)
+   * @param options - Optional abort signal and streaming callbacks
+   * @returns Result of the agent run including text, tool calls, and usage
+   */
+  async run(
+    message: string,
+    conversationId?: string,
+    metadata?: Record<string, string>,
+    options?: { abortSignal?: AbortSignal; streaming?: StreamingEventCallbacks },
+  ): Promise<AgentRunResult> {
+    return new Promise<AgentRunResult>((resolve, reject) => {
+      this.messageQueue.push({ message, conversationId, metadata, resolve, reject, options });
+      if (!this.processing) {
+        this.processQueue();
+      }
+    });
+  }
+
+  /**
+   * Abort the current in-progress run.
+   * Signals the active streamText/generateText call to cancel.
+   *
+   * @returns True if an active run was aborted, false if no run was in progress
+   */
+  abortCurrentRun(): boolean {
+    if (this.currentRunAbort) {
+      this.currentRunAbort.abort();
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Check if the agent is currently processing a message.
+   *
+   * @returns True if processing is in progress
+   */
+  isProcessing(): boolean {
+    return this.processing;
+  }
+
+  /**
+   * Get current conversation state (for inspection/debugging).
+   *
+   * @returns Current conversation state
+   */
+  getState(): ConversationState {
+    return { ...this.state };
+  }
+
+  /**
+   * Shut down the agent runner, disconnecting MCP servers.
+   *
+   * Should be called when the agent session ends to clean up
+   * child processes spawned by MCP server connections.
+   */
+  async shutdown(): Promise<void> {
+    if (this.mcpClient) {
+      await this.mcpClient.disconnectAll();
+      this.mcpClient = null;
+      this.mcpToolDefs = {};
+    }
+  }
+
+  /**
+   * Get the names of connected MCP servers.
+   *
+   * @returns Array of server names, or empty if no MCP client is configured
+   */
+  getMcpServerNames(): string[] {
+    return this.mcpClient?.getConnectedServers() ?? [];
+  }
+
+  /**
+   * Get the number of MCP tools currently loaded.
+   *
+   * @returns Number of MCP tool definitions
+   */
+  getMcpToolCount(): number {
+    return Object.keys(this.mcpToolDefs).length;
+  }
+
+  /**
+   * Get the current Slack context (channelId + threadTs).
+   * Used by the runtime service to inject Slack awareness into the agent.
+   *
+   * @returns Current Slack context or undefined
+   */
+  getSlackContext(): { channelId: string; threadTs?: string } | undefined {
+    return this.currentSlackContext;
+  }
+
+  /**
+   * Get the number of messages in the conversation history.
+   *
+   * @returns Message count
+   */
+  getHistoryLength(): number {
+    return this.state.messages.length;
+  }
+
+  /**
+   * Check if the agent runner has been initialized.
+   *
+   * @returns True if initialize() has been called successfully
+   */
+  isInitialized(): boolean {
+    return this.model !== null;
+  }
+
+  /**
+   * Get current context budget status.
+   *
+   * Calculates token usage as a percentage of the model's context window
+   * and determines the budget level (normal/warning/critical).
+   *
+   * @returns ContextBudgetStatus with usage stats and level
+   */
+  getContextBudget(): ContextBudgetStatus {
+    const lifetimeTokensUsed = this.state.totalTokens.input + this.state.totalTokens.output;
+    // Occupancy, NOT lifetime spend. The prompt is re-sent in full on every
+    // request, so the lifetime sum counts the same history once per turn and
+    // sails past the window within a handful of messages — which used to pin
+    // `level` at 'critical' forever and run a compaction before every single
+    // message, doubling the model calls for the rest of the session.
+    const contextTokensUsed = this.state.lastContextTokens > 0
+      ? this.state.lastContextTokens
+      : this.estimateContextTokens();
+    const contextWindowSize = MODEL_CONTEXT_WINDOWS[this.config.model.modelId]
+      ?? MODEL_CONTEXT_WINDOWS.default;
+    const usagePercent = contextWindowSize > 0
+      ? contextTokensUsed / contextWindowSize
+      : 0;
+
+    const threshold = this.config.compactionThreshold;
+    const warningThreshold = threshold * 0.85; // warn at 85% of compaction threshold
+    let level: ContextBudgetStatus['level'] = 'normal';
+    if (usagePercent >= threshold) {
+      level = 'critical';
+    } else if (usagePercent >= warningThreshold) {
+      level = 'warning';
+    }
+
+    const compactionPending = this.state.messages.length >= this.config.maxHistoryMessages
+      || usagePercent >= threshold;
+
+    const pct = (usagePercent * 100).toFixed(1);
+    let summary = `${pct}% of context budget used (${contextTokensUsed.toLocaleString()}/${contextWindowSize.toLocaleString()} tokens, ${this.state.messages.length} messages, ${lifetimeTokensUsed.toLocaleString()} billed this session)`;
+    if (level === 'critical') {
+      summary += ' — CRITICAL: compaction recommended immediately';
+    } else if (level === 'warning') {
+      summary += ' — WARNING: approaching compaction threshold';
+    }
+
+    return {
+      contextTokensUsed,
+      lifetimeTokensUsed,
+      contextWindowSize,
+      usagePercent,
+      level,
+      messageCount: this.state.messages.length,
+      compactionPending,
+      summary,
+    };
+  }
+
+  /**
+   * Provider-specific request options.
+   *
+   * Turns on Anthropic prompt caching. Every request re-sends the same
+   * prefix — the system prompt (tens of KB for an orchestrator) followed by
+   * the tool schemas — and that prefix is byte-stable for the life of the
+   * session, which is exactly the shape caching is for. Without this the
+   * whole prefix is billed at full rate on every single turn.
+   *
+   * The top-level `cacheControl` places the breakpoint at the last cacheable
+   * block, so tools + system + settled history are covered by one marker and
+   * only the newest turn is uncached.
+   *
+   * Anthropic-only by design: DeepSeek caches server-side with no opt-in, and
+   * the other providers ignore an option namespaced to a provider that is not
+   * theirs — but sending it only where it means something keeps the request
+   * honest.
+   *
+   * @returns Provider options for the current model, or undefined when the
+   *          provider needs none
+   */
+  private buildProviderOptions(): Record<string, Record<string, unknown>> | undefined {
+    if (this.config.model.provider !== 'anthropic') return undefined;
+    return { anthropic: { cacheControl: { type: 'ephemeral' } } };
+  }
+
+  /**
+   * Record how full the context is after a completed request.
+   *
+   * The prompt the provider just billed IS the context size — `input` covers
+   * the system prompt, the tool schemas and the retained history, and
+   * `cachedInput` covers the part of that same prompt served from cache
+   * (billed cheaper, but still occupying the window, so it must be added
+   * back). The reply is included because the next request carries it forward.
+   *
+   * Assigns rather than accumulates: this is a snapshot of the current turn,
+   * and compaction shrinks it back down on the next measurement.
+   *
+   * @param usage - Token counts reported by the provider for the request
+   */
+  private recordContextOccupancy(
+    usage: { input: number; output: number; cachedInput: number },
+  ): void {
+    this.state.lastContextTokens = usage.input + usage.cachedInput + usage.output;
+  }
+
+  /**
+   * Estimate context occupancy from the text we are about to send.
+   *
+   * Only used before the first response of a conversation, when no provider
+   * measurement exists yet. A rough number is fine there — one turn later it
+   * is replaced by the provider's own count — but it must not be wildly low,
+   * because a 40KB system prompt already fills a meaningful slice of a small
+   * window before any history exists.
+   *
+   * CJK and Latin text are counted separately: a single chars-per-token ratio
+   * misjudges a Chinese prompt by more than 2x in whichever direction it is
+   * tuned for. Tool schemas are not included — they are unavailable here and
+   * the estimate is superseded immediately.
+   *
+   * @returns Estimated tokens currently occupying the context window
+   */
+  private estimateContextTokens(): number {
+    let text = this.state.systemPrompt ?? '';
+    for (const m of this.state.messages) {
+      text += typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+    }
+    let cjk = 0;
+    for (const ch of text) {
+      const code = ch.codePointAt(0) ?? 0;
+      // CJK ideographs, kana, Hangul, and full-width forms.
+      if ((code >= 0x3040 && code <= 0x9fff)
+        || (code >= 0xac00 && code <= 0xd7af)
+        || (code >= 0xf900 && code <= 0xfaff)
+        || (code >= 0xff00 && code <= 0xffef)) {
+        cjk++;
+      }
+    }
+    const latin = [...text].length - cjk;
+    return Math.ceil(
+      latin / CREWLY_AGENT_DEFAULTS.CHARS_PER_TOKEN_LATIN
+      + cjk / CREWLY_AGENT_DEFAULTS.CHARS_PER_TOKEN_CJK,
+    );
+  }
+
+  /**
+   * Process queued messages serially.
+   */
+  private async processQueue(): Promise<void> {
+    this.processing = true;
+    while (this.messageQueue.length > 0) {
+      const item = this.messageQueue.shift()!;
+      try {
+        // Update current conversationId for tool context.
+        // If the incoming message has an explicit conversationId, use it and
+        // remember it for future messages. If not, fall back to the last known
+        // conversationId so tools (especially [NOTIFY] output) can still route
+        // responses correctly for system messages like scheduled checks.
+        if (item.conversationId) {
+          this.currentConversationId = item.conversationId;
+          this.lastKnownConversationId = item.conversationId;
+        } else {
+          this.currentConversationId = this.lastKnownConversationId;
+        }
+        // Update Slack context from message metadata (Bug 5 fix).
+        // When a message arrives via Slack, metadata contains channelId + threadTs
+        // so the agent's tools (reply_slack) know where to reply.
+        if (item.metadata?.channelId) {
+          this.currentSlackContext = {
+            channelId: item.metadata.channelId,
+            threadTs: item.metadata.threadTs,
+          };
+        }
+        // 2026-05-15 thread isolation: pick the per-conversation
+        // state for this message so the LLM sees only this thread's
+        // history. Prefer the explicit conversationId; for Slack
+        // inbound that has no conversationId yet (rare path), derive
+        // it from the channelId+threadTs marker using the same
+        // `slack-${channelId}-${threadTs}` shape persistSlackInbound
+        // and `/slack/send` use, so chat-v2 channel ids and runner
+        // conversation keys stay aligned. Fall back to `__default__`
+        // for runtime-internal messages (scheduled checks, system
+        // events) that have no thread identity.
+        const resolvedConvKey: string =
+          item.conversationId ??
+          (item.metadata?.channelId && item.metadata?.threadTs
+            ? synthesizeSlackConversationId(
+                String(item.metadata.channelId),
+                String(item.metadata.threadTs),
+              )
+            : this.lastKnownConversationId ?? '__default__');
+        this.currentConversationKey = resolvedConvKey;
+        // Set streaming callbacks for this run
+        this.streamingCallbacks = item.options?.streaming ?? {};
+        const result = await this.tracing.withSpan(TRACING_CONSTANTS.SPANS.AGENT_RUN, {
+          attributes: {
+            'agent.session': this.config.sessionName,
+            'agent.role': this.config.role,
+          }
+        }, async () => {
+          return this.executeRun(item.message, item.options?.abortSignal);
+        });
+        item.resolve(result);
+      } catch (error) {
+        item.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+    this.processing = false;
+
+    // Re-check: a message may have been pushed between the while-loop exit
+    // condition check and this.processing = false. Without this guard, the
+    // queued message would be stranded — nobody restarts processQueue.
+    if (this.messageQueue.length > 0) {
+      this.processQueue();
+    }
+  }
+
+  /**
+   * Execute a single streamText run with the current conversation context.
+   *
+   * Uses streamText for real-time token emission and tool call feedback.
+   * Falls back to generateText when _generateTextFn is set (testing).
+   *
+   * @param message - New message to add to the conversation
+   * @param externalAbortSignal - Optional external abort signal for cancellation
+   * @returns Agent run result
+   */
+  private async executeRun(message: string, externalAbortSignal?: AbortSignal): Promise<AgentRunResult> {
+    if (!this.model) {
+      throw new Error('AgentRunner not initialized. Call initialize() first.');
+    }
+
+    // Check if compaction is needed before adding new message
+    // Trigger on message count OR token budget threshold
+    const budget = this.getContextBudget();
+    if (this.state.messages.length >= this.config.maxHistoryMessages || budget.level === 'critical') {
+      await this.compactHistory();
+    }
+
+    // Add user message to history
+    this.state.messages.push({ role: 'user', content: message });
+    this.state.lastActivityAt = new Date();
+
+    // Build tools with callbacks for compaction, audit, and security enforcement
+    const callbacks: ToolCallbacks = {
+      onCompactMemory: () => this.requestCompaction(),
+      onGetContextBudget: () => this.getContextBudget(),
+      onAuditLog: (entry: AuditEntry) => this.recordAudit({ ...entry, sessionName: this.config.sessionName }),
+      onCheckApproval: (toolName: string, sensitivity: ToolSensitivity) => this.checkApproval(toolName, sensitivity),
+      onGetAuditLog: (filters: AuditLogFilters) => this.getFilteredAuditLog(filters),
+      onEnqueueApproval: (toolName: string, sensitivity: ToolSensitivity, args: Record<string, unknown>) => {
+        const approval = this.approvalQueue.enqueue(this.config.sessionName, toolName, sensitivity, args);
+        return { approvalId: approval.id };
+      },
+    };
+    const mcpTools = Object.keys(this.mcpToolDefs).length > 0 ? this.mcpToolDefs : undefined;
+    const tools = this.attachSubagentTools(
+      createTools(this.apiClient, this.config.sessionName, this.config.projectPath, callbacks, this.currentConversationId, this.currentSlackContext, mcpTools),
+    );
+
+    // Create abort controller that merges external signal with internal control
+    const runAbort = new AbortController();
+    this.currentRunAbort = runAbort;
+
+    // If external signal is already aborted, abort immediately
+    if (externalAbortSignal?.aborted) {
+      runAbort.abort();
+    } else if (externalAbortSignal) {
+      externalAbortSignal.addEventListener('abort', () => runAbort.abort(), { once: true });
+    }
+
+    // Wall-clock budget for the ENTIRE run (all retries included).
+    //
+    // Without this, a model connection that opens but then goes silent — no
+    // bytes, no FIN, no error — hangs `await streamResult` forever: undici
+    // applies no idle deadline to a streaming body. That stalled promise wedges
+    // processQueue permanently (`this.processing` stays true), so every later
+    // message queues behind it and the agent goes silently catatonic: the
+    // process is alive and heartbeating, but no run ever completes and no error
+    // is ever raised. Bounding the run converts that invisible hang into a
+    // normal rejection the caller can log, surface, and recover from.
+    const timeoutMs = this.resolveRunTimeoutMs();
+    let hardTimer: ReturnType<typeof setTimeout> | undefined;
+    let softTimer: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      // If a test override is set, use generateText path (backward compatible)
+      const runPromise = this._generateTextFn
+        ? this.executeRunWithGenerateText(tools, runAbort.signal)
+        // Production path: streamText for real-time feedback
+        : this.executeRunWithStreamText(tools, runAbort.signal);
+
+      // The loser of the race stays pending. Attach a no-op catch so its
+      // eventual abort-rejection is never an unhandled rejection (which
+      // crashes the agent process under Node's default policy).
+      runPromise.catch(() => { /* settled by the race below */ });
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        softTimer = setTimeout(() => {
+          console.warn(
+            `[AgentRunner] Run exceeded soft warning threshold `
+            + `(${CREWLY_AGENT_DEFAULTS.MESSAGE_SOFT_WARNING_MS}ms) — still waiting on the model.`,
+          );
+        }, CREWLY_AGENT_DEFAULTS.MESSAGE_SOFT_WARNING_MS);
+
+        hardTimer = setTimeout(() => {
+          // Abort first so the in-flight HTTP request and any tool work are
+          // torn down, then reject — a well-behaved provider unwinds on the
+          // signal, and a wedged one no longer holds the queue hostage.
+          runAbort.abort();
+          reject(new AgentRunTimeoutError(timeoutMs, this.config.model.modelId));
+        }, timeoutMs);
+      });
+
+      return await Promise.race([runPromise, timeoutPromise]);
+    } finally {
+      if (hardTimer) clearTimeout(hardTimer);
+      if (softTimer) clearTimeout(softTimer);
+      this.currentRunAbort = null;
+    }
+  }
+
+  /**
+   * Give a run its sub-agent tools (#1317).
+   *
+   * A sub-agent (config.subagent set) gets the restricted map — file, search
+   * and shell tools confined to its cwd, plus `report_to_parent` — and
+   * nothing that talks to people or spawns further helpers. Any other runner
+   * gets the full map plus `spawn_subagent`, whose children are built from
+   * this runner's config and counted in its registry and usage.
+   *
+   * @param tools - The full `createTools()` map
+   * @returns The map this run should see
+   */
+  private attachSubagentTools(tools: Record<string, ToolDefinition>): Record<string, ToolDefinition> {
+    if (this.config.subagent) {
+      return restrictToolsForSubagent(tools, this.config.subagent, (report) => { this.subagentReport = report; });
+    }
+    return {
+      ...tools,
+      spawn_subagent: createSpawnSubagentTool({
+        parentConfig: this.config,
+        registry: this.subagentRegistry,
+        createRunner: (config) => new AgentRunnerService(config, this.modelManager, this.apiClient),
+        onUsage: (usage) => this.recordChildUsage(usage),
+        // The child's tool calls reach the parent's session log as `sub-<n>:<tool>`.
+        childStreaming: (sessionName) => forwardChildToolCalls(() => this.streamingCallbacks, sessionName),
+      }),
+    };
+  }
+
+  /**
+   * What this runner reported through `report_to_parent`, when it is a
+   * sub-agent; null for a parent or a child that never reported.
+   *
+   * @returns The last report
+   */
+  getSubagentReport(): SubagentReport | null {
+    return this.subagentReport;
+  }
+
+  /**
+   * Count a child's tokens against this runner (#1317): they are spent on
+   * this agent's behalf, so its ledger and spend cap must see them.
+   *
+   * @param usage - The child's usage
+   */
+  recordChildUsage(usage: { input: number; output: number; cachedInput: number }): void {
+    this.childUsage.input += usage.input;
+    this.childUsage.output += usage.output;
+    this.childUsage.cachedInput += usage.cachedInput;
+  }
+
+  /**
+   * Fold pending child usage into a run's reported usage and this runner's
+   * totals, then reset it. Context occupancy is not touched: a child's
+   * tokens never sat in this runner's context window.
+   *
+   * @param own - The run's own usage
+   * @returns Own plus children
+   */
+  private absorbChildUsage(own: { input: number; output: number; cachedInput: number }): { input: number; output: number; cachedInput: number } {
+    const child = this.childUsage;
+    if (child.input === 0 && child.output === 0 && child.cachedInput === 0) return own;
+    this.childUsage = { input: 0, output: 0, cachedInput: 0 };
+    this.state.totalTokens.input += child.input;
+    this.state.totalTokens.output += child.output;
+    return { input: own.input + child.input, output: own.output + child.output, cachedInput: own.cachedInput + child.cachedInput };
+  }
+
+  /**
+   * Resolve the wall-clock budget for one run.
+   *
+   * Per-model overrides win over the global default: reasoning models emit
+   * chain-of-thought tokens far slower than plain content, so a budget tuned
+   * for a chat model would kill them mid-thought.
+   *
+   * @returns Budget in milliseconds for the currently configured model
+   */
+  private resolveRunTimeoutMs(): number {
+    return (
+      CREWLY_AGENT_DEFAULTS.MODEL_TIMEOUT_MS[this.config.model.modelId]
+      ?? CREWLY_AGENT_DEFAULTS.MESSAGE_TIMEOUT_MS
+    );
+  }
+
+  /**
+   * Check if an error is recoverable and eligible for automatic retry.
+   *
+   * Recoverable errors include:
+   * - HTTP 429 (rate limit)
+   * - HTTP 5xx (server errors)
+   * - Network timeouts and connection errors
+   *
+   * @param error - The error to classify
+   * @returns True if the error is recoverable
+   */
+  private isRecoverableError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    // Hard-budget expiry is terminal by construction: the budget spans the
+    // whole run, so retrying would just re-enter the stall it bounded.
+    if (error instanceof AgentRunTimeoutError) return false;
+    const msg = error.message.toLowerCase();
+    const statusMatch = msg.match(/\b(429|5\d{2})\b/);
+    if (statusMatch) return true;
+    if (msg.includes('rate limit') || msg.includes('too many requests')) return true;
+    if (msg.includes('timeout') || msg.includes('econnreset') || msg.includes('econnrefused')) return true;
+    if (msg.includes('network') || msg.includes('fetch failed') || msg.includes('socket hang up')) return true;
+    if (msg.includes('service unavailable') || msg.includes('internal server error')) return true;
+    return false;
+  }
+
+  /**
+   * Check if an error indicates the context length was exceeded.
+   *
+   * @param error - The error to classify
+   * @returns True if the error is a context length exceeded error
+   */
+  private isContextLengthError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const msg = error.message.toLowerCase();
+    return msg.includes('context length') || msg.includes('token limit')
+      || msg.includes('max_tokens') || msg.includes('context window')
+      || msg.includes('too long') || msg.includes('maximum context');
+  }
+
+  /**
+   * Sleep for a specified duration.
+   *
+   * @param ms - Milliseconds to sleep
+   * @returns Promise that resolves after the delay
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Execute run using streamText for real-time streaming output.
+   * This is the production path — emits events as tokens arrive.
+   *
+   * Includes automatic retry with exponential backoff for recoverable errors
+   * (429, 5xx, network) and progressive context trimming for context length errors.
+   */
+  private async executeRunWithStreamText(
+    tools: Record<string, unknown>,
+    abortSignal: AbortSignal,
+  ): Promise<AgentRunResult> {
+    let result = await this.attemptWithSalvage(tools, abortSignal);
+    let outcome = classifyFinish(result.finishReason, result.steps, this.config.maxSteps);
+    let recoveryAttempts = 0;
+
+    // A turn only "finished" if the model chose to stop. Anything else left
+    // the job half-done, and until 0.1.2 that fragment was returned as if it
+    // were the answer — the agent would promise to do something, get cut off,
+    // and the user was told it was done (2026-09-19: the orchestrator ended
+    // 4 turns in a row on `other` and silently created nothing).
+    while (outcome.recoverable && recoveryAttempts < outcome.budget && !abortSignal.aborted) {
+      recoveryAttempts++;
+      this.streamingCallbacks.onTextChunk?.(`[recover] ${outcome.reason} — continuing (${recoveryAttempts}/${outcome.budget})\n`);
+      this.state.messages.push({ role: 'user', content: outcome.nudge });
+      const next = await this.attemptWithSalvage(tools, abortSignal);
+      result = mergeRuns(result, next);
+      outcome = classifyFinish(next.finishReason, next.steps, this.config.maxSteps);
+    }
+
+    if (outcome.reason === null) {
+      // A turn can finish cleanly and still have left the desktop task
+      // half done — the model stopped because it believed it was finished.
+      // That belief is the thing being checked, so the checkpoints get the
+      // last word before the reply goes out.
+      const unverified = unverifiedDesktopWork(this.config.sessionName);
+      if (!unverified) return result;
+      return {
+        ...result,
+        incomplete: {
+          reason: 'desktop-unverified',
+          detail:
+            `The desktop task is not finished — ${unverified.goals.length} subgoal(s) never passed their checkpoint: ` +
+            `${unverified.goals.join('; ')}.\n${unverified.summary}`,
+          finishReason: result.finishReason,
+          recoveryAttempts,
+        },
+      };
+    }
+
+    return {
+      ...result,
+      incomplete: {
+        reason: outcome.reason,
+        detail: outcome.detail,
+        finishReason: result.finishReason,
+        recoveryAttempts,
+      },
+    };
+  }
+
+  /**
+   * Run one turn, then rescue any tool call the model *wrote* instead of called.
+   *
+   * A weak model sometimes emits its call envelope into the text channel:
+   * the provider returns prose, the SDK sees no tool call, and the step ends
+   * having done nothing — the failure mode behind both the markup users saw
+   * in Slack and the turns that promised work and produced none. Rather than
+   * strip the markup and lose the intent, the envelope is parsed, the tools
+   * are executed for real, and the results are handed back so the turn can
+   * carry on.
+   *
+   * Salvaged calls go through the tool's own `execute`, so approval gates and
+   * command blocklists apply exactly as they do to a native call — this
+   * recovers lost work, it does not widen what the agent may do.
+   *
+   * @param tools - The tool registry for this run
+   * @param abortSignal - Cancels the turn and any further rounds
+   * @returns The turn's result, with salvaged calls folded into `toolCalls`
+   */
+  private async attemptWithSalvage(
+    tools: Record<string, unknown>,
+    abortSignal: AbortSignal,
+  ): Promise<AgentRunResult> {
+    let attempt = await this.attemptWithErrorRetries(tools, abortSignal);
+    const salvaged: ToolCallRecord[] = [];
+
+    for (let round = 0; round < CREWLY_AGENT_DEFAULTS.MAX_TEXT_TOOL_SALVAGES; round++) {
+      if (abortSignal.aborted) break;
+      const parsed = parseTextToolCalls(attempt.text ?? '');
+      if (parsed.calls.length === 0) break;
+
+      console.warn('[AgentRunner] Model wrote tool calls as text — executing them:', {
+        round: round + 1,
+        tools: parsed.calls.map(c => c.toolName),
+      });
+      this.streamingCallbacks.onTextChunk?.(
+        `[salvage] running ${parsed.calls.length} tool call(s) the model wrote as text\n`,
+      );
+
+      const { records, report } = await this.runSalvagedCalls(parsed.calls, tools);
+      salvaged.push(...records);
+
+      // Rewrite the turn's own message so the transcript does not keep
+      // teaching the model that writing markup is how a tool gets called.
+      this.replaceLastAssistantMessage(parsed.text || '(I wrote a tool call as text instead of calling the tool.)');
+      this.state.messages.push({ role: 'user', content: report });
+
+      const next = await this.attemptWithErrorRetries(tools, abortSignal);
+      attempt = mergeRuns({ ...attempt, text: parsed.text }, next);
+    }
+
+    return salvaged.length > 0
+      ? { ...attempt, toolCalls: [...attempt.toolCalls, ...salvaged] }
+      : attempt;
+  }
+
+  /**
+   * Execute the tool calls recovered from text and describe the results.
+   *
+   * Unknown tools and arguments the schema rejects are reported back rather
+   * than guessed at: the model gets a specific complaint it can act on, which
+   * is far more useful than silence.
+   *
+   * @param calls - Calls parsed out of the model's text
+   * @param tools - The tool registry for this run
+   * @returns Records for the run ledger, and the message to feed back
+   */
+  private async runSalvagedCalls(
+    calls: TextToolCall[],
+    tools: Record<string, unknown>,
+  ): Promise<{ records: ToolCallRecord[]; report: string }> {
+    const records: ToolCallRecord[] = [];
+    const sections: string[] = [];
+    const registry = tools as Record<string, ToolDefinition | undefined>;
+
+    for (const call of calls.slice(0, CREWLY_AGENT_DEFAULTS.MAX_SALVAGED_CALLS_PER_ROUND)) {
+      // A model that has seen another harness asks for `Bash`, not `bash_exec`.
+      const resolved = resolveToolName(call.toolName, Object.keys(registry));
+      const def = resolved ? registry[resolved] : undefined;
+      if (!resolved || !def || typeof def.execute !== 'function') {
+        sections.push(`### ${call.toolName}\nThere is no tool with that name. Available tools: ${Object.keys(registry).join(', ')}`);
+        continue;
+      }
+
+      const { args, error } = coerceArgs(call.args, def.inputSchema as unknown as SchemaLike | undefined);
+      if (error) {
+        sections.push(`### ${resolved}\nThe arguments were rejected: ${error}`);
+        continue;
+      }
+
+      const startedAt = Date.now();
+      this.streamingCallbacks.onToolCallStart?.(resolved, args);
+      let output: unknown;
+      try {
+        output = await def.execute(args);
+      } catch (err) {
+        output = { error: err instanceof Error ? err.message : String(err) };
+      }
+      this.streamingCallbacks.onToolCallFinish?.(resolved, args, output, Date.now() - startedAt);
+
+      records.push({ toolName: resolved, args, result: output });
+      // Name it as the model wrote it when that differed, so it learns the real name.
+      const heading = resolved === call.toolName ? resolved : `${resolved} (you wrote "${call.toolName}")`;
+      sections.push(`### ${heading}\n${this.summarizeSalvagedResult(output)}`);
+    }
+
+    const skipped = calls.length - Math.min(calls.length, CREWLY_AGENT_DEFAULTS.MAX_SALVAGED_CALLS_PER_ROUND);
+    const report = [
+      'You wrote your tool calls as text, so the model API never received them. I executed them for you; here is what they returned.',
+      ...sections,
+      skipped > 0 ? `(${skipped} further call(s) were not run — make them yourself.)` : '',
+      'Use the tool-calling mechanism from now on: text in your reply is shown to the user verbatim and executes nothing. Continue the task with these results.',
+    ].filter(Boolean).join('\n\n');
+
+    return { records, report };
+  }
+
+  /**
+   * Render a salvaged tool result small enough to feed back.
+   *
+   * @param output - Whatever the tool returned
+   * @returns A string, truncated with a note when it was long
+   */
+  private summarizeSalvagedResult(output: unknown): string {
+    let rendered: string;
+    try {
+      rendered = typeof output === 'string' ? output : JSON.stringify(output, null, 2) ?? String(output);
+    } catch {
+      rendered = String(output);
+    }
+    const limit = CREWLY_AGENT_DEFAULTS.SALVAGED_RESULT_MAX_CHARS;
+    return rendered.length > limit
+      ? `${rendered.slice(0, limit)}\n… (truncated, ${rendered.length - limit} more characters)`
+      : rendered;
+  }
+
+  /**
+   * Rewrite the assistant message this turn just added to the transcript.
+   *
+   * Stops at the user message that opened the turn, so an earlier, healthy
+   * reply is never touched.
+   *
+   * @param content - Replacement content
+   */
+  private replaceLastAssistantMessage(content: string): void {
+    for (let i = this.state.messages.length - 1; i >= 0; i--) {
+      const message = this.state.messages[i];
+      if (message.role === 'assistant') {
+        this.state.messages[i] = { ...message, content };
+        return;
+      }
+      if (message.role === 'user') return;
+    }
+  }
+
+  /**
+   * Run one turn, retrying only on *thrown* failures (rate limits, network,
+   * context length). A turn that returns with a bad `finishReason` is the
+   * caller's problem — see {@link executeRunWithStreamText}.
+   */
+  private async attemptWithErrorRetries(
+    tools: Record<string, unknown>,
+    abortSignal: AbortSignal,
+  ): Promise<AgentRunResult> {
+    const maxRetries = CREWLY_AGENT_DEFAULTS.MAX_RETRIES;
+    const baseDelay = CREWLY_AGENT_DEFAULTS.RETRY_BASE_DELAY_MS;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.executeStreamTextAttempt(tools, abortSignal);
+      } catch (error) {
+        // Context length exceeded — try compaction then retry once
+        if (this.isContextLengthError(error)) {
+          this.streamingCallbacks.onTextChunk?.('[retry] Context length exceeded, compacting history...\n');
+          const compactionResult = await this.requestCompaction();
+          if (compactionResult.compacted) {
+            try {
+              return await this.executeStreamTextAttempt(tools, abortSignal);
+            } catch (retryError) {
+              // If still too long, remove earliest non-system messages and try once more
+              if (this.isContextLengthError(retryError) && this.state.messages.length > 2) {
+                this.streamingCallbacks.onTextChunk?.('[retry] Still too long, trimming oldest messages...\n');
+                this.trimOldestNonSystemMessages();
+                return await this.executeStreamTextAttempt(tools, abortSignal);
+              }
+              throw retryError;
+            }
+          }
+        }
+
+        // Recoverable error — retry with backoff
+        if (this.isRecoverableError(error) && attempt < maxRetries) {
+          const delay = baseDelay * Math.pow(2, attempt);
+          this.streamingCallbacks.onTextChunk?.(`[retry] Recoverable error (attempt ${attempt + 1}/${maxRetries}), retrying in ${delay}ms...\n`);
+          await this.sleep(delay);
+          continue;
+        }
+
+        throw error;
+      }
+    }
+
+    // Unreachable — the loop always returns or throws
+    throw new Error('Retry loop exhausted without result');
+  }
+
+  /**
+   * Single attempt of streamText execution (no retry logic).
+   */
+  private async executeStreamTextAttempt(
+    tools: Record<string, unknown>,
+    abortSignal: AbortSignal,
+  ): Promise<AgentRunResult> {
+    const toolCalls: ToolCallRecord[] = [];
+    let stepCount = 0;
+    const loopDetector = new ToolCallLoopDetector();
+    // Local abort controller so we can abort on loop detection
+    const loopAbort = new AbortController();
+    const mergedSignal = AbortSignal.any([abortSignal, loopAbort.signal]);
+
+    const streamResult = streamText({
+      model: this.model!,
+      system: this.state.systemPrompt,
+      messages: this.state.messages,
+      providerOptions: this.buildProviderOptions(),
+      tools: tools as any,
+      stopWhen: stepCountIs(this.config.maxSteps),
+      temperature: this.config.model.temperature,
+      maxOutputTokens: resolveMaxOutputTokens(this.config.model),
+      abortSignal: mergedSignal,
+      onChunk: ({ chunk }: { chunk: { type: string; text?: string } }) => {
+        // Emit text chunks in real-time
+        if (chunk.type === 'text-delta' && chunk.text) {
+          this.streamingCallbacks.onTextChunk?.(chunk.text);
+        }
+      },
+      experimental_onToolCallStart: (event: any) => {
+        const tc = event.toolCall;
+        const args = tc?.args ?? tc?.input ?? {};
+        this.streamingCallbacks.onToolCallStart?.(tc?.toolName ?? 'unknown', (typeof args === 'string' ? JSON.parse(args) : args) as Record<string, unknown>);
+      },
+      experimental_onToolCallFinish: (event: any) => {
+        const tc = event.toolCall;
+        const args = tc?.args ?? tc?.input ?? {};
+        this.streamingCallbacks.onToolCallFinish?.(tc?.toolName ?? 'unknown', (typeof args === 'string' ? JSON.parse(args) : args) as Record<string, unknown>, event.toolResult, event.durationMs ?? 0);
+      },
+      onStepFinish: ({ toolCalls: stepToolCalls, toolResults }: { stepNumber: number; toolCalls?: Array<{ toolName: string; toolCallId: string }>; toolResults?: Array<{ toolCallId: string; output?: unknown }> }) => {
+        stepCount++;
+        const hasTools = (stepToolCalls?.length ?? 0) > 0;
+
+        // Collect tool calls from this step and check for loops
+        if (stepToolCalls) {
+          for (const tc of stepToolCalls) {
+            const args = (tc as Record<string, unknown>).input as Record<string, unknown> ?? {};
+            const result = toolResults?.find(
+              (tr: { toolCallId: string }) => tr.toolCallId === tc.toolCallId,
+            )?.output;
+            toolCalls.push({ toolName: tc.toolName, args, result });
+            loopDetector.recordToolCall(tc.toolName, args, result);
+          }
+        }
+
+        // Abort if loop detected — will be caught below
+        if (loopDetector.loopDetected) {
+          console.warn('[AgentRunner] Loop detected, aborting run:', loopDetector.loopReason);
+          loopAbort.abort();
+        }
+
+        this.streamingCallbacks.onStepFinish?.(stepCount, hasTools);
+      },
+    });
+
+    // I2 — DeepSeek reasoning buffer leak guard.
+    // The DeepSeek custom fetch wrapper accumulates parser handles per HTTP call.
+    // If streamText throws (timeout, network) BEFORE the success-path consume runs,
+    // those handles never drain and leak across run boundaries. The try/finally
+    // guarantees a consume call happens on every exit path. Consume-once
+    // semantics in ModelManager make double-call on the success path harmless
+    // (second call returns null).
+    try {
+      // Await the full result (stream completes when all steps are done or aborted)
+      let result;
+      try {
+        result = await streamResult;
+      } catch (err) {
+        // If aborted due to loop detection, handle gracefully
+        if (loopDetector.loopDetected) {
+          return this.handleLoopDetected(loopDetector, toolCalls, stepCount);
+        }
+        throw err;
+      }
+
+      // Also check post-completion in case the loop threshold was hit on the final step
+      if (loopDetector.loopDetected) {
+        return this.handleLoopDetected(loopDetector, toolCalls, stepCount);
+      }
+
+      // Warn if tool call count is excessive (polling dead-loop protection)
+      const maxToolCalls = CREWLY_AGENT_DEFAULTS.MAX_TOOL_CALLS_PER_RESPONSE;
+      if (toolCalls.length > maxToolCalls) {
+        console.warn('[AgentRunner] Excessive tool calls in single response:', {
+          count: toolCalls.length,
+          limit: maxToolCalls,
+          topTools: toolCalls.slice(0, 5).map(tc => tc.toolName),
+        });
+      }
+
+      // Add assistant response to history
+      let text = await result.text;
+      if (text) {
+        this.state.messages.push({ role: 'assistant', content: text });
+      }
+
+      // Empty response fallback: if model made tool calls but produced no text,
+      // prompt it once more for a short reply (prevents silent completions).
+      // Skipped when a reply tool already sent the answer: the "summary" that
+      // followed was the status report the owner got as noise (2026-09-26).
+      if (shouldRequestSummaryFallback(text, toolCalls)) {
+        console.warn('[AgentRunner] Empty text response after tool calls, requesting summary fallback');
+        const fallbackResult = await this.requestSummaryFallback();
+        if (fallbackResult) {
+          text = fallbackResult;
+        }
+      }
+
+      // Security guardrail: redact any API keys from agent output
+      if (text) {
+        const scanResult = this.outputFilter.scan(text);
+        if (scanResult.detected) {
+          console.warn('[AgentRunner] API keys redacted from output:', scanResult.matchedPatterns);
+          text = scanResult.redactedText;
+        }
+      }
+
+      // Update token tracking
+      const resultUsage = await result.usage;
+      const usage = {
+        input: resultUsage?.inputTokens ?? 0,
+        output: resultUsage?.outputTokens ?? 0,
+        cachedInput: resultUsage?.cachedInputTokens ?? 0,
+      };
+      this.state.totalTokens.input += usage.input;
+      this.state.totalTokens.output += usage.output;
+      this.recordContextOccupancy(usage);
+
+      // Check budget after token update
+      const postBudget = this.getContextBudget();
+      const budgetWarning = postBudget.level !== 'normal' ? postBudget.summary : undefined;
+
+      const finishReason = await result.finishReason;
+
+      // P0 Stop Hook: In eval mode, check if required output files were created.
+      // If deliverables are missing, inject a corrective message and do one more run.
+      // Note: If loop was detected, we already returned early via handleLoopDetected.
+      if (this.config.evalMode) {
+        const stopHookResult = await this.executeStopHook(toolCalls, tools, abortSignal);
+        if (stopHookResult) {
+          // Merge tool calls and update text from the follow-up run
+          toolCalls.push(...stopHookResult.toolCalls);
+          if (stopHookResult.text) {
+            text = stopHookResult.text;
+          }
+        }
+      }
+
+      // I2 — DeepSeek-R1 reasoning_content drain.
+      // After streamResult is fully drained, pull any reasoning the custom fetch
+      // wrapper accumulated for this run. Returns null for non-DeepSeek providers
+      // (the wrapper only runs on the DeepSeek provider path) or when no
+      // reasoning was produced.
+      const reasoning = this.config.model.provider === 'deepseek'
+        ? await this.modelManager.consumeDeepseekReasoning()
+        : undefined;
+
+      return {
+        text,
+        steps: stepCount,
+        usage: this.absorbChildUsage(usage),
+        toolCalls,
+        finishReason,
+        budgetWarning,
+        reasoning,
+      };
+    } finally {
+      // Cleanup-drain — if try block threw before the success-path consume,
+      // this prevents the parser handle array from leaking across runs.
+      // Safe on success path: consume-once semantics return null on 2nd call.
+      if (this.config.model.provider === 'deepseek') {
+        try {
+          await this.modelManager.consumeDeepseekReasoning();
+        } catch (e) {
+          console.warn('[AgentRunner] DeepSeek reasoning cleanup-drain failed:', e);
+        }
+      }
+    }
+  }
+
+  /**
+   * Execute run using generateText (batch mode).
+   * Used when _generateTextFn is set for testing, or as fallback.
+   *
+   * Includes automatic retry with exponential backoff for recoverable errors
+   * and progressive context trimming for context length errors.
+   */
+  private async executeRunWithGenerateText(
+    tools: Record<string, unknown>,
+    abortSignal: AbortSignal,
+  ): Promise<AgentRunResult> {
+    const maxRetries = CREWLY_AGENT_DEFAULTS.MAX_RETRIES;
+    const baseDelay = CREWLY_AGENT_DEFAULTS.RETRY_BASE_DELAY_MS;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.executeGenerateTextAttempt(tools, abortSignal);
+      } catch (error) {
+        // Context length exceeded — try compaction then retry once
+        if (this.isContextLengthError(error)) {
+          const compactionResult = await this.requestCompaction();
+          if (compactionResult.compacted) {
+            try {
+              return await this.executeGenerateTextAttempt(tools, abortSignal);
+            } catch (retryError) {
+              if (this.isContextLengthError(retryError) && this.state.messages.length > 2) {
+                this.trimOldestNonSystemMessages();
+                return await this.executeGenerateTextAttempt(tools, abortSignal);
+              }
+              throw retryError;
+            }
+          }
+        }
+
+        // Recoverable error — retry with backoff
+        if (this.isRecoverableError(error) && attempt < maxRetries) {
+          const delay = baseDelay * Math.pow(2, attempt);
+          await this.sleep(delay);
+          continue;
+        }
+
+        throw error;
+      }
+    }
+
+    throw new Error('Retry loop exhausted without result');
+  }
+
+  /**
+   * Single attempt of generateText execution (no retry logic).
+   */
+  private async executeGenerateTextAttempt(
+    tools: Record<string, unknown>,
+    abortSignal: AbortSignal,
+  ): Promise<AgentRunResult> {
+    const generateFn = this._generateTextFn || (generateText as Function);
+    const result = await generateFn({
+      model: this.model,
+      system: this.state.systemPrompt,
+      messages: this.state.messages,
+      providerOptions: this.buildProviderOptions(),
+      tools,
+      stopWhen: stepCountIs(this.config.maxSteps),
+      temperature: this.config.model.temperature,
+      maxOutputTokens: resolveMaxOutputTokens(this.config.model),
+      abortSignal,
+    });
+
+    // Track tool calls across all steps with loop detection
+    const toolCalls: ToolCallRecord[] = [];
+    const loopDetector = new ToolCallLoopDetector();
+    for (const step of result.steps) {
+      if (step.toolCalls) {
+        for (const tc of step.toolCalls) {
+          const args = (tc as Record<string, unknown>).input as Record<string, unknown> ?? {};
+          const tcResult = step.toolResults?.find(
+            (tr: { toolCallId: string }) => tr.toolCallId === tc.toolCallId,
+          )?.output;
+          toolCalls.push({ toolName: tc.toolName, args, result: tcResult });
+          loopDetector.recordToolCall(tc.toolName, args, tcResult);
+        }
+      }
+    }
+
+    // If loop detected in generateText path, handle gracefully
+    if (loopDetector.loopDetected) {
+      console.warn('[AgentRunner] Loop detected in generateText:', loopDetector.loopReason);
+      return this.handleLoopDetected(loopDetector, toolCalls, result.steps.length);
+    }
+
+    // Warn if tool call count is excessive
+    const maxToolCalls = CREWLY_AGENT_DEFAULTS.MAX_TOOL_CALLS_PER_RESPONSE;
+    if (toolCalls.length > maxToolCalls) {
+      console.warn('[AgentRunner] Excessive tool calls in single response:', {
+        count: toolCalls.length,
+        limit: maxToolCalls,
+        topTools: toolCalls.slice(0, 5).map(tc => tc.toolName),
+      });
+    }
+
+    // Add assistant response to history
+    let finalText = result.text;
+    if (finalText) {
+      this.state.messages.push({ role: 'assistant', content: finalText });
+    }
+
+    // Empty response fallback (see the streaming path): a short reply, and
+    // none at all when a reply tool already sent the answer.
+    if (shouldRequestSummaryFallback(finalText, toolCalls)) {
+      console.warn('[AgentRunner] Empty text response after tool calls, requesting summary fallback');
+      const fallbackResult = await this.requestSummaryFallback();
+      if (fallbackResult) {
+        finalText = fallbackResult;
+      }
+    }
+
+    // Security guardrail: redact any API keys from agent output
+    if (finalText) {
+      const scanResult = this.outputFilter.scan(finalText);
+      if (scanResult.detected) {
+        console.warn('[AgentRunner] API keys redacted from output:', scanResult.matchedPatterns);
+        finalText = scanResult.redactedText;
+      }
+    }
+
+    // Update token tracking
+    const usage = {
+      input: result.usage?.inputTokens ?? 0,
+      output: result.usage?.outputTokens ?? 0,
+      cachedInput: result.usage?.cachedInputTokens ?? 0,
+    };
+    this.state.totalTokens.input += usage.input;
+    this.state.totalTokens.output += usage.output;
+    this.recordContextOccupancy(usage);
+
+    // Check budget after token update and attach warning if approaching limits
+    const postBudget = this.getContextBudget();
+    const budgetWarning = postBudget.level !== 'normal' ? postBudget.summary : undefined;
+
+    // P0 Stop Hook: In eval mode, check if required output files were created.
+    // Note: If loop was detected via loopDetector, we already returned early.
+    if (this.config.evalMode) {
+      const stopHookResult = await this.executeStopHook(toolCalls, tools, abortSignal);
+      if (stopHookResult) {
+        toolCalls.push(...stopHookResult.toolCalls);
+        if (stopHookResult.text) {
+          finalText = stopHookResult.text;
+        }
+      }
+    }
+
+    // I2 — DeepSeek-R1 reasoning_content drain (generateText path).
+    // Same as the streamText path: pull buffered reasoning the custom fetch
+    // wrapper accumulated. Returns null for non-DeepSeek providers.
+    const reasoning = this.config.model.provider === 'deepseek'
+      ? await this.modelManager.consumeDeepseekReasoning()
+      : undefined;
+
+    return {
+      text: finalText,
+      steps: result.steps.length,
+      usage: this.absorbChildUsage(usage),
+      toolCalls,
+      finishReason: result.finishReason,
+      budgetWarning,
+      reasoning,
+    };
+  }
+
+  /**
+   * Remove the oldest non-system messages to reduce context size.
+   * Preserves the most recent messages and any system-role messages.
+   */
+  private trimOldestNonSystemMessages(): void {
+    // Remove up to 5 of the oldest non-system messages
+    let removed = 0;
+    const maxRemove = 5;
+    this.state.messages = this.state.messages.filter((msg) => {
+      if (removed >= maxRemove) return true;
+      if (msg.role === 'system') return true;
+      removed++;
+      return false;
+    });
+  }
+
+  /**
+   * Handle a detected tool call loop by injecting a corrective system message
+   * into conversation history and returning a structured result.
+   *
+   * @param detector - The loop detector with reason details
+   * @param toolCalls - Tool calls collected so far
+   * @param steps - Number of steps taken
+   * @returns AgentRunResult with the loop warning as text
+   */
+  private handleLoopDetected(
+    detector: ToolCallLoopDetector,
+    toolCalls: ToolCallRecord[],
+    steps: number,
+  ): AgentRunResult {
+    const guidance = `[LOOP DETECTED] ${detector.loopReason}. ` +
+      'You are repeating the same action without progress. ' +
+      'STOP and try a different approach: use a different tool, change the arguments, ' +
+      'skip this step, or ask for help. Do NOT repeat the same call again.';
+
+    // Inject corrective message so the model sees it on the next run
+    this.state.messages.push({ role: 'assistant', content: `[Loop detected — halting. ${detector.loopReason}]` });
+    this.state.messages.push({ role: 'user', content: guidance });
+
+    this.streamingCallbacks.onTextChunk?.(`\n⚠️ ${guidance}\n`);
+
+    return {
+      text: `[Loop detected] ${detector.loopReason}`,
+      steps,
+      usage: { input: 0, output: 0 },
+      toolCalls,
+      finishReason: 'loop-detected',
+      budgetWarning: undefined,
+    };
+  }
+
+  /**
+   * Execute the Stop Hook: check if the agent produced all required deliverables.
+   *
+   * Scans the original task prompt (first user message) for expected output files,
+   * then checks if write_file/edit_file tool calls created them. If files are
+   * missing, injects a corrective prompt and runs one more generateText call
+   * with tools so the agent can create the missing deliverables.
+   *
+   * Inspired by Claude Code's Stop hook which blocks the agent from finishing
+   * until task requirements are met.
+   *
+   * @param toolCalls   - Tool calls made so far
+   * @param tools       - Available tools for the follow-up run
+   * @param abortSignal - Abort signal for cancellation
+   * @returns Additional AgentRunResult from the follow-up, or null if no action needed
+   */
+  private async executeStopHook(
+    toolCalls: ToolCallRecord[],
+    tools: Record<string, unknown>,
+    abortSignal: AbortSignal,
+  ): Promise<AgentRunResult | null> {
+    if (!this.model) return null;
+
+    // Find the original task prompt (first user message)
+    const firstUserMsg = this.state.messages.find((m) => m.role === 'user');
+    if (!firstUserMsg) return null;
+    const taskPrompt = typeof firstUserMsg.content === 'string'
+      ? firstUserMsg.content
+      : JSON.stringify(firstUserMsg.content);
+
+    // Extract expected output files from the task prompt
+    const expectedFiles = AgentRunnerService.extractExpectedOutputFiles(taskPrompt);
+    if (expectedFiles.length === 0) return null;
+
+    // Check which files are missing
+    const missingFiles = AgentRunnerService.checkMissingDeliverables(expectedFiles, toolCalls);
+    if (missingFiles.length === 0) return null;
+
+    // Inject corrective message
+    const stopMessage = [
+      '[STOP HOOK — Deliverable Check Failed]',
+      '',
+      `The task requires you to create these files: ${expectedFiles.map(f => '`' + f + '`').join(', ')}`,
+      `Missing files: ${missingFiles.map(f => '`' + f + '`').join(', ')}`,
+      '',
+      'You MUST create these files before finishing. Use write_file to create each missing file now.',
+      'Do NOT delegate this work. Implement and write the files directly.',
+    ].join('\n');
+
+    this.state.messages.push({ role: 'user', content: stopMessage });
+    this.streamingCallbacks.onTextChunk?.(`\n⚠️ Stop Hook: Missing deliverables: ${missingFiles.join(', ')}. Running follow-up...\n`);
+
+    try {
+      // Run one more round with tools to create missing files
+      const followUp = await generateText({
+        model: this.model,
+        system: this.state.systemPrompt,
+        messages: this.state.messages,
+        providerOptions: this.buildProviderOptions(),
+        tools: tools as any,
+        stopWhen: stepCountIs(20), // Limited steps for follow-up
+        temperature: this.config.model.temperature,
+        maxOutputTokens: resolveMaxOutputTokens(this.config.model),
+        abortSignal,
+      });
+
+      // Extract results from the generateText response using safe property access
+      const followUpResult = followUp as unknown as Record<string, unknown>;
+      const steps = (followUpResult.steps as Array<Record<string, unknown>>) ?? [];
+      const text = (followUpResult.text as string) ?? '';
+      const followUpUsage = followUpResult.usage as { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } | undefined;
+      const finishReason = (followUpResult.finishReason as string) ?? 'stop';
+
+      const followUpToolCalls: ToolCallRecord[] = [];
+      for (const step of steps) {
+        if (step.toolCalls) {
+          for (const tc of step.toolCalls as Array<{ toolName: string; input?: Record<string, unknown> }>) {
+            const args = tc.input ?? {};
+            followUpToolCalls.push({ toolName: tc.toolName, args, result: undefined });
+          }
+        }
+      }
+
+      if (text) {
+        this.state.messages.push({ role: 'assistant', content: text });
+      }
+
+      // Track follow-up token usage. This is a later request in the same run,
+      // so its prompt is the most current picture of how full the context is.
+      if (followUpUsage) {
+        this.state.totalTokens.input += followUpUsage.inputTokens ?? 0;
+        this.state.totalTokens.output += followUpUsage.outputTokens ?? 0;
+        this.recordContextOccupancy({
+          input: followUpUsage.inputTokens ?? 0,
+          output: followUpUsage.outputTokens ?? 0,
+          cachedInput: followUpUsage.cachedInputTokens ?? 0,
+        });
+      }
+
+      return {
+        text,
+        steps: steps.length,
+        usage: {
+          input: followUpUsage?.inputTokens ?? 0,
+          output: followUpUsage?.outputTokens ?? 0,
+          cachedInput: followUpUsage?.cachedInputTokens ?? 0,
+        },
+        toolCalls: followUpToolCalls,
+        finishReason,
+      };
+    } catch (err) {
+      console.warn('[AgentRunner] Stop hook follow-up failed:', err instanceof Error ? err.message : err);
+      return null;
+    }
+  }
+
+  /**
+   * Ask the model for a closing reply when the previous response had tool
+   * calls but no text output. Injects {@link SUMMARY_FALLBACK_PROMPT} (a short
+   * reply to the person, in their language — not a status report) and makes a
+   * single generateText call with no tools to force a text-only response.
+   *
+   * @returns The reply text, or empty string if the fallback also fails
+   */
+  private async requestSummaryFallback(): Promise<string> {
+    if (!this.model) return '';
+
+    this.state.messages.push({ role: 'user', content: SUMMARY_FALLBACK_PROMPT });
+
+    try {
+      const generateFn = this._generateTextFn || (generateText as Function);
+      const fallback = await generateFn({
+        model: this.model,
+        system: this.state.systemPrompt,
+        messages: this.state.messages,
+        providerOptions: this.buildProviderOptions(),
+        maxOutputTokens: resolveMaxOutputTokens(this.config.model),
+        temperature: this.config.model.temperature,
+      });
+
+      const text = fallback.text || '';
+      if (text) {
+        this.state.messages.push({ role: 'assistant', content: text });
+        this.streamingCallbacks.onTextChunk?.(text);
+
+        // Track fallback token usage
+        const fallbackUsage = fallback.usage;
+        if (fallbackUsage) {
+          this.state.totalTokens.input += fallbackUsage.inputTokens ?? 0;
+          this.state.totalTokens.output += fallbackUsage.outputTokens ?? 0;
+          this.recordContextOccupancy({
+            input: fallbackUsage.inputTokens ?? 0,
+            output: fallbackUsage.outputTokens ?? 0,
+            cachedInput: fallbackUsage.cachedInputTokens ?? 0,
+          });
+        }
+      }
+
+      return text;
+    } catch (err) {
+      console.error('[AgentRunner] Summary fallback failed:', err instanceof Error ? err.message : err);
+      return '';
+    }
+  }
+
+  /**
+   * Public method for agent-initiated context compaction.
+   * Called by the compact_memory tool to intelligently summarize conversation state.
+   *
+   * Uses the model to generate a structured summary preserving:
+   * - Active tasks and their status
+   * - Key decisions made
+   * - Important findings and blockers
+   * - Current working context
+   *
+   * @returns CompactionResult with before/after stats
+   */
+  async requestCompaction(): Promise<CompactionResult> {
+    if (!this.model || this.state.messages.length < 10) {
+      return {
+        compacted: false,
+        messagesBefore: this.state.messages.length,
+        messagesAfter: this.state.messages.length,
+        reason: this.state.messages.length < 10
+          ? 'Too few messages to compact'
+          : 'Model not initialized',
+      };
+    }
+    return this.compactHistory();
+  }
+
+  /**
+   * Get the security audit log.
+   *
+   * @param limit - Maximum number of entries to return (most recent first)
+   * @returns Array of audit entries
+   */
+  getAuditLog(limit?: number): AuditEntry[] {
+    const entries = [...this.auditLog].reverse();
+    return limit ? entries.slice(0, limit) : entries;
+  }
+
+  /**
+   * Get the current security policy.
+   *
+   * @returns Current security policy configuration
+   */
+  getSecurityPolicy(): SecurityPolicy {
+    return { ...this.securityPolicy };
+  }
+
+  /**
+   * Update the security policy.
+   *
+   * @param updates - Partial security policy to merge
+   */
+  updateSecurityPolicy(updates: Partial<SecurityPolicy>): void {
+    this.securityPolicy = { ...this.securityPolicy, ...updates };
+  }
+
+  /**
+   * Get the approval queue service instance.
+   * Used by the approvals controller to manage pending approvals.
+   *
+   * @returns The ApprovalQueueService instance
+   */
+  getApprovalQueue(): ApprovalQueueService {
+    return this.approvalQueue;
+  }
+
+  /**
+   * Record an audit entry for a tool invocation.
+   *
+   * @param entry - Audit entry to record
+   */
+  private recordAudit(entry: AuditEntry): void {
+    if (!this.securityPolicy.auditEnabled) return;
+
+    this.auditLog.push(entry);
+
+    // Enforce max entries limit
+    if (this.auditLog.length > this.securityPolicy.maxAuditEntries) {
+      this.auditLog = this.auditLog.slice(-this.securityPolicy.maxAuditEntries);
+    }
+  }
+
+  /**
+   * Check if a tool is allowed to execute under the current security policy.
+   *
+   * Evaluates the tool against two checks:
+   * 1. blockedTools — tools explicitly blocked by name (returns blocked=true)
+   * 2. requireApproval — tools whose sensitivity requires approval (returns requiresApproval=true)
+   *
+   * @param toolName - Name of the tool being invoked
+   * @param sensitivity - Sensitivity classification of the tool
+   * @returns ApprovalCheckResult indicating if execution is allowed
+   */
+  private checkApproval(toolName: string, sensitivity: ToolSensitivity): ApprovalCheckResult {
+    // Check read-only mode — block all write/modify tools
+    if (this.securityPolicy.readOnlyMode && WRITE_TOOLS.includes(toolName)) {
+      return {
+        allowed: false,
+        blocked: true,
+        reason: `Tool '${toolName}' is blocked — read-only audit mode is active`,
+      };
+    }
+
+    // Check blocked tools
+    if (this.securityPolicy.blockedTools.includes(toolName)) {
+      return {
+        allowed: false,
+        blocked: true,
+        reason: `Tool '${toolName}' is blocked by security policy`,
+      };
+    }
+
+    // Check approval requirements
+    if (this.securityPolicy.requireApproval.includes(sensitivity)) {
+      return {
+        allowed: false,
+        blocked: false,
+        reason: `Tool '${toolName}' (${sensitivity}) requires approval — approval mode is active for '${sensitivity}' tools`,
+      };
+    }
+
+    return { allowed: true };
+  }
+
+  /**
+   * Get filtered audit log entries.
+   *
+   * @param filters - Query filters for limit, sensitivity, and toolName
+   * @returns Filtered audit entries (most recent first)
+   */
+  private getFilteredAuditLog(filters: AuditLogFilters): AuditEntry[] {
+    let entries = [...this.auditLog].reverse();
+
+    if (filters.sensitivity) {
+      entries = entries.filter(e => e.sensitivity === filters.sensitivity);
+    }
+    if (filters.toolName) {
+      entries = entries.filter(e => e.toolName === filters.toolName);
+    }
+
+    return entries.slice(0, filters.limit);
+  }
+
+  /**
+   * Compact conversation history using AI-generated structured summary.
+   *
+   * Keeps the most recent messages and uses the model to generate an
+   * intelligent summary of older messages that preserves critical state:
+   * decisions, active tasks, findings, and working context.
+   *
+   * Falls back to truncation-based summary if AI summarization fails.
+   *
+   * @returns CompactionResult with before/after statistics
+   */
+  private async compactHistory(): Promise<CompactionResult> {
+    // Guard against concurrent compaction — if already compacting, skip
+    if (this.compacting) {
+      return {
+        compacted: false,
+        messagesBefore: this.state.messages.length,
+        messagesAfter: this.state.messages.length,
+        reason: 'Compaction already in progress',
+      };
+    }
+
+    if (!this.model || this.state.messages.length < 10) {
+      return {
+        compacted: false,
+        messagesBefore: this.state.messages.length,
+        messagesAfter: this.state.messages.length,
+        reason: 'History too small to compact',
+      };
+    }
+
+    this.compacting = true;
+    try {
+
+    const messagesBefore = this.state.messages.length;
+    // Determine the split point: keep at least 10 recent messages but adjust
+    // to avoid breaking tool_call/tool_result pairs. If the first "recent"
+    // message is a tool result (role === 'tool'), extend keepRecent backwards
+    // to include its paired assistant tool_call message.
+    let keepRecent = Math.min(10, this.state.messages.length - 2);
+    if (keepRecent < 2) keepRecent = 2;
+
+    // Expand keepRecent if we'd split inside a tool call pair
+    let splitIdx = this.state.messages.length - keepRecent;
+    while (splitIdx > 0 && splitIdx < this.state.messages.length) {
+      const firstKept = this.state.messages[splitIdx];
+      // If the first kept message is a tool result, we must also keep the
+      // preceding assistant message that contained the tool_call
+      if (firstKept.role === 'tool') {
+        splitIdx--;
+        keepRecent++;
+      } else {
+        break;
+      }
+    }
+
+    const oldMessages = this.state.messages.slice(0, splitIdx);
+    const recentMessages = this.state.messages.slice(splitIdx);
+
+    // Pre-compaction context flush (#153): extract critical items from old
+    // messages so they can be explicitly included in the AI summary prompt.
+    // This ensures task progress, decisions, technical details, and blockers
+    // survive compaction even if the AI summary would otherwise miss them.
+    const flushService = ContextFlushService.getInstance();
+    const oldText = oldMessages.map(msg => {
+      const content = typeof msg.content === 'string'
+        ? msg.content
+        : JSON.stringify(msg.content);
+      return content;
+    }).join('\n');
+    const extractedItems = flushService.extract(oldText);
+
+    // Attempt AI-powered summarization
+    let summaryText: string;
+    try {
+      summaryText = await this.generateAISummary(oldMessages, extractedItems);
+    } catch {
+      // Fallback to truncation-based summary
+      summaryText = this.generateFallbackSummary(oldMessages, extractedItems);
+    }
+
+    this.state.messages = [
+      { role: 'assistant', content: summaryText },
+      ...recentMessages,
+    ];
+
+    return {
+      compacted: true,
+      messagesBefore,
+      messagesAfter: this.state.messages.length,
+    };
+    } finally {
+      this.compacting = false;
+    }
+  }
+
+  /**
+   * Generate an AI-powered structured summary of conversation messages.
+   *
+   * Asks the model to extract and preserve critical state from the
+   * conversation history in a structured format. Pre-extracted critical
+   * items from ContextFlushService are included in the prompt to ensure
+   * they are preserved even if the AI would otherwise miss them.
+   *
+   * @param messages - Messages to summarize
+   * @param extractedItems - Critical items extracted by ContextFlushService
+   * @returns Structured summary string
+   */
+  private async generateAISummary(
+    messages: ModelMessage[],
+    extractedItems: import('../../memory/context-flush.service.js').ExtractedContextItem[] = [],
+  ): Promise<string> {
+    const conversationText = messages.map(msg => {
+      const content = typeof msg.content === 'string'
+        ? msg.content.substring(0, 2000)
+        : JSON.stringify(msg.content).substring(0, 2000);
+      return `[${msg.role}]: ${content}`;
+    }).join('\n');
+
+    // Build critical items section if any were extracted
+    let criticalItemsSection = '';
+    if (extractedItems.length > 0) {
+      const itemLines = extractedItems.map(
+        item => `- [${item.category}] ${item.content} (confidence: ${item.confidence})`,
+      ).join('\n');
+      criticalItemsSection = `\n\nIMPORTANT — The following critical items were auto-extracted and MUST appear in your summary:\n${itemLines}\n`;
+    }
+
+    const summarizationPrompt = `Summarize this conversation history into a structured state snapshot. Preserve ALL of the following if present:
+
+1. **Active Tasks**: What tasks are in progress, assigned to whom, their status
+2. **Decisions Made**: Key decisions and their rationale
+3. **Key Findings**: Important discoveries, patterns, or blockers found
+4. **Current Context**: What the agent is currently working on
+5. **Pending Items**: Anything awaiting response or follow-up
+${criticalItemsSection}
+Be concise but complete. This summary replaces the original messages.
+
+Conversation (${messages.length} messages):
+${conversationText}`;
+
+    const generateFn = this._generateTextFn || (generateText as Function);
+    const result = await generateFn({
+      model: this.model,
+      messages: [{ role: 'user', content: summarizationPrompt }],
+      maxOutputTokens: 2048,
+      temperature: 0.1,
+    });
+
+    const summary = result.text || '';
+    if (!summary || summary.length < 20) {
+      throw new Error('AI summary too short, falling back');
+    }
+
+    return `[Compacted State — ${messages.length} messages summarized]\n\n${summary}`;
+  }
+
+  /**
+   * Generate a truncation-based fallback summary when AI summarization fails.
+   * Includes pre-extracted critical items so they survive compaction.
+   *
+   * @param messages - Messages to summarize
+   * @param extractedItems - Critical items extracted by ContextFlushService
+   * @returns Simple concatenated summary string
+   */
+  private generateFallbackSummary(
+    messages: ModelMessage[],
+    extractedItems: import('../../memory/context-flush.service.js').ExtractedContextItem[] = [],
+  ): string {
+    const summaryParts: string[] = [];
+    for (const msg of messages) {
+      const content = typeof msg.content === 'string'
+        ? msg.content.substring(0, 1000)
+        : JSON.stringify(msg.content).substring(0, 1000);
+      summaryParts.push(`[${msg.role}]: ${content}`);
+    }
+
+    let result = `Previous conversation summary (${messages.length} messages compressed):\n${summaryParts.join('\n')}`;
+
+    if (extractedItems.length > 0) {
+      const itemLines = extractedItems.map(
+        item => `- [${item.category}] ${item.content}`,
+      ).join('\n');
+      result += `\n\nExtracted critical context:\n${itemLines}`;
+    }
+
+    return result;
+  }
+}

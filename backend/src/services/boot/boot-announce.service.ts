@@ -1,0 +1,166 @@
+/**
+ * Boot Announce Service
+ *
+ * Posts a one-time "back online" message to the owner's channel after the
+ * backend restarts and the orchestrator is ready, so a restart is visible
+ * instead of silent. The message is deterministic (composed here, not by the
+ * orchestrator) and reports startup success + the running version, optionally
+ * enriched with how long the system was offline and how many queued messages
+ * were replayed.
+ *
+ * Design: the composer is PURE (unit-testable); sending takes injected
+ * dependencies (Slack connectivity + sender + logger) so the I/O is testable
+ * and the caller in index.ts stays thin. Sending is best-effort — any failure
+ * is swallowed and logged, never blocking boot.
+ *
+ * v1 targets Slack (the owner's primary channel). Posting to the web chat
+ * (chat-v2) can be layered on later via the same composer.
+ *
+ * @module services/boot/boot-announce.service
+ */
+
+import { existsSync, writeFileSync } from 'fs';
+
+/** Inputs describing the just-completed boot. */
+export interface BootAnnounceInfo {
+  /** The running Crewly version, e.g. "1.11.3". */
+  version: string;
+  /**
+   * Which machine this is, e.g. "macbookpro.lan".
+   *
+   * Several instances share one Slack workspace, so without it two restarts
+   * on the same version are indistinguishable in the channel (2026-09-21).
+   */
+  deviceName?: string;
+  /** True on the first-ever boot (welcome) vs a restart (back-online). */
+  firstBoot?: boolean;
+  /** How long the system was offline before this boot, in ms (optional). */
+  offlineDurationMs?: number;
+  /** How many queued offline messages were replayed on boot (optional). */
+  replayedCount?: number;
+}
+
+/** A composed announcement ready to send. */
+export interface BootAnnounceMessage {
+  /** Short title / headline. */
+  title: string;
+  /** Body text (one fact per line). */
+  message: string;
+}
+
+/**
+ * Formats a millisecond duration as a short human-readable English string.
+ *
+ * @param ms - Duration in milliseconds.
+ * @returns e.g. "<1 min", "12 min", "2 h 5 min".
+ */
+function formatDuration(ms: number): string {
+  const totalMin = Math.floor(ms / 60_000);
+  if (totalMin < 1) return '<1 min';
+  if (totalMin < 60) return `${totalMin} min`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return m > 0 ? `${h} h ${m} min` : `${h} h`;
+}
+
+/**
+ * Composes the boot announcement text. Pure — no I/O.
+ *
+ * Always includes startup success + version. Adds an offline-duration line and
+ * a replayed-messages line only when those values are present and meaningful.
+ *
+ * @param info - The boot info (version required; offline/replayed optional).
+ * @returns The title + message to send.
+ *
+ * @example
+ * composeBootAnnouncement({ version: '1.11.3', offlineDurationMs: 720000, replayedCount: 3 })
+ * // → { title: '✅ Crewly is back online', message: '• Version: 1.11.3\n• Offline: 12 min\n• Caught up: 3 offline messages' }
+ */
+export function composeBootAnnouncement(info: BootAnnounceInfo): BootAnnounceMessage {
+  // First-ever boot: a welcome, not a "restarted" message — and offline /
+  // replayed lines are meaningless (there was no prior run).
+  const machine = info.deviceName?.trim();
+  if (info.firstBoot) {
+    return {
+      title: machine ? `🎉 Welcome to Crewly! (${machine})` : '🎉 Welcome to Crewly!',
+      message: `Crewly is up and ready.\n• Version: ${info.version}`,
+    };
+  }
+
+  const lines: string[] = [`• Version: ${info.version}`];
+  if (machine) lines.unshift(`• Machine: ${machine}`);
+  if (typeof info.offlineDurationMs === 'number' && info.offlineDurationMs > 0) {
+    lines.push(`• Offline: ${formatDuration(info.offlineDurationMs)}`);
+  }
+  if (typeof info.replayedCount === 'number' && info.replayedCount > 0) {
+    lines.push(`• Caught up: ${info.replayedCount} offline message${info.replayedCount === 1 ? '' : 's'}`);
+  }
+  return {
+    title: machine ? `✅ Crewly is back online (${machine})` : '✅ Crewly is back online',
+    message: lines.join('\n'),
+  };
+}
+
+/** Injected dependencies for sending the announcement (keeps I/O testable). */
+export interface BootAnnounceDeps {
+  /** Whether the Slack channel is currently connected. */
+  isSlackConnected: () => boolean;
+  /** Sends the composed announcement to Slack (e.g. via sendNotification). */
+  sendSlack: (msg: BootAnnounceMessage) => Promise<unknown>;
+  /** Minimal logger. */
+  logger: {
+    info: (message: string, meta?: Record<string, unknown>) => void;
+    warn: (message: string, meta?: Record<string, unknown>) => void;
+  };
+}
+
+/**
+ * Sends the boot announcement. Best-effort: skips silently when Slack is not
+ * connected, and swallows any send error (logged as a warning) so a failed
+ * announcement never affects startup.
+ *
+ * @param info - The boot info to announce.
+ * @param deps - Injected Slack connectivity + sender + logger.
+ */
+export async function sendBootAnnouncement(
+  info: BootAnnounceInfo,
+  deps: BootAnnounceDeps,
+): Promise<void> {
+  const composed = composeBootAnnouncement(info);
+  try {
+    if (!deps.isSlackConnected()) {
+      deps.logger.info('Boot announce: Slack not connected — skipping', { version: info.version });
+      return;
+    }
+    await deps.sendSlack(composed);
+    deps.logger.info('Boot announce sent', { version: info.version });
+  } catch (err) {
+    deps.logger.warn('Boot announce failed (non-critical)', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Returns true if no boot marker exists yet — i.e. this is the first-ever boot.
+ *
+ * @param markerPath - Absolute path to the boot marker file.
+ * @returns True when the marker is absent.
+ */
+export function isFirstBoot(markerPath: string): boolean {
+  return !existsSync(markerPath);
+}
+
+/**
+ * Persists the boot marker so subsequent boots are recognized as restarts.
+ * Best-effort: if the write fails, a future boot may re-show the welcome — harmless.
+ *
+ * @param markerPath - Absolute path to the boot marker file.
+ */
+export function markBooted(markerPath: string): void {
+  try {
+    writeFileSync(markerPath, new Date().toISOString());
+  } catch {
+    // Ignore — persistence is best-effort.
+  }
+}

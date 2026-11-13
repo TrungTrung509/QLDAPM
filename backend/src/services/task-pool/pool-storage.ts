@@ -1,0 +1,402 @@
+/**
+ * Pool Storage — JSON file persistence for Task Pool
+ *
+ * Handles reading and writing the task pool state to disk using
+ * atomic writes (temp-file + fsync + rename) and operation locks
+ * to prevent corruption on crash or concurrent access.
+ *
+ * @module services/task-pool/pool-storage
+ */
+
+import * as path from 'path';
+import {
+  ensureDir,
+  safeReadJson,
+  atomicWriteFile,
+  modifyJsonFile,
+} from '../../utils/file-io.utils.js';
+import type { WorkItem } from '../../types/v2/work-item.types.js';
+import type { TaskClaim } from '../../types/v2/claim.types.js';
+import { LoggerService, type ComponentLogger } from '../core/logger.service.js';
+import { getCrewlyHomePath } from '../core/crewly-home.utils.js';
+import { traceWorkItemCreated, traceWorkItemStatus } from '../trace/trace-recorder.js';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/**
+ * On-disk shape of the pool data file.
+ */
+export interface PoolData {
+  /** All work items currently in the pool */
+  workItems: WorkItem[];
+  /** All active and historical claims */
+  claims: TaskClaim[];
+  /** ISO8601 — last time the file was written */
+  lastUpdatedAt: string;
+}
+
+/**
+ * Options for PoolStorage construction.
+ */
+export interface PoolStorageOptions {
+  /** Override the default data directory (defaults to ~/.crewly/task-pool/) */
+  dataDir?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Default directory name under ~/.crewly/ for pool data. */
+const POOL_DIR_NAME = 'task-pool';
+
+/** File name for the pool data. */
+const POOL_FILE_NAME = 'pool.json';
+
+/** Debounce interval in ms for write batching. */
+const WRITE_DEBOUNCE_MS = 500;
+
+// ---------------------------------------------------------------------------
+// PoolStorage
+// ---------------------------------------------------------------------------
+
+/**
+ * Persists task pool state to a JSON file with atomic writes.
+ *
+ * Uses the same patterns as the rest of the Crewly backend:
+ * - {@link atomicWriteFile} for crash-safe writes
+ * - {@link modifyJsonFile} for locked read-modify-write cycles
+ * - Debounced flushing to reduce disk I/O under burst writes
+ */
+export class PoolStorage {
+  private readonly filePath: string;
+  private readonly logger: ComponentLogger;
+
+  /** In-memory cache — authoritative after first load. */
+  private cache: PoolData | null = null;
+
+  /** Debounce timer handle for batching writes. */
+  private flushTimer: NodeJS.Timeout | null = null;
+
+  /** Whether a flush is pending. */
+  private dirty = false;
+
+  constructor(options?: PoolStorageOptions) {
+    const dataDir =
+      options?.dataDir ??
+      path.join(getCrewlyHomePath(), POOL_DIR_NAME);
+    this.filePath = path.join(dataDir, POOL_FILE_NAME);
+    this.logger = LoggerService.getInstance().createComponentLogger('PoolStorage');
+  }
+
+  // -----------------------------------------------------------------------
+  // Public API
+  // -----------------------------------------------------------------------
+
+  /**
+   * Loads pool data from disk (or returns cached copy).
+   *
+   * **F-CYCLE7-3 (2026-05-07):** Normalizes legacy / partial on-disk
+   * shapes — if a previous write produced a `pool.json` missing the
+   * `workItems` or `claims` arrays (root cause of the post-restart
+   * `Cannot read properties of undefined (reading 'filter')` storm in
+   * `ReconcilerDataProvider`), we coerce the missing slots to `[]`
+   * before caching so every downstream consumer can rely on the
+   * `PoolData` invariant.
+   *
+   * @returns Current pool data with `workItems` and `claims` guaranteed to be arrays
+   */
+  async load(): Promise<PoolData> {
+    if (this.cache) return this.cache;
+
+    await ensureDir(path.dirname(this.filePath));
+    const raw = await safeReadJson<PoolData>(
+      this.filePath,
+      createEmptyPoolData(),
+      this.logger,
+    );
+    // Defensive normalization. `safeReadJson` round-trips whatever
+    // shape is on disk, so a partial / pre-migration file can produce
+    // `data.workItems === undefined`. Repair to canonical shape once,
+    // here, instead of every read site.
+    const normalized: PoolData = {
+      workItems: Array.isArray(raw?.workItems) ? raw.workItems : [],
+      claims: Array.isArray(raw?.claims) ? raw.claims : [],
+      lastUpdatedAt: raw?.lastUpdatedAt ?? new Date(0).toISOString(),
+    };
+    this.cache = normalized;
+    return normalized;
+  }
+
+  /**
+   * Returns all work items currently in the pool.
+   *
+   * Always returns an array — `load()` normalizes a missing
+   * `workItems` field to `[]` (F-CYCLE7-3).
+   *
+   * @returns Array of WorkItems
+   */
+  async getWorkItems(): Promise<WorkItem[]> {
+    const data = await this.load();
+    return data.workItems ?? [];
+  }
+
+  /**
+   * Returns all claims.
+   *
+   * Always returns an array — `load()` normalizes a missing `claims`
+   * field to `[]` (F-CYCLE7-3).
+   *
+   * @returns Array of TaskClaims
+   */
+  async getClaims(): Promise<TaskClaim[]> {
+    const data = await this.load();
+    return data.claims ?? [];
+  }
+
+  /**
+   * Finds a work item by ID.
+   *
+   * @param workItemId - The work item ID
+   * @returns The work item, or undefined
+   */
+  async findWorkItem(workItemId: string): Promise<WorkItem | undefined> {
+    const data = await this.load();
+    return data.workItems.find((wi) => wi.id === workItemId);
+  }
+
+  /**
+   * Finds a claim by work item ID (active claims only).
+   *
+   * @param workItemId - The work item ID
+   * @returns The active claim, or undefined
+   */
+  async findActiveClaimByWorkItem(workItemId: string): Promise<TaskClaim | undefined> {
+    const data = await this.load();
+    return data.claims.find(
+      (c) => c.workItemId === workItemId && c.status === 'active',
+    );
+  }
+
+  /**
+   * Finds a claim by agent ID (active claims only).
+   *
+   * @param agentId - The agent session name
+   * @returns The active claim, or undefined
+   */
+  async findActiveClaimByAgent(agentId: string): Promise<TaskClaim | undefined> {
+    const data = await this.load();
+    return data.claims.find(
+      (c) => c.agentId === agentId && c.status === 'active',
+    );
+  }
+
+  /**
+   * Adds a work item to the pool.
+   *
+   * @param workItem - The work item to add
+   */
+  async addWorkItem(workItem: WorkItem): Promise<void> {
+    const data = await this.load();
+    traceWorkItemCreated(workItem);
+    data.workItems.push(workItem);
+    this.markDirty();
+  }
+
+  /**
+   * Updates a work item in-place.
+   *
+   * @param workItemId - ID of the work item to update
+   * @param updater - Function that mutates the work item
+   * @returns True if item was found and updated
+   */
+  async updateWorkItem(
+    workItemId: string,
+    updater: (wi: WorkItem) => void,
+  ): Promise<boolean> {
+    const data = await this.load();
+    const item = data.workItems.find((wi) => wi.id === workItemId);
+    if (!item) return false;
+    const previousStatus = item.status;
+    updater(item);
+    traceWorkItemStatus(item, previousStatus);
+    this.markDirty();
+    return true;
+  }
+
+  /**
+   * Removes a work item from the pool.
+   *
+   * @param workItemId - ID of the work item to remove
+   * @returns True if item was found and removed
+   */
+  async removeWorkItem(workItemId: string): Promise<boolean> {
+    const data = await this.load();
+    const idx = data.workItems.findIndex((wi) => wi.id === workItemId);
+    if (idx === -1) return false;
+    data.workItems.splice(idx, 1);
+    this.markDirty();
+    return true;
+  }
+
+  /**
+   * Removes several work items at once (one in-memory pass, one flush
+   * scheduled). Used by the one-time archive, which writes the items to the
+   * archive file first.
+   *
+   * @param workItemIds - IDs to remove
+   * @returns How many were removed
+   */
+  async removeWorkItems(workItemIds: ReadonlySet<string>): Promise<number> {
+    const data = await this.load();
+    // In place: other callers may hold the array reference.
+    let removed = 0;
+    for (let i = data.workItems.length - 1; i >= 0; i--) {
+      if (workItemIds.has(data.workItems[i].id)) {
+        data.workItems.splice(i, 1);
+        removed += 1;
+      }
+    }
+    if (removed > 0) this.markDirty();
+    return removed;
+  }
+
+  /**
+   * Removes several claims at once (in place, one flush scheduled). Used by
+   * the pool prune, which writes them to the archive first.
+   *
+   * @param claimIds - IDs to remove
+   * @returns How many were removed
+   */
+  async removeClaims(claimIds: ReadonlySet<string>): Promise<number> {
+    const data = await this.load();
+    let removed = 0;
+    for (let i = data.claims.length - 1; i >= 0; i--) {
+      if (claimIds.has(data.claims[i].id)) {
+        data.claims.splice(i, 1);
+        removed += 1;
+      }
+    }
+    if (removed > 0) this.markDirty();
+    return removed;
+  }
+
+  /**
+   * Directory the pool file lives in (`~/.crewly/task-pool` by default).
+   *
+   * @returns Absolute directory path
+   */
+  getDataDir(): string {
+    return path.dirname(this.filePath);
+  }
+
+  /**
+   * Adds a claim to storage.
+   *
+   * @param claim - The claim to add
+   */
+  async addClaim(claim: TaskClaim): Promise<void> {
+    const data = await this.load();
+    data.claims.push(claim);
+    this.markDirty();
+  }
+
+  /**
+   * Updates a claim in-place.
+   *
+   * @param claimId - ID of the claim to update
+   * @param updater - Function that mutates the claim
+   * @returns True if claim was found and updated
+   */
+  async updateClaim(
+    claimId: string,
+    updater: (claim: TaskClaim) => void,
+  ): Promise<boolean> {
+    const data = await this.load();
+    const claim = data.claims.find((c) => c.id === claimId);
+    if (!claim) return false;
+    updater(claim);
+    this.markDirty();
+    return true;
+  }
+
+  /**
+   * Forces an immediate flush to disk (bypasses debounce).
+   * Call this during graceful shutdown.
+   */
+  async flush(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (!this.dirty || !this.cache) return;
+
+    this.cache.lastUpdatedAt = new Date().toISOString();
+    // Cleared BEFORE the write: a change made while it runs sets the flag
+    // again and gets its own flush. Clearing it after would swallow that
+    // change until the next unrelated write.
+    this.dirty = false;
+    try {
+      // Compact JSON: the pretty-printed file was twice the size and the
+      // whole-file rewrite is the cost of every pool write (crewly#1108).
+      await atomicWriteFile(this.filePath, JSON.stringify(this.cache));
+    } catch (err) {
+      this.dirty = true;
+      throw err;
+    }
+    this.logger.debug?.('Pool data flushed to disk', { path: this.filePath });
+  }
+
+  /**
+   * Clears all pool data (useful for testing).
+   */
+  async clear(): Promise<void> {
+    this.cache = createEmptyPoolData();
+    this.dirty = true;
+    await this.flush();
+  }
+
+  /**
+   * Cleanup: cancels pending debounce timer and flushes.
+   */
+  async destroy(): Promise<void> {
+    await this.flush();
+  }
+
+  // -----------------------------------------------------------------------
+  // Internal
+  // -----------------------------------------------------------------------
+
+  /**
+   * Marks cache as dirty and schedules a debounced flush.
+   */
+  private markDirty(): void {
+    this.dirty = true;
+    if (this.flushTimer) return; // already scheduled
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.flush().catch((err) => {
+        this.logger.warn('Failed to flush pool data', { error: String(err) });
+      });
+    }, WRITE_DEBOUNCE_MS);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates an empty pool data structure.
+ *
+ * @returns Empty PoolData
+ */
+export function createEmptyPoolData(): PoolData {
+  return {
+    workItems: [],
+    claims: [],
+    lastUpdatedAt: new Date().toISOString(),
+  };
+}

@@ -1,0 +1,579 @@
+/**
+ * Slack Agent Post Service — an agent starting a Slack conversation itself.
+ *
+ * Everything else in the Slack layer is reactive: a message arrives, an agent
+ * answers. This is the other direction. An agent calls the `slack-post` skill
+ * and the message goes to a channel or into a DM, under the agent's own
+ * identity when it has one.
+ *
+ * Target syntax (one string, so the skill stays a one-liner):
+ *
+ * | Target | Meaning |
+ * |---|---|
+ * | `#general`, `general` | public/private channel by name (lower-case) |
+ * | `C0123ABCD` | channel by id (upper-case) |
+ * | `D0123ABCD` | an already-open DM channel |
+ * | `@sam`, `U0123ABCD` | DM that person |
+ *
+ * Identity: an agent with a Cloud-provisioned Slack app posts with its own
+ * bot token, so a DM is a real conversation between the person and that agent.
+ * Without one it falls back to the shared Crewly bot with the agent's name and
+ * icon — visually similar, but the DM is Crewly's, not the agent's.
+ *
+ * @module services/slack/slack-agent-post.service
+ */
+
+import type { SlackTypingPlaceholderService } from './slack-typing-placeholder.service.js';
+import type { Team } from '../../types/index.js';
+import type { SlackChannelInfo, SlackOutgoingMessage } from '../../types/slack.types.js';
+import { LoggerService, type ComponentLogger } from '../core/logger.service.js';
+import { SLACK_AGENT_POST_CONSTANTS, SLACK_TYPING_CONSTANTS } from '../../constants.js';
+import { slackIdentityFor } from './slack-team-channel.service.js';
+import { parseSlackThreadKey } from './slack-thread-key.js';
+import type { SlackAgentIdentityService } from './slack-agent-identity.service.js';
+import { reportOwnerThreadAgentPost } from '../messaging/owner-thread-sentinel.service.js';
+
+/** The slice of SlackService this service uses. */
+export interface AgentPostSlackApi {
+  isConnected(): boolean;
+  sendMessage(message: SlackOutgoingMessage): Promise<string>;
+  findChannelByName(name: string): Promise<SlackChannelInfo | null>;
+  openDirectMessage(userId: string, botToken?: string): Promise<string>;
+  findUserByHandle(handle: string): Promise<string | null>;
+  /** Upload a file into a channel; optional so a slice without it can still post text. */
+  uploadFile?(options: {
+    channelId: string;
+    filePath: string;
+    filename?: string;
+    threadTs?: string;
+    botToken?: string;
+    persona?: { username: string; iconEmoji?: string; iconUrl?: string };
+  }): Promise<{ fileId?: string }>;
+}
+
+/** The slice of the identity service this service uses. */
+export type AgentPostIdentityApi = Pick<SlackAgentIdentityService, 'load' | 'getInstalled'>;
+
+/** Storage slice — used to give a token-less agent its name and icon. */
+export interface AgentPostStorageApi {
+  getTeams(): Promise<Team[]>;
+}
+
+/** Constructor dependencies. */
+export interface SlackAgentPostServiceDeps {
+  slack: AgentPostSlackApi;
+  storage: AgentPostStorageApi;
+  identities?: AgentPostIdentityApi | null;
+  /** Placeholders of replies agents owe — a post into such a conversation answers it */
+  typing?: (Pick<SlackTypingPlaceholderService, 'findOwed' | 'resolve'> &
+    Partial<Pick<SlackTypingPlaceholderService, 'owes' | 'noteAnswerPosted'>>) | null;
+  /** Links `@Name` to real Slack mentions (agents' bots and known people). */
+  linkMentions?: SlackMentionLinker;
+  /**
+   * Channel a Crewly team room is mapped to, by its Slack name. Consulted
+   * before `conversations.list`, which does not return a private channel the
+   * workspace bot is not a member of.
+   */
+  findMappedChannelByName?: (name: string) => { id: string; name: string } | null;
+  /**
+   * Whether the agent still owes a person an answer in this DM (the owner
+   * message watchdog). With no placeholder left either, a top-level DM post
+   * is one the agent started (#1387).
+   */
+  owesAnswerIn?: (agentSession: string, slackChannelId: string) => boolean;
+}
+
+/** A top-level DM post the agent started, not an answer (#1387). */
+export interface AgentStartedDmPost {
+  agent: string;
+  /** The DM; absent when the post did not go through this service (the orchestrator's own post) */
+  slackChannelId?: string;
+  text: string;
+}
+
+const startedDmPostListeners = new Set<(post: AgentStartedDmPost) => void>();
+
+/**
+ * Listen to top-level DM posts agents start (not answers to something they
+ * were asked): the weekly owner-pulls line counts them.
+ *
+ * @param listener - Called once per post; errors are swallowed
+ * @returns Unsubscribe
+ */
+export function onAgentStartedDmPost(listener: (post: AgentStartedDmPost) => void): () => void {
+  startedDmPostListeners.add(listener);
+  return () => {
+    startedDmPostListeners.delete(listener);
+  };
+}
+
+/**
+ * Report a top-level DM post an agent started, from a path that does not go
+ * through {@link SlackAgentPostService} (the orchestrator's own owner-DM
+ * post). Same listeners, same once-per-post rule; errors are swallowed.
+ *
+ * @param post - The post (the text is read for its last sentence only)
+ */
+export function reportAgentStartedDmPost(post: AgentStartedDmPost): void {
+  for (const listener of startedDmPostListeners) {
+    try {
+      listener(post);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
+/** One post request. */
+export interface SlackAgentPostRequest {
+  /** The agent asking (its session name). */
+  agentSession: string;
+  /** Channel or person — see the table in the module docs. */
+  target: string;
+  text: string;
+  /** Reply inside an existing Slack thread. */
+  threadTs?: string;
+  /**
+   * A new topic: post top-level even when the agent owes an answer in this
+   * channel (scheduled output must never land in an unrelated owed thread —
+   * specs/2026-10-01-decision-cards.md §6).
+   */
+  newTopLevel?: boolean;
+  /** Absolute paths of files to upload into the same channel/thread after the text. */
+  files?: string[];
+}
+
+/** What happened. */
+export interface SlackAgentPostResult {
+  channelId: string;
+  messageTs: string;
+  kind: 'channel' | 'dm';
+  /** `agent` when the agent's own bot posted, `crewly` for the shared bot. */
+  postedAs: 'agent' | 'crewly';
+  /** Display name the message carries. */
+  identity: string;
+  /** Files uploaded to Slack (absolute paths), when `files` were requested. */
+  filesSent?: string[];
+  /** Files Slack did not take, with Slack's own error code. */
+  filesFailed?: Array<{ path: string; error: string }>;
+}
+
+/**
+ * Turns `@Name` into `<@Uxxx>` for known agents and people. Optional; when
+ * absent (or when it fails) the text is posted as written.
+ */
+export type SlackMentionLinker = (text: string, channelId: string) => Promise<string>;
+
+/** Reasons a post can be refused, for HTTP mapping. */
+export type SlackAgentPostErrorCode = 'validation' | 'not_connected' | 'target_not_found' | 'slack_error' | 'thread_mismatch' | 'thread_required';
+
+/** Structured failure. */
+export class SlackAgentPostError extends Error {
+  constructor(
+    public readonly code: SlackAgentPostErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'SlackAgentPostError';
+  }
+}
+
+// Case is the discriminator, and it is reliable: Slack ids are uppercase,
+// while Slack forces channel names to lowercase. Matching case-insensitively
+// would swallow ordinary names — `general` is `G` followed by six
+// alphanumerics, so it would have been read as a private-channel id.
+const CHANNEL_ID_RE = /^[CG][A-Z0-9]{6,}$/;
+const DM_ID_RE = /^D[A-Z0-9]{6,}$/;
+const USER_ID_RE = /^[UW][A-Z0-9]{6,}$/;
+
+/**
+ * Service — see module docs.
+ */
+export class SlackAgentPostService {
+  private readonly logger: ComponentLogger;
+  private readonly deps: SlackAgentPostServiceDeps;
+
+  constructor(deps: SlackAgentPostServiceDeps) {
+    this.deps = deps;
+    this.logger = LoggerService.getInstance().createComponentLogger('SlackAgentPost');
+  }
+
+  /**
+   * Link `@Name` mentions, falling back to the text as written.
+   *
+   * @param text - Agent text
+   * @param channelId - Where it is going (decides between same-named agents)
+   * @returns Text with Slack mentions where a name is known
+   */
+  private async linkMentions(text: string, channelId: string): Promise<string> {
+    if (!this.deps.linkMentions || !text.includes('@')) return text;
+    try {
+      return await this.deps.linkMentions(text, channelId);
+    } catch (err) {
+      this.logger.warn('Mention linking failed — posting as written', { error: errText(err) });
+      return text;
+    }
+  }
+
+  /**
+   * Whether a top-level DM post is one the agent started: it owes no answer
+   * there (no reply placeholder of any age, nothing the watchdog tracks). A
+   * late answer the agent posts top-level is still an answer.
+   *
+   * @param agentSession - The agent
+   * @param channelId - The DM
+   * @returns True when nothing in this DM waits on the agent
+   */
+  private isStartedByAgent(agentSession: string, channelId: string): boolean {
+    try {
+      if (this.deps.typing?.findOwed(agentSession, channelId)) return false;
+      return !(this.deps.owesAnswerIn?.(agentSession, channelId) ?? true);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Send one agent-initiated message.
+   *
+   * @param req - Who is posting, where, and what
+   * @returns Where it landed and which identity carried it
+   * @throws {SlackAgentPostError} `validation` for bad input, `not_connected`
+   *   when Slack is not up, `target_not_found` when the channel or person
+   *   cannot be resolved, `slack_error` when Slack refuses the send
+   */
+  async post(request: SlackAgentPostRequest): Promise<SlackAgentPostResult> {
+    let req = request;
+    const agentSession = (req.agentSession ?? '').trim();
+    const target = (req.target ?? '').trim();
+    const rawText = req.text ?? '';
+    if (!agentSession) throw new SlackAgentPostError('validation', 'agentSession is required');
+    if (!target) throw new SlackAgentPostError('validation', 'target is required');
+    if (!rawText.trim()) throw new SlackAgentPostError('validation', 'text is required');
+    if (rawText.length > SLACK_AGENT_POST_CONSTANTS.MAX_TEXT_LENGTH) {
+      throw new SlackAgentPostError(
+        'validation',
+        `text exceeds ${SLACK_AGENT_POST_CONSTANTS.MAX_TEXT_LENGTH} characters`,
+      );
+    }
+    if (!this.deps.slack.isConnected()) {
+      throw new SlackAgentPostError('not_connected', 'Slack is not connected');
+    }
+
+    const { identity, botToken, postedAs } = await this.resolveIdentity(agentSession);
+    const { channelId, kind } = await this.resolveTarget(target, botToken);
+    // `--thread` may be the Slack thread key from the agent's prompt
+    // (`<channel>:<ts>`); only its ts means anything to Slack.
+    const namedThread = parseSlackThreadKey(req.threadTs);
+    // A key for ANOTHER channel is not this target's thread: never replace
+    // it with a top-level post or another thread
+    // (specs/2026-10-02-harness-owned-routing.md §1). The caller resolves
+    // where the message really belongs.
+    if (namedThread && namedThread.slackChannelId !== channelId) {
+      throw new SlackAgentPostError(
+        'thread_mismatch',
+        `Thread ${namedThread.slackChannelId}:${namedThread.threadTs} is in channel ${namedThread.slackChannelId}, not ${channelId}`,
+      );
+    }
+    if (namedThread) req = { ...req, threadTs: namedThread.threadTs };
+    // "@Ella" → a real mention. This path posted agent text verbatim, so an
+    // agent naming a colleague here never notified them (2026-09-25).
+    const text = await this.linkMentions(rawText, channelId);
+
+    // A post that names no thread is never put into a thread by guess, and
+    // never lands at a channel's top level unasked (R7, 2026-10-18 audit).
+    // It used to go into the agent's oldest open "working on it…" thread of
+    // the channel (Ella, 2026-09-25), else top level — Ella's "@Rex …" for a
+    // #crewly-marketing ask landed at the top of #awesome-videos. Now: an
+    // owed thread is named back to the agent, and a channel post needs
+    // --thread or --new-topic. A DM may still start a new message.
+    if (!req.threadTs && !req.newTopLevel) {
+      const owedHere = this.deps.typing?.findOwed(agentSession, channelId, {
+        maxAgeMs: SLACK_TYPING_CONSTANTS.UNTHREADED_ANSWER_MAX_AGE_MS,
+      }) ?? null;
+      if (owedHere?.threadTs) {
+        throw new SlackAgentPostError(
+          'thread_required',
+          `Not posted: you owe an answer in thread ${channelId}:${owedHere.threadTs}. Pass --thread ${channelId}:${owedHere.threadTs} to answer it there, or --new-topic for a new top-level message.`,
+        );
+      }
+      if (!channelId.startsWith('D')) {
+        throw new SlackAgentPostError(
+          'thread_required',
+          `Not posted: name the thread this answers (--thread <[SLACK-THREAD:<key>] from your prompt>), or pass --new-topic for a deliberate new top-level message in ${channelId}. A post with neither is never placed by guess.`,
+        );
+      }
+    }
+    // A post that names its thread, where a placeholder is up, is that
+    // thread's answer: it replaces the placeholder rather than landing
+    // beside it (2026-09-28).
+    const namedKey = req.threadTs ? { agentSession, slackChannelId: channelId, threadTs: req.threadTs } : null;
+    const owed = namedKey && this.deps.typing?.owes?.(namedKey) ? namedKey : null;
+    if (owed) {
+      // The caller gets the ts of the message that carries its text, as for
+      // any other post: an empty ts made scheduled runs treat a successful
+      // parent post as failed and post it again (#808).
+      let answeredTs = '';
+      try {
+        await this.deps.typing!.resolve(owed, text, {
+          displayName: identity.username ?? agentSession,
+          ...(identity.botToken ? { botToken: identity.botToken } : {}),
+          ...(identity.username ? { username: identity.username } : {}),
+          ...(identity.iconEmoji ? { iconEmoji: identity.iconEmoji } : {}),
+          ...(identity.iconUrl ? { iconUrl: identity.iconUrl } : {}),
+        }, { onMessageTs: (ts) => { answeredTs = ts; } });
+      } catch (err) {
+        throw new SlackAgentPostError('slack_error', this.explainSendFailure(err, kind, postedAs));
+      }
+      this.logger.info('Agent posted to Slack', {
+        agentSession,
+        channelId,
+        kind,
+        postedAs,
+        threaded: !!owed.threadTs,
+        answeredOwedReply: true,
+        chars: text.length,
+      });
+      reportOwnerThreadAgentPost({ agent: agentSession, slackChannelId: channelId, ...(owed.threadTs ? { threadTs: owed.threadTs } : {}), text: rawText });
+      return {
+        channelId, messageTs: answeredTs, kind, postedAs, identity: identity.username ?? agentSession,
+        ...(await this.uploadFiles(req, channelId, owed.threadTs ?? req.threadTs, identity)),
+      };
+    }
+
+    let messageTs: string;
+    try {
+      messageTs = await this.deps.slack.sendMessage({
+        channelId,
+        text,
+        threadTs: req.threadTs,
+        // The chat-v2 mirror attributes outbound Slack replies to the
+        // orchestrator, which would misfile an agent's own post. Team-channel
+        // traffic is mirrored by its own path; this one stays Slack-only.
+        skipChatV2Mirror: true,
+        ...identity,
+      });
+    } catch (err) {
+      throw new SlackAgentPostError('slack_error', this.explainSendFailure(err, kind, postedAs));
+    }
+
+    if (req.threadTs) this.deps.typing?.noteAnswerPosted?.(channelId, req.threadTs);
+    reportOwnerThreadAgentPost({ agent: agentSession, slackChannelId: channelId, ...(req.threadTs ? { threadTs: req.threadTs } : {}), text: rawText });
+    if (kind === 'dm' && !req.threadTs && this.isStartedByAgent(agentSession, channelId)) {
+      reportAgentStartedDmPost({ agent: agentSession, slackChannelId: channelId, text: rawText });
+    }
+    this.logger.info('Agent posted to Slack', {
+      agentSession,
+      channelId,
+      kind,
+      postedAs,
+      threaded: !!req.threadTs,
+      chars: text.length,
+    });
+    return {
+      channelId, messageTs, kind, postedAs, identity: identity.username ?? agentSession,
+      ...(await this.uploadFiles(req, channelId, req.threadTs, identity)),
+    };
+  }
+
+  /**
+   * Upload the requested files with the identity that just posted the text:
+   * the agent's own bot when it has one, otherwise the workspace bot (the
+   * one that already proved it can post here) with the agent's persona.
+   * Never throws; each failure is reported with Slack's error code.
+   *
+   * @param req - The post request (carries `files`)
+   * @param channelId - Resolved conversation id
+   * @param threadTs - Thread to upload into, if any
+   * @param identity - Identity the text was sent under
+   * @returns `filesSent` / `filesFailed` fields (empty when no files requested)
+   */
+  private async uploadFiles(
+    req: SlackAgentPostRequest,
+    channelId: string,
+    threadTs: string | undefined,
+    identity: Pick<SlackOutgoingMessage, 'username' | 'iconEmoji' | 'iconUrl' | 'botToken'>,
+  ): Promise<Pick<SlackAgentPostResult, 'filesSent' | 'filesFailed'>> {
+    const files = req.files ?? [];
+    if (files.length === 0) return {};
+    const filesSent: string[] = [];
+    const filesFailed: Array<{ path: string; error: string }> = [];
+    for (const path of files) {
+      try {
+        if (!this.deps.slack.uploadFile) throw new Error('file upload is not available');
+        await this.deps.slack.uploadFile({
+          channelId,
+          filePath: path,
+          ...(threadTs ? { threadTs } : {}),
+          ...(identity.botToken
+            ? { botToken: identity.botToken }
+            : identity.username
+              ? { persona: { username: identity.username, ...(identity.iconEmoji ? { iconEmoji: identity.iconEmoji } : {}), ...(identity.iconUrl ? { iconUrl: identity.iconUrl } : {}) } }
+              : {}),
+        });
+        filesSent.push(path);
+      } catch (err) {
+        const error = errText(err);
+        this.logger.warn('Agent file upload failed', { agentSession: req.agentSession, channelId, path, error });
+        filesFailed.push({ path, error });
+      }
+    }
+    return { filesSent, ...(filesFailed.length ? { filesFailed } : {}) };
+  }
+
+  /**
+   * Which identity this agent posts under: its own bot token when installed,
+   * otherwise the shared bot with the member's name and icon.
+   */
+  private async resolveIdentity(agentSession: string): Promise<{
+    identity: Pick<SlackOutgoingMessage, 'username' | 'iconEmoji' | 'iconUrl' | 'botToken'>;
+    botToken?: string;
+    postedAs: 'agent' | 'crewly';
+  }> {
+    if (this.deps.identities) {
+      await this.deps.identities.load();
+      const installed = this.deps.identities.getInstalled(agentSession);
+      if (installed) {
+        const member = await this.findMember(agentSession);
+        return {
+          identity: { botToken: installed.botToken, username: member?.name ?? agentSession },
+          botToken: installed.botToken,
+          postedAs: 'agent',
+        };
+      }
+    }
+    const member = await this.findMember(agentSession);
+    return { identity: slackIdentityFor(member, agentSession), postedAs: 'crewly' };
+  }
+
+  /** The team member behind a session, for name and avatar. */
+  private async findMember(agentSession: string): Promise<Team['members'][number] | undefined> {
+    try {
+      const teams = await this.deps.storage.getTeams();
+      for (const team of teams) {
+        const member = team.members?.find((m) => m.sessionName === agentSession);
+        if (member) return member;
+      }
+    } catch (err) {
+      this.logger.debug('Could not read teams for agent identity', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return undefined;
+  }
+
+  /**
+   * Turn a target string into a Slack conversation id.
+   *
+   * @param target - See the table in the module docs
+   * @param botToken - Token to open the DM with, so the DM belongs to the agent
+   * @returns The conversation id and whether it is a channel or a DM
+   */
+  private async resolveTarget(target: string, botToken?: string): Promise<{ channelId: string; kind: 'channel' | 'dm' }> {
+    if (DM_ID_RE.test(target)) return { channelId: target, kind: 'dm' };
+    if (CHANNEL_ID_RE.test(target)) return { channelId: target, kind: 'channel' };
+    if (USER_ID_RE.test(target)) return { channelId: await this.openDm(target, botToken), kind: 'dm' };
+
+    if (target.startsWith('@')) {
+      const handle = target.slice(1);
+      const userId = await this.lookupHandle(handle);
+      if (!userId) throw new SlackAgentPostError('target_not_found', `No Slack user matches "@${handle}"`);
+      return { channelId: await this.openDm(userId, botToken), kind: 'dm' };
+    }
+
+    const name = target.replace(/^#/, '');
+    // A Crewly team room is known by name locally, even when it is private
+    // and the workspace bot cannot list it.
+    const mapped = this.deps.findMappedChannelByName?.(name);
+    if (mapped) return { channelId: mapped.id, kind: 'channel' };
+    let channel: SlackChannelInfo | null;
+    try {
+      channel = await this.deps.slack.findChannelByName(name);
+    } catch (err) {
+      const text = errText(err);
+      // Resolving a name needs channels:read / groups:read. Say so, rather
+      // than handing the agent a bare Slack error code it cannot act on.
+      const hint = /missing_scope/.test(text)
+        ? ' — the app is missing channels:read; reinstall it to pick up the new scopes, or pass the channel id instead'
+        : '';
+      throw new SlackAgentPostError('slack_error', `Could not look up channel "#${name}": ${text}${hint}`);
+    }
+    if (!channel) throw new SlackAgentPostError('target_not_found', `No Slack channel named "#${name}"`);
+    if (channel.isArchived) throw new SlackAgentPostError('target_not_found', `Channel "#${name}" is archived`);
+    return { channelId: channel.id, kind: 'channel' };
+  }
+
+  private async openDm(userId: string, botToken?: string): Promise<string> {
+    try {
+      return await this.deps.slack.openDirectMessage(userId, botToken);
+    } catch (err) {
+      const text = errText(err);
+      if (/missing_scope/.test(text)) {
+        throw new SlackAgentPostError(
+          'slack_error',
+          'Slack refused to open the DM: the app is missing the im:write scope — reinstall it to pick up the new scopes',
+        );
+      }
+      // Slack refuses a DM between two apps. An agent reaching for "@<its
+      // own name>" lands here, and the raw code told it nothing — one agent
+      // read it as "DMs are unavailable" and posted the owner's personal
+      // calendar into a public team channel instead (2026-09-21).
+      if (/cannot_dm_bot/.test(text)) {
+        throw new SlackAgentPostError(
+          'target_not_found',
+          `${userId} is a bot, and Slack does not allow one app to DM another. Target the person instead (@their-handle). Do not fall back to a channel: whatever you were about to say privately stays private.`,
+        );
+      }
+      throw new SlackAgentPostError('slack_error', `Could not open a DM with ${userId}: ${text}`);
+    }
+  }
+
+  private async lookupHandle(handle: string): Promise<string | null> {
+    try {
+      return await this.deps.slack.findUserByHandle(handle);
+    } catch (err) {
+      throw new SlackAgentPostError('slack_error', `Could not look up "@${handle}": ${errText(err)}`);
+    }
+  }
+
+  /** Turn Slack's send errors into something an agent can act on. */
+  private explainSendFailure(err: unknown, kind: 'channel' | 'dm', postedAs: 'agent' | 'crewly'): string {
+    const text = errText(err);
+    if (/not_in_channel|channel_not_found/.test(text) && kind === 'channel') {
+      const who = postedAs === 'agent' ? "this agent's Slack bot" : 'the Crewly bot';
+      return `Slack refused the post (${text}): invite ${who} into the channel, or use a public channel (chat:write.public covers those)`;
+    }
+    if (/missing_scope/.test(text)) {
+      return `Slack refused the post (${text}): reinstall the app to pick up the new scopes`;
+    }
+    return `Slack refused the post: ${text}`;
+  }
+}
+
+function errText(err: unknown): string {
+  if (err && typeof err === 'object') {
+    const data = (err as { data?: { error?: string } }).data;
+    if (typeof data?.error === 'string') return data.error;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+let instance: SlackAgentPostService | null = null;
+
+/**
+ * Install the process-wide instance (composition root).
+ *
+ * @param service - The service or null
+ */
+export function setSlackAgentPostService(service: SlackAgentPostService | null): void {
+  instance = service;
+}
+
+/**
+ * The process-wide instance, or null before wiring.
+ *
+ * @returns The service or null
+ */
+export function getSlackAgentPostService(): SlackAgentPostService | null {
+  return instance;
+}

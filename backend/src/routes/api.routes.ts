@@ -1,0 +1,501 @@
+import { createPeopleRouter } from '../controllers/people/people.routes.js';
+import { createExperimentsRouter } from '../controllers/experiments/experiments.routes.js';
+import { Router } from 'express';
+import { ApiController } from '../controllers/api.controller.js';
+import { createApiRouter, type ApiContext } from '../controllers/index.js';
+import { registerTaskManagementRoutes } from './modules/task-management.routes.js';
+import { registerSystemRoutes } from './modules/system.routes.js';
+import { registerSchedulerRoutes } from './modules/scheduler.routes.js';
+import { registerTerminalRoutes } from './modules/terminal.routes.js';
+import { registerAssignmentsRoutes } from './modules/assignments.routes.js';
+import { registerErrorRoutes } from './modules/errors.routes.js';
+import { registerScheduledMessageRoutes } from './modules/scheduled-messages.routes.js';
+import { registerDeliveryLogRoutes } from './modules/delivery-logs.routes.js';
+import { registerConfigRoutes } from './modules/config.routes.js';
+import { registerCronTaskRoutes } from './modules/cron-task.routes.js';
+import { createFactoryRoutes } from './factory.routes.js';
+import { selfImprovementRouter } from '../controllers/self-improvement/index.js';
+import { createMessagingRouter } from '../controllers/messaging/messaging.routes.js';
+import { createTeamsBackupRouter } from '../controllers/teams-backup/teams-backup.routes.js';
+import { createBackupRouter } from '../controllers/backup/backup.routes.js';
+import { createTeamMovesRouter } from '../controllers/team-move/team-move.controller.js';
+import { createEventBusRouter } from '../controllers/event-bus/event-bus.routes.js';
+import { createSlackThreadRouter } from '../controllers/slack/slack-thread.routes.js';
+import { createMemoryRouter } from '../controllers/memory/memory.routes.js';
+import { createWikiRouter } from '../controllers/wiki/wiki.routes.js';
+import { createCredentialsRouter } from '../controllers/credentials/credentials.routes.js';
+import { createQualityGateRouter } from './modules/quality-gate.routes.js';
+import { createMarketplaceRouter } from '../controllers/marketplace/index.js';
+import { createTemplateRouter } from '../controllers/template/index.js';
+import { createAuditorRouter } from '../controllers/auditor/auditor.routes.js';
+import { createPaymentRouter } from '../controllers/payment/payment.routes.js';
+import { createProvisioningRouter } from '../controllers/provisioning/provisioning.routes.js';
+import { createCloudRouter } from '../controllers/cloud/index.js';
+import { createPrReviewRouter } from '../controllers/pr-review/pr-review.routes.js';
+import { createApprovalsRouter } from '../controllers/approvals/approvals.routes.js';
+import { createAgentHooksRouter } from '../controllers/agent-hooks/agent-hooks.routes.js';
+import { createBrowserRouter } from '../controllers/browser/browser.routes.js';
+import { createCrossMachineRouter } from '../controllers/cross-machine/index.js';
+import { createWebsiteAnalysisRouter } from '../controllers/onboarding/website-analysis.routes.js';
+import { createOnboardingRouter } from '../controllers/onboarding/onboarding.routes.js';
+import { createOnboardingChecklistRouter } from '../controllers/onboarding/onboarding-checklist.routes.js';
+import { createOrchestratorOnboardingRouter } from '../controllers/orchestrator-onboarding/orchestrator-onboarding.routes.js';
+import { createDataRouter } from '../controllers/data/data.routes.js';
+import { createIntentTaskRouter } from '../controllers/intent-task/intent-task.routes.js';
+import { createTaskPoolRouter, createTaskScoreRouter } from '../controllers/task-pool/task-pool.routes.js';
+import { createRequestRouter } from '../controllers/request/request.routes.js';
+import { createTicketsRouter } from '../controllers/tickets/tickets.routes.js';
+import { createDecisionsRouter, createSlackInteractivityHandler, lazyDecisionsControllerDeps } from '../controllers/decisions/decisions.controller.js';
+import { createSignalDigestRouter } from '../controllers/signal-digest/signal-digest.controller.js';
+import { createProjectTicketsMigrationRouter, createProjectTicketsRouter, createTicketAutopilotRouter } from '../controllers/project-tickets/project-tickets.routes.js';
+import { createOwnerReceiptRouter } from '../controllers/owner-receipt/owner-receipt.routes.js';
+import { createHarnessRouter } from '../controllers/harness/harness.routes.js';
+import { createSkillSetupRouter } from '../controllers/skill-setup/skill-setup.routes.js';
+import { createBundleRouter } from '../controllers/bundle/bundle.routes.js';
+import { createReconcilerRouter } from '../controllers/reconciler/reconciler.routes.js';
+import { createSubagentsRouter } from '../controllers/subagents/subagents.routes.js';
+import { createWorktreeJanitorRouter } from '../controllers/worktree-janitor/worktree-janitor.routes.js';
+import { createTeamHealthRouter } from '../controllers/team-health/team-health.routes.js';
+import { createUsageLedgerRouter } from '../controllers/usage-ledger/usage-ledger.routes.js';
+import { createBoardRouter } from '../controllers/board/board.routes.js';
+import { createFissionRouter } from '../controllers/fission/fission.routes.js';
+import { createMissionPolicyRouter } from '../controllers/mission/mission-policy.routes.js';
+import { createV2WorkspaceRouter } from '../controllers/v2-workspace/workspace.routes.js';
+import { createTriggerRouter } from '../controllers/trigger/trigger.routes.js';
+import { createGrowthRouter } from '../controllers/growth/growth.routes.js';
+import { createGoogleRouter } from '../controllers/google/google.routes.js';
+import { createDesktopRouter } from '../controllers/desktop/desktop.routes.js';
+import { createTalkTranscribeRouter } from '../controllers/talk/talk-transcribe.routes.js';
+import { createTalkLiveTokenRouter } from '../controllers/talk/talk-live-token.controller.js';
+import { createTeamRosterRouter } from '../controllers/team-roster/team-roster.controller.js';
+import { createDriveLogsRouter } from '../controllers/drive-logs/drive-logs.controller.js';
+import { createBriefingRouter } from '../controllers/briefing/briefing.controller.js';
+import { createCanvaRouter } from '../controllers/canva/canva.routes.js';
+import { createAppsRouter } from '../controllers/apps/apps.routes.js';
+import { createMicrosoftTodoRouter } from '../controllers/microsoft/microsoft-todo.routes.js';
+import { createConnectorRouter } from '../controllers/connector/connector.routes.js';
+import { createAgentSelfImprovementRouter } from '../controllers/agent-self-improvement/agent-self-improvement.controller.js';
+import taskProjectionRouter from '../controllers/task-projection/task-projection.routes.js';
+import { createActiveWorkRouter } from '../controllers/active-work/active-work.controller.js';
+import { createStandingRouter } from '../controllers/standing/standing.controller.js';
+import { createTraceRouter } from '../controllers/trace/trace.controller.js';
+import { traceHttpMiddleware } from '../services/trace/trace-http.middleware.js';
+import { createChatV2Router } from '../controllers/chat-v2/index.js';
+import { createChannelsRouter } from '../controllers/channels/channels.routes.js';
+import { ChannelComposeService } from '../services/channels/crewly-channel-compose.service.js';
+import {
+  CrewlyChannelService,
+  agentsFromTeams,
+  getCrewlyChannelService,
+  setCrewlyChannelService,
+} from '../services/channels/crewly-channel.service.js';
+import { getSlackTeamChannelService } from '../services/slack/slack-team-channel.service.js';
+import { getChatV2RealtimeDeps } from '../services/chat-v2/chat-v2.realtime-holder.js';
+import { getChatV2Service } from '../services/chat-v2/chat-v2.singleton.js';
+import { createOssTeamMembershipValidator } from '../services/chat-v2/chat-v2.team-membership.js';
+import {
+  createOssAgentDirectoryProvider,
+  createOssAgentPresenceProvider,
+  createOssSyncPresence,
+} from '../services/chat-v2/chat-v2.providers.js';
+
+/**
+ * Creates API routes using the new organized controller structure
+ * @param apiController - Legacy API controller (for backward compatibility)
+ * @returns Express router configured with all API routes
+ */
+export function createApiRoutes(apiController: ApiController): Router {
+  const router = Router();
+
+  // Create context from ApiController for new organized controllers
+  const context: ApiContext = {
+    storageService: apiController.storageService,
+    tmuxService: apiController.tmuxService,
+    agentRegistrationService: apiController.agentRegistrationService,
+    schedulerService: apiController.schedulerService,
+    messageSchedulerService: apiController.messageSchedulerService,
+    activeProjectsService: apiController.activeProjectsService,
+    promptTemplateService: apiController.promptTemplateService,
+    cleanupProjectScheduledMessages: async (projectId: string) => {
+      // Import and call the cleanup function with the current context
+      const { cleanupProjectScheduledMessages } = await import('../controllers/project/project.controller.js');
+      return cleanupProjectScheduledMessages.call(context, projectId);
+    }
+  };
+
+  // Run traces (#983): attribute agent skill calls to their run, and carry
+  // the sender's trace on agent → agent messages. Before every route.
+  router.use(traceHttpMiddleware);
+
+  // Use the new organized controller structure
+  router.use('/', createApiRouter(context));
+
+  // Factory routes for 3D visualization
+  router.use('/factory', createFactoryRoutes());
+
+  // Self-improvement routes for orchestrator codebase modifications
+  router.use('/self-improvement', selfImprovementRouter);
+
+  // Message queue routes
+  router.use('/messaging', createMessagingRouter());
+
+  // Teams backup and restore routes
+  router.use('/teams/backup', createTeamsBackupRouter());
+  // Workspace cloud backup, startable remotely (portal / phone over the relay).
+  router.use('/backup', createBackupRouter());
+  // Move a team to another machine of the account (crewly#1189).
+  router.use('/team-moves', createTeamMovesRouter());
+
+  // Event bus subscription routes
+  router.use('/events', createEventBusRouter());
+
+  // Slack thread storage routes
+  router.use('/slack-threads', createSlackThreadRouter());
+
+  // Memory routes for agent/project knowledge storage and retrieval
+  router.use('/memory', createMemoryRouter());
+
+  // LLM-wiki (Phase 1 — per spec v2.1 §3): POST /wiki/ingest writes a source
+  // into a vault's llm-curated/log.md. Used by chat subscriber + wiki-ingest skill.
+  router.use('/wiki', createWikiRouter());
+
+  // Credentials routes for OAuth tokens and API keys used by skills
+  router.use('/credentials', createCredentialsRouter());
+
+  // Quality gate routes for running quality checks before task completion
+  router.use('/quality-gates', createQualityGateRouter());
+
+  // Marketplace routes for browsing, installing, and managing marketplace items
+  router.use('/marketplace', createMarketplaceRouter());
+
+  // Template routes for team template management and team creation
+  router.use('/templates', createTemplateRouter());
+
+  // Auditor routes for manual audit triggers and status
+  router.use('/auditor', createAuditorRouter());
+
+  // Payment routes for Stripe checkout, subscriptions, and webhooks
+  router.use('/payment', createPaymentRouter());
+
+  // Provisioning routes for DigitalOcean deployment management
+  router.use('/provisioning', createProvisioningRouter());
+
+  // Cloud routes for connect, disconnect, validate, status, templates, and Google OAuth
+  router.use('/cloud', createCloudRouter());
+
+
+  // PR review routes for automated GitHub PR reviews via webhooks
+  router.use('/pr-review', createPrReviewRouter());
+
+  // Tool approval management routes for granular tool execution control
+  router.use('/approvals', createApprovalsRouter());
+
+  // Agent-status hook events (#815): waiting_on_human signal from Claude Code hooks
+  router.use('/agent-hooks', createAgentHooksRouter());
+
+  // Crewly in Chrome routes for browser control
+  router.use('/browser', createBrowserRouter());
+
+  // Cross-machine communication routes for Slack-based inter-machine messaging
+  router.use('/cross-machine', createCrossMachineRouter());
+
+  // Website Analysis routes for KR3 magic onboarding — SSE + sync analysis
+  router.use('/website-analysis', createWebsiteAnalysisRouter());
+
+  // First-run checklist after the harness (specs/onboarding-harness-login.md,
+  // Phase 3): /checklist, /starters, /starter-team, /first-task. Mounted
+  // before the session router that shares the prefix; unmatched paths fall through.
+  router.use('/onboarding', createOnboardingChecklistRouter());
+
+  // Onboarding session routes for KR3 Cloud Portal onboarding flow
+  router.use('/onboarding', createOnboardingRouter());
+
+  // Orchestrator-Onboarding routes (v3 cold-start) — recommend-team + materialize-team.
+  // Invoked by the onboarding-only bash skills under config/skills/agent/onboarding/.
+  router.use('/orchestrator/onboarding', createOrchestratorOnboardingRouter());
+
+  // Data Architecture V2 — Unified Data Model, Schemas, Sinks
+  router.use('/v2/data', createDataRouter());
+
+  // Intent Task routes for task decomposition, tracking, and lifecycle
+  router.use('/intent-tasks', createIntentTaskRouter());
+
+  // Request routes for V3 incoming pipeline
+  router.use('/requests', createRequestRouter());
+
+  // Ticket loop (specs/ticket-loop.md): board list, lookup by TKT, "不用记"
+  router.use('/tickets', createTicketsRouter());
+  // Project tickets (specs/2026-09-28-project-tickets.md): a project's own
+  // backlog, one markdown file per ticket in <project>/.crewly/tickets/.
+  router.use('/project-tickets', createProjectTicketsRouter());
+  router.use('/project-tickets-migrate', createProjectTicketsMigrationRouter());
+  // Decision cards (specs/2026-10-01-decision-cards.md): structured owner
+  // questions, answered on a Slack card, by reaction / reply, or here.
+  const decisionDeps = lazyDecisionsControllerDeps();
+  router.use('/decisions', createDecisionsRouter(decisionDeps));
+  router.post('/slack/interactivity', createSlackInteractivityHandler(decisionDeps));
+  // Daily signal digest (#987, specs/2026-10-03-signal-digest.md): a lead's
+  // 3–5 actions for a site, answered Do / Skip on one Slack card.
+  router.use('/signal-digests', createSignalDigestRouter());
+  // Ticket autopilot switch (specs/2026-09-30-ticket-autopilot.md), owner / orchestrator only.
+  router.use('/project-ticket-autopilot', createTicketAutopilotRouter());
+  // #828: the daily owner receipt (dashboard data + settings + send now)
+  router.use('/owner-receipt', createOwnerReceiptRouter());
+  // Talk voice (#1074): the portal's clip transcribed by whisper.cpp on this
+  // machine; the text goes back to the phone for the owner to confirm.
+  router.use('/talk/transcribe', createTalkTranscribeRouter());
+  // Drive mode (specs/2026-10-08-drive-mode.md): the owner's briefing queue
+  // and the Gemini Live token the phone's voice briefer connects with.
+  router.use('/talk/live-token', createTalkLiveTokenRouter());
+  router.use('/briefing', createBriefingRouter());
+  // Team roster (specs/2026-10-10-team-roster.md): who owns what, ranked owner lookup
+  router.use('/team-roster', createTeamRosterRouter());
+  // Drive mode session logs (specs/2026-10-09-drive-mode-v3.md §10): what was said, decided, missed
+  router.use('/drive-logs', createDriveLogsRouter());
+
+  // Harness onboarding (specs/onboarding-harness-login.md): detect, install,
+  // choose the orc harness and log in — shared engine with the CLI
+  router.use('/harness', createHarnessRouter());
+
+  // On-demand skill install (specs/skill-auto-install.md): find-skill /
+  // install-skill — find an official skill, install it with its dependencies
+  // as a background job, message the requesting agent when it is done
+  router.use('/skill-setup', createSkillSetupRouter());
+  // Solution bundles (specs/solution-bundles.md): list, preview with the
+  // deploy questions, apply in one step with progress. Apply is owner-only.
+  router.use('/bundles', createBundleRouter());
+
+  // Task Pool routes for V2 work item pool management
+  router.use('/task-pool', createTaskPoolRouter());
+
+  // Auditor quality scoring (`POST /api/tasks/score`, used by the score-task skill)
+  router.use('/tasks', createTaskScoreRouter());
+
+  // Reconciler routes for status monitoring, manual trigger, and history
+  router.use('/reconciler', createReconcilerRouter());
+  // Bounded in-process helpers for agents on any runtime (#1317)
+  router.use('/subagents', createSubagentsRouter());
+
+  // Worktree janitor: dry-run listing (GET /worktrees) and manual pass (POST /run)
+  router.use('/worktree-janitor', createWorktreeJanitorRouter());
+
+  // Team-Health-Watchdog (THW) — Layer 4 liveness aggregator routes
+  router.use('/team-health', createTeamHealthRouter());
+
+  // Usage ledger: per-ticket time / token reports and the owner's report categories
+  router.use('/usage-ledger', createUsageLedgerRouter());
+
+  // Owner board (crewly#1247): the snapshot pushed to Cloud, for the local dashboard
+  router.use('/board', createBoardRouter());
+
+  // Fission guardrail routes for config, stats, violations, and pre-checks
+  router.use('/fission', createFissionRouter());
+
+  // Mission policy routes for CRUD and dry-run policy checks
+  router.use('/missions', createMissionPolicyRouter());
+
+  // V2 Shared Workspace routes — versioned JSON CRUD with CAS
+  router.use('/v2/workspaces', createV2WorkspaceRouter());
+
+  // Trigger routes — unified TimeTrigger, SignalTrigger, CompoundTrigger management
+  router.use('/triggers', createTriggerRouter());
+
+  // Growth routes — agent growth area tracking (keyword-based, no LLM)
+  router.use('/growth', createGrowthRouter());
+
+  // Google Workspace (Gmail + Calendar) on the owner's account — Cloud holds
+  // the grant, this instance talks to Google. Backs the gmail-*/calendar-* skills.
+  router.use('/google', createGoogleRouter());
+  // Desktop control — same shape as /api/browser, one machine's screen.
+  router.use('/desktop', createDesktopRouter());
+
+  // Canva Connect on the owner's account — Cloud holds the grant. Backs the canva-* skills.
+  router.use('/canva', createCanvaRouter());
+
+  // Crewly Apps: agents publish small web apps to apps.crewlyai.com and read/write
+  // their data through this instance's Cloud login. Backs publish-app / app-data.
+  router.use('/apps', createAppsRouter());
+
+  // Microsoft To Do on the owner's account — Cloud holds the `microsoft` grant. Backs the todo-* skills.
+  router.use('/microsoft-todo', createMicrosoftTodoRouter());
+
+  // Which agent roles may use each connected account.
+  router.use('/connectors', createConnectorRouter());
+  // People directory: Slack user ↔ person + role (issue #968)
+  router.use('/people', createPeopleRouter());
+  // Experiment cards: hypothesis + metric + window, measured after ship (issue #986)
+  router.use('/experiments', createExperimentsRouter());
+
+  // Agent self-improvement — attention / self-model / prediction calibration /
+  // memory consolidation. Mounted at /api/agents/:sessionName/self-improvement
+  // and backed by the set-focus / suppress-noise / record-prediction /
+  // resolve-prediction skills.
+  router.use('/agents', createAgentSelfImprovementRouter());
+
+  // Task Projection routes — V3.1 TaskRecord + TaskEvent observability layer
+  router.use('/task-projection', taskProjectionRouter);
+
+  // Active-work briefing routes — backs the `core/get-my-active-work` skill
+  // (issue #395). Mounted at /api/v3/agents/:sessionName/active-work.
+  router.use('/v3/agents', createActiveWorkRouter());
+
+  // Standing-answer pages (#816) — backs the `core/standing-update` skill.
+  // GET /api/standing?projectPath=&sessionName=, PUT /api/standing/:pageId/section.
+  router.use('/standing', createStandingRouter());
+
+  // Run traces (#983): GET /api/traces, /api/traces/by-ref, /api/traces/:id; POST /api/traces.
+  router.use('/traces', createTraceRouter());
+
+  // Chat V2 (Agent-First Chat MVP Phase 1) — mounts /api/chat/channels/*
+  // Coexists with the legacy /api/chat/{send,messages,conversations,...} routes
+  // registered by `createApiRouter` → no route overlap.
+  //
+  // F2b (#333): inject the OSS team-membership validator on the singleton's
+  // first construction so type='channel' creates are gated by team
+  // existence (single-user OSS treats existence === membership; Cloud
+  // Portal Phase E swaps in a tenant-aware validator).
+  //
+  // Phase F (/agents page): inject `directory` + `presence` providers so
+  // the new `/agents` + `/presence/:agentId` + `/channels/dm/ensure`
+  // endpoints can resolve real team data and live agent status. Providers
+  // live in `chat-v2.providers.ts` so this wire-up doesn't bloat the
+  // route table or pull controller code into the routes module.
+  const chatV2Service = getChatV2Service({
+    validateTeamMembership: createOssTeamMembershipValidator(),
+  });
+  // Wire the SYNC presence used by the channel-list DTOs (the DM presence
+  // dots). Via a setter — not the constructor — because the singleton may
+  // already have been built (with DEFAULT_PRESENCE='offline') by an earlier
+  // no-arg caller (ws gateway / slack bridge / replay), in which case
+  // constructor overrides are ignored. Without this every DM dot reads offline
+  // even while agents are running. The async provider below still backs the
+  // richer /presence endpoint.
+  chatV2Service.setPresenceProvider(createOssSyncPresence());
+  router.use(
+    '/chat',
+    createChatV2Router(chatV2Service, {
+      directory: createOssAgentDirectoryProvider(apiController.storageService),
+      presence: createOssAgentPresenceProvider(apiController.storageService),
+    }),
+  );
+
+  // Crewly channels — named rooms of agents from any team, matched to Slack
+  // channels (specs/2026-10-07-crewly-channels.md). Built here, next to the
+  // chat-v2 service it shares huddles with.
+  if (!getCrewlyChannelService()) {
+    const channels = new CrewlyChannelService({
+      chat: chatV2Service,
+      getRooms: () => getSlackTeamChannelService(),
+      listAgents: async () => agentsFromTeams(await apiController.storageService.getTeams()),
+      getDispatcher: () => getChatV2RealtimeDeps().dispatcher ?? null,
+    });
+    setCrewlyChannelService(channels);
+    void channels.start().catch(() => undefined);
+  }
+  // The orchestrator's "make a channel with these agents, on any machine".
+  // Remote names come from Cloud's colleague directory; remote members join
+  // through a Cloud room-join request (resolved lazily — Slack/Cloud wire up
+  // after the routes).
+  let channelCompose: ChannelComposeService | null = null;
+  const getChannelCompose = (): ChannelComposeService | null => {
+    const channels = getCrewlyChannelService();
+    if (!channels) return null;
+    if (!channelCompose) {
+      channelCompose = new ChannelComposeService({
+        channels,
+        listAgents: async () => agentsFromTeams(await apiController.storageService.getTeams()),
+        listRemote: async () => {
+          const { getSlackDirectoryService } = await import('../services/slack/slack-directory.service.js');
+          const directory = getSlackDirectoryService();
+          if (!directory) return null;
+          const entries = await directory.list();
+          return entries
+            .filter((e) => e.source === 'this-account' && e.kind === 'agent' && e.agentSession && e.instanceId)
+            .map((e) => ({
+              agentSession: e.agentSession as string,
+              name: e.name,
+              instanceId: e.instanceId as string,
+              machine: e.machine,
+              team: e.team,
+              isLeader: e.isLeader,
+            }));
+        },
+        requestRoomJoin: async (body) => {
+          const { getSlackInstanceRegistryService } = await import('../services/slack/slack-instance-registry.service.js');
+          const registry = getSlackInstanceRegistryService();
+          if (!registry) throw new Error('Not connected to Crewly Cloud');
+          await registry.requestRoomJoin(body);
+        },
+      });
+    }
+    return channelCompose;
+  };
+  router.use('/channels', createChannelsRouter(() => getCrewlyChannelService(), getChannelCompose));
+
+  // Keep legacy modular routes for handlers not yet migrated (for backward compatibility)
+  // Note: Project routes consolidated into new architecture - no longer needed here
+  registerTaskManagementRoutes(router, apiController);
+  registerSystemRoutes(router, apiController);
+  registerSchedulerRoutes(router, apiController);
+  registerTerminalRoutes(router, apiController);
+  registerAssignmentsRoutes(router, apiController);
+  registerErrorRoutes(router, apiController);
+  registerScheduledMessageRoutes(router, apiController);
+  registerDeliveryLogRoutes(router, apiController);
+  registerConfigRoutes(router, apiController);
+  registerCronTaskRoutes(router);
+
+  // Escalation routes — human escalation resolution
+  router.get('/escalations', async (_req, res) => {
+    try {
+      const { EscalationRouterService } = await import('../services/v3/escalation-router.service.js');
+      const pending = await EscalationRouterService.getInstance().listPending();
+      res.json({ success: true, data: pending, count: pending.length });
+    } catch (err) { res.status(500).json({ success: false, error: String(err) }); }
+  });
+
+  router.post('/escalations/:id/resolve', async (req, res) => {
+    try {
+      const { EscalationRouterService } = await import('../services/v3/escalation-router.service.js');
+      const { resolution, resolvedBy, verdict } = req.body;
+      if (!resolution) { res.status(400).json({ success: false, error: 'resolution is required' }); return; }
+      // #819: only meaningful for a `tl_verification` escalation (an
+      // unreviewed WorkItem escalated to the owner) — resolve() ignores it
+      // for other escalation sources. Optional; defaults to 'verified'.
+      if (verdict !== undefined && verdict !== 'verified' && verdict !== 'rejected') {
+        res.status(400).json({ success: false, error: "verdict must be 'verified' or 'rejected' when provided" });
+        return;
+      }
+      const result = await EscalationRouterService.getInstance().resolve(
+        req.params.id, resolution, resolvedBy || 'user', verdict,
+      );
+      if (!result) { res.status(404).json({ success: false, error: 'Escalation not found' }); return; }
+      res.json({ success: true, data: result });
+    } catch (err) { res.status(500).json({ success: false, error: String(err) }); }
+  });
+
+  // Relay devices stubs (prevents 404 noise from dashboard relay health card).
+  //
+  // Two URL shapes are supported because callers use either the local-stub
+  // form (`/api/relay/devices`) or the cloud-relay form (`/api/v1/relay/devices`).
+  // The cloud constants (CLOUD_CONSTANTS.RELAY_ENDPOINTS in `backend/src/constants.ts`)
+  // standardize on the `/api/v1/relay/*` form when targeting cloud, and dev
+  // proxies (frontend Vite proxy → localhost:8787) can route those requests at
+  // the local backend instead, producing 404 noise. The aliases below re-use
+  // the same stub handlers so both shapes return identical payloads.
+  const relayDevicesHandler = (_req: import('express').Request, res: import('express').Response): void => {
+    res.json({ success: true, data: { devices: [], client: { state: 'offline', sessionId: null } } });
+  };
+  router.get('/relay/devices', relayDevicesHandler);
+  router.get('/v1/relay/devices', relayDevicesHandler);
+
+  // Legacy cloud-devices endpoint (used by RelayHealthCard and CloudTab).
+  // Same dual-shape rationale as `/relay/devices` above.
+  const relayCloudDevicesHandler = (_req: import('express').Request, res: import('express').Response): void => {
+    res.json({ success: true, data: [] });
+  };
+  router.get('/relay/cloud-devices', relayCloudDevicesHandler);
+  router.get('/v1/relay/cloud-devices', relayCloudDevicesHandler);
+
+  return router;
+}

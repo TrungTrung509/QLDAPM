@@ -1,0 +1,527 @@
+/**
+ * Tests for SlackAgentPostService — target resolution, identity choice and
+ * the error messages an agent sees.
+ *
+ * @module services/slack/slack-agent-post.service.test
+ */
+
+import {
+  onAgentStartedDmPost,
+  reportAgentStartedDmPost,
+  SlackAgentPostService,
+  SlackAgentPostError,
+  getSlackAgentPostService,
+  setSlackAgentPostService,
+  type AgentPostIdentityApi,
+  type AgentPostSlackApi,
+} from './slack-agent-post.service.js';
+import type { Team, TeamMember } from '../../types/index.js';
+import type { SlackOutgoingMessage } from '../../types/slack.types.js';
+
+jest.mock('../core/logger.service.js', () => ({
+  LoggerService: {
+    getInstance: () => ({
+      createComponentLogger: () => ({ info: jest.fn(), warn: jest.fn(), debug: jest.fn(), error: jest.fn() }),
+    }),
+  },
+}));
+
+function member(name: string, role: TeamMember['role'], extra: Partial<TeamMember> = {}): TeamMember {
+  return {
+    id: `m-${name}`,
+    name,
+    sessionName: `crewly-a-${name.toLowerCase()}`,
+    role,
+    systemPrompt: '',
+    agentStatus: 'active',
+    workingStatus: 'idle',
+    runtimeType: 'claude-code',
+    createdAt: 'x',
+    updatedAt: 'x',
+    ...extra,
+  } as TeamMember;
+}
+
+class FakeSlack implements AgentPostSlackApi {
+  connected = true;
+  sent: SlackOutgoingMessage[] = [];
+  channels: Record<string, { id: string; name: string; isArchived: boolean; isPrivate: boolean }> = {
+    general: { id: 'C-GEN', name: 'general', isArchived: false, isPrivate: false },
+    old: { id: 'C-OLD', name: 'old', isArchived: true, isPrivate: false },
+  };
+  handles: Record<string, string> = { steve: 'USTEVE' };
+  dmOpens: Array<{ userId: string; botToken?: string }> = [];
+  sendError: unknown = null;
+  openError: unknown = null;
+  isConnected() {
+    return this.connected;
+  }
+  async sendMessage(m: SlackOutgoingMessage) {
+    if (this.sendError) throw this.sendError;
+    this.sent.push(m);
+    return '111.222';
+  }
+  async findChannelByName(name: string) {
+    return this.channels[name] ?? null;
+  }
+  async openDirectMessage(userId: string, botToken?: string) {
+    if (this.openError) throw this.openError;
+    this.dmOpens.push({ userId, botToken });
+    return `D-${userId}`;
+  }
+  async findUserByHandle(handle: string) {
+    return this.handles[handle.toLowerCase()] ?? null;
+  }
+  uploads: Array<Record<string, unknown>> = [];
+  uploadError: unknown = null;
+  async uploadFile(o: Record<string, unknown>) {
+    if (this.uploadError) throw this.uploadError;
+    this.uploads.push(o);
+    return { fileId: 'F1' };
+  }
+}
+
+class FakeIdentities implements AgentPostIdentityApi {
+  installed: Record<string, { botUserId: string; botToken: string }> = {};
+  loaded = 0;
+  async load() {
+    this.loaded += 1;
+    return { version: 1 as const, identities: [] };
+  }
+  getInstalled(agentSession: string) {
+    return this.installed[agentSession] ?? null;
+  }
+}
+
+const TEAMS: Team[] = [
+  { id: 't1', name: 'Alpha', members: [member('Sam', 'developer', { avatar: ':computer:' }), member('Leo', 'qa')], projectIds: [], createdAt: 'x', updatedAt: 'x' } as Team,
+];
+
+let slack: FakeSlack;
+let identities: FakeIdentities | null;
+let service: SlackAgentPostService;
+
+beforeEach(() => {
+  slack = new FakeSlack();
+  identities = new FakeIdentities();
+  service = new SlackAgentPostService({
+    slack,
+    storage: { getTeams: async () => TEAMS },
+    identities,
+  });
+});
+
+afterEach(() => setSlackAgentPostService(null));
+
+describe('validation and availability', () => {
+  it('rejects missing fields and oversized text', async () => {
+    await expect(service.post({ agentSession: '', target: '#general', text: 'x', newTopLevel: true })).rejects.toMatchObject({ code: 'validation' });
+    await expect(service.post({ agentSession: 'a', target: ' ', text: 'x', newTopLevel: true })).rejects.toMatchObject({ code: 'validation' });
+    await expect(service.post({ agentSession: 'a', target: '#general', text: '  ', newTopLevel: true })).rejects.toMatchObject({ code: 'validation' });
+    await expect(service.post({ agentSession: 'a', target: '#general', text: 'x'.repeat(12_001), newTopLevel: true })).rejects.toMatchObject({
+      code: 'validation',
+    });
+  });
+
+  it('refuses when Slack is down', async () => {
+    slack.connected = false;
+    await expect(service.post({ agentSession: 'a', target: '#general', text: 'hi', newTopLevel: true })).rejects.toMatchObject({
+      code: 'not_connected',
+    });
+  });
+});
+
+describe('target resolution', () => {
+  it('posts to a channel by name, with or without the hash', async () => {
+    const res = await service.post({ agentSession: 'crewly-a-sam', target: '#general', text: 'hello', newTopLevel: true });
+    expect(res).toMatchObject({ channelId: 'C-GEN', kind: 'channel', messageTs: '111.222' });
+    await service.post({ agentSession: 'crewly-a-sam', target: 'general', text: 'again', newTopLevel: true });
+    expect(slack.sent.map((m) => m.channelId)).toEqual(['C-GEN', 'C-GEN']);
+  });
+
+  it('accepts channel and DM ids verbatim', async () => {
+    expect(await service.post({ agentSession: 'a', target: 'C0123ABC', text: 'x', newTopLevel: true })).toMatchObject({ channelId: 'C0123ABC', kind: 'channel' });
+    expect(await service.post({ agentSession: 'a', target: 'D0123ABC', text: 'x', newTopLevel: true })).toMatchObject({ channelId: 'D0123ABC', kind: 'dm' });
+    expect(slack.dmOpens).toEqual([]);
+  });
+
+  // `general` is `G` plus six alphanumerics. Matching ids case-insensitively
+  // would have read it as a private-channel id and posted nowhere.
+  it('treats a lower-case target as a channel name, never as an id', async () => {
+    slack.channels.gaming = { id: 'C-GAM', name: 'gaming', isArchived: false, isPrivate: false };
+    expect(await service.post({ agentSession: 'a', target: 'gaming', text: 'x', newTopLevel: true })).toMatchObject({ channelId: 'C-GAM' });
+    await expect(service.post({ agentSession: 'a', target: 'c0123abc', text: 'x', newTopLevel: true })).rejects.toMatchObject({
+      code: 'target_not_found',
+    });
+  });
+
+  it('opens a DM for a user id and for an @handle', async () => {
+    expect(await service.post({ agentSession: 'a', target: 'U0123ABC', text: 'x', newTopLevel: true })).toMatchObject({ channelId: 'D-U0123ABC', kind: 'dm' });
+    expect(await service.post({ agentSession: 'a', target: '@Steve', text: 'x', newTopLevel: true })).toMatchObject({ channelId: 'D-USTEVE', kind: 'dm' });
+  });
+
+  it('reports an unknown channel, an archived channel and an unknown handle', async () => {
+    await expect(service.post({ agentSession: 'a', target: '#nope', text: 'x', newTopLevel: true })).rejects.toMatchObject({
+      code: 'target_not_found',
+      message: expect.stringContaining('#nope'),
+    });
+    await expect(service.post({ agentSession: 'a', target: '#old', text: 'x', newTopLevel: true })).rejects.toMatchObject({
+      message: expect.stringContaining('archived'),
+    });
+    await expect(service.post({ agentSession: 'a', target: '@ghost', text: 'x', newTopLevel: true })).rejects.toMatchObject({
+      code: 'target_not_found',
+      message: expect.stringContaining('@ghost'),
+    });
+  });
+});
+
+describe('identity', () => {
+  it("uses the agent's own bot token when installed, and opens the DM as that bot", async () => {
+    identities!.installed['crewly-a-sam'] = { botUserId: 'USAM', botToken: 'xoxb-sam' };
+    const res = await service.post({ agentSession: 'crewly-a-sam', target: '@steve', text: 'ping', newTopLevel: true });
+    expect(res.postedAs).toBe('agent');
+    expect(res.identity).toBe('Sam');
+    expect(slack.dmOpens).toEqual([{ userId: 'USTEVE', botToken: 'xoxb-sam' }]);
+    expect(slack.sent[0]).toEqual(expect.objectContaining({ botToken: 'xoxb-sam', skipChatV2Mirror: true }));
+    expect(slack.sent[0].iconEmoji).toBeUndefined();
+  });
+
+  it('falls back to the shared bot with the member name and icon', async () => {
+    const res = await service.post({ agentSession: 'crewly-a-sam', target: '#general', text: 'hi', newTopLevel: true });
+    expect(res.postedAs).toBe('crewly');
+    expect(slack.sent[0]).toEqual(expect.objectContaining({ username: 'Sam', iconEmoji: ':computer:' }));
+    expect(slack.sent[0].botToken).toBeUndefined();
+    expect(slack.dmOpens).toEqual([]);
+  });
+
+  it('works with no identity service and with an unknown agent', async () => {
+    const bare = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS } });
+    await bare.post({ agentSession: 'crewly-a-ghost', target: '#general', text: 'hi', newTopLevel: true });
+    expect(slack.sent[0]).toEqual(expect.objectContaining({ username: 'crewly-a-ghost', iconEmoji: ':robot_face:' }));
+  });
+
+  it('survives a storage failure', async () => {
+    const broken = new SlackAgentPostService({
+      slack,
+      storage: { getTeams: async () => { throw new Error('disk'); } },
+      identities,
+    });
+    const res = await broken.post({ agentSession: 'crewly-a-sam', target: '#general', text: 'hi', newTopLevel: true });
+    expect(res.postedAs).toBe('crewly');
+    expect(slack.sent[0].username).toBe('crewly-a-sam');
+  });
+
+  it('forwards threadTs', async () => {
+    await service.post({ agentSession: 'a', target: '#general', text: 'x', threadTs: '100.1' });
+    expect(slack.sent[0].threadTs).toBe('100.1');
+  });
+
+  it('takes the [SLACK-THREAD:<key>] key from the prompt as --thread and posts in its ts', async () => {
+    await service.post({ agentSession: 'a', target: 'C0GENERAL', text: 'x', threadTs: 'C0GENERAL:1790000000.000100' });
+    expect(slack.sent[0].threadTs).toBe('1790000000.000100');
+  });
+
+  it('a thread key from ANOTHER channel than the target is refused — never a top-level post here (2026-10-02)', async () => {
+    await expect(
+      service.post({ agentSession: 'a', target: '#general', text: 'x', threadTs: 'C0OTHER01:1790000000.000100' }),
+    ).rejects.toMatchObject({ code: 'thread_mismatch' });
+    expect(slack.sent).toHaveLength(0);
+  });
+
+  it('a post naming a thread where a placeholder is up replaces that placeholder (2026-09-28)', async () => {
+    const resolved: unknown[][] = [];
+    const svc = new SlackAgentPostService({
+      slack,
+      storage: { getTeams: async () => [] },
+      identities,
+      typing: {
+        findOwed: () => null,
+        owes: (key: { threadTs?: string }) => key.threadTs === '1790000000.000100',
+        resolve: async (...args: unknown[]) => { resolved.push(args); return 'edited' as const; },
+      } as never,
+    });
+    await svc.post({ agentSession: 'a', target: 'C0GENERAL', text: 'answer', threadTs: 'C0GENERAL:1790000000.000100' });
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0][0]).toMatchObject({ agentSession: 'a', threadTs: '1790000000.000100' });
+    expect(slack.sent).toHaveLength(0);
+    // No placeholder there → a plain threaded post.
+    await svc.post({ agentSession: 'a', target: '#general', text: 'x', threadTs: '1790000009.000100' });
+    expect(slack.sent[0].threadTs).toBe('1790000009.000100');
+  });
+});
+
+describe('Slack failures get actionable messages', () => {
+  it('explains not_in_channel with the right bot', async () => {
+    slack.sendError = Object.assign(new Error('not_in_channel'), { data: { error: 'not_in_channel' } });
+    await expect(service.post({ agentSession: 'crewly-a-sam', target: '#general', text: 'x', newTopLevel: true })).rejects.toMatchObject({
+      code: 'slack_error',
+      message: expect.stringContaining('invite the Crewly bot'),
+    });
+    identities!.installed['crewly-a-sam'] = { botUserId: 'USAM', botToken: 'xoxb-sam' };
+    await expect(service.post({ agentSession: 'crewly-a-sam', target: '#general', text: 'x', newTopLevel: true })).rejects.toMatchObject({
+      message: expect.stringContaining("invite this agent's Slack bot"),
+    });
+  });
+
+  it('explains a missing scope on send and on DM open', async () => {
+    slack.sendError = Object.assign(new Error('missing_scope'), { data: { error: 'missing_scope' } });
+    await expect(service.post({ agentSession: 'a', target: '#general', text: 'x', newTopLevel: true })).rejects.toMatchObject({
+      message: expect.stringContaining('reinstall'),
+    });
+    slack.sendError = null;
+    slack.openError = Object.assign(new Error('missing_scope'), { data: { error: 'missing_scope' } });
+    await expect(service.post({ agentSession: 'a', target: '@steve', text: 'x', newTopLevel: true })).rejects.toMatchObject({
+      message: expect.stringContaining('im:write'),
+    });
+  });
+
+  // Slack refuses a DM between two apps, and an agent reaching for its own
+  // name lands here. The bare code told it nothing: one agent read it as
+  // "DMs are unavailable" and posted the owner's personal calendar into a
+  // public team channel instead (2026-09-21, #personal-assistant-team).
+  it('says a bot cannot be DMed, and that the content still stays private', async () => {
+    slack.openError = Object.assign(new Error('cannot_dm_bot'), { data: { error: 'cannot_dm_bot' } });
+
+    await expect(service.post({ agentSession: 'a', target: '@steve', text: 'x', newTopLevel: true })).rejects.toMatchObject({
+      code: 'target_not_found',
+      message: expect.stringContaining('is a bot'),
+    });
+    await expect(service.post({ agentSession: 'a', target: '@steve', text: 'x', newTopLevel: true })).rejects.toMatchObject({
+      // The instruction matters more than the diagnosis: the fallback an
+      // agent reaches for is exactly the harmful one.
+      message: expect.stringContaining('Do not fall back to a channel'),
+    });
+  });
+
+  it('explains a missing scope while resolving a channel name', async () => {
+    const lookupFails = new SlackAgentPostService({
+      slack: Object.assign(Object.create(Object.getPrototypeOf(slack)), slack, {
+        findChannelByName: async () => {
+          throw Object.assign(new Error('missing_scope'), { data: { error: 'missing_scope' } });
+        },
+      }),
+      storage: { getTeams: async () => TEAMS },
+    });
+    await expect(lookupFails.post({ agentSession: 'a', target: '#general', text: 'x', newTopLevel: true })).rejects.toMatchObject({
+      code: 'slack_error',
+      message: expect.stringContaining('channels:read'),
+    });
+  });
+
+  it('passes other Slack errors through', async () => {
+    slack.sendError = Object.assign(new Error('rate_limited'), { data: { error: 'rate_limited' } });
+    await expect(service.post({ agentSession: 'a', target: '#general', text: 'x', newTopLevel: true })).rejects.toMatchObject({
+      message: 'Slack refused the post: rate_limited',
+    });
+  });
+});
+
+describe('singleton', () => {
+  it('is null until set', () => {
+    expect(getSlackAgentPostService()).toBeNull();
+    setSlackAgentPostService(service);
+    expect(getSlackAgentPostService()).toBe(service);
+  });
+  it('SlackAgentPostError carries its code', () => {
+    expect(new SlackAgentPostError('validation', 'x').code).toBe('validation');
+  });
+});
+
+describe('answering an owed reply (2026-09-25)', () => {
+  it('a post without a thread where a reply is owed is refused and names that thread (R7: no oldest-placeholder capture)', async () => {
+    const resolve = jest.fn();
+    const typing = {
+      findOwed: (agent: string, channel: string) => (agent === 'crewly-a-sam' && channel === 'D-U0OWNER1' ? { agentSession: agent, slackChannelId: channel, threadTs: '9.9' } : null),
+      resolve,
+    };
+    const svc = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS }, identities, typing });
+    await expect(svc.post({ agentSession: 'crewly-a-sam', target: 'U0OWNER1', text: '好的，我在填。' })).rejects.toMatchObject({
+      code: 'thread_required',
+      message: expect.stringContaining('D-U0OWNER1:9.9'),
+    });
+    expect(resolve).not.toHaveBeenCalled();
+    expect(slack.sent).toHaveLength(0);
+  });
+
+  it('a post naming the owed thread replaces its placeholder', async () => {
+    const resolved: unknown[][] = [];
+    const typing = {
+      findOwed: () => null,
+      owes: (k: { agentSession: string; slackChannelId: string; threadTs?: string }) => k.threadTs === '9.9',
+      resolve: async (...a: unknown[]) => { resolved.push(a); return 'replaced' as const; },
+    };
+    const svc = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS }, identities, typing });
+    const res = await svc.post({ agentSession: 'crewly-a-sam', target: 'U0OWNER1', text: '好的，我在填。', threadTs: '9.9' });
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0][0]).toEqual({ agentSession: 'crewly-a-sam', slackChannelId: 'D-U0OWNER1', threadTs: '9.9' });
+    expect(slack.sent).toHaveLength(0);
+    expect(res.channelId).toBe('D-U0OWNER1');
+  });
+
+  it('a channel post with neither --thread nor --new-topic is refused (R7: Ella\'s "@Rex" at the top of #awesome-videos)', async () => {
+    const svc = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS }, identities, typing: { findOwed: () => null, resolve: jest.fn() } });
+    await expect(svc.post({ agentSession: 'crewly-a-sam', target: '#general', text: '@Rex 再取一条' })).rejects.toMatchObject({ code: 'thread_required' });
+    expect(slack.sent).toHaveLength(0);
+  });
+
+  it('newTopLevel posts top-level even when a reply is owed there (scheduled output, spec 2026-10-01 §6)', async () => {
+    const typing = {
+      findOwed: () => ({ agentSession: 'crewly-a-sam', slackChannelId: 'D-U0OWNER1', threadTs: '9.9' }),
+      resolve: jest.fn(),
+    };
+    const svc = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS }, identities, typing });
+    await svc.post({ agentSession: 'crewly-a-sam', target: 'U0OWNER1', text: 'Weekly digest', newTopLevel: true });
+    expect(typing.resolve).not.toHaveBeenCalled();
+    expect(slack.sent).toHaveLength(1);
+    expect((slack.sent[0] as { threadTs?: string }).threadTs).toBeUndefined();
+  });
+
+  it('returns the real ts when the post answered an owed reply (#808)', async () => {
+    const typing = {
+      findOwed: () => null,
+      owes: () => true,
+      resolve: async (_k: unknown, _t: unknown, _i: unknown, opts?: { onMessageTs?: (ts: string) => void }) => {
+        opts?.onMessageTs?.('9.95');
+        return 'replaced' as const;
+      },
+    };
+    const svc = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS }, identities, typing });
+    const res = await svc.post({ agentSession: 'crewly-a-sam', target: 'U0OWNER1', text: 'answer', threadTs: '9.9' });
+    expect(res.messageTs).toBe('9.95');
+  });
+
+  it('an unthreaded post only looks for placeholders from the current turn (#808)', async () => {
+    const findOwed = jest.fn(() => null);
+    const typing = { findOwed, resolve: jest.fn() };
+    const svc = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS }, identities, typing });
+    await svc.post({ agentSession: 'crewly-a-sam', target: 'U0OWNER1', text: 'Email triage 16:00' });
+    expect(findOwed).toHaveBeenCalledWith('crewly-a-sam', 'D-U0OWNER1', { maxAgeMs: 30 * 60 * 1000 });
+    expect(slack.sent).toHaveLength(1);
+  });
+
+  it('a post into the owed thread clears it, so a later unthreaded post is not captured (#808)', async () => {
+    const { SlackTypingPlaceholderService } = await import('./slack-typing-placeholder.service.js');
+    const typingSlack = {
+      isConnected: () => true,
+      sendMessage: async () => 'p-1',
+      updateMessage: async () => undefined,
+      deleteMessage: async () => undefined,
+    };
+    const typing = new SlackTypingPlaceholderService({ slack: typingSlack, setTimer: () => 0 as unknown as ReturnType<typeof setTimeout>, clearTimer: () => undefined });
+    await typing.begin({ agentSession: 'crewly-a-sam', slackChannelId: 'D-U0OWNER1', threadTs: '1790341683.050219' }, { displayName: 'Sam' });
+    const svc = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS }, identities, typing });
+
+    await svc.post({ agentSession: 'crewly-a-sam', target: 'U0OWNER1', text: 'in-thread answer', threadTs: '1790341683.050219' });
+    expect(typing.owes({ agentSession: 'crewly-a-sam', slackChannelId: 'D-U0OWNER1', threadTs: '1790341683.050219' })).toBe(false);
+
+    const before = slack.sent.length;
+    const res = await svc.post({ agentSession: 'crewly-a-sam', target: 'U0OWNER1', text: 'Email triage' });
+    expect(slack.sent).toHaveLength(before + 1);
+    expect((slack.sent.at(-1) as { threadTs?: string }).threadTs).toBeUndefined();
+    expect(res.messageTs).not.toBe('');
+  });
+
+  it('an explicit thread, or nothing owed, posts normally', async () => {
+    const typing = { findOwed: () => null, resolve: jest.fn() };
+    const svc = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS }, identities, typing });
+    await svc.post({ agentSession: 'crewly-a-sam', target: 'U0OWNER1', text: 'hi' });
+    expect(slack.sent).toHaveLength(1);
+    expect(typing.resolve).not.toHaveBeenCalled();
+  });
+});
+
+describe('mention linking', () => {
+  it('links @Name through the linker, and posts as written when the linker fails', async () => {
+    const linked = new SlackAgentPostService({
+      slack,
+      storage: { getTeams: async () => TEAMS },
+      identities,
+      linkMentions: async (t, channelId) => (channelId === 'C-GEN' ? t.replace('@Ella', '<@UELLA>') : t),
+    });
+    await linked.post({ agentSession: 'crewly-a-sam', target: '#general', text: '@Ella 补一句', newTopLevel: true });
+    expect(slack.sent[0].text).toBe('<@UELLA> 补一句');
+
+    const broken = new SlackAgentPostService({
+      slack,
+      storage: { getTeams: async () => TEAMS },
+      identities,
+      linkMentions: async () => {
+        throw new Error('boom');
+      },
+    });
+    await broken.post({ agentSession: 'crewly-a-sam', target: '#general', text: '@Ella hi', newTopLevel: true });
+    expect(slack.sent[1].text).toBe('@Ella hi');
+  });
+});
+
+describe('app-less agents: mapped channel names and file uploads (2026-10-13)', () => {
+  it('resolves a team room by its mapped name even when conversations.list cannot see it', async () => {
+    service = new SlackAgentPostService({
+      slack,
+      storage: { getTeams: async () => TEAMS },
+      identities,
+      findMappedChannelByName: (n) => (n === 'content-team' ? { id: 'C0C46TTBNNP', name: 'content-team' } : null),
+    });
+    const res = await service.post({ agentSession: 'crewly-a-sam', target: '#content-team', text: 'hi', newTopLevel: true });
+    expect(res.channelId).toBe('C0C46TTBNNP');
+  });
+
+  it('uploads files with the workspace bot under the agent persona when the agent has no bot', async () => {
+    const res = await service.post({ agentSession: 'crewly-a-sam', target: '#general', text: 'draft', files: ['/p/a.md'], newTopLevel: true });
+    expect(res.filesSent).toEqual(['/p/a.md']);
+    expect(slack.uploads[0]).toMatchObject({ channelId: 'C-GEN', filePath: '/p/a.md', persona: { username: 'Sam' } });
+    expect(slack.uploads[0].botToken).toBeUndefined();
+  });
+
+  it('uploads with the agent bot token when it has one', async () => {
+    identities!.installed['crewly-a-sam'] = { botUserId: 'UB', botToken: 'xoxb-sam' };
+    await service.post({ agentSession: 'crewly-a-sam', target: '#general', text: 'draft', files: ['/p/a.md'], threadTs: '1.2' });
+    expect(slack.uploads[0]).toMatchObject({ botToken: 'xoxb-sam', threadTs: '1.2' });
+  });
+
+  it('reports Slack\'s error code when an upload fails, and still returns the post', async () => {
+    slack.uploadError = Object.assign(new Error('x'), { data: { error: 'not_in_channel' } });
+    const res = await service.post({ agentSession: 'crewly-a-sam', target: '#general', text: 'draft', files: ['/p/a.md'], newTopLevel: true });
+    expect(res.messageTs).toBe('111.222');
+    expect(res.filesFailed).toEqual([{ path: '/p/a.md', error: 'not_in_channel' }]);
+  });
+});
+
+describe('agent-started DM posts (#1387)', () => {
+  const noTyping = { findOwed: () => null, resolve: jest.fn() };
+
+  it('reports a top-level DM post when nothing there waits on the agent', async () => {
+    const seen: unknown[] = [];
+    const off = onAgentStartedDmPost((p) => seen.push(p));
+    const svc = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS }, identities, typing: noTyping, owesAnswerIn: () => false });
+    await svc.post({ agentSession: 'crewly-a-sam', target: 'U0OWNER1', text: 'Posted the schedule.' });
+    off();
+    expect(seen).toEqual([{ agent: 'crewly-a-sam', slackChannelId: 'D-U0OWNER1', text: 'Posted the schedule.' }]);
+  });
+
+  it('reportAgentStartedDmPost reaches the same listeners and survives a throwing one', () => {
+    const seen: unknown[] = [];
+    const offBad = onAgentStartedDmPost(() => {
+      throw new Error('boom');
+    });
+    const off = onAgentStartedDmPost((p) => seen.push(p));
+    reportAgentStartedDmPost({ agent: 'crewly-orc', text: 'Heads up.' });
+    off();
+    offBad();
+    expect(seen).toEqual([{ agent: 'crewly-orc', text: 'Heads up.' }]);
+  });
+
+  it('does not report a late answer, a threaded post, a channel post, or when the answer state is unknown', async () => {
+    const seen: unknown[] = [];
+    const off = onAgentStartedDmPost((p) => seen.push(p));
+    const owing = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS }, identities, typing: noTyping, owesAnswerIn: () => true });
+    await owing.post({ agentSession: 'crewly-a-sam', target: 'U0OWNER1', text: 'Here is the answer.' });
+    const free = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS }, identities, typing: noTyping, owesAnswerIn: () => false });
+    await free.post({ agentSession: 'crewly-a-sam', target: 'U0OWNER1', text: 'In thread.', threadTs: '1.1' });
+    await free.post({ agentSession: 'crewly-a-sam', target: '#general', text: 'Hi all', newTopLevel: true });
+    const unknown = new SlackAgentPostService({ slack, storage: { getTeams: async () => TEAMS }, identities, typing: noTyping });
+    await unknown.post({ agentSession: 'crewly-a-sam', target: 'U0OWNER1', text: 'No watchdog.' });
+    off();
+    expect(seen).toEqual([]);
+  });
+});

@@ -1,0 +1,180 @@
+/**
+ * Chat Message Styles
+ *
+ * Layout and message-variant styles only.
+ * Primitives (badges, buttons, avatars) are handled by UI library components.
+ */
+
+.chat-message {
+  display: flex;
+  flex-direction: column;
+  padding: 0.75rem 1rem;
+  margin: 0.5rem 1rem;
+  border-radius: 0.5rem;
+  animation: messageIn 0.2s ease-out;
+}
+
+/* Sender type variants */
+.chat-message.user {
+  background-color: var(--color-primary-light);
+  align-self: flex-end;
+  max-width: 80%;
+  margin-left: auto;
+}
+
+.chat-message.orchestrator {
+  background-color: var(--color-bg-secondary);
+  align-self: flex-start;
+  max-width: 85%;
+}
+
+.chat-message.agent {
+  background-color: var(--color-warning-light);
+  align-self: flex-start;
+  max-width: 85%;
+}
+
+.chat-message.system {
+  background-color: var(--color-bg-tertiary);
+  align-self: center;
+  max-width: 90%;
+  font-style: italic;
+  opacity: 0.85;
+}
+
+.chat-message.error-status {
+  border: 1px solid var(--color-error);
+}
+
+/* Header */
+.message-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.sender-name {
+  font-weight: 600;
+  font-size: 0.875rem;
+  color: var(--color-text-primary);
+}
+
+.message-time {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  margin-left: auto;
+}
+
+/* Content */
+.message-content {
+  font-size: 0.9375rem;
+  line-height: 1.6;
+  color: var(--color-text-primary);
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+.message-content p {
+  margin: 0;
+}
+
+.message-content .formatted-content {
+  white-space: pre-wrap;
+}
+
+/* Code blocks */
+.message-content .code-block {
+  background-color: var(--color-bg-code);
+  color: var(--color-text-code);
+  padding: 1rem;
+  border-radius: 0.375rem;
+  overflow-x: auto;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  margin: 0.75rem 0;
+}
+
+.message-content .code-block code {
+  background: none;
+  padding: 0;
+  font-family: inherit;
+}
+
+/* Inline code */
+.message-content .inline-code {
+  background-color: var(--color-bg-tertiary);
+  padding: 0.125rem 0.375rem;
+  border-radius: 0.25rem;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 0.875em;
+  color: var(--color-text-secondary);
+}
+
+/* Raw output */
+.raw-output {
+  background-color: var(--color-bg-tertiary);
+  padding: 0.75rem;
+  border-radius: 0.25rem;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  color: var(--color-text-secondary);
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* Metadata row */
+.message-metadata {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  flex-wrap: wrap;
+}
+
+/* Error state */
+.message-error {
+  margin-top: 0.5rem;
+  padding: 0.25rem 0.5rem;
+  background-color: var(--color-error-light);
+  color: var(--color-error);
+  border-radius: 0.25rem;
+  font-size: 0.75rem;
+}
+
+/* Animation */
+@keyframes messageIn {
+  from {
+    opacity: 0;
+    transform: translateY(0.5rem);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Mobile responsive */
+@media (max-width: 768px) {
+  .chat-message {
+    margin: 0.375rem 0.5rem;
+    padding: 0.5rem 0.75rem;
+  }
+
+  .chat-message.user,
+  .chat-message.orchestrator,
+  .chat-message.agent {
+    max-width: 90%;
+  }
+
+  .message-content {
+    font-size: 0.875rem;
+  }
+
+  .code-block {
+    font-size: 0.8125rem;
+  }
+}

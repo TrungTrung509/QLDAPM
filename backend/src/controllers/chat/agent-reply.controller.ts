@@ -1,0 +1,375 @@
+/**
+ * POST /api/chat/reply — the single reply entry point behind the `reply`
+ * skill (specs/2026-09-30-owner-message-guarantee.md §B).
+ *
+ * The agent says only what to answer; the harness sends it back where the
+ * message it is answering came from (Slack DM, Slack room thread, portal /
+ * Talk chat), over the right transport. Status markers still go to the
+ * orchestrator; explicit ids that are the agent's own still win.
+ *
+ * @module controllers/chat/agent-reply.controller
+ */
+
+import { getOwnerCompletionReport } from '../../services/orc/owner-completion-report.service.js';
+import type { Request, Response, NextFunction } from 'express';
+import { ORCHESTRATOR_SESSION_NAME, REPLY_ROUTING_CONSTANTS } from '../../constants.js';
+import { readAgentSessionHeader } from '../../utils/agent-caller.utils.js';
+import { OrcReplyRouteService } from '../../services/orc/orc-reply-route.service.js';
+import { isStatusReport, planAgentReply, type AgentReplyPlan } from '../../services/orc/agent-reply-target.js';
+import {
+  defaultWorkDestinationDeps,
+  postNewThread,
+  type WorkDestinationDeps,
+} from '../../services/orc/work-item-destination.wiring.js';
+import { deliverReply, type DeliverReplyInput, type ReplyDelivery } from '../../services/orc/reply-destination.wiring.js';
+import type { ReplyReference } from '../../services/orc/agent-prompt-reference.service.js';
+import { parseSlackThreadKey } from '../../services/slack/slack-thread-key.js';
+import { getOwnerMessageWatchdog, type OwnerMessageEntry } from '../../services/messaging/owner-message-watchdog.service.js';
+import { AgentPostLog } from '../../services/messaging/queue-priority.js';
+import { reportOwnerThreadAgentPost } from '../../services/messaging/owner-thread-sentinel.service.js';
+import { reportAgentPostForFollowThrough } from '../../services/agent/follow-through.service.js';
+import { LoggerService, type ComponentLogger } from '../../services/core/logger.service.js';
+import { agentResponse, deliverAgentReplyToConversation, isAgentsOwnConversation } from './chat.controller.js';
+
+const logger: ComponentLogger = LoggerService.getInstance().createComponentLogger('AgentReply');
+
+/** Injectable collaborators (tests). */
+export interface AgentReplyDeps {
+  /** The status / orchestrator-chat path (`/api/chat/agent-response`). */
+  agentResponse: (req: Request, res: Response, next: NextFunction) => Promise<void>;
+  deliver: typeof deliverAgentReplyToConversation;
+  ownsConversation: (agentSession: string, conversationId: string) => Promise<boolean>;
+  /** The orchestrator answering a Slack thread through the master bot. */
+  postOrcSlack: (input: { channelId: string; threadTs?: string; text: string }) => Promise<string>;
+  /** Work-item destinations (specs/2026-10-01-decision-cards.md §6) — `--new-thread` */
+  workDestination: () => Promise<WorkDestinationDeps>;
+  /** The one destination resolver + delivery (specs/2026-10-02-harness-owned-routing.md) */
+  deliverReply: (input: DeliverReplyInput) => Promise<ReplyDelivery>;
+  /** `reply --none`: take down the agent's placeholder in that thread */
+  settleNoReply?: (agentSession: string, slackChannelId: string, threadTs: string) => Promise<number>;
+  /** `reply --drive <session>`: the answer goes to the owner's Drive mode session (their phone), not Slack */
+  driveReply?: (agentSession: string, sessionId: string, input: { text: string; interim: boolean; recap: boolean; ack?: boolean }) => Promise<{ conversationId: string; closed: boolean }>;
+}
+
+/**
+ * Default orchestrator Slack post: same send + bookkeeping as `/api/slack/send`.
+ *
+ * @param input - Channel, thread and text
+ * @returns The Slack message ts
+ */
+async function defaultPostOrcSlack(input: { channelId: string; threadTs?: string; text: string }): Promise<string> {
+  const { getSlackService } = await import('../../services/slack/slack.service.js');
+  const slack = getSlackService();
+  if (!slack.isConnected()) throw new Error('Slack is not connected');
+  const ts = await slack.sendMessage({ channelId: input.channelId, text: input.text, ...(input.threadTs ? { threadTs: input.threadTs } : {}) });
+  reportOwnerThreadAgentPost({ agent: ORCHESTRATOR_SESSION_NAME, slackChannelId: input.channelId, ...(input.threadTs ? { threadTs: input.threadTs } : {}), text: input.text });
+  const { recordSlackReplyBookkeeping } = await import('../slack/slack.controller.js');
+  await recordSlackReplyBookkeeping({
+    channelId: input.channelId,
+    threadTs: input.threadTs,
+    senderSessionName: ORCHESTRATOR_SESSION_NAME,
+    content: input.text,
+    replyKind: 'text',
+  });
+  return ts;
+}
+
+const defaultDeps: AgentReplyDeps = {
+  agentResponse,
+  deliver: deliverAgentReplyToConversation,
+  ownsConversation: isAgentsOwnConversation,
+  postOrcSlack: defaultPostOrcSlack,
+  workDestination: defaultWorkDestinationDeps,
+  deliverReply: (input) => deliverReply(input),
+  driveReply: async (agentSession, sessionId, input) => {
+    const { getDriveAgentService, DriveAgentError } = await import('../../services/drive/drive-agent.service.js');
+    const drive = getDriveAgentService();
+    if (!drive) throw new DriveAgentError(503, 'Drive mode is not ready on this machine — answer the usual way (reply).');
+    return drive.agentReply(agentSession, sessionId, input);
+  },
+  settleNoReply: async (agentSession, slackChannelId, threadTs) => {
+    const { getSlackTypingPlaceholderService } = await import('../../services/slack/slack-typing-placeholder.service.js');
+    return (await getSlackTypingPlaceholderService()?.settleNoReplyNeeded(agentSession, slackChannelId, threadTs)) ?? 0;
+  },
+};
+
+/**
+ * The reference a `reply` names (`--to`, `--ticket`, `--work-item`, `--decision`).
+ *
+ * @param body - Request body
+ * @returns The reference, or undefined
+ */
+export function referenceOf(body: Record<string, unknown>): ReplyReference | undefined {
+  const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
+  const ref: ReplyReference = {
+    ...(str(body.to) ?? str(body.messageId) ? { messageId: (str(body.to) ?? str(body.messageId))! } : {}),
+    ...(str(body.ticket) ? { ticket: str(body.ticket)! } : {}),
+    ...(str(body.workItemId) ? { workItemId: str(body.workItemId)! } : {}),
+    ...(str(body.decision) ? { decisionId: str(body.decision)! } : {}),
+  };
+  return Object.keys(ref).length > 0 ? ref : undefined;
+}
+
+/**
+ * The owner's own new channel post this agent still owes an answer to.
+ *
+ * Such a post is already its own thread. An agent that answers it with
+ * `--new-thread` (the owner's request looked like "a new topic") would open a
+ * second thread next to it, and the post would read as unanswered
+ * (2026-10-18: Pia answered the NECINA request in a thread of her own; the
+ * owner's post got only Crewly's "hasn't replied" note).
+ *
+ * @param session - The replying agent
+ * @param now - Current time (epoch ms)
+ * @returns The newest such post still owed, or null
+ */
+export function ownerRootPostOwed(session: string, now: number = Date.now()): OwnerMessageEntry | null {
+  const owed = getOwnerMessageWatchdog()?.owedBy(session) ?? [];
+  const roots = owed.filter(
+    (e) =>
+      e.surface === 'slack' &&
+      e.responsible === session &&
+      !!e.messageId &&
+      !!e.sourceTs &&
+      !!e.slackChannelId &&
+      !e.slackChannelId.startsWith('D') &&
+      (e.threadTs ?? e.sourceTs) === e.sourceTs &&
+      now - e.receivedAt <= REPLY_ROUTING_CONSTANTS.OWNER_ROOT_POST_ANSWER_WINDOW_MS,
+  );
+  return roots.at(-1) ?? null;
+}
+
+/**
+ * Build the handler.
+ *
+ * @param deps - Collaborators (defaults to the real ones)
+ * @returns Express handler
+ */
+export function createAgentReplyHandler(deps: AgentReplyDeps = defaultDeps) {
+  return async function agentReply(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const session = readAgentSessionHeader(req) ?? (typeof body.senderName === 'string' ? body.senderName : undefined);
+      if (!session) {
+        res.status(400).json({ success: false, error: 'Who is replying? Run the skill from an agent session (CREWLY_SESSION_NAME).' });
+        return;
+      }
+      const none = body.none === true;
+      const content = typeof body.content === 'string' ? body.content : '';
+      if (!none && content.trim().length === 0) {
+        res.status(400).json({ success: false, error: 'Reply text is required' });
+        return;
+      }
+      const interim = body.interim === true;
+      // Drive mode (specs/2026-10-08-drive-mode.md §7): the owner is listening on the phone.
+      if (typeof body.drive === 'string' && body.drive.trim() && !none) {
+        if (!deps.driveReply) {
+          res.status(503).json({ success: false, error: 'Drive mode is not available here — answer the usual way (reply).' });
+          return;
+        }
+        try {
+          // `--ack`: the quick first phase of a two-phase Drive answer (specs/2026-10-09-drive-mode-v3.md).
+          const ack = body.ack === true && body.recap !== true;
+          const out = await deps.driveReply(session, body.drive.trim(), { text: content, interim: interim || ack, recap: body.recap === true, ...(ack ? { ack: true } : {}) });
+          res.status(201).json({ success: true, data: { destination: 'drive', ...out } });
+        } catch (err) {
+          const status = typeof (err as { status?: unknown }).status === 'number' ? (err as { status: number }).status : 409;
+          res.status(status).json({ success: false, error: err instanceof Error ? err.message : String(err) });
+        }
+        return;
+      }
+      const requestedConv = typeof body.conversationId === 'string' ? body.conversationId : undefined;
+      const requestedThread = typeof body.thread === 'string' ? body.thread : undefined;
+      const isOrchestrator = session === ORCHESTRATOR_SESSION_NAME;
+      const newThread = typeof body.newThread === 'string' ? body.newThread.trim() : '';
+
+      // `reply --new-thread` while the owner's own new post is still owed:
+      // the answer goes under that post, not into a second thread.
+      const owedRoot = newThread && !none && !isOrchestrator ? ownerRootPostOwed(session) : null;
+      if (owedRoot) logger.info('New thread asked for while the owner post is owed — answering under that post', { session, title: newThread, ref: owedRoot.key });
+
+      // `reply --new-thread "<title>"`: an agent-initiated new topic.
+      if (newThread && !none && !owedRoot) {
+        const delivered = isOrchestrator ? null : await postNewThread(session, newThread, content, await deps.workDestination());
+        if (!delivered) {
+          res.status(409).json({
+            success: false,
+            error: 'Could not start a new thread: you have no Slack team channel. Reply without --new-thread, or use slack-post with a channel.',
+          });
+          return;
+        }
+        logger.info('Agent started a new thread', { session, slackChannelId: delivered.slackChannelId, title: newThread });
+        res.status(201).json({ success: true, data: { slackChannelId: delivered.slackChannelId, messageTs: delivered.messageTs, destination: delivered.kind } });
+        return;
+      }
+
+      // Every agent answer goes through the one destination resolver
+      // (specs/2026-10-02-harness-owned-routing.md): references first
+      // (--to / --ticket / --work-item / --decision), then the ids it passed
+      // when they validate, then what the harness last prompted it about,
+      // its turn origin / current work, and its owner DM.
+      if (!isOrchestrator && !none && !isStatusReport(content)) {
+        const reference = owedRoot?.messageId ? { messageId: owedRoot.messageId } : referenceOf(body);
+        const delivery = await deps.deliverReply({
+          session,
+          content,
+          interim,
+          ...(body.addsNew === true ? { addsNew: true } : {}),
+          ...(body.share === true ? { share: true } : {}),
+          ...(reference ? { reference } : {}),
+          ...(requestedConv || requestedThread
+            ? { hints: { ...(requestedConv ? { conversationId: requestedConv } : {}), ...(requestedThread ? { thread: requestedThread } : {}) } }
+            : {}),
+        });
+        if (!delivery.ok) {
+          logger.warn('Agent reply could not be delivered — told the agent (not filed as status)', { session, error: delivery.error });
+          res.status(409).json({ success: false, error: delivery.error });
+          return;
+        }
+        // An answer in a Slack thread (a decision card's, a ticket's): a
+        // reminder about that thread still on this agent's queue is stale.
+        if (!interim && delivery.slackChannelId && delivery.threadTs) {
+          AgentPostLog.getInstance().note(session, { slackChannelId: delivery.slackChannelId, threadTs: delivery.threadTs });
+        }
+        // A report named by work item tells the owner for that item's chain,
+        // wherever it landed: stop the report-due reminder (CREW-503).
+        if (!interim && reference?.workItemId) getOwnerCompletionReport()?.noteWorkItemReply(reference.workItemId);
+        // A chat-only answer never reaches the sentinel; the follow-through
+        // guard still needs to see what the agent told the owner.
+        if (!delivery.slackChannelId) reportAgentPostForFollowThrough({ agent: session, text: content, interim });
+        // A promise ("~15 min") in an owner thread is timed by the sentinel.
+        if (delivery.slackChannelId) {
+          reportOwnerThreadAgentPost({
+            agent: session,
+            slackChannelId: delivery.slackChannelId,
+            ...(delivery.threadTs ? { threadTs: delivery.threadTs } : {}),
+            text: content,
+            interim,
+          });
+        }
+        const dest = delivery.destination;
+        res.status(201).json({
+          success: true,
+          data: {
+            ...(delivery.messageId ? { messageId: delivery.messageId, conversationId: delivery.conversationId } : {}),
+            ...(delivery.slackChannelId ? { slackChannelId: delivery.slackChannelId, messageTs: delivery.messageTs } : {}),
+            ...(delivery.threadTs ? { threadTs: delivery.threadTs } : {}),
+            // An answer to another agent's message went back to it (crewly#1375).
+            ...(delivery.agentSession ? { agentSession: delivery.agentSession } : {}),
+            destination: dest.kind === 'work' ? dest.destination.kind : 'conversation',
+            via: dest.source,
+            // crewly#969: the reply went to the owner DM instead of a shared place.
+            ...(delivery.heldFrom
+              ? { heldFrom: delivery.heldFrom, note: `Posted to your DM with the owner instead of ${delivery.heldFrom}: it draws on someone's private data. When the owner says to share it there, run the same reply with --share.` }
+              : {}),
+          },
+        });
+        return;
+      }
+
+      const origin = OrcReplyRouteService.getInstance().getLastOrigin(session);
+      const owns = requestedConv && !isOrchestrator ? await deps.ownsConversation(session, requestedConv) : false;
+
+      const plan = planAgentReply({
+        session,
+        isOrchestrator,
+        content,
+        none,
+        requested: { conversationId: requestedConv, thread: requestedThread },
+        origin,
+        ownsConversation: () => owns,
+      });
+      logReplyPlan(session, plan);
+
+      switch (plan.kind) {
+        case 'status': {
+          req.body = { content, senderName: session, senderType: 'agent', ...(typeof body.workItemId === 'string' ? { workItemId: body.workItemId } : {}) };
+          await deps.agentResponse(req, res, next);
+          return;
+        }
+        case 'none': {
+          const key = parseSlackThreadKey(plan.origin?.slackThreadKey);
+          const closed =
+            getOwnerMessageWatchdog()?.closeByAgent(session, {
+              ...(plan.origin ? { chatChannelId: plan.origin.conversationId } : {}),
+              ...(key ? { slackChannelId: key.slackChannelId, threadTs: key.threadTs } : {}),
+            }) ?? 0;
+          // The agent said explicitly that no answer is needed: its
+          // "working on it" in that thread may go (spec §5 — a turn that just
+          // ends does not take it down).
+          if (key) await deps.settleNoReply?.(session, key.slackChannelId, key.threadTs).catch(() => 0);
+          res.json({ success: true, data: { closed } });
+          return;
+        }
+        case 'orc-chat': {
+          req.body = {
+            content,
+            senderName: 'Orchestrator',
+            senderType: 'orchestrator',
+            // Only a conversation the agent NAMED is passed on: an unnamed post
+            // is placed by the harness (work item, fresh origin, owner DM).
+            ...(requestedConv && plan.conversationId ? { conversationId: plan.conversationId } : {}),
+            ...(requestedConv ? { crossPost: body.crossPost === true } : {}),
+            // The thread and work item the post answers: the harness places it there.
+            ...(requestedThread ? { slackThread: requestedThread } : {}),
+            ...(typeof body.workItemId === 'string' && body.workItemId ? { workItemId: body.workItemId } : {}),
+            // `reply --decision D-12`: the card's thread (D-890, 2026-10-19).
+            ...(typeof body.decision === 'string' && body.decision ? { decisionId: body.decision } : {}),
+          };
+          await deps.agentResponse(req, res, next);
+          return;
+        }
+        case 'orc-slack': {
+          const ts = await deps.postOrcSlack({ channelId: plan.channelId, threadTs: plan.threadTs, text: content });
+          res.json({ success: true, data: { slackChannelId: plan.channelId, threadTs: plan.threadTs, messageTs: ts } });
+          return;
+        }
+        case 'post': {
+          // Only the orchestrator's own-conversation posts reach here.
+          const messageId = await deps.deliver({ conversationId: plan.conversationId, thread: plan.thread, agentSession: session, content, interim });
+          if (!messageId) {
+            res.status(409).json({
+              success: false,
+              error: `Your message was NOT delivered: conversation ${plan.conversationId} did not take it. Run: reply "<your message>" without ids.`,
+            });
+            return;
+          }
+          res.status(201).json({ success: true, data: { messageId, conversationId: plan.conversationId } });
+          return;
+        }
+        case 'no-target':
+        default: {
+          res.status(409).json({
+            success: false,
+            error: `Nothing to reply to: ${plan.kind === 'no-target' ? plan.reason : 'unknown'}. Pass --conversation <id> from your prompt.`,
+          });
+          return;
+        }
+      }
+    } catch (err) {
+      next(err);
+    }
+  };
+}
+
+/**
+ * Log where a reply went and why (warn when it overrode the agent's ids).
+ *
+ * @param session - Replying agent
+ * @param plan - The decision
+ */
+function logReplyPlan(session: string, plan: AgentReplyPlan): void {
+  if (plan.kind === 'post' && plan.via === 'origin') {
+    logger.info('Agent reply sent to the conversation its message came from', {
+      session,
+      conversationId: plan.conversationId,
+      thread: plan.thread,
+      reason: plan.reason,
+    });
+  } else {
+    logger.debug('Agent reply plan', { session, plan: plan.kind });
+  }
+}
+
+/** The handler with the real collaborators. */
+export const agentReply = createAgentReplyHandler();

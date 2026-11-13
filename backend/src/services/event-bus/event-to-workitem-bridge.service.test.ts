@@ -1,0 +1,1114 @@
+/**
+ * Tests for EventToWorkItemBridge (BRIDGE-1.4).
+ *
+ * Covers Arch Vetos V1 (idempotency), V2 (retry cap), V4 (TL fail-fast),
+ * V5 (no Trigger entity — verified by absence in src), and V6/V9
+ * (cron-recursion block + cron→event demote on retry).
+ *
+ * @module services/event-bus/event-to-workitem-bridge.test
+ */
+
+import { EventBusService } from './event-bus.service.js';
+import {
+  EventToWorkItemBridge,
+  withRejectionFeedback,
+  CronRecursionError,
+  BridgeTeamLeadResolutionError,
+  assertNoCronFromCron,
+  BRIDGE_SUBSCRIBED_EVENTS,
+} from './event-to-workitem-bridge.service.js';
+import type { AgentEvent } from '../../types/event-bus.types.js';
+import type {
+  WorkItem,
+  WorkItemType,
+  WorkItemOwner,
+  WorkItemStatus,
+} from '../../types/v2/work-item.types.js';
+import type { Mission } from '../../types/v2/mission.types.js';
+import type { Team } from '../../types/index.js';
+
+jest.mock('../core/logger.service.js', () => ({
+  LoggerService: {
+    getInstance: () => ({
+      createComponentLogger: () => ({
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn(),
+        debug: jest.fn(),
+      }),
+    }),
+  },
+}));
+
+// ---------------------------------------------------------------------------
+// Test fixtures
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a real WorkItem fixture (Sam's reminder #2: real shape, not a mock).
+ */
+function buildWorkItem(overrides: Partial<WorkItem> = {}): WorkItem {
+  return {
+    id: 'wi-source-1',
+    type: 'delegate' as WorkItemType,
+    owner: 'agent' as WorkItemOwner,
+    target: 'crewly-product-leo-member-n',
+    title: 'Implement feature X',
+    description: 'Some delegated work',
+    status: 'running' as WorkItemStatus,
+    createdAt: '2026-04-26T20:00:00.000Z',
+    retryCount: 0,
+    maxRetries: 3,
+    inputTokens: 0,
+    outputTokens: 0,
+    cost: 0,
+    metadata: {
+      teamId: 'team-product',
+      triggerSource: 'event',
+    },
+    ...overrides,
+  };
+}
+
+function buildTeam(overrides: Partial<Team> = {}): Team {
+  return {
+    id: 'team-product',
+    name: 'Crewly Product',
+    description: 'Product team',
+    members: [
+      {
+        id: 'tl-1',
+        name: 'Sam',
+        sessionName: 'crewly-product-sam',
+        role: 'team-leader',
+        systemPrompt: '',
+        agentStatus: 'active',
+        workingStatus: 'idle',
+        runtimeType: 'claude-code',
+        createdAt: '',
+        updatedAt: '',
+        hierarchyLevel: 1,
+        canDelegate: true,
+      } as Team['members'][number],
+    ],
+    projectIds: [],
+    createdAt: '',
+    updatedAt: '',
+    ...overrides,
+  };
+}
+
+function buildMission(overrides: Partial<Mission> = {}): Mission {
+  return {
+    id: 'mission-1',
+    objective: 'Ship Crewly Pro 1.0',
+    ownerTeamId: 'team-product',
+    successCriteria: [],
+    currentStrategy: 'iterative',
+    activeProjectTaskIds: [],
+    cadence: 'weekly',
+    policy: {
+      // Minimal valid policy — bridge tests don't exercise any policy gate
+      taskCreation: 'free',
+      reprioritization: 'free',
+      taskClosure: 'free',
+      stagingDeploy: 'requires_approval',
+      productionDeploy: 'requires_approval',
+      spendingMoney: 'requires_approval',
+      userVisibleBehavior: 'requires_approval',
+      replanning: 'free',
+      phaseGateApproval: 'none',
+      strictPhaseGate: false,
+    },
+    status: 'active',
+    createdAt: '',
+    updatedAt: '',
+    learnings: [],
+    ...overrides,
+  } as Mission;
+}
+
+function buildEvent(overrides: Partial<AgentEvent> = {}): AgentEvent {
+  return {
+    id: 'evt-1',
+    type: 'task:done_by_worker',
+    timestamp: '2026-04-27T01:00:00.000Z',
+    teamId: 'team-product',
+    teamName: 'Crewly Product',
+    memberId: 'leo',
+    memberName: 'Leo',
+    sessionName: 'crewly-product-leo',
+    previousValue: 'running',
+    newValue: 'done_by_worker',
+    changedField: 'taskStatus',
+    workItemId: 'wi-source-1',
+    ...overrides,
+  };
+}
+
+/**
+ * Build a fake TaskPoolService — only the methods bridge actually calls.
+ * Tracks addToPool calls on a shared array so tests can assert deterministic-id.
+ */
+function buildFakeTaskPool(initial: WorkItem[] = []) {
+  const items = new Map<string, WorkItem>();
+  for (const wi of initial) items.set(wi.id, wi);
+  const addCalls: WorkItem[] = [];
+
+  return {
+    addCalls,
+    items,
+    addToPool: jest.fn(async (wi: WorkItem) => {
+      addCalls.push(wi);
+      // Mirror real addToPool: dedup by id
+      if (items.has(wi.id)) return;
+      items.set(wi.id, wi);
+    }),
+    findWorkItem: jest.fn(async (id: string) => items.get(id) ?? null),
+    disposeFailedWorkItem: jest.fn(async () => null),
+  };
+}
+
+function buildBridge({
+  taskPool,
+  loadMission,
+  loadTeam,
+  eventBus,
+}: {
+  taskPool: ReturnType<typeof buildFakeTaskPool>;
+  loadMission?: (id: string) => Promise<Mission | null>;
+  loadTeam?: (id: string) => Promise<Team | null>;
+  eventBus?: EventBusService;
+}) {
+  const bus = eventBus ?? new EventBusService();
+  return {
+    bus,
+    bridge: new EventToWorkItemBridge({
+      eventBus: bus,
+      // Cast: we only need the methods bridge actually uses
+      taskPool: taskPool as unknown as import('../task-pool/task-pool.service.js').TaskPoolService,
+      loadMission: loadMission ?? (async () => null),
+      loadTeam: loadTeam ?? (async () => buildTeam()),
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Specs
+// ---------------------------------------------------------------------------
+
+describe('EventToWorkItemBridge', () => {
+  // V5 sanity check at the metadata layer — the file is the source of truth
+  // for which event types are subscribed; PR-time grep guards verify there's
+  // no parallel Trigger entity in the same directory.
+  it('BRIDGE_SUBSCRIBED_EVENTS exposes the 7 event types the brief lists', () => {
+    expect(BRIDGE_SUBSCRIBED_EVENTS).toEqual([
+      'task:done_by_worker',
+      'task:rejected',
+      'task:blocked',
+      'team:all_tasks_done',
+      'mission:review_due',
+      'mission:stale',
+      'mission:replanned',
+    ]);
+  });
+
+  describe('start / stop lifecycle', () => {
+    it('start() is idempotent — calling twice does not double-subscribe', async () => {
+      const sourceWI = buildWorkItem();
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+      bridge.start();
+
+      bus.publish(buildEvent());
+      // Drain microtasks
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(1);
+      bridge.stop();
+    });
+
+    it('stop() detaches subscriptions — no further handler invocations', async () => {
+      const sourceWI = buildWorkItem();
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+      bridge.stop();
+
+      bus.publish(buildEvent());
+      await Promise.resolve();
+      expect(taskPool.addCalls).toHaveLength(0);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // task:done_by_worker → verification WI for TL
+  // -------------------------------------------------------------------------
+  describe('task:done_by_worker handler', () => {
+    it('creates a verification WI for the TL with deterministic id (V1)', async () => {
+      const sourceWI = buildWorkItem();
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:done_by_worker' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(1);
+      const verifyWI = taskPool.addCalls[0];
+      expect(verifyWI.id).toBe(`${sourceWI.id}:verify:${sourceWI.id}`);
+      expect(verifyWI.type).toBe('review');
+      expect(verifyWI.owner).toBe('team_lead');
+      expect(verifyWI.target).toBe('crewly-product-sam');
+      // V1: idempotencyKey === id (documentary)
+      expect(verifyWI.metadata?.idempotencyKey).toBe(verifyWI.id);
+      // V6: triggerSource = 'event' on bridge-created WI
+      expect(verifyWI.metadata?.triggerSource).toBe('event');
+      bridge.stop();
+    });
+
+    it('tells the reviewer about the evidence the worker sent (#873)', async () => {
+      const withEvidence = buildWorkItem({
+        output: { summary: 'x', evidence: [{ type: 'artifact', path: '/a' }, { type: 'command', command: 'npm test', exitCode: 0 }] },
+      });
+      const taskPool = buildFakeTaskPool([withEvidence]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+      bus.publish(buildEvent({ type: 'task:done_by_worker' }));
+      await bridge.flushPending();
+      expect(taskPool.addCalls[0].description).toContain('Evidence: 1 artifact(s), 1 command(s)');
+      bridge.stop();
+
+      const noEvidence = buildWorkItem({ output: { summary: 'trust me' } });
+      const pool2 = buildFakeTaskPool([noEvidence]);
+      const b2 = buildBridge({ taskPool: pool2 });
+      b2.bridge.start();
+      b2.bus.publish(buildEvent({ type: 'task:done_by_worker' }));
+      await b2.bridge.flushPending();
+      expect(pool2.addCalls[0].description).toContain('Evidence: NONE');
+      b2.bridge.stop();
+    });
+
+    it("puts the worker's decision record in the brief, and nothing when there is none (#875)", async () => {
+      const withRecord = buildWorkItem({
+        output: {
+          summary: 'x',
+          evidence: [{ type: 'artifact', path: '/a' }],
+          decisions: ['Kept the v1 schema'],
+          notTaken: ['A new table — needs a migration'],
+          assumptions: ['Relay is on 1.5.24'],
+        },
+      });
+      const taskPool = buildFakeTaskPool([withRecord]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+      bus.publish(buildEvent({ type: 'task:done_by_worker' }));
+      await bridge.flushPending();
+      const brief = taskPool.addCalls[0].description;
+      expect(brief).toContain("Worker's record");
+      expect(brief).toContain('Decisions:\n  - Kept the v1 schema');
+      expect(brief).toContain('Not taken:\n  - A new table — needs a migration');
+      expect(brief).toContain('Assumptions:\n  - Relay is on 1.5.24');
+      bridge.stop();
+
+      const noRecord = buildWorkItem({ output: { summary: 'x', evidence: [{ type: 'artifact', path: '/a' }] } });
+      const pool2 = buildFakeTaskPool([noRecord]);
+      const b2 = buildBridge({ taskPool: pool2 });
+      b2.bridge.start();
+      b2.bus.publish(buildEvent({ type: 'task:done_by_worker' }));
+      await b2.bridge.flushPending();
+      expect(pool2.addCalls[0].description).not.toContain("Worker's record");
+      b2.bridge.stop();
+    });
+
+    // 2026-09-16: every verify WI is a full orchestrator wake-up. A cron tick
+    // re-runs itself, and bridge-auto wiki maintenance re-scans itself, so
+    // neither needs a verifier.
+    it('does NOT create a verification WI when the source is a cron_run', async () => {
+      const sourceWI = buildWorkItem({ type: 'cron_run' as WorkItemType });
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:done_by_worker' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(0);
+      bridge.stop();
+    });
+
+    it('does NOT create a verification WI for bridge-auto maintenance work (metadata.autoCreated)', async () => {
+      const sourceWI = buildWorkItem({
+        metadata: { teamId: 'team-product', triggerSource: 'event', autoCreated: true, kind: 'wiki_legacy_migrate' },
+      });
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:done_by_worker' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(0);
+      bridge.stop();
+    });
+
+    it('replay of the same event does NOT create a duplicate verification WI (V1)', async () => {
+      const sourceWI = buildWorkItem();
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:done_by_worker', id: 'evt-A' }));
+      await bridge.flushPending();
+      // Use a distinct sessionName so the EventBus's own publish-debounce doesn't
+      // suppress the second publish; the bridge-side dedup is the contract under test.
+      bus.publish(
+        buildEvent({ type: 'task:done_by_worker', id: 'evt-B', sessionName: 'agent-other' }),
+      );
+      await bridge.flushPending();
+
+      // addToPool was called twice (deterministic) but pool.items has one entry
+      expect(taskPool.addCalls).toHaveLength(2);
+      expect(taskPool.items.size).toBe(2); // sourceWI + 1 verify WI
+      bridge.stop();
+    });
+
+    it('logs and skips when source WorkItem cannot be resolved', async () => {
+      const taskPool = buildFakeTaskPool([]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:done_by_worker' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(0);
+      bridge.stop();
+    });
+
+    // -----------------------------------------------------------------------
+    // #698 — verify-of-verify cascade guard. A verification WI is itself a
+    // task; when the team lead completes it, it re-emits task:done_by_worker.
+    // Without the guard, each verify spawns another verify (verify-of-verify),
+    // an unbounded cascade that floods the pool and starves real work. These
+    // three tests pin each of the guard's recognised "source is a verification"
+    // signals → NO new verification WI is created.
+    // -----------------------------------------------------------------------
+    it('does NOT create a verify-of-verify when the source WI is a review (type=review)', async () => {
+      const sourceWI = buildWorkItem({ type: 'review' as WorkItemType });
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:done_by_worker' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(0);
+      bridge.stop();
+    });
+
+    it('does NOT create a verify-of-verify when the source id contains ":verify:" (cascade breaker)', async () => {
+      const verifyWI = buildWorkItem({ id: 'wi-x:verify:wi-x' });
+      const taskPool = buildFakeTaskPool([verifyWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:done_by_worker', workItemId: 'wi-x:verify:wi-x' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(0);
+      bridge.stop();
+    });
+
+    it('does NOT create a verify-of-verify when the source WI carries metadata.verifyOf', async () => {
+      const sourceWI = buildWorkItem({
+        metadata: { teamId: 'team-product', triggerSource: 'event', verifyOf: 'wi-source-1' },
+      });
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:done_by_worker' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(0);
+      bridge.stop();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // task:rejected → retry / escalation (V2)
+  // -------------------------------------------------------------------------
+  describe('task:rejected handler (V2 retry cap)', () => {
+    it('first rejection creates a retry WI with retryCount=1', async () => {
+      const sourceWI = buildWorkItem({ retryCount: 0 });
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:rejected' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(1);
+      const retryWI = taskPool.addCalls[0];
+      expect(retryWI.id).toBe(`${sourceWI.id}:retry:1`);
+      expect(retryWI.retryCount).toBe(1);
+      expect(retryWI.type).toBe(sourceWI.type); // same execution type
+      expect(retryWI.target).toBe(sourceWI.target); // same worker
+      expect(retryWI.metadata?.idempotencyKey).toBe(retryWI.id); // V1
+      bridge.stop();
+    });
+
+    it('retry of a non-delegate source carries requiresVerification so it goes back to review (CREW-403)', async () => {
+      const sourceWI = buildWorkItem({ retryCount: 0, type: 'project_task' as never });
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:rejected' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls[0].metadata?.requiresVerification).toBe(true);
+      bridge.stop();
+    });
+
+    it('third rejection escalates to a review WI (V2 — does NOT enqueue a retry)', async () => {
+      // Source WI has already been retried 3 times → retryCount >= cap
+      const sourceWI = buildWorkItem({ retryCount: 3 });
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:rejected' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(1);
+      const escalation = taskPool.addCalls[0];
+      expect(escalation.id).toBe(`${sourceWI.id}:review:max_retries`);
+      expect(escalation.type).toBe('review');
+      expect(escalation.owner).toBe('team_lead');
+      expect(escalation.target).toBe('crewly-product-sam');
+      expect(escalation.metadata?.reviewReason).toBe('max_retries_exceeded');
+      // V2 invariant: NO retry-shaped WI (id contains ':retry:')
+      const retries = taskPool.addCalls.filter((wi) => wi.id.includes(':retry:'));
+      expect(retries).toHaveLength(0);
+      bridge.stop();
+    });
+
+    it('at the retry cap the source is stamped succeeded_by → the review WI (#736 lifecycle)', async () => {
+      const sourceWI = buildWorkItem({ retryCount: 3 });
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:rejected' }));
+      await bridge.flushPending();
+
+      const reviewId = `${sourceWI.id}:review:max_retries`;
+      expect(taskPool.addCalls.map((wi) => wi.id)).toEqual([reviewId]);
+      // The source's lifecycle ends here: the disposition stamp points at the
+      // review WI, so the reconciler's safety net never re-escalates it and
+      // the auto-retry rule never re-queues it. Status is NOT mutated — the
+      // bridge never transitions status (see class doc), and `rejected` has
+      // no terminal edge by design (#733/#740).
+      expect(taskPool.disposeFailedWorkItem).toHaveBeenCalledTimes(1);
+      expect(taskPool.disposeFailedWorkItem).toHaveBeenCalledWith(sourceWI.id, {
+        reason: expect.stringContaining('retry cap'),
+        successorWorkItemId: reviewId,
+      });
+      expect(taskPool.items.get(sourceWI.id)?.status).toBe(sourceWI.status);
+      bridge.stop();
+    });
+
+    it('a retry rejection stamps the source with the retry WI as successor', async () => {
+      const sourceWI = buildWorkItem({ retryCount: 1 });
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:rejected' }));
+      await bridge.flushPending();
+
+      expect(taskPool.disposeFailedWorkItem).toHaveBeenCalledWith(sourceWI.id, {
+        reason: expect.stringContaining('retry 2/'),
+        successorWorkItemId: `${sourceWI.id}:retry:2`,
+      });
+      bridge.stop();
+    });
+
+    it('cron-sourced rejection demotes triggerSource on the retry WI (V6 / V9)', async () => {
+      // Sam's reminder #2: real WorkItem fixture with metadata.triggerSource='cron'
+      const sourceWI = buildWorkItem({
+        retryCount: 0,
+        metadata: { teamId: 'team-product', triggerSource: 'cron' },
+      });
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:rejected' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(1);
+      const retryWI = taskPool.addCalls[0];
+      // V6 / V9 demote: cron → event
+      expect(retryWI.metadata?.triggerSource).toBe('event');
+      expect(retryWI.metadata?.triggerSource).not.toBe('cron');
+      bridge.stop();
+    });
+
+    describe('model-upgrade hint for a worker on the Sonnet default', () => {
+      const teamWithLeo = (leoOverrides: Record<string, unknown> = {}): Team => {
+        const base = buildTeam();
+        return {
+          ...base,
+          members: [
+            ...base.members,
+            {
+              ...base.members[0],
+              id: 'leo-1',
+              name: 'Leo',
+              sessionName: 'crewly-product-leo-member-n',
+              role: 'developer',
+              hierarchyLevel: 2,
+              canDelegate: false,
+              parentMemberId: 'tl-1',
+              ...leoOverrides,
+            } as Team['members'][number],
+          ],
+        };
+      };
+      const HINT = 'Leo runs on Sonnet and was sent back twice for this';
+
+      it('first rejection: no hint', async () => {
+        const taskPool = buildFakeTaskPool([buildWorkItem({ retryCount: 0 })]);
+        const { bridge, bus } = buildBridge({ taskPool, loadTeam: async () => teamWithLeo() });
+        bridge.start();
+        bus.publish(buildEvent({ type: 'task:rejected' }));
+        await bridge.flushPending();
+        expect(taskPool.addCalls[0].metadata?.reviewerNote).toBeUndefined();
+        bridge.stop();
+      });
+
+      it('second rejection: the retry carries the hint and the next Verify item shows it', async () => {
+        const taskPool = buildFakeTaskPool([buildWorkItem({ retryCount: 1 })]);
+        const { bridge, bus } = buildBridge({ taskPool, loadTeam: async () => teamWithLeo() });
+        bridge.start();
+        bus.publish(buildEvent({ type: 'task:rejected' }));
+        await bridge.flushPending();
+        const retry = taskPool.addCalls[0];
+        expect(String(retry.metadata?.reviewerNote)).toContain(HINT);
+        expect(String(retry.metadata?.reviewerNote)).toContain('only change it after the owner says yes');
+
+        // The retry is done by the worker → the reviewer's Verify item includes the hint.
+        taskPool.items.set(retry.id, { ...retry, status: 'done_by_worker' });
+        bus.publish(buildEvent({ id: 'evt-2', type: 'task:done_by_worker', workItemId: retry.id }));
+        await bridge.flushPending();
+        const verify = taskPool.addCalls.find((wi) => wi.id === `${retry.id}:verify:${retry.id}`);
+        expect(verify?.description).toContain(HINT);
+        bridge.stop();
+      });
+
+      it('escalation text includes the hint', async () => {
+        const taskPool = buildFakeTaskPool([buildWorkItem({ retryCount: 3 })]);
+        const { bridge, bus } = buildBridge({ taskPool, loadTeam: async () => teamWithLeo() });
+        bridge.start();
+        bus.publish(buildEvent({ type: 'task:rejected' }));
+        await bridge.flushPending();
+        expect(taskPool.addCalls[0].description).toContain(HINT);
+        bridge.stop();
+      });
+
+      it('no hint when the worker has an explicit model', async () => {
+        const taskPool = buildFakeTaskPool([buildWorkItem({ retryCount: 1 })]);
+        const { bridge, bus } = buildBridge({ taskPool, loadTeam: async () => teamWithLeo({ modelId: 'sonnet' }) });
+        bridge.start();
+        bus.publish(buildEvent({ type: 'task:rejected' }));
+        await bridge.flushPending();
+        expect(taskPool.addCalls[0].metadata?.reviewerNote).toBeUndefined();
+        bridge.stop();
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // task:blocked → review WI for TL
+  // -------------------------------------------------------------------------
+  describe('task:blocked handler', () => {
+    it('creates a task-blocked review WI for the TL (reviewReason=task_blocked)', async () => {
+      const sourceWI = buildWorkItem({ status: 'blocked' });
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:blocked' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(1);
+      const reviewWI = taskPool.addCalls[0];
+      expect(reviewWI.id).toBe(`${sourceWI.id}:review:blocked`);
+      expect(reviewWI.type).toBe('review');
+      expect(reviewWI.owner).toBe('team_lead');
+      expect(reviewWI.metadata?.reviewReason).toBe('task_blocked');
+      expect(reviewWI.metadata?.idempotencyKey).toBe(reviewWI.id);
+      bridge.stop();
+    });
+
+    it('creates no review when the block has an until time — a planned wait (CREW-893)', async () => {
+      const sourceWI = buildWorkItem({
+        status: 'blocked',
+        blockSource: 'explicit',
+        metadata: { teamId: 'team-product', blockedUntil: '2026-10-27T14:05:00.000Z' },
+      });
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({ taskPool });
+      bridge.start();
+
+      bus.publish(buildEvent({ type: 'task:blocked' }));
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(0);
+      bridge.stop();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // team:all_tasks_done → emit mission:review_due
+  // -------------------------------------------------------------------------
+  describe('team:all_tasks_done handler', () => {
+    it('emits mission:review_due when mission is active', async () => {
+      const mission = buildMission();
+      const taskPool = buildFakeTaskPool([]);
+      const { bridge, bus } = buildBridge({
+        taskPool,
+        loadMission: async () => mission,
+      });
+
+      const downstream = jest.fn();
+      bus.onInProcess('mission:review_due', downstream);
+      bridge.start();
+
+      bus.publish(
+        buildEvent({
+          type: 'team:all_tasks_done',
+          missionId: mission.id,
+          workItemId: undefined,
+        }),
+      );
+      await bridge.flushPending();
+
+      // Downstream fired → bridge re-emitted as mission:review_due
+      expect(downstream).toHaveBeenCalledTimes(1);
+      const downstreamEvent = downstream.mock.calls[0][0] as AgentEvent;
+      expect(downstreamEvent.type).toBe('mission:review_due');
+      expect(downstreamEvent.missionId).toBe(mission.id);
+
+      // And the chained mission:review_due handler created the review WI
+      // (the bridge handler also fires for the emitted event)
+      const reviewWIs = taskPool.addCalls.filter((wi) => wi.type === 'review');
+      expect(reviewWIs.length).toBeGreaterThanOrEqual(1);
+      bridge.stop();
+    });
+
+    it('does NOT emit mission:review_due for non-active mission', async () => {
+      const mission = buildMission({ status: 'paused' });
+      const taskPool = buildFakeTaskPool([]);
+      const { bridge, bus } = buildBridge({
+        taskPool,
+        loadMission: async () => mission,
+      });
+
+      const downstream = jest.fn();
+      bus.onInProcess('mission:review_due', downstream);
+      bridge.start();
+
+      bus.publish(
+        buildEvent({
+          type: 'team:all_tasks_done',
+          missionId: mission.id,
+          workItemId: undefined,
+        }),
+      );
+      await bridge.flushPending();
+
+      expect(downstream).not.toHaveBeenCalled();
+      expect(taskPool.addCalls).toHaveLength(0);
+      bridge.stop();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // mission:* → review WI
+  // -------------------------------------------------------------------------
+  describe('mission:* handlers', () => {
+    it('mission:review_due creates a review WI with REVIEW-1-compatible id', async () => {
+      const mission = buildMission();
+      const taskPool = buildFakeTaskPool([]);
+      const { bridge, bus } = buildBridge({
+        taskPool,
+        loadMission: async () => mission,
+      });
+      bridge.start();
+
+      bus.publish(
+        buildEvent({
+          type: 'mission:review_due',
+          missionId: mission.id,
+          workItemId: undefined,
+        }),
+      );
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(1);
+      const reviewWI = taskPool.addCalls[0];
+      expect(reviewWI.id).toMatch(/^mission-1:review:\d{4}-\d{2}-\d{2}$/);
+      expect(reviewWI.metadata?.reviewReason).toBe('scheduled_review');
+      bridge.stop();
+    });
+
+    it('mission:stale creates a no_active_work review WI keyed on the day', async () => {
+      const mission = buildMission();
+      const taskPool = buildFakeTaskPool([]);
+      const { bridge, bus } = buildBridge({
+        taskPool,
+        loadMission: async () => mission,
+      });
+      bridge.start();
+
+      bus.publish(
+        buildEvent({
+          type: 'mission:stale',
+          missionId: mission.id,
+          workItemId: undefined,
+        }),
+      );
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(1);
+      const reviewWI = taskPool.addCalls[0];
+      expect(reviewWI.id).toMatch(/^mission-1:review:stale:\d{4}-\d{2}-\d{2}$/);
+      expect(reviewWI.metadata?.reviewReason).toBe('no_active_work');
+      bridge.stop();
+    });
+
+    it('mission:replanned uses the event id in the review WI id (one-shot per replan)', async () => {
+      const mission = buildMission();
+      const taskPool = buildFakeTaskPool([]);
+      const { bridge, bus } = buildBridge({
+        taskPool,
+        loadMission: async () => mission,
+      });
+      bridge.start();
+
+      const eventId = 'replan-evt-42';
+      bus.publish(
+        buildEvent({
+          id: eventId,
+          type: 'mission:replanned',
+          missionId: mission.id,
+          workItemId: undefined,
+        }),
+      );
+      await bridge.flushPending();
+
+      expect(taskPool.addCalls).toHaveLength(1);
+      const reviewWI = taskPool.addCalls[0];
+      expect(reviewWI.id).toBe(`mission-1:review:replan:${eventId}`);
+      bridge.stop();
+    });
+
+    it.each(['mission:review_due', 'mission:stale', 'mission:replanned'] as const)(
+      '%s does NOT create a review WI for a mission still pending approval',
+      async (type) => {
+        const mission = buildMission({ approval: { state: 'pending_approval' } });
+        const taskPool = buildFakeTaskPool([]);
+        const { bridge, bus } = buildBridge({
+          taskPool,
+          loadMission: async () => mission,
+        });
+        bridge.start();
+
+        bus.publish(buildEvent({ type, missionId: mission.id, workItemId: undefined }));
+        await bridge.flushPending();
+
+        expect(taskPool.addCalls).toHaveLength(0);
+        bridge.stop();
+      },
+    );
+
+    it('team:all_tasks_done does NOT emit review_due for a mission still pending approval', async () => {
+      const mission = buildMission({ approval: { state: 'pending_approval' } });
+      const taskPool = buildFakeTaskPool([]);
+      const { bridge, bus } = buildBridge({
+        taskPool,
+        loadMission: async () => mission,
+      });
+      bridge.start();
+      const published: string[] = [];
+      bus.onInProcess('mission:review_due', (e) => {
+        published.push(e.id);
+      });
+
+      bus.publish(
+        buildEvent({ type: 'team:all_tasks_done', missionId: mission.id, workItemId: undefined }),
+      );
+      await bridge.flushPending();
+
+      expect(published).toHaveLength(0);
+      expect(taskPool.addCalls).toHaveLength(0);
+      bridge.stop();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // V4 — TL fail-fast
+  // -------------------------------------------------------------------------
+  describe('V4: team-lead fail-fast', () => {
+    it('throws BridgeTeamLeadResolutionError when team is unknown', async () => {
+      const sourceWI = buildWorkItem();
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const { bridge, bus } = buildBridge({
+        taskPool,
+        loadTeam: async () => null, // no team resolvable
+      });
+      // Hook into the EE so we can observe the error
+      const errors: unknown[] = [];
+      bridge.start();
+      bus.publish(buildEvent({ type: 'task:done_by_worker' }));
+
+      // Drain microtasks so the safeDispatch's rethrow + EventBus's
+      // .catch() fire and we can grab the rejected promise from the
+      // bridge directly.
+      await bridge.flushPending();
+
+      // No WI was created because the TL resolution threw
+      expect(taskPool.addCalls).toHaveLength(0);
+      // Sanity: the actual error class is reachable via direct call too
+      const direct = (
+        bridge as unknown as {
+          resolveTeamLeadSession: (wi: WorkItem) => Promise<string>;
+        }
+      ).resolveTeamLeadSession(sourceWI);
+      await expect(direct).rejects.toBeInstanceOf(BridgeTeamLeadResolutionError);
+      void errors;
+      bridge.stop();
+    });
+
+    it('throws when team has no members at all', async () => {
+      const sourceWI = buildWorkItem();
+      const taskPool = buildFakeTaskPool([sourceWI]);
+      const teamWithNoMembers = buildTeam({ members: [] });
+      const { bridge } = buildBridge({
+        taskPool,
+        loadTeam: async () => teamWithNoMembers,
+      });
+      const direct = (
+        bridge as unknown as {
+          resolveTeamLeadSession: (wi: WorkItem) => Promise<string>;
+        }
+      ).resolveTeamLeadSession(sourceWI);
+      await expect(direct).rejects.toBeInstanceOf(BridgeTeamLeadResolutionError);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // V6 / V9 — assertNoCronFromCron
+  // -------------------------------------------------------------------------
+  describe('V6/V9: cron-recursion guard', () => {
+    it('assertNoCronFromCron throws when source WI has triggerSource=cron', () => {
+      // Sam's reminder #2: real WorkItem fixture, not a mock
+      const cronSource = buildWorkItem({
+        metadata: { teamId: 'team-product', triggerSource: 'cron' },
+      });
+      expect(() => assertNoCronFromCron(cronSource, 'schedule retry cron')).toThrow(
+        CronRecursionError,
+      );
+    });
+
+    it('assertNoCronFromCron is a no-op for event-sourced WI', () => {
+      const eventSource = buildWorkItem({
+        metadata: { teamId: 'team-product', triggerSource: 'event' },
+      });
+      expect(() => assertNoCronFromCron(eventSource, 'whatever')).not.toThrow();
+    });
+
+    it('assertNoCronFromCron is a no-op for manual-sourced WI', () => {
+      const manualSource = buildWorkItem({
+        metadata: { teamId: 'team-product', triggerSource: 'manual' },
+      });
+      expect(() => assertNoCronFromCron(manualSource, 'whatever')).not.toThrow();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ticket loop Phase 3 — review routing without metadata.teamId
+// ---------------------------------------------------------------------------
+
+describe('EventToWorkItemBridge — review routing (ticket-loop Phase 3)', () => {
+  /**
+   * Team member fixture.
+   *
+   * @param id - Member id
+   * @param sessionName - Session
+   * @param extra - More fields
+   * @returns Member
+   */
+  function member(id: string, sessionName: string, extra: Record<string, unknown> = {}) {
+    return { id, name: id, sessionName, role: 'developer', systemPrompt: '', agentStatus: 'active', workingStatus: 'idle', runtimeType: 'claude-code', createdAt: '', updatedAt: '', ...extra } as Team['members'][number];
+  }
+
+  /**
+   * Bridge with a listable team set and a pool that records verdicts.
+   *
+   * @param teams - Teams
+   * @param source - The finished item
+   * @returns Bridge, bus, pool
+   */
+  function setup(teams: Team[], source: WorkItem) {
+    const taskPool = {
+      ...buildFakeTaskPool([source]),
+      verifyItem: jest.fn(async () => null),
+      stampReviewEscalation: jest.fn(async () => true),
+    };
+    const escalateReviewToOwner = jest.fn(async () => undefined);
+    const bus = new EventBusService();
+    const bridge = new EventToWorkItemBridge({
+      eventBus: bus,
+      taskPool: taskPool as unknown as import('../task-pool/task-pool.service.js').TaskPoolService,
+      loadMission: async () => null,
+      loadTeam: async (id) => teams.find((t) => t.id === id) ?? null,
+      loadTeams: async () => teams,
+      escalateReviewToOwner,
+    });
+    bridge.start();
+    return { bridge, bus, taskPool, escalateReviewToOwner };
+  }
+
+  const worker = buildWorkItem({ target: 'dev-ann', metadata: { triggerSource: 'event' }, requestId: 'ticket-1' });
+
+  it('routes to the worker’s parent member, found from its session', async () => {
+    const team = buildTeam({
+      members: [member('tl', 'tl-sam', { canDelegate: true, hierarchyLevel: 1 }), member('lead-b', 'lead-bo', { canDelegate: true }), member('ann', 'dev-ann', { parentMemberId: 'lead-b' })],
+    });
+    const { bridge, bus, taskPool } = setup([team], worker);
+    bus.publish(buildEvent());
+    await bridge.flushPending();
+    expect(taskPool.addCalls).toHaveLength(1);
+    expect(taskPool.addCalls[0]).toMatchObject({ type: 'review', target: 'lead-bo' });
+    expect(taskPool.addCalls[0].description).toContain('"verdict":"rejected"');
+    expect(taskPool.verifyItem).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the team lead when the worker has no parent', async () => {
+    const team = buildTeam({ members: [member('tl', 'tl-sam', { canDelegate: true, hierarchyLevel: 1 }), member('ann', 'dev-ann')] });
+    const { bridge, bus, taskPool } = setup([team], worker);
+    bus.publish(buildEvent());
+    await bridge.flushPending();
+    expect(taskPool.addCalls[0]).toMatchObject({ target: 'tl-sam' });
+  });
+
+  it('routes to the orchestrator when the worker is its own lead or in no team — never self-verifies (#813)', async () => {
+    const solo = buildTeam({ members: [member('ann', 'dev-ann', { canDelegate: true, hierarchyLevel: 1 })] });
+    const a = setup([solo], worker);
+    a.bus.publish(buildEvent());
+    await a.bridge.flushPending();
+    expect(a.taskPool.addCalls).toHaveLength(1);
+    expect(a.taskPool.addCalls[0]).toMatchObject({ type: 'review', target: 'crewly-orc', metadata: expect.objectContaining({ verifyOf: worker.id }) });
+    expect(a.taskPool.verifyItem).not.toHaveBeenCalled();
+
+    const b = setup([], worker);
+    b.bus.publish(buildEvent());
+    await b.bridge.flushPending();
+    expect(b.taskPool.addCalls).toHaveLength(1);
+    expect(b.taskPool.addCalls[0]).toMatchObject({ target: 'crewly-orc' });
+    expect(b.taskPool.verifyItem).not.toHaveBeenCalled();
+  });
+
+  // 2026-10-26, WorkItem 599125f5: the orc did the work, the review item was
+  // targeted at the orc, the gate refused it as self_review on every attempt
+  // and the reconciler redelivered it every 5 min until the orc cancelled it.
+  it('work the orchestrator did itself goes to the owner for review — no review item targeted at the worker', async () => {
+    const orcWork = buildWorkItem({ target: 'crewly-orc', metadata: { triggerSource: 'event' } });
+    const orcTeam = buildTeam({ id: 'orc-team', members: [member('orc', 'crewly-orc', { canDelegate: true, hierarchyLevel: 1 })] });
+    const { bridge, bus, taskPool, escalateReviewToOwner } = setup([orcTeam], orcWork);
+    bus.publish(buildEvent());
+    await bridge.flushPending();
+    expect(taskPool.addCalls).toHaveLength(0);
+    expect(taskPool.verifyItem).not.toHaveBeenCalled();
+    expect(taskPool.stampReviewEscalation).toHaveBeenCalledWith(orcWork.id, 'reviewOwnerEscalatedAt');
+    expect(escalateReviewToOwner).toHaveBeenCalledWith(expect.objectContaining({ id: orcWork.id }));
+  });
+
+  it('a failed owner escalation is logged, not thrown; a failed stamp raises nothing', async () => {
+    const orcWork = buildWorkItem({ target: 'crewly-orc', metadata: { triggerSource: 'event' } });
+    const a = setup([], orcWork);
+    a.escalateReviewToOwner.mockRejectedValueOnce(new Error('relay down'));
+    a.bus.publish(buildEvent());
+    await expect(a.bridge.flushPending()).resolves.not.toThrow();
+    expect(a.taskPool.addCalls).toHaveLength(0);
+
+    const b = setup([], orcWork);
+    b.taskPool.stampReviewEscalation.mockResolvedValueOnce(false);
+    b.bus.publish(buildEvent());
+    await b.bridge.flushPending();
+    expect(b.escalateReviewToOwner).not.toHaveBeenCalled();
+    expect(b.taskPool.addCalls).toHaveLength(0);
+  });
+
+  it('reviews a cron/auto item that explicitly requires verification instead of skipping it (#813)', async () => {
+    const team = buildTeam({ members: [member('tl', 'tl-sam', { canDelegate: true, hierarchyLevel: 1 }), member('ann', 'dev-ann')] });
+    for (const gated of [
+      buildWorkItem({ type: 'cron_run', target: 'dev-ann', metadata: { requiresVerification: true } }),
+      buildWorkItem({ target: 'dev-ann', metadata: { autoCreated: true, requiresVerification: true } }),
+    ]) {
+      const { bridge, bus, taskPool } = setup([team], gated);
+      bus.publish(buildEvent());
+      await bridge.flushPending();
+      expect(taskPool.addCalls).toHaveLength(1);
+      expect(taskPool.addCalls[0]).toMatchObject({ type: 'review', target: 'tl-sam' });
+    }
+  });
+
+  it('a retry carries the reviewer’s feedback', async () => {
+    const rejected = buildWorkItem({ status: 'rejected', error: 'the header row is missing', description: 'export csv' });
+    const taskPool = buildFakeTaskPool([rejected]);
+    const { bridge, bus } = buildBridge({ taskPool });
+    bridge.start();
+    bus.publish(buildEvent({ type: 'task:rejected', newValue: 'rejected' }));
+    await bridge.flushPending();
+    const retry = taskPool.addCalls.find((w) => w.id.includes(':retry:'));
+    expect(retry?.description).toBe(
+      '## Rejection feedback (attempt 1)\n\nthe header row is missing\n\n---\n## Original brief\n\nexport csv',
+    );
+    expect(retry?.briefMarkdown).toBeUndefined();
+  });
+
+  it('retry carries rejection feedback above the brief in description AND briefMarkdown', async () => {
+    const rejected = buildWorkItem({
+      status: 'rejected',
+      error: 'add the footer',
+      description: 'short',
+      briefMarkdown: '# Long brief\nbody',
+    });
+    const taskPool = buildFakeTaskPool([rejected]);
+    const { bridge, bus } = buildBridge({ taskPool });
+    bridge.start();
+    bus.publish(buildEvent({ type: 'task:rejected', newValue: 'rejected' }));
+    await bridge.flushPending();
+    const retry = taskPool.addCalls.find((w) => w.id.includes(':retry:'));
+    for (const field of [retry?.description, retry?.briefMarkdown]) {
+      expect(field?.startsWith('## Rejection feedback (attempt 1)\n\nadd the footer')).toBe(true);
+    }
+    expect(retry?.briefMarkdown).toContain('## Original brief\n\n# Long brief\nbody');
+  });
+
+  it('a repeated rejection replaces the old feedback instead of stacking it', () => {
+    const first = withRejectionFeedback('brief', 'fix A', 1);
+    const second = withRejectionFeedback(first, 'fix B', 2);
+    expect(second).toBe('## Rejection feedback (attempt 2)\n\nfix B\n\n---\n## Original brief\n\nbrief');
+    expect(second).not.toContain('fix A');
+    expect(withRejectionFeedback('brief', undefined, 1)).toBe('brief');
+    expect(withRejectionFeedback(undefined, undefined, 1)).toBeUndefined();
+  });
+});

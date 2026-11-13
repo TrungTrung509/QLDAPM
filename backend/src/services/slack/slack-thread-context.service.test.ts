@@ -1,0 +1,480 @@
+/**
+ * Tests for SlackThreadContextService — the Slack thread / channel context
+ * read at delivery time (2026-09-28 #daily-info incident: a thread post by an
+ * agent on another machine never reached this machine).
+ */
+
+import { describeSlackFiles,
+  SlackThreadContextService,
+  contextKindFor,
+  renderSlackThreadContext,
+  type SlackContextFetch,
+  type SlackThreadContext,
+} from './slack-thread-context.service.js';
+import { SLACK_THREAD_CONTEXT_CONSTANTS } from '../../constants.js';
+
+type Handler = (method: string, params: URLSearchParams, token: string) => {
+  status?: number;
+  headers?: Record<string, string>;
+  body?: unknown;
+  throws?: Error;
+};
+
+/** A fake Slack Web API; records every call. */
+function fakeSlack(handler: Handler) {
+  const calls: Array<{ method: string; params: URLSearchParams; token: string }> = [];
+  const fetchImpl: SlackContextFetch = async (url, init) => {
+    const u = new URL(url);
+    const method = u.pathname.split('/').pop() as string;
+    const token = init.headers.Authorization.replace('Bearer ', '');
+    calls.push({ method, params: u.searchParams, token });
+    const r = handler(method, u.searchParams, token);
+    if (r.throws) throw r.throws;
+    const headers = r.headers ?? {};
+    return {
+      status: r.status ?? 200,
+      headers: { get: (n: string) => headers[n.toLowerCase()] ?? null },
+      json: async () => r.body,
+    };
+  };
+  return { fetchImpl, calls };
+}
+
+function makeLogger() {
+  return { info: jest.fn(), warn: jest.fn(), debug: jest.fn() };
+}
+
+const CH = 'C0C2QCGE9K9';
+const ROOT = '1790000000.000100';
+const DIGEST = '1790000100.000200';
+const TRIGGER = '1790000200.000300';
+
+/** The incident thread: owner's root, Ella's digest from the other machine, then the owner's @Atlas. */
+const incidentReplies = {
+  ok: true,
+  messages: [
+    { ts: ROOT, user: 'USTEVE', text: 'daily info thread' },
+    {
+      ts: DIGEST,
+      user: 'UELLABOT',
+      bot_id: 'B_ELLA',
+      bot_profile: { name: 'Ella (Personal Assistant Team)' },
+      text: '📬 Email digest: 1) AWS invoice 2) <@USTEVE> dentist reminder',
+    },
+    { ts: TRIGGER, user: 'USTEVE', text: '<@UATLASBOT> 看看上面的这些' },
+  ],
+};
+
+const usersInfo = (params: URLSearchParams) => {
+  const names: Record<string, { display_name: string; is_bot?: boolean }> = {
+    USTEVE: { display_name: 'Steve' },
+    UATLASBOT: { display_name: 'Atlas', is_bot: true },
+  };
+  const hit = names[params.get('user') as string];
+  return hit
+    ? { body: { ok: true, user: { name: hit.display_name.toLowerCase(), is_bot: !!hit.is_bot, profile: { display_name: hit.display_name } } } }
+    : { body: { ok: false, error: 'user_not_found' } };
+};
+
+describe('contextKindFor', () => {
+  it('thread reply → thread; top-level channel @ → channel; top-level DM or plain channel message → none', () => {
+    expect(contextKindFor({ channelId: CH, ts: TRIGGER, threadTs: ROOT })).toBe('thread');
+    expect(contextKindFor({ channelId: 'D123', ts: TRIGGER, threadTs: ROOT })).toBe('thread');
+    expect(contextKindFor({ channelId: CH, ts: TRIGGER, text: '<@UATLASBOT> hi' })).toBe('channel');
+    expect(contextKindFor({ channelId: 'D123', ts: TRIGGER, text: '<@UATLASBOT> hi' })).toBeNull();
+    expect(contextKindFor({ channelId: CH, ts: TRIGGER, text: 'hello' })).toBeNull();
+    // A thread root itself (threadTs === ts) is not a reply.
+    expect(contextKindFor({ channelId: CH, ts: ROOT, threadTs: ROOT, text: 'x' })).toBeNull();
+  });
+});
+
+describe('SlackThreadContextService', () => {
+  it('includes another machine\'s bot post with its author, excludes the trigger, resolves names', async () => {
+    const { fetchImpl, calls } = fakeSlack((method, params) =>
+      method === 'conversations.replies' ? { body: incidentReplies } : usersInfo(params),
+    );
+    const svc = new SlackThreadContextService({ fetchImpl, logger: makeLogger() });
+    const ctx = await svc.getContext(
+      { channelId: CH, ts: TRIGGER, threadTs: ROOT, text: '<@UATLASBOT> 看看上面的这些' },
+      ['xoxb-atlas', 'xoxb-workspace'],
+    );
+    expect(ctx?.kind).toBe('thread');
+    expect(ctx?.messages.map((m) => m.ts)).toEqual([ROOT, DIGEST]);
+    expect(ctx?.messages[1]).toMatchObject({ authorName: 'Ella (Personal Assistant Team)', isBot: true, userId: 'UELLABOT' });
+    expect(ctx?.messages[1].text).toContain('@Steve dentist');
+    expect(ctx?.messages[0].authorName).toBe('Steve');
+    const replies = calls.find((c) => c.method === 'conversations.replies');
+    expect(replies?.token).toBe('xoxb-atlas');
+    expect(replies?.params.get('ts')).toBe(ROOT);
+
+    const block = renderSlackThreadContext(ctx, { botUserId: 'UATLASBOT', name: 'Atlas' });
+    expect(block).toContain('Slack thread so far');
+    expect(block).toContain('Ella (Personal Assistant Team) [bot]: 📬 Email digest');
+    expect(block).not.toContain('看看上面的这些');
+  });
+
+  it('never shows an agent a signed Crewly Apps link from the conversation (apps P3)', () => {
+    const block = renderSlackThreadContext({
+      kind: 'channel',
+      totalBefore: 1,
+      messages: [{ ts: '1.1', authorName: 'Ella', isBot: true, text: '📱 G · <https://apps.crewlyai.com/28au74d9cj?k=SECRET_TOKEN|Open app>' }],
+    } as unknown as Parameters<typeof renderSlackThreadContext>[0]);
+    expect(block).not.toContain('SECRET_TOKEN');
+    expect(block).toContain('<https://apps.crewlyai.com/28au74d9cj?k=[redacted]|Open app>');
+  });
+
+  it('marks lines written by the same agent — own bot user id, or a username override with its name', async () => {
+    const { fetchImpl } = fakeSlack((method, params) =>
+      method === 'conversations.replies'
+        ? {
+            body: {
+              ok: true,
+              messages: [
+                { ts: '1.1', user: 'UATLASBOT', bot_id: 'B_A', bot_profile: { name: 'Atlas' }, text: 'my earlier answer' },
+                { ts: '1.2', bot_id: 'B_MASTER', subtype: 'bot_message', username: 'Atlas', text: 'posted via workspace bot' },
+                { ts: '1.3', bot_id: 'B_MASTER', subtype: 'bot_message', username: 'Ella', text: 'someone else' },
+                { ts: '1.4', user: 'USTEVE', text: 'follow-up' },
+              ],
+            },
+          }
+        : usersInfo(params),
+    );
+    const svc = new SlackThreadContextService({ fetchImpl, logger: makeLogger() });
+    const ctx = await svc.getContext({ channelId: CH, ts: '1.9', threadTs: '1.1' }, ['t']);
+    const block = renderSlackThreadContext(ctx, { botUserId: 'UATLASBOT', name: 'Atlas' });
+    expect(block).toContain('Atlas [bot] (you): my earlier answer');
+    expect(block).toContain('Atlas [bot] (you): posted via workspace bot');
+    expect(block).toContain('Ella [bot]: someone else');
+    expect(block).toContain('Steve: follow-up');
+    // Another agent sees no "(you)" on Atlas's lines.
+    expect(renderSlackThreadContext(ctx, { botUserId: 'UELLA', name: 'Ella' })).not.toContain('Atlas [bot] (you)');
+  });
+
+  it('leaves out replies posted after the trigger and channel housekeeping', async () => {
+    const { fetchImpl } = fakeSlack((method, params) =>
+      method === 'conversations.replies'
+        ? {
+            body: {
+              ok: true,
+              messages: [
+                { ts: '1.1', user: 'USTEVE', text: 'root' },
+                { ts: '1.2', user: 'USTEVE', subtype: 'channel_join', text: 'joined' },
+                { ts: '1.5', user: 'USTEVE', text: 'trigger' },
+                { ts: '1.6', user: 'USTEVE', text: 'later' },
+              ],
+            },
+          }
+        : usersInfo(params),
+    );
+    const svc = new SlackThreadContextService({ fetchImpl, logger: makeLogger() });
+    const ctx = await svc.getContext({ channelId: CH, ts: '1.5', threadTs: '1.1' }, ['t']);
+    expect(ctx?.messages.map((m) => m.text)).toEqual(['root']);
+  });
+
+  it('caps the count and the characters, keeping the newest', async () => {
+    const many = Array.from({ length: 50 }, (_, i) => ({ ts: `2.${String(i + 1).padStart(3, '0')}`, username: 'Bot', bot_id: 'B', text: `msg-${i + 1}` }));
+    const { fetchImpl } = fakeSlack(() => ({ body: { ok: true, messages: many } }));
+    const svc = new SlackThreadContextService({ fetchImpl, logger: makeLogger() });
+    const ctx = await svc.getContext({ channelId: CH, ts: '2.999', threadTs: '2.001' }, ['t']);
+    expect(ctx?.messages).toHaveLength(SLACK_THREAD_CONTEXT_CONSTANTS.MAX_MESSAGES);
+    expect(ctx?.totalBefore).toBe(50);
+    expect(ctx?.messages[ctx.messages.length - 1].text).toBe('msg-50');
+    // The rendered block is compact: the newest BLOCK_RECENT_MESSAGES when the agent never posted here.
+    // The thread root is not among the messages kept (the read is capped at MAX_MESSAGES), so no root line.
+    const block = renderSlackThreadContext(ctx);
+    expect(block).toContain(`${SLACK_THREAD_CONTEXT_CONSTANTS.BLOCK_RECENT_MESSAGES} of 50 messages, older ones omitted`);
+    expect(block).toContain('msg-50');
+    expect(block).not.toContain('msg-40');
+    expect(block).not.toContain(SLACK_THREAD_CONTEXT_CONSTANTS.ROOT_MARK);
+
+    // Character budget: the newest message survives, older ones fall off.
+    const big: SlackThreadContext = {
+      kind: 'thread',
+      channelId: CH,
+      messages: [
+        { ts: '3.1', isBot: false, authorName: 'A', text: 'old '.repeat(100) },
+        { ts: '3.2', isBot: false, authorName: 'B', text: 'newest' },
+      ],
+      totalBefore: 2,
+    };
+    const small = renderSlackThreadContext({ ...big, kind: 'channel' }, undefined, 50);
+    expect(small).toContain('B: newest');
+    expect(small).not.toContain('A: old');
+    expect(small).toContain('1 of 2 messages, older ones omitted');
+  });
+
+  // crewly#1344: a thread older than the window arrived headless — the agent
+  // saw the newest eight lines and not what the thread was about.
+  it('a thread block always opens with the root message, marked, and says how many messages lie between', () => {
+    const ctx: SlackThreadContext = {
+      kind: 'thread',
+      channelId: CH,
+      threadTs: '4.001',
+      totalBefore: 12,
+      messages: Array.from({ length: 12 }, (_, i) => ({ ts: `4.${String(i + 1).padStart(3, '0')}`, isBot: false, authorName: i === 0 ? 'Steve' : 'Dana', text: i === 0 ? 'Plan the Q4 launch video' : `detail ${i}` })),
+    };
+    const block = renderSlackThreadContext(ctx);
+    const lines = block.split('\n').filter((l) => l.startsWith('  '));
+    expect(lines[0]).toBe(`  Steve ${SLACK_THREAD_CONTEXT_CONSTANTS.ROOT_MARK}: Plan the Q4 launch video`);
+    expect(lines[1]).toBe('  … 3 older messages omitted …');
+    expect(lines).toHaveLength(2 + SLACK_THREAD_CONTEXT_CONSTANTS.BLOCK_RECENT_MESSAGES);
+    expect(block).toContain('9 of 12 messages, the root and the newest kept, older ones omitted');
+    // Everything shown already: no root line, no omitted line.
+    const short = renderSlackThreadContext({ ...ctx, totalBefore: 3, messages: ctx.messages.slice(0, 3) });
+    expect(short).not.toContain(SLACK_THREAD_CONTEXT_CONSTANTS.ROOT_MARK);
+    expect(short).toContain('3 messages');
+  });
+
+  it('describes attachments by kind, name and title / alt text instead of a bare file name (crewly#1344)', async () => {
+    const { fetchImpl } = fakeSlack((method, params) =>
+      method === 'conversations.replies'
+        ? {
+            body: {
+              ok: true,
+              messages: [
+                { ts: '5.1', user: 'USTEVE', text: 'see these', files: [{ name: 'IMG_4821.jpg', mimetype: 'image/jpeg', filetype: 'jpg', alt_txt: 'the venue entrance' }, { name: 'deck.pdf', filetype: 'pdf', title: 'Q4 deck' }, { title: 'notes', filetype: 'txt' }] },
+                { ts: '5.5', user: 'USTEVE', text: 'trigger' },
+              ],
+            },
+          }
+        : usersInfo(params),
+    );
+    const svc = new SlackThreadContextService({ fetchImpl, logger: makeLogger() });
+    const ctx = await svc.getContext({ channelId: CH, ts: '5.5', threadTs: '5.1' }, ['t']);
+    expect(ctx?.messages[0].text).toBe('see these [attachments: image "IMG_4821.jpg" — alt: the venue entrance; PDF "deck.pdf" — Q4 deck; txt file "notes"]');
+    expect(describeSlackFiles(undefined)).toBe('');
+    expect(describeSlackFiles([{ name: 'clip.mp4', mimetype: 'video/mp4' }])).toBe('[attachments: video "clip.mp4"]');
+  });
+
+  // 2026-10-08, #content-team: Rex (another machine) asked Ella three times
+  // in the thread; none of it reached Ella's machine. The owner then pinged
+  // "@Ella" with no text, and Ella answered a different topic.
+  describe('compact thread so far (2026-10-08 #content-team)', () => {
+    const ELLA = 'U0ELLA';
+    const REX = 'U0REX';
+    const thread = (): SlackThreadContext => ({
+      kind: 'thread',
+      channelId: CH,
+      totalBefore: 14,
+      messages: [
+        { ts: '10.01', isBot: false, authorName: 'Steve', text: 'video plan?' },
+        ...Array.from({ length: 8 }, (_, i) => ({ ts: `10.${String(i + 2).padStart(2, '0')}`, isBot: true, authorName: 'Dana', text: `old research ${i}` })),
+        { ts: '10.20', isBot: true, userId: ELLA, authorName: 'Ella (Crewly Marketing)', text: 'Here is the English draft: ' + 'x'.repeat(4000) },
+        { ts: '10.21', isBot: true, userId: REX, authorName: 'Rex', text: '@Ella (Crewly Marketing) the people half section is missing', mentionIds: [ELLA] },
+        { ts: '10.22', isBot: true, userId: REX, authorName: 'Rex', text: 'Steve, status: still waiting on the people half' },
+        { ts: '10.23', isBot: true, userId: REX, authorName: 'Rex', text: '@Ella (Crewly Marketing) please paste the body here', mentionIds: [ELLA] },
+        { ts: '10.24', isBot: false, userId: 'USTEVE', authorName: 'Steve', text: 'anything else?' },
+      ],
+    });
+
+    it('shows everything since the agent\'s own last post (at least the newest 8), clipped, other machines included', () => {
+      const block = renderSlackThreadContext(thread(), { botUserId: ELLA, name: 'Ella (Crewly Marketing)' });
+      const lines = block.split('\n').filter((l) => l.startsWith('  '));
+      // The thread root first (crewly#1344), then the newest 8, which reach back past Ella's own post.
+      expect(lines).toHaveLength(2 + 8);
+      expect(lines[0]).toBe(`  Steve ${SLACK_THREAD_CONTEXT_CONSTANTS.ROOT_MARK}: video plan?`);
+      expect(lines[1]).toBe('  … 5 older messages omitted …');
+      expect(lines[2]).toContain('Dana [bot]: old research 5');
+      expect(block).toContain('Ella (Crewly Marketing) [bot] (you): Here is the English draft');
+      // A 4 000-char post is clipped to the block's per-message size.
+      const own = lines.find((l) => l.includes('(you)')) as string;
+      expect(own.length).toBeLessThan(SLACK_THREAD_CONTEXT_CONSTANTS.BLOCK_PER_MESSAGE_CHARS + 80);
+      expect(block).toContain('Rex [bot]: @Ella (Crewly Marketing) please paste the body here');
+    });
+
+    it('marks what came after the agent\'s last post and is addressed to it (or a person\'s post) as not answered', () => {
+      const block = renderSlackThreadContext(thread(), { botUserId: ELLA, name: 'Ella (Crewly Marketing)' });
+      const mark = SLACK_THREAD_CONTEXT_CONSTANTS.UNANSWERED_MARK;
+      const marked = block.split('\n').filter((l) => l.endsWith(mark));
+      expect(marked.map((l) => l.trim())).toEqual([
+        `Rex [bot]: @Ella (Crewly Marketing) the people half section is missing ${mark}`,
+        `Rex [bot]: @Ella (Crewly Marketing) please paste the body here ${mark}`,
+        `Steve: anything else? ${mark}`,
+      ]);
+      // A bot's status line not addressed to her, and her own post, are not marked.
+      expect(block).not.toMatch(new RegExp(`still waiting on the people half ${mark}`));
+      expect(block).toContain('3 lines marked');
+      // Another agent sees no marks for Ella's requests.
+      expect(renderSlackThreadContext(thread(), { botUserId: 'U0ATLAS', name: 'Atlas' })).not.toContain(mark);
+    });
+
+    it('reaches back to the agent\'s own last post when that is older than the newest 8', () => {
+      const ctx = thread();
+      // Ella's post moved to the start: everything after it is shown.
+      ctx.messages = [ctx.messages[9], ...ctx.messages.slice(0, 9), ...ctx.messages.slice(10)];
+      const lines = renderSlackThreadContext(ctx, { botUserId: ELLA }, 100_000).split('\n').filter((l) => l.startsWith('  '));
+      expect(lines).toHaveLength(ctx.messages.length);
+      expect(lines[0]).toContain('(you)');
+    });
+
+    it('records the ids a message @-mentions', async () => {
+      const { fetchImpl } = fakeSlack((method, params) =>
+        method === 'conversations.replies'
+          ? { body: { ok: true, messages: [{ ts: '1.1', user: 'USTEVE', text: 'root' }, { ts: '1.2', user: 'UREX', bot_id: 'B_REX', bot_profile: { name: 'Rex' }, text: '<@UATLASBOT> paste it <@USTEVE>' }] } }
+          : usersInfo(params),
+      );
+      const svc = new SlackThreadContextService({ fetchImpl, logger: makeLogger() });
+      const ctx = await svc.getContext({ channelId: CH, ts: '1.9', threadTs: '1.1' }, ['t']);
+      expect(ctx?.messages[1].mentionIds).toEqual(['UATLASBOT', 'USTEVE']);
+      expect(ctx?.messages[0].mentionIds).toBeUndefined();
+    });
+  });
+
+  it('reuses one fetch per (channel, thread) for a minute', async () => {
+    let now = 1_000_000;
+    const { fetchImpl, calls } = fakeSlack((method, params) =>
+      method === 'conversations.replies' ? { body: incidentReplies } : usersInfo(params),
+    );
+    const svc = new SlackThreadContextService({ fetchImpl, now: () => now, logger: makeLogger() });
+    const req = { channelId: CH, ts: TRIGGER, threadTs: ROOT };
+    await svc.getContext(req, ['t']);
+    await svc.getContext(req, ['t']);
+    expect(calls.filter((c) => c.method === 'conversations.replies')).toHaveLength(1);
+    // Names are cached too.
+    const lookups = calls.filter((c) => c.method === 'users.info').length;
+    now += SLACK_THREAD_CONTEXT_CONSTANTS.CACHE_TTL_MS + 1;
+    await svc.getContext(req, ['t']);
+    expect(calls.filter((c) => c.method === 'conversations.replies')).toHaveLength(2);
+    expect(calls.filter((c) => c.method === 'users.info').length).toBe(lookups);
+  });
+
+  it('missing scope: tries the next token, then gives up with no block and logs the scope once per channel', async () => {
+    const logger = makeLogger();
+    const { fetchImpl, calls } = fakeSlack(() => ({ body: { ok: false, error: 'missing_scope', needed: 'groups:history' } }));
+    const svc = new SlackThreadContextService({ fetchImpl, logger, now: (() => { let t = 0; return () => (t += 120_000); })() });
+    const req = { channelId: 'G_PRIVATE', ts: TRIGGER, threadTs: ROOT };
+    expect(await svc.getContext(req, ['a', 'b'])).toBeNull();
+    expect(calls.map((c) => c.token)).toEqual(['a', 'b']);
+    expect(await svc.getContext(req, ['a', 'b'])).toBeNull();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][1]).toMatchObject({ channelId: 'G_PRIVATE', missingScope: 'groups:history' });
+  });
+
+  it('not_in_channel with the first token falls back to the next', async () => {
+    const { fetchImpl } = fakeSlack((method, params, token) => {
+      if (method === 'conversations.replies') {
+        return token === 'outsider' ? { body: { ok: false, error: 'not_in_channel' } } : { body: incidentReplies };
+      }
+      return usersInfo(params);
+    });
+    const svc = new SlackThreadContextService({ fetchImpl, logger: makeLogger() });
+    const ctx = await svc.getContext({ channelId: CH, ts: TRIGGER, threadTs: ROOT }, ['outsider', 'member']);
+    expect(ctx?.messages).toHaveLength(2);
+  });
+
+  it('429: no block, the token rests for Retry-After, logged once', async () => {
+    let now = 5_000_000;
+    const logger = makeLogger();
+    const { fetchImpl, calls } = fakeSlack(() => ({ status: 429, headers: { 'retry-after': '30' }, body: {} }));
+    const svc = new SlackThreadContextService({ fetchImpl, logger, now: () => now });
+    expect(await svc.getContext({ channelId: CH, ts: TRIGGER, threadTs: ROOT }, ['t'])).toBeNull();
+    // Within Retry-After: the token is not called again.
+    now += 10_000;
+    expect(await svc.getContext({ channelId: CH, ts: '1790000300.1', threadTs: ROOT }, ['t'])).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][1]).toMatchObject({ reason: 'rate_limited', retryAfterMs: 30_000 });
+  });
+
+  it('getContextWithinRateLimit: waits out a retry-after that fits the budget, gives up at once when it does not (one responder, the one retry)', async () => {
+    let now = 5_000_000;
+    let limited = true;
+    const { fetchImpl, calls } = fakeSlack((method, params) => {
+      if (method === 'conversations.replies') {
+        if (limited) {
+          limited = false;
+          return { status: 429, headers: { 'retry-after': '1' }, body: {} };
+        }
+        return { body: incidentReplies };
+      }
+      return usersInfo(params);
+    });
+    const sleep = jest.fn(async (ms: number) => {
+      now += ms;
+    });
+    const svc = new SlackThreadContextService({ fetchImpl, logger: makeLogger(), now: () => now, sleep });
+    const req = { channelId: CH, ts: TRIGGER, threadTs: ROOT };
+    expect(await svc.getContext(req, ['t'])).toBeNull();
+    // A plain retry inside the retry-after would not even call Slack; this one waits it out.
+    const ctx = await svc.getContextWithinRateLimit(req, ['t'], 1_600);
+    expect(sleep).toHaveBeenCalledWith(1_000);
+    expect(ctx?.messages).toHaveLength(2);
+    expect(calls.filter((c) => c.method === 'conversations.replies')).toHaveLength(2);
+
+    // A retry-after longer than the budget: no wait, no call.
+    const slow = fakeSlack(() => ({ status: 429, headers: { 'retry-after': '5' }, body: {} }));
+    const sleep2 = jest.fn(async () => undefined);
+    const svc2 = new SlackThreadContextService({ fetchImpl: slow.fetchImpl, logger: makeLogger(), now: () => now, sleep: sleep2 });
+    expect(await svc2.getContext(req, ['t'])).toBeNull();
+    expect(await svc2.getContextWithinRateLimit(req, ['t'], 1_600)).toBeNull();
+    expect(sleep2).not.toHaveBeenCalled();
+    expect(slow.calls).toHaveLength(1);
+  });
+
+  it('network error: no block, never throws, logged once', async () => {
+    const logger = makeLogger();
+    const { fetchImpl } = fakeSlack(() => ({ throws: new Error('ECONNRESET') }));
+    const svc = new SlackThreadContextService({ fetchImpl, logger, now: (() => { let t = 0; return () => (t += 120_000); })() });
+    await expect(svc.getContext({ channelId: CH, ts: TRIGGER, threadTs: ROOT }, ['a', 'b'])).resolves.toBeNull();
+    await expect(svc.getContext({ channelId: CH, ts: TRIGGER, threadTs: ROOT }, ['a', 'b'])).resolves.toBeNull();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][1]).toMatchObject({ reason: 'network', error: 'ECONNRESET' });
+  });
+
+  it('a top-level @-mention reads recent channel history before it (oldest→newest)', async () => {
+    const { fetchImpl, calls } = fakeSlack((method, params) =>
+      method === 'conversations.history'
+        ? {
+            body: {
+              ok: true,
+              messages: [
+                { ts: '4.3', bot_id: 'B_ELLA', user: 'UELLABOT', bot_profile: { name: 'Ella' }, text: 'newest bot post' },
+                { ts: '4.1', user: 'USTEVE', text: 'older human post' },
+              ],
+            },
+          }
+        : usersInfo(params),
+    );
+    const svc = new SlackThreadContextService({ fetchImpl, logger: makeLogger() });
+    const ctx = await svc.getContext({ channelId: CH, ts: '4.5', text: '<@UATLASBOT> what do you think?' }, ['t']);
+    const history = calls.find((c) => c.method === 'conversations.history');
+    expect(history?.params.get('latest')).toBe('4.5');
+    expect(history?.params.get('inclusive')).toBe('false');
+    expect(history?.params.get('limit')).toBe(String(SLACK_THREAD_CONTEXT_CONSTANTS.CHANNEL_HISTORY_LIMIT));
+    expect(ctx?.kind).toBe('channel');
+    expect(ctx?.messages.map((m) => m.text)).toEqual(['older human post', 'newest bot post']);
+    expect(renderSlackThreadContext(ctx)).toContain('Recent Slack channel messages before this one');
+  });
+
+  it('a top-level DM, and a channel message with no mention, fetch nothing', async () => {
+    const { fetchImpl, calls } = fakeSlack(() => ({ body: { ok: true, messages: [] } }));
+    const svc = new SlackThreadContextService({ fetchImpl, logger: makeLogger() });
+    expect(await svc.getContext({ channelId: 'D0C2YLU8F2A', ts: '5.1', text: '<@UX1> hi' }, ['t'])).toBeNull();
+    expect(await svc.getContext({ channelId: CH, ts: '5.1', text: 'hi all' }, ['t'])).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a threaded DM reads the DM thread', async () => {
+    const { fetchImpl, calls } = fakeSlack((method, params) =>
+      method === 'conversations.replies' ? { body: { ok: true, messages: [{ ts: '6.1', user: 'USTEVE', text: 'root' }] } } : usersInfo(params),
+    );
+    const svc = new SlackThreadContextService({ fetchImpl, logger: makeLogger() });
+    const ctx = await svc.getContext({ channelId: 'D0C2YLU8F2A', ts: '6.2', threadTs: '6.1' }, ['xoxb-ella']);
+    expect(calls[0]).toMatchObject({ method: 'conversations.replies', token: 'xoxb-ella' });
+    expect(ctx?.messages.map((m) => m.text)).toEqual(['root']);
+  });
+
+  it('no tokens → nothing fetched', async () => {
+    const { fetchImpl, calls } = fakeSlack(() => ({ body: {} }));
+    const svc = new SlackThreadContextService({ fetchImpl, logger: makeLogger() });
+    expect(await svc.getContext({ channelId: CH, ts: TRIGGER, threadTs: ROOT }, [])).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe('renderSlackThreadContext', () => {
+  it('returns an empty string for no context', () => {
+    expect(renderSlackThreadContext(null)).toBe('');
+    expect(renderSlackThreadContext({ kind: 'thread', channelId: CH, messages: [], totalBefore: 0 })).toBe('');
+  });
+});

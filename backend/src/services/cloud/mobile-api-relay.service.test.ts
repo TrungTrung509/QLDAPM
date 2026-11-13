@@ -1,0 +1,417 @@
+/**
+ * Tests for MobileApiRelayService — allowlist, proxying, reply round-trip,
+ * and resilience (never hangs the phone).
+ *
+ * @module services/cloud/mobile-api-relay.service.test
+ */
+
+import {
+  MobileApiRelayService,
+  isAllowedMobileApiCall,
+  pathForLog,
+  type MobileRelayIncomingMessage,
+  type IMobileRelayCloudSync,
+} from './mobile-api-relay.service.js';
+import { verifyInternalCredential } from '../core/owner-auth.service.js';
+
+const SILENT = {
+  info() {},
+  warn() {},
+  error() {},
+  debug() {},
+} as unknown as ConstructorParameters<typeof MobileApiRelayService>[0]['logger'];
+
+/** In-memory cloud-sync stub that captures replies + lets tests inject messages. */
+function makeSync() {
+  const handlers: Array<(msg: MobileRelayIncomingMessage) => void> = [];
+  const sent: Array<{ to: string; type: string; payload: unknown }> = [];
+  const sync: IMobileRelayCloudSync = {
+    on: (_e, h) => { handlers.push(h); },
+    off: (_e, h) => { const i = handlers.indexOf(h); if (i >= 0) handlers.splice(i, 1); },
+    sendMessage: async (to, type, payload) => { sent.push({ to, type, payload }); },
+  };
+  const emit = (msg: MobileRelayIncomingMessage) => { for (const h of [...handlers]) h(msg); };
+  return { sync, sent, emit, handlers };
+}
+
+const flush = () => new Promise((r) => setTimeout(r, 0));
+
+describe('isAllowedMobileApiCall', () => {
+  it('allows the owner Upgrade / Restart controls but not other system mutations', () => {
+    expect(isAllowedMobileApiCall('GET', '/system/update-status')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/system/upgrade')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/system/restart')).toBe(true);
+    expect(isAllowedMobileApiCall('PATCH', '/system/config')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/system/config/default')).toBe(false);
+  });
+
+  it('allows Talk voice transcription (status, clip, setup) and nothing else under /talk', () => {
+    expect(isAllowedMobileApiCall('GET', '/talk/transcribe/status')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/talk/transcribe')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/talk/transcribe/setup')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/talk/other')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/talk/other')).toBe(false);
+  });
+
+  it('allows Drive mode: the briefing queue, its four actions and the live token', () => {
+    expect(isAllowedMobileApiCall('GET', '/briefing')).toBe(true);
+    for (const action of ['answer', 'skip', 'later', 'ask']) {
+      expect(isAllowedMobileApiCall('POST', `/briefing/d%3AD-7/${action}`)).toBe(true);
+    }
+    expect(isAllowedMobileApiCall('GET', '/talk/live-token/status')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/talk/live-token')).toBe(true);
+    // Nothing else under those paths.
+    expect(isAllowedMobileApiCall('POST', '/briefing')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/briefing/d%3AD-7/delete')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/briefing//answer')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/briefing/../decisions/answer')).toBe(false);
+    expect(isAllowedMobileApiCall('GET', '/briefing/extra')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/talk/live-token/other')).toBe(false);
+  });
+
+  it('allows the read surface', () => {
+    expect(isAllowedMobileApiCall('GET', '/teams')).toBe(true);
+    // Portal-driven Slack team channel management.
+    expect(isAllowedMobileApiCall('GET', '/slack/team-channels')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/slack/team-channels')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/slack/cloud/status')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/slack/cloud/workspace')).toBe(false);
+    expect(isAllowedMobileApiCall('GET', '/escalations')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/task-pool/items')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/requests?status=running')).toBe(true);
+  });
+
+  it('carries the owner driving a browser they took over, but not the agent driving endpoints', () => {
+    expect(isAllowedMobileApiCall('POST', '/browser/sessions/pia/take-control')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/browser/sessions/pia/input')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/browser/click')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/browser/navigate')).toBe(false);
+  });
+
+  it('carries project tickets but not the v1 migration', () => {
+    expect(isAllowedMobileApiCall('GET', '/project-tickets/p1')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/project-tickets/p1/APP-1/transition')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/project-tickets-migrate/p1')).toBe(false);
+  });
+
+  it('allows reading an agent timeline, not writing to it', () => {
+    expect(isAllowedMobileApiCall('GET', '/chat/agents/ella/timeline?limit=50')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/chat/agents/ella/timeline')).toBe(false);
+  });
+
+  it('allows only the human-in-the-loop mutations', () => {
+    expect(isAllowedMobileApiCall('POST', '/escalations/abc/resolve')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/approvals/xyz/approve')).toBe(true);
+    // Ticket loop: read the board, and "不用记" from the phone.
+    expect(isAllowedMobileApiCall('GET', '/tickets?column=todo')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/tickets/abc/dismiss')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/teams')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/task-pool/add')).toBe(false);
+    // WhatsApp reply drafts: review / send / discard from the phone; the inbox itself stays local.
+    expect(isAllowedMobileApiCall('GET', '/whatsapp/drafts?status=pending')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/whatsapp/drafts/W3/send')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/whatsapp/inbox')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/whatsapp/send')).toBe(false);
+  });
+
+  it('allows the device-code Cloud pairing routes, but not the token-carrying connect', () => {
+    expect(isAllowedMobileApiCall('POST', '/cloud/device/start')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/cloud/device/status')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/cloud/device/cancel')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/cloud/device/start')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/cloud/connect')).toBe(false);
+  });
+
+  it('rejects traversal, non-rooted, and odd methods', () => {
+    expect(isAllowedMobileApiCall('GET', '/teams/../settings')).toBe(false);
+    expect(isAllowedMobileApiCall('GET', 'teams')).toBe(false);
+    expect(isAllowedMobileApiCall('GET', '//evil')).toBe(false);
+    expect(isAllowedMobileApiCall('DELETE', '/teams')).toBe(false);
+  });
+});
+
+describe('MobileApiRelayService', () => {
+  it('proxies an allowed GET to the local API and replies api_response', async () => {
+    const { sync, sent, emit } = makeSync();
+    const fetchImpl = jest.fn().mockResolvedValue(
+      new Response(JSON.stringify({ success: true, data: [{ id: 't1' }] }), { status: 200 }),
+    ) as unknown as typeof fetch;
+    const svc = new MobileApiRelayService({ cloudSync: sync, webPort: 8787, fetchImpl, logger: SILENT });
+    svc.start();
+
+    emit({ type: 'api_request', from: 'phone-1', payload: { id: 'r1', method: 'GET', path: '/teams' } });
+    await flush();
+
+    expect(fetchImpl).toHaveBeenCalledWith('http://127.0.0.1:8787/api/teams', expect.objectContaining({ method: 'GET' }));
+    // Marks the call as the phone's (tickets it files are `mobile`).
+    expect((fetchImpl as unknown as jest.Mock).mock.calls[0][1].headers).toMatchObject({ 'x-crewly-client': 'mobile' });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ to: 'phone-1', type: 'api_response' });
+    const payload = sent[0].payload as { id: string; status: number; body: { success: boolean } };
+    expect(payload.id).toBe('r1');
+    expect(payload.status).toBe(200);
+    expect(payload.body.success).toBe(true);
+  });
+
+  it('replies to a portal sender (queue id in fromDeviceName, no device id) via sendToPeerQueueId', async () => {
+    const { sync, sent, emit } = makeSync();
+    const viaQueue: Array<{ to: string; type: string }> = [];
+    (sync as IMobileRelayCloudSync).sendToPeerQueueId = async (to, type) => { viaQueue.push({ to, type }); };
+    const fetchImpl = jest.fn().mockResolvedValue(new Response(JSON.stringify({ success: true, data: {} }), { status: 200 })) as unknown as typeof fetch;
+    const svc = new MobileApiRelayService({ cloudSync: sync, webPort: 8787, fetchImpl, logger: SILENT });
+    svc.start();
+
+    emit({ type: 'api_request', fromDeviceName: 'portal-queue-1', payload: { id: 'p1', method: 'GET', path: '/slack/team-channels' } });
+    await flush();
+
+    expect(viaQueue).toEqual([{ to: 'portal-queue-1', type: 'api_response' }]);
+    expect(sent).toHaveLength(0);
+  });
+
+  it('forwards POST bodies for allowed mutations', async () => {
+    const { sync, sent, emit } = makeSync();
+    const fetchImpl = jest.fn().mockResolvedValue(new Response('{"success":true}', { status: 200 })) as unknown as typeof fetch;
+    const svc = new MobileApiRelayService({ cloudSync: sync, webPort: 8787, fetchImpl, logger: SILENT });
+    svc.start();
+
+    emit({
+      type: 'api_request',
+      from: 'phone-1',
+      payload: { id: 'r2', method: 'POST', path: '/escalations/e1/resolve', body: { resolution: 'approve' } },
+    });
+    await flush();
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://127.0.0.1:8787/api/escalations/e1/resolve',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ resolution: 'approve' }),
+        // Relayed calls are the Cloud-authenticated owner's: they present the owner token.
+        headers: expect.objectContaining({ 'x-crewly-token': expect.any(String) }),
+      }),
+    );
+    // …and the in-memory relay credential, which makes the call `relay-owner` (#999).
+    const relayHeaders = (fetchImpl as unknown as jest.Mock).mock.calls[0][1].headers as Record<string, string>;
+    expect(verifyInternalCredential(relayHeaders['x-crewly-internal'])).toBe('relay');
+    expect((sent[0].payload as { status: number }).status).toBe(200);
+  });
+
+  it('replies 403 (never silent-drops) for a blocked path', async () => {
+    const { sync, sent, emit } = makeSync();
+    const fetchImpl = jest.fn() as unknown as typeof fetch;
+    const svc = new MobileApiRelayService({ cloudSync: sync, webPort: 8787, fetchImpl, logger: SILENT });
+    svc.start();
+
+    emit({ type: 'api_request', from: 'phone-1', payload: { id: 'r3', method: 'POST', path: '/settings' } });
+    await flush();
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect((sent[0].payload as { status: number }).status).toBe(403);
+  });
+
+  it('replies 502 when the local API is unreachable', async () => {
+    const { sync, sent, emit } = makeSync();
+    const fetchImpl = jest.fn().mockRejectedValue(new Error('ECONNREFUSED')) as unknown as typeof fetch;
+    const svc = new MobileApiRelayService({ cloudSync: sync, webPort: 8787, fetchImpl, logger: SILENT });
+    svc.start();
+
+    emit({ type: 'api_request', from: 'phone-1', payload: { id: 'r4', method: 'GET', path: '/teams' } });
+    await flush();
+
+    expect((sent[0].payload as { status: number; body: { error: string } }).status).toBe(502);
+  });
+
+  it('ignores non-api_request messages and missing sender', async () => {
+    const { sync, sent, emit } = makeSync();
+    const fetchImpl = jest.fn() as unknown as typeof fetch;
+    const svc = new MobileApiRelayService({ cloudSync: sync, webPort: 8787, fetchImpl, logger: SILENT });
+    svc.start();
+
+    emit({ type: 'chat_request', from: 'phone-1', payload: { id: 'x' } });
+    emit({ type: 'api_request', payload: { id: 'r5', method: 'GET', path: '/teams' } }); // no sender
+    await flush();
+
+    expect(sent).toHaveLength(0);
+  });
+
+  it('start is idempotent and stop detaches', async () => {
+    const { sync, emit, sent, handlers } = makeSync();
+    const fetchImpl = jest.fn().mockResolvedValue(new Response('{}', { status: 200 })) as unknown as typeof fetch;
+    const svc = new MobileApiRelayService({ cloudSync: sync, webPort: 8787, fetchImpl, logger: SILENT });
+    svc.start();
+    svc.start();
+    expect(handlers).toHaveLength(1);
+    svc.stop();
+    emit({ type: 'api_request', from: 'p', payload: { id: 'r6', method: 'GET', path: '/teams' } });
+    await flush();
+    expect(sent).toHaveLength(0);
+  });
+});
+
+describe('allowlist additions — projects/wiki/chat reads', () => {
+  it('allows the new mobile read surfaces', () => {
+    expect(isAllowedMobileApiCall('GET', '/projects')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/projects/abc/stats')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/wiki/vaults')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/wiki/page?vaultPath=/x&relativePath=a.md')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/chat/channels/c1/messages?limit=30&cursor=abc')).toBe(true);
+  });
+
+  it('still blocks writes to those surfaces', () => {
+    expect(isAllowedMobileApiCall('POST', '/projects')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/wiki/ingest')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/chat/channels/c1/messages')).toBe(false);
+  });
+});
+
+describe('allowlist additions — harness setup from the phone', () => {
+  it('lets the phone read status and drive install, orc choice and login', () => {
+    expect(isAllowedMobileApiCall('GET', '/harness')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/harness/install/job-1')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/harness/login/s1')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/harness/orc')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/harness/claude-code/install')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/harness/codex-cli/login')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/harness/login/s1/input')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/harness/login/s1/cancel')).toBe(true);
+  });
+
+  it('keeps API keys off the relay', () => {
+    expect(isAllowedMobileApiCall('POST', '/harness/claude-code/api-key')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/harness/codex-cli/api-key')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/harness/opencode-cli/install')).toBe(false);
+    // Antigravity can be installed from the phone; its Gemini key is never relayed.
+    expect(isAllowedMobileApiCall('POST', '/harness/antigravity-cli/install')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/harness/antigravity-cli/api-key')).toBe(false);
+  });
+});
+
+describe('allowlist additions — first-run checklist from the phone', () => {
+  it('lets the phone read the checklist and drive the owner choices', () => {
+    expect(isAllowedMobileApiCall('GET', '/onboarding/checklist')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/onboarding/starters')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/onboarding/checklist/dismiss')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/onboarding/starter-team')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/onboarding/first-task')).toBe(true);
+  });
+
+  it('keeps the Cloud Portal onboarding sessions and cloud connect off the relay', () => {
+    expect(isAllowedMobileApiCall('GET', '/onboarding/sessions')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/onboarding/provision')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/onboarding/checklist')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/cloud/connect')).toBe(false);
+  });
+});
+
+describe('allowlist additions — solution bundles from the phone', () => {
+  it('lets the phone list bundles, read one, deploy it and watch the job', () => {
+    expect(isAllowedMobileApiCall('GET', '/bundles')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/bundles/smb-marketing-team')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/bundles/apply/bundle-123')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/bundles/apply')).toBe(true);
+  });
+
+  it('allows no other bundle mutation and no traversal', () => {
+    expect(isAllowedMobileApiCall('POST', '/bundles/smb-marketing-team')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/bundles')).toBe(false);
+    expect(isAllowedMobileApiCall('GET', '/bundles/../harness/claude-code/api-key')).toBe(false);
+  });
+});
+
+describe('allowlist additions — Cloud Portal Marketplace', () => {
+  it('lets the portal list templates on this machine and deploy one as a team', () => {
+    expect(isAllowedMobileApiCall('GET', '/templates')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/templates/research-team')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/templates/research-team/deploy')).toBe(true);
+  });
+
+  it('allows no other template mutation', () => {
+    expect(isAllowedMobileApiCall('POST', '/templates/research-team/create-team')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/templates/research-team')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/templates/deploy')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/templates//deploy')).toBe(false); // no id between prefix and suffix
+    expect(isAllowedMobileApiCall('POST', '/templates/../settings/deploy')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/templates/x/deploy?force=1')).toBe(false);
+  });
+
+  it('lets the portal read the skill catalogue, install, watch the job and remove', () => {
+    expect(isAllowedMobileApiCall('GET', '/skill-setup/catalog')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/skill-setup/jobs/job-1')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/skill-setup/install')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/skill-setup/uninstall')).toBe(true);
+  });
+
+  it('lets the portal use a Marketplace app template on this machine, and nothing else of the template surface', () => {
+    expect(isAllowedMobileApiCall('POST', '/apps/templates/tpl-abcdefghij/use')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/apps/templates//use')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/apps/templates/tpl-abcdefghij/unlist')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/apps/abcdefghij/template-request')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/apps/publish')).toBe(false);
+  });
+
+  it('keeps the rest of the skill and marketplace surface off the relay', () => {
+    expect(isAllowedMobileApiCall('GET', '/skill-setup/find?query=x')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/marketplace/submit')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/marketplace/x/install')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/skills/x/execute')).toBe(false);
+  });
+});
+
+describe('remote MCP servers over the relay', () => {
+  const SECRET_URL = 'https://crm-600.zohomcp.com/mcp/SECRETKEY123/message';
+
+  it('allows list, add, test, rename, remove and the per-server allowlist', () => {
+    expect(isAllowedMobileApiCall('GET', '/connectors/remote-mcp')).toBe(true);
+    expect(isAllowedMobileApiCall('GET', '/connectors/access')).toBe(true);
+    expect(isAllowedMobileApiCall('POST', '/connectors/remote-mcp')).toBe(true);
+    for (const action of ['test', 'rename', 'remove', 'access', 'authorize']) {
+      expect(isAllowedMobileApiCall('POST', `/connectors/remote-mcp/zoho/${action}`)).toBe(true);
+    }
+  });
+
+  it('does not open anything else under /connectors', () => {
+    // The connector-wide allowlist (Google, Canva, …) stays machine-only.
+    expect(isAllowedMobileApiCall('POST', '/connectors/access/google')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/connectors/access/mcp:zoho')).toBe(false);
+    expect(isAllowedMobileApiCall('GET', '/connectors/access/x')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/connectors/remote-mcp/zoho')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/connectors/remote-mcp//test')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/connectors/remote-mcp/zoho/other')).toBe(false);
+    // The agent proxy is agents-only and never reachable over the relay.
+    expect(isAllowedMobileApiCall('POST', '/connectors/remote-mcp/zoho/mcp')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/connectors/remote-mcpx')).toBe(false);
+    expect(isAllowedMobileApiCall('POST', '/connectors/google/token')).toBe(false);
+  });
+
+  it('drops the query string of a connector path in logs', () => {
+    expect(pathForLog('/connectors/remote-mcp?url=SECRET')).toBe('/connectors/remote-mcp');
+    expect(pathForLog('/teams?x=1')).toBe('/teams?x=1');
+  });
+
+  it('forwards the add body but never logs it', async () => {
+    const lines: unknown[] = [];
+    const capture = (...args: unknown[]) => { lines.push(args); };
+    const logger = { info: capture, warn: capture, error: capture, debug: capture } as unknown as typeof SILENT;
+    const { sync, sent, emit } = makeSync();
+    const fetchImpl = jest.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, data: { id: 'zoho', urlMasked: 'https://crm-600.zohomcp.com/…' } }), { status: 201 }))
+      .mockRejectedValueOnce(new Error('ECONNREFUSED')) as unknown as typeof fetch;
+    const svc = new MobileApiRelayService({ cloudSync: sync, webPort: 8787, fetchImpl, logger });
+    svc.start();
+
+    const body = { label: 'Zoho', url: SECRET_URL, provider: 'zoho' };
+    emit({ type: 'api_request', from: 'portal', payload: { id: 'm1', method: 'POST', path: '/connectors/remote-mcp', body } });
+    await flush();
+    // Local API unreachable on the second add: the failure is logged, the body is not.
+    emit({ type: 'api_request', from: 'portal', payload: { id: 'm2', method: 'POST', path: '/connectors/remote-mcp', body } });
+    await flush();
+    // Blocked, with the secret in the query string.
+    emit({ type: 'api_request', from: 'portal', payload: { id: 'm3', method: 'GET', path: `/connectors/other?url=${SECRET_URL}`, body } });
+    await flush();
+
+    expect((fetchImpl as unknown as jest.Mock).mock.calls[0][1].body).toBe(JSON.stringify(body));
+    expect(sent.map((m) => (m.payload as { status: number }).status)).toEqual([201, 502, 403]);
+    expect(lines.length).toBeGreaterThan(0);
+    expect(JSON.stringify(lines)).not.toContain('SECRETKEY');
+  });
+});

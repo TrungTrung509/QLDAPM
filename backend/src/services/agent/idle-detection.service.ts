@@ -1,0 +1,715 @@
+/**
+ * Idle Detection Service
+ *
+ * Periodically checks for idle agents and suspends them to free resources.
+ * Uses PtyActivityTrackerService for PTY idle time and AgentHeartbeatService
+ * for heartbeat staleness as dual signals.
+ *
+ * @module idle-detection-service
+ */
+
+import { LoggerService, ComponentLogger } from '../core/logger.service.js';
+import { StorageService } from '../core/storage.service.js';
+import { CREWLY_CONSTANTS, AGENT_SUSPEND_CONSTANTS } from '../../constants.js';
+import { PtyActivityTrackerService } from './pty-activity-tracker.service.js';
+import { AgentSuspendService } from './agent-suspend.service.js';
+import { ActivityMonitorService } from '../monitoring/activity-monitor.service.js';
+import { getSettingsService } from '../settings/index.js';
+import { getSessionBackendSync } from '../session/index.js';
+import { CronTaskService } from '../workflow/cron-task.service.js';
+import { getMemoryStats } from '../core/system-health.util.js';
+import { ResourceModeService, RESOURCE_MODE_CONSTANTS, memoryIsTightFor } from './resource-mode.service.js';
+import { noteMemoryStop } from './memory-stop-hold.js';
+import type { AgentRegistrationService } from './agent-registration.service.js';
+import type { WorkItemStatus } from '../../types/v2/work-item.types.js';
+import { effectiveRuntimeType } from '../runtime-fallback/effective-runtime.js';
+import { getOwnerThreadSentinel, reportOwnerThreadBlocking } from '../messaging/owner-thread-sentinel.service.js';
+import { isDriveWarm } from '../drive/drive-keep-warm.js';
+
+/**
+ * WorkItem statuses that mean "work is waiting for this agent" (not yet
+ * running): an agent targeted by one is kept alive by the idle check. A
+ * `running` item is left to the working-status check — an agent idle for
+ * the whole timeout on a running item is not held up forever.
+ */
+export const PENDING_WORK_STATUSES: ReadonlySet<WorkItemStatus> = new Set<WorkItemStatus>(['queued', 'proposed', 'accepted', 'running']);
+
+/**
+ * Why an agent must be kept alive (a reason string), or false/null when
+ * nothing holds it: a WorkItem (queued, accepted or running), an assigned
+ * ticket, an owner promise, an unfulfilled "doing X now". See idle-work-guard.ts.
+ */
+export type PendingWorkCheck = (sessionName: string) => Promise<boolean | string | null>;
+
+/**
+ * Called before an idle agent is stopped for memory: put the work it holds
+ * back in the queue so it is redelivered when the agent starts again.
+ */
+export type WorkReleaser = (sessionName: string, why: string) => Promise<unknown>;
+
+/**
+ * Periodically scans active agents and suspends those that have been
+ * idle longer than the configured `agentIdleTimeoutMinutes`.
+ *
+ * An agent is considered idle when BOTH:
+ * 1. PTY has had no output for the timeout period
+ * 2. Agent is not the orchestrator (exempt)
+ */
+export class IdleDetectionService {
+	private static instance: IdleDetectionService | null = null;
+	private logger: ComponentLogger;
+	private timer: ReturnType<typeof setInterval> | null = null;
+	private agentRegistrationService: AgentRegistrationService | null = null;
+	private pendingWorkCheck: PendingWorkCheck | null = null;
+	private workReleaser: WorkReleaser | null = null;
+	private owedStopHook: ((sessionName: string) => void) | null = null;
+
+	// Observability: surfaces silent hangs that previously caused the
+	// loop to "stop" for hours with no log evidence (2026-05-14 incident).
+	private isChecking = false;
+	private lastTickStartedAt: number | null = null;
+	private lastTickCompletedAt: number | null = null;
+	private lastTickDurationMs: number | null = null;
+	private consecutiveSkippedTicks = 0;
+	private forcedResetCount = 0;
+
+	private constructor() {
+		this.logger = LoggerService.getInstance().createComponentLogger('IdleDetection');
+	}
+
+	/**
+	 * Inject AgentRegistrationService for auto-stop capability.
+	 *
+	 * @param service - AgentRegistrationService instance
+	 */
+	setAgentRegistrationService(service: AgentRegistrationService): void {
+		this.agentRegistrationService = service;
+	}
+
+	/**
+	 * Inject the pending-work check: an agent with work queued for it is not
+	 * idle-stopped (it was usually just started for that work).
+	 *
+	 * @param check - Check, or null to disable
+	 */
+	setPendingWorkCheck(check: PendingWorkCheck | null): void {
+		this.pendingWorkCheck = check;
+	}
+
+	/**
+	 * Inject the releaser used when memory forces a stop of an agent that
+	 * still holds work: its running items go back to the queue (same target).
+	 *
+	 * @param releaser - Releaser, or null to disable
+	 */
+	setWorkReleaser(releaser: WorkReleaser | null): void {
+		this.workReleaser = releaser;
+	}
+
+	/**
+	 * Get the singleton instance.
+	 *
+	 * @returns The IdleDetectionService singleton
+	 */
+	static getInstance(): IdleDetectionService {
+		if (!IdleDetectionService.instance) {
+			IdleDetectionService.instance = new IdleDetectionService();
+		}
+		return IdleDetectionService.instance;
+	}
+
+	/**
+	 * Reset the singleton (for testing).
+	 */
+	static resetInstance(): void {
+		if (IdleDetectionService.instance) {
+			IdleDetectionService.instance.stop();
+		}
+		IdleDetectionService.instance = null;
+	}
+
+	/**
+	 * Start the periodic idle check cycle.
+	 */
+	start(): void {
+		if (this.timer) {
+			this.logger.warn('Idle detection already running');
+			return;
+		}
+
+		this.logger.info('Starting idle detection service', {
+			checkIntervalMs: AGENT_SUSPEND_CONSTANTS.IDLE_CHECK_INTERVAL_MS,
+		});
+
+		this.timer = setInterval(() => {
+			this.runTick();
+		}, AGENT_SUSPEND_CONSTANTS.IDLE_CHECK_INTERVAL_MS);
+	}
+
+	/**
+	 * Wrapper around `performCheck` that adds re-entrancy guard, heartbeat
+	 * logging, and duration tracking. Defensive against silent hangs — if
+	 * `performCheck` ever stops resolving (e.g., dependency hangs), the
+	 * `isChecking` guard prevents overlapping invocations from piling up,
+	 * and `consecutiveSkippedTicks` makes the stuck state observable.
+	 *
+	 * Why: on 2026-05-14 the loop stopped producing logs for 21 hours while
+	 * the timer was still scheduled. Without a per-tick heartbeat the
+	 * regression was invisible.
+	 */
+	private runTick(): void {
+		if (this.isChecking) {
+			this.consecutiveSkippedTicks++;
+			const elapsedMs = this.lastTickStartedAt ? Date.now() - this.lastTickStartedAt : 0;
+
+			// Self-heal watchdog: if a tick has been "in flight" for
+			// significantly longer than the configured tick interval, the
+			// previous `performCheck` is almost certainly hung on an
+			// upstream dependency that never resolves (e.g., a
+			// `getWorkingStatusForSession` that silently never settles —
+			// the 2026-05-14 incident shape). Re-entrancy guard alone is
+			// insufficient: every subsequent tick is just dropped while
+			// the system makes zero progress.
+			//
+			// Threshold = 3 × IDLE_CHECK_INTERVAL_MS. Tight enough that a
+			// genuinely slow but eventual completion (e.g., 1.5×
+			// interval) is not falsely flagged; loose enough that a real
+			// hang surfaces within ~6 minutes at the 2-minute default.
+			//
+			// Recovery action: force-reset `isChecking` and log at error
+			// level. We accept the small risk that the still-running
+			// previous tick later resolves into stale stats — that's
+			// strictly better than wedging the loop indefinitely.
+			const stuckThresholdMs = AGENT_SUSPEND_CONSTANTS.IDLE_CHECK_INTERVAL_MS * 3;
+			if (elapsedMs > stuckThresholdMs) {
+				this.forcedResetCount++;
+				this.logger.error('Idle check tick appears hung — force-resetting guard', {
+					elapsedMs,
+					stuckThresholdMs,
+					consecutiveSkippedTicks: this.consecutiveSkippedTicks,
+					forcedResetCount: this.forcedResetCount,
+					lastTickStartedAt: this.lastTickStartedAt
+						? new Date(this.lastTickStartedAt).toISOString()
+						: null,
+				});
+				this.isChecking = false;
+				// Fall through to start a fresh tick this cycle.
+			} else {
+				this.logger.warn('Idle check skipped — previous tick still running', {
+					consecutiveSkippedTicks: this.consecutiveSkippedTicks,
+					lastTickStartedAt: this.lastTickStartedAt
+						? new Date(this.lastTickStartedAt).toISOString()
+						: null,
+					elapsedMs,
+				});
+				return;
+			}
+		}
+
+		this.isChecking = true;
+		this.consecutiveSkippedTicks = 0;
+		this.lastTickStartedAt = Date.now();
+		this.logger.debug('Idle check tick started');
+
+		this.performCheck()
+			.then(() => {
+				this.lastTickCompletedAt = Date.now();
+				this.lastTickDurationMs = this.lastTickCompletedAt - (this.lastTickStartedAt ?? this.lastTickCompletedAt);
+				this.logger.debug('Idle check tick completed', {
+					durationMs: this.lastTickDurationMs,
+				});
+			})
+			.catch((err: unknown) => {
+				this.lastTickCompletedAt = Date.now();
+				this.lastTickDurationMs = this.lastTickCompletedAt - (this.lastTickStartedAt ?? this.lastTickCompletedAt);
+				this.logger.error('Idle check cycle failed', {
+					error: err instanceof Error ? err.message : String(err),
+					durationMs: this.lastTickDurationMs,
+				});
+			})
+			.finally(() => {
+				this.isChecking = false;
+			});
+	}
+
+	/**
+	 * Snapshot of recent tick activity. Used by health/status endpoints
+	 * to detect a silently stuck loop without parsing logs.
+	 *
+	 * @returns Tick observability stats. All timestamps in epoch ms.
+	 */
+	getStats(): {
+		isRunning: boolean;
+		isChecking: boolean;
+		lastTickStartedAt: number | null;
+		lastTickCompletedAt: number | null;
+		lastTickDurationMs: number | null;
+		consecutiveSkippedTicks: number;
+		forcedResetCount: number;
+	} {
+		return {
+			isRunning: this.isRunning(),
+			isChecking: this.isChecking,
+			lastTickStartedAt: this.lastTickStartedAt,
+			lastTickCompletedAt: this.lastTickCompletedAt,
+			lastTickDurationMs: this.lastTickDurationMs,
+			consecutiveSkippedTicks: this.consecutiveSkippedTicks,
+			forcedResetCount: this.forcedResetCount,
+		};
+	}
+
+	/**
+	 * Stop the periodic idle check cycle.
+	 */
+	stop(): void {
+		if (this.timer) {
+			clearInterval(this.timer);
+			this.timer = null;
+			this.logger.info('Idle detection service stopped');
+		}
+	}
+
+	/**
+	 * Check if the service is currently running.
+	 *
+	 * @returns True if the check cycle is active
+	 */
+	isRunning(): boolean {
+		return this.timer !== null;
+	}
+
+	/** Memory reading, overridable in tests. */
+	memoryStats: () => {
+		usedPercent: number;
+		freeMB: number;
+		totalMB: number;
+		swapUsedPercent?: number;
+		pressureElevated?: boolean;
+	} = getMemoryStats;
+
+	/**
+	 * Whether memory is tight enough to stop idle agents for it.
+	 *
+	 * @returns True at or above the used-share threshold, below the free
+	 *   floor, with swap mostly full, or when the OS reports pressure
+	 */
+	private memoryIsTight(): boolean {
+		return memoryIsTightFor(this.memoryStats());
+	}
+
+	/**
+	 * Perform a single idle check across all active agents.
+	 * Reads the timeout setting, iterates active members, and
+	 * suspends any that exceed the idle threshold.
+	 */
+	async performCheck(): Promise<void> {
+		// Read current idle timeout from settings
+		let timeoutMinutes: number;
+		try {
+			const settings = await getSettingsService().getSettings();
+			timeoutMinutes = ResourceModeService.getInstance().effectiveIdleTimeoutMinutes(
+				settings.general.agentIdleTimeoutMinutes,
+				settings.general.pressureIdleTimeoutMinutes ?? RESOURCE_MODE_CONSTANTS.DEFAULT_IDLE_TIMEOUT_MINUTES,
+			);
+		} catch {
+			timeoutMinutes = AGENT_SUSPEND_CONSTANTS.DEFAULT_IDLE_TIMEOUT_MINUTES;
+		}
+		const pressure = ResourceModeService.getInstance().getMode() === 'pressure';
+
+		// 0 = disabled
+		if (timeoutMinutes <= 0) {
+			return;
+		}
+
+		const timeoutMs = timeoutMinutes * 60 * 1000;
+		const activityTracker = PtyActivityTrackerService.getInstance();
+		const suspendService = AgentSuspendService.getInstance();
+
+		// Get all teams and their members
+		let teams;
+		try {
+			teams = await StorageService.getInstance().getTeams();
+		} catch (err) {
+			this.logger.error('Failed to get teams for idle check', {
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return;
+		}
+
+		for (const team of teams) {
+			for (const member of team.members || []) {
+				// Check active and started agents (started agents may be stuck)
+				const isActive = member.agentStatus === CREWLY_CONSTANTS.AGENT_STATUSES.ACTIVE;
+				const isStarted = member.agentStatus === CREWLY_CONSTANTS.AGENT_STATUSES.STARTED;
+				if (!isActive && !isStarted) {
+					continue;
+				}
+
+				// Skip always-on roles (orchestrator, auditor)
+				if (AGENT_SUSPEND_CONSTANTS.ALWAYS_ON_ROLES.includes(
+					member.role as typeof AGENT_SUSPEND_CONSTANTS.ALWAYS_ON_ROLES[number]
+				)) {
+					continue;
+				}
+
+				// The owner is talking to it in Drive mode: keep it warm (specs/2026-10-09-drive-mode-v3.md §5)
+				if (isDriveWarm(member.sessionName)) {
+					continue;
+				}
+
+				// Skip agents already being suspended or rehydrated
+				if (suspendService.isSuspended(member.sessionName) || suspendService.isRehydrating(member.sessionName)) {
+					continue;
+				}
+
+				// Use longer timeout for 'started' agents to allow initialization to complete
+				let effectiveTimeoutMs = isStarted
+					? AGENT_SUSPEND_CONSTANTS.STARTED_AGENT_IDLE_TIMEOUT_MINUTES * 60 * 1000
+					: timeoutMs;
+				// A member in a conversation with the owner (an owner thread active in
+				// the last two hours) waits at least OWNER_THREAD_IDLE_TIMEOUT_MINUTES
+				// before an idle stop, whatever the configured or pressure timeout
+				// says (crewly#1344: 50 ten-minute idle stops in 9 h, many of them
+				// agents the owner was still talking to). Memory pressure below still
+				// decides whether the stop happens at all.
+				if (!isStarted && this.ownerConversationActive(member.sessionName)) {
+					effectiveTimeoutMs = Math.max(effectiveTimeoutMs, AGENT_SUSPEND_CONSTANTS.OWNER_THREAD_IDLE_TIMEOUT_MINUTES * 60 * 1000);
+				}
+
+				// Check if idle — dual detection:
+				// PTY-based runtimes: use PtyActivityTracker
+				// In-process runtimes (crewly-agent): use member.updatedAt timestamp
+				const isCrewlyAgent = effectiveRuntimeType(member.sessionName, member.runtimeType ?? '') === 'crewly-agent';
+				let isIdle = false;
+				if (isCrewlyAgent) {
+					// crewly-agent has no PTY — check last updatedAt or readyAt timestamp
+					const lastActive = member.readyAt || member.updatedAt || member.createdAt;
+					if (lastActive) {
+						const idleMs = Date.now() - new Date(lastActive).getTime();
+						isIdle = idleMs > effectiveTimeoutMs;
+					}
+				} else {
+					isIdle = activityTracker.isIdleFor(member.sessionName, effectiveTimeoutMs);
+				}
+
+				if (isIdle) {
+					// Skip agents that are actively working (workingStatus: in_progress)
+					// This prevents suspending agents that are mid-task but happen to
+					// have stale PTY output (e.g., waiting for a long API call)
+					try {
+						const workingStatus = await ActivityMonitorService.getInstance()
+							.getWorkingStatusForSession(member.sessionName);
+						if (workingStatus === 'in_progress') {
+							this.logger.debug('Agent PTY idle but workingStatus is in_progress, skipping suspend', {
+								sessionName: member.sessionName,
+								role: member.role,
+							});
+							continue;
+						}
+					} catch {
+						// If we can't check workingStatus, proceed with normal idle check
+					}
+
+					// Keep an agent alive when a cron run for it is imminent. Stopping
+					// it now only to respawn it for the cron pays a full cold start
+					// (init prompt + registration + recall) every run.
+					if (isActive && (await this.hasImminentCronRun(member.sessionName))) {
+						this.logger.debug('Agent idle but a cron run is due soon, keeping alive', {
+							sessionName: member.sessionName,
+							role: member.role,
+							windowMinutes: AGENT_SUSPEND_CONSTANTS.CRON_KEEPALIVE_WINDOW_MINUTES,
+						});
+						continue;
+					}
+
+					// #201: Agents stuck in 'started' state should be marked inactive,
+					// not suspended, since they never completed initialization
+					// and have no session to rehydrate.
+					if (isStarted) {
+						this.logger.warn('Agent stuck in started state, marking inactive', {
+							sessionName: member.sessionName,
+							role: member.role,
+							idleMinutes: effectiveTimeoutMs / 60000,
+						});
+
+						try {
+							// Kill PTY session if it exists
+							const backend = getSessionBackendSync();
+							if (backend && backend.sessionExists(member.sessionName)) {
+								await backend.killSession(member.sessionName);
+							}
+
+							// Clear activity tracker
+							PtyActivityTrackerService.getInstance().clearSession(member.sessionName);
+
+							// Mark as inactive
+							await StorageService.getInstance().updateAgentStatus(
+								member.sessionName,
+								CREWLY_CONSTANTS.AGENT_STATUSES.INACTIVE as any
+							);
+						} catch (err) {
+							this.logger.error('Failed to mark stuck started agent as inactive', {
+								sessionName: member.sessionName,
+								error: err instanceof Error ? err.message : String(err),
+							});
+						}
+					} else {
+						// Only when the machine needs the memory. An idle agent
+						// spends nothing; stopping it means a cold start — and a
+						// rebuilt context — the next time it is spoken to.
+						if (!pressure && !this.memoryIsTight()) {
+							this.logger.debug('Agent idle but memory is fine, keeping alive', {
+								sessionName: member.sessionName,
+								role: member.role,
+							});
+							continue;
+						}
+						// Never stop an agent that owes work (a WorkItem, an assigned
+						// ticket, a promise to the owner) — unless the machine is in
+						// pressure mode, where memory wins; then the work is put back
+						// in the queue first so the next start redelivers it.
+						const held = await this.holdReason(member.sessionName);
+						// A promise made to the owner minutes ago is spared even under
+						// pressure; only the emergency stop overrides it.
+						if (held === 'fresh_promise' || (held && !pressure)) {
+							this.logger.info('Agent idle but has queued work, keeping alive', {
+								sessionName: member.sessionName,
+								role: member.role,
+								reason: held,
+							});
+							continue;
+						}
+						if (held) {
+							this.logger.warn('Stopping an idle agent that still owes work (memory pressure) — work is put back in the queue', {
+								sessionName: member.sessionName,
+								role: member.role,
+								reason: held,
+							});
+							await this.releaseWork(member.sessionName, 'idle stop under memory pressure');
+						}
+						// Stopped for memory: the wake paths leave it down while pressure
+						// lasts, or the stop frees nothing (memory-stop-hold.ts).
+						noteMemoryStop(member.sessionName);
+						// Auto-stop: terminate idle agents to free resources
+						if (this.agentRegistrationService) {
+							this.logger.info('Agent idle timeout reached, stopping', {
+								sessionName: member.sessionName,
+								role: member.role,
+								idleMinutes: effectiveTimeoutMs / 60000,
+								agentStatus: member.agentStatus,
+							});
+
+							try {
+								await this.agentRegistrationService.terminateAgentSession(
+									member.sessionName,
+									member.role
+								);
+								await StorageService.getInstance().updateAgentStatus(
+									member.sessionName,
+									CREWLY_CONSTANTS.AGENT_STATUSES.INACTIVE as any,
+									'idle_exit'
+								);
+								reportOwnerThreadBlocking(member.sessionName, { kind: 'stopped', why: 'idle' });
+								if (held) this.runOwedStopHook(member.sessionName);
+							} catch (err) {
+								this.logger.error('Failed to stop idle agent', {
+									sessionName: member.sessionName,
+									error: err instanceof Error ? err.message : String(err),
+								});
+							}
+						} else {
+							// Fallback: suspend if registration service not available
+							this.logger.info('Agent idle timeout reached, suspending (no registration service)', {
+								sessionName: member.sessionName,
+								role: member.role,
+								idleMinutes: effectiveTimeoutMs / 60000,
+							});
+
+							try {
+								await suspendService.suspendAgent(
+									member.sessionName,
+									team.id,
+									member.id,
+									member.role
+								);
+							} catch (err) {
+								this.logger.error('Failed to suspend idle agent', {
+									sessionName: member.sessionName,
+									error: err instanceof Error ? err.message : String(err),
+								});
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	/**
+	 * Why the agent must be kept alive, or null.
+	 *
+	 * @param sessionName - Agent session
+	 * @returns A reason, or null when nothing holds it or the check fails
+	 */
+	/**
+	 * Inject what happens after an agent that still owed work was stopped for
+	 * memory: it is brought back when a slot frees (the work is already queued).
+	 *
+	 * @param hook - Called once per such stop, or null
+	 */
+	setOwedStopHook(hook: ((sessionName: string) => void) | null): void {
+		this.owedStopHook = hook;
+	}
+
+	/**
+	 * Whether the owner spoke to the agent in a watched Slack thread (or it
+	 * promised the owner something there) in the last two hours.
+	 *
+	 * @param sessionName - Agent session
+	 * @returns True while the owner conversation is live; false without a sentinel
+	 */
+	private ownerConversationActive(sessionName: string): boolean {
+		try {
+			return getOwnerThreadSentinel()?.ownerActiveRecently(sessionName) === true;
+		} catch {
+			return false;
+		}
+	}
+
+	private async holdReason(sessionName: string): Promise<string | null> {
+		if (!this.pendingWorkCheck) return null;
+		try {
+			const r = await this.pendingWorkCheck(sessionName);
+			if (typeof r === 'string') return r;
+			return r ? 'work' : null;
+		} catch {
+			return null;
+		}
+	}
+
+	private runOwedStopHook(sessionName: string): void {
+		try {
+			this.owedStopHook?.(sessionName);
+		} catch {
+			/* best-effort */
+		}
+	}
+
+	/** Put the work a stopping agent holds back in the queue (best-effort). */
+	private async releaseWork(sessionName: string, why: string): Promise<void> {
+		try {
+			await this.workReleaser?.(sessionName, why);
+		} catch {
+			/* freeing memory must not depend on it */
+		}
+	}
+
+	/**
+	 * Whether an enabled cron task targeting `sessionName` is due within
+	 * {@link AGENT_SUSPEND_CONSTANTS.CRON_KEEPALIVE_WINDOW_MINUTES} (an overdue
+	 * one counts too — it is about to fire).
+	 *
+	 * @param sessionName - Agent session to check
+	 * @returns True when the agent should be kept alive for its cron; false on
+	 *   any lookup failure so the idle check falls back to normal behaviour
+	 */
+	private async hasImminentCronRun(sessionName: string): Promise<boolean> {
+		try {
+			const tasks = await CronTaskService.getInstance().list({ targetAgent: sessionName, enabled: true });
+			const windowMs = AGENT_SUSPEND_CONSTANTS.CRON_KEEPALIVE_WINDOW_MINUTES * 60 * 1000;
+			const now = Date.now();
+			return tasks.some((task) => {
+				if (!task.nextRunAt) return false;
+				const dueAt = Date.parse(task.nextRunAt);
+				return Number.isFinite(dueAt) && dueAt - now <= windowMs;
+			});
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Emergency stop of idle agents during memory pressure.
+	 * Stops all non-orchestrator agents with workingStatus 'idle',
+	 * regardless of the configured idle timeout.
+	 *
+	 * Called by SystemResourceAlertService when memory usage is critical.
+	 *
+	 * @returns Number of agents stopped
+	 */
+	async forceStopIdleAgents(): Promise<number> {
+		let stoppedCount = 0;
+
+		let teams;
+		try {
+			teams = await StorageService.getInstance().getTeams();
+		} catch {
+			return 0;
+		}
+
+		const backend = getSessionBackendSync();
+
+		for (const team of teams) {
+			for (const member of team.members || []) {
+				if (member.agentStatus !== CREWLY_CONSTANTS.AGENT_STATUSES.ACTIVE &&
+					member.agentStatus !== CREWLY_CONSTANTS.AGENT_STATUSES.STARTED) {
+					continue;
+				}
+
+				// Skip members with no session
+				if (!member.sessionName) {
+					continue;
+				}
+
+				// Never stop orchestrator
+				if (AGENT_SUSPEND_CONSTANTS.ALWAYS_ON_ROLES.includes(
+					member.role as typeof AGENT_SUSPEND_CONSTANTS.ALWAYS_ON_ROLES[number]
+				)) {
+					continue;
+				}
+
+				// Drive mode keep-warm deliberately does NOT apply here: the
+				// emergency memory-pressure stop always wins (specs/2026-10-09-drive-mode-v3.md §5).
+
+				// Only stop agents that are idle.
+				// NOTE: Intentionally checks member.workingStatus directly instead of
+				// ActivityMonitorService. This is the emergency OOM path — ActivityMonitorService
+				// may not be available or its state may lag behind reality. The raw
+				// workingStatus field from StorageService is the most reliable signal here.
+				if (member.workingStatus === 'in_progress') {
+					continue;
+				}
+
+				this.logger.warn('Force-stopping idle agent due to memory pressure', {
+					sessionName: member.sessionName,
+					role: member.role,
+				});
+
+				try {
+					// The work it holds survives the stop: back in the queue, redelivered on the next start.
+					noteMemoryStop(member.sessionName);
+					await this.releaseWork(member.sessionName, 'emergency stop under memory pressure');
+					if (backend && member.sessionName && backend.sessionExists(member.sessionName)) {
+						await backend.killSession(member.sessionName);
+					}
+					PtyActivityTrackerService.getInstance().clearSession(member.sessionName);
+					await StorageService.getInstance().updateAgentStatus(
+						member.sessionName,
+						CREWLY_CONSTANTS.AGENT_STATUSES.INACTIVE as any,
+						'idle_exit_pressure'
+					);
+					reportOwnerThreadBlocking(member.sessionName, { kind: 'stopped', why: 'pressure' });
+					this.runOwedStopHook(member.sessionName);
+					stoppedCount++;
+				} catch (err) {
+					this.logger.error('Failed to force-stop agent', {
+						sessionName: member.sessionName,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			}
+		}
+
+		return stoppedCount;
+	}
+}

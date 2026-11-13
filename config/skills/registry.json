@@ -1,0 +1,1882 @@
+{
+  "schemaVersion": 2,
+  "lastUpdated": "2026-10-27T01:11:19.863Z",
+  "cdnBaseUrl": "https://raw.githubusercontent.com/stevehuang0115/crewly/main",
+  "source": "github",
+  "items": [
+    {
+      "id": "agent-send-pdf-to-slack",
+      "type": "skill",
+      "name": "Send PDF to Slack",
+      "description": "Convert a markdown file to PDF and upload it to a Slack channel.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "communication",
+      "tags": [
+        "communication",
+        "slack",
+        "pdf",
+        "markdown",
+        "export"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-10-18T13:10:51.841Z",
+      "source": "config/skills/agent/marketplace/send-pdf-to-slack",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/send-pdf-to-slack",
+        "checksum": "",
+        "sizeBytes": 8754
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "developer",
+          "qa",
+          "tpm",
+          "designer",
+          "frontend-developer",
+          "backend-developer",
+          "fullstack-dev",
+          "qa-engineer",
+          "product-manager",
+          "architect",
+          "generalist",
+          "sales",
+          "support"
+        ],
+        "triggers": [
+          "send pdf",
+          "pdf to slack",
+          "markdown to pdf",
+          "export pdf"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "ai-studio",
+      "type": "skill",
+      "name": "AI Studio App Builder",
+      "description": "Use Chrome to build React apps on Google AI Studio (aistudio.google.com). Navigate to the Build page, input prompts, and generate interactive prototypes.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "automation",
+      "tags": [
+        "ai-studio",
+        "google",
+        "gemini",
+        "react",
+        "prototype",
+        "chrome"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-27T00:00:00.000Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/ai-studio",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/ai-studio",
+        "checksum": "",
+        "sizeBytes": 9468
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "triggers": [
+          "ai studio",
+          "google ai studio",
+          "build app",
+          "react prototype",
+          "gemini app"
+        ],
+        "files": [
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "browse-stealth",
+      "type": "skill",
+      "name": "Stealth Browser (Patchright + CDP)",
+      "description": "Fallback only: use the remote-browser skill (Crewly in Chrome) first; use this only when Crewly in Chrome is not drivable. Anti-detection browser automation using Patchright (Playwright fork) connected to a real Chrome instance via CDP. Bypasses navigator.webdriver checks, fingerprint anomalies, and headless detection used by platforms like 小红书, X/Twitter, and LinkedIn.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "browser",
+        "stealth",
+        "patchright",
+        "cdp",
+        "anti-detection",
+        "automation"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-28T00:00:00.000Z",
+      "updatedAt": "2026-10-16T16:52:24.796Z",
+      "source": "config/skills/agent/browse-stealth",
+      "assets": {
+        "archive": "config/skills/agent/browse-stealth",
+        "checksum": "",
+        "sizeBytes": 23859
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "developer",
+          "qa",
+          "qa-engineer",
+          "fullstack-dev",
+          "backend-developer",
+          "frontend-developer",
+          "generalist",
+          "ops",
+          "content-strategist"
+        ],
+        "triggers": [
+          "stealth browse",
+          "browse stealth",
+          "anti-detection",
+          "xiaohongshu",
+          "rednote browse",
+          "patchright",
+          "cdp browse",
+          "stealth scrape"
+        ],
+        "files": [
+          "execute.sh",
+          "launch-chrome-cdp.sh",
+          "SKILL.md",
+          "stealth-browse.py"
+        ]
+      }
+    },
+    {
+      "id": "bug-triage",
+      "type": "skill",
+      "name": "Bug Triage",
+      "description": "Triage a bug report by searching the codebase for related files and suggesting severity, priority, and assignee.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "bug",
+        "triage",
+        "priority",
+        "severity",
+        "issue",
+        "project-management"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/bug-triage",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/bug-triage",
+        "checksum": "",
+        "sizeBytes": 8009
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "qa",
+          "qa-engineer",
+          "product-manager",
+          "tpm",
+          "developer",
+          "generalist"
+        ],
+        "triggers": [
+          "triage bug",
+          "bug triage",
+          "classify bug",
+          "prioritize bug",
+          "analyze bug"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "chrome-browser",
+      "type": "skill",
+      "name": "Claude Code Chrome Browser",
+      "description": "Enable browser automation capabilities in Claude Code using the Chrome extension. This allows agents to interact with web pages, fill forms, click buttons, and perform automated browser tasks.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "automation",
+      "tags": [
+        "browser",
+        "automation",
+        "chrome",
+        "mcp",
+        "web"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/chrome-browser",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/chrome-browser",
+        "checksum": "",
+        "sizeBytes": 2542
+      },
+      "metadata": {
+        "skillType": "mcp",
+        "triggers": [
+          "browser",
+          "chrome",
+          "web automation",
+          "browse",
+          "click",
+          "fill form",
+          "navigate"
+        ],
+        "files": [
+          "skill.json",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "code-review",
+      "type": "skill",
+      "name": "Code Review",
+      "description": "Analyze git changes and produce a structured code review with automated checks for missing tests, debug statements, potential secrets, large changes, and dependency modifications. Use when reviewing staged changes, unstaged diffs, recent commits, or branch comparisons before submitting a pull request. For task-level quality gates, use check-quality-gates instead.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "code-review",
+        "git",
+        "diff",
+        "quality",
+        "security",
+        "development"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/code-review",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/code-review",
+        "checksum": "",
+        "sizeBytes": 11012
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "developer",
+          "qa",
+          "qa-engineer",
+          "frontend-developer",
+          "backend-developer",
+          "fullstack-dev",
+          "architect"
+        ],
+        "triggers": [
+          "code review",
+          "review code",
+          "review changes",
+          "review PR",
+          "review diff"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "computer-use",
+      "type": "skill",
+      "name": "Desktop Automation (Computer Use)",
+      "description": "Control the macOS desktop: take screenshots, move/click the mouse, type text, and read app content via Accessibility API. Uses native macOS APIs (screencapture, CoreGraphics, System Events, Accessibility) with zero external dependencies.",
+      "author": "Crewly Team",
+      "version": "2.0.0",
+      "category": "automation",
+      "tags": [
+        "automation",
+        "desktop",
+        "screenshot",
+        "mouse",
+        "keyboard",
+        "macos",
+        "accessibility",
+        "ui-reading"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/computer-use",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/computer-use",
+        "checksum": "",
+        "sizeBytes": 24786
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "generalist",
+          "designer",
+          "qa"
+        ],
+        "triggers": [
+          "screenshot",
+          "click",
+          "mouse",
+          "type text",
+          "desktop automation",
+          "computer use",
+          "read app",
+          "scroll",
+          "accessibility",
+          "ui elements"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "daily-standup-report",
+      "type": "skill",
+      "name": "Daily Standup Report",
+      "description": "Generate a daily standup report from git commits, task status, and agent activity.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "standup",
+        "report",
+        "daily",
+        "git",
+        "status",
+        "project-management"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/daily-standup-report",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/daily-standup-report",
+        "checksum": "",
+        "sizeBytes": 6271
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "product-manager",
+          "tpm",
+          "developer",
+          "generalist",
+          "fullstack-dev"
+        ],
+        "triggers": [
+          "standup",
+          "daily standup",
+          "standup report",
+          "what did we do yesterday"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "decompose-okr",
+      "type": "skill",
+      "name": "Decompose OKR",
+      "description": "Decompose a parent Mission (OKR) into child OKRs one cascade tier down (company→team→project) as a PROPOSAL. The runtime drafts the child objectives + Key Results; the skill submits them to the backend as pending_approval. Children are NOT active until the human owner approves. Output includes an [APPROVE] block naming the parent and proposed children for the owner's decision.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "okr",
+        "cascade",
+        "mission",
+        "planning",
+        "proposal",
+        "approval"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-05-30T00:00:00.000Z",
+      "updatedAt": "2026-10-03T03:41:05.949Z",
+      "source": "config/skills/orchestrator/decompose-okr",
+      "assets": {
+        "archive": "config/skills/orchestrator/decompose-okr",
+        "checksum": "",
+        "sizeBytes": 8475
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "orchestrator",
+          "team-leader"
+        ],
+        "triggers": [
+          "decompose okr",
+          "cascade okr",
+          "propose child okrs",
+          "break okr into team okrs",
+          "okr decomposition"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "dep-updater",
+      "type": "skill",
+      "name": "Dependency Updater",
+      "description": "Check for outdated npm packages and show available updates with change type.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "dependencies",
+        "npm",
+        "outdated",
+        "updates",
+        "maintenance"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/dep-updater",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/dep-updater",
+        "checksum": "",
+        "sizeBytes": 4530
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "developer",
+          "frontend-developer",
+          "backend-developer",
+          "fullstack-dev",
+          "generalist"
+        ],
+        "triggers": [
+          "check updates",
+          "outdated",
+          "update deps",
+          "dependency check",
+          "npm outdated"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "email-responder",
+      "type": "skill",
+      "name": "Email Responder",
+      "description": "Generate professional email response drafts based on incoming email context, tone, and intent.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "communication",
+      "tags": [
+        "email",
+        "communication",
+        "response",
+        "draft",
+        "customer-support"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/email-responder",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/email-responder",
+        "checksum": "",
+        "sizeBytes": 9859
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "support",
+          "generalist",
+          "sales",
+          "product-manager"
+        ],
+        "triggers": [
+          "reply email",
+          "email response",
+          "draft email",
+          "respond to email"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "env-setup-checker",
+      "type": "skill",
+      "name": "Environment Setup Checker",
+      "description": "Validate Node/Python versions, check dependencies, and verify .env variables are set.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "environment",
+        "setup",
+        "node",
+        "python",
+        "dependencies",
+        "dotenv"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/env-setup-checker",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/env-setup-checker",
+        "checksum": "",
+        "sizeBytes": 5447
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "developer",
+          "frontend-developer",
+          "backend-developer",
+          "fullstack-dev",
+          "qa-engineer",
+          "generalist"
+        ],
+        "triggers": [
+          "check env",
+          "environment check",
+          "setup check",
+          "verify setup",
+          "health check"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "feedback-analyzer",
+      "type": "skill",
+      "name": "Customer Feedback Analyzer",
+      "description": "Analyze customer feedback to extract sentiment, topics, priority, and actionable insights.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "feedback",
+        "customer",
+        "sentiment",
+        "analytics",
+        "product-management"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/feedback-analyzer",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/feedback-analyzer",
+        "checksum": "",
+        "sizeBytes": 11626
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "product-manager",
+          "support",
+          "generalist",
+          "sales"
+        ],
+        "triggers": [
+          "analyze feedback",
+          "customer feedback",
+          "feedback analysis",
+          "sentiment analysis"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "flow-generate-video",
+      "type": "skill",
+      "name": "flow-generate-video",
+      "description": "Make a short film from AI-generated clips in Google Flow (Veo) through Crewly in Chrome. Keyframe images first, then one clip per pair of neighbouring keyframes, a judge step per clip with re-draws, and a pixel-matched stitch. Use when asked to generate video with Veo/Flow. Costs credits: agree the budget with the user first.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "video",
+        "veo",
+        "flow",
+        "browser"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-10-17T12:34:09.391Z",
+      "updatedAt": "2026-10-17T12:37:31.553Z",
+      "source": "config/skills/agent/marketplace/flow-generate-video",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/flow-generate-video",
+        "checksum": "",
+        "sizeBytes": 7276
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "*"
+        ],
+        "triggers": [
+          "generate video with Veo",
+          "make a video in Flow",
+          "AI video clips",
+          "keyframe video"
+        ],
+        "files": [
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "gemini-video",
+      "type": "skill",
+      "name": "Gemini Video Understanding",
+      "description": "Analyze videos using Google's Gemini API. Supports YouTube URLs (direct analysis) and local video files (upload via Files API). Produces summaries, key points, transcript highlights, and answers questions about video content.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "video",
+        "analysis",
+        "youtube",
+        "gemini",
+        "ai",
+        "content",
+        "summary"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-28T00:00:00.000Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/gemini-video",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/gemini-video",
+        "checksum": "",
+        "sizeBytes": 11751
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "developer",
+          "researcher",
+          "content"
+        ],
+        "triggers": [
+          "analyze video",
+          "video summary",
+          "youtube analysis",
+          "video understanding",
+          "gemini video"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "git-commit-helper",
+      "type": "skill",
+      "name": "Git Commit Helper",
+      "description": "Analyze staged changes and create a well-formatted conventional commit message.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "git",
+        "commit",
+        "conventional-commits",
+        "version-control"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/git-commit-helper",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/git-commit-helper",
+        "checksum": "",
+        "sizeBytes": 4080
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "developer",
+          "frontend-developer",
+          "backend-developer",
+          "fullstack-dev",
+          "generalist"
+        ],
+        "triggers": [
+          "commit",
+          "git commit",
+          "conventional commit",
+          "commit changes"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "gmail",
+      "type": "skill",
+      "name": "Gmail",
+      "description": "Multi-action Gmail skill for agents — list/read/search messages, compose one as a draft (never sends; the owner sends it), manage labels (add/remove/list), and toggle read/unread. Requires a google-oauth credential bound to the 'gmail' slot with gmail.modify scope.",
+      "author": "Crewly Team",
+      "version": "1.2.0",
+      "category": "communication",
+      "tags": [
+        "gmail",
+        "email",
+        "oauth",
+        "google",
+        "send",
+        "search",
+        "labels",
+        "modify"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-04-25T00:15:10.000Z",
+      "updatedAt": "2026-10-27T01:11:19.863Z",
+      "source": "config/skills/agent/marketplace/gmail",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/gmail",
+        "checksum": "",
+        "sizeBytes": 63263
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "orchestrator",
+          "assistant"
+        ],
+        "triggers": [
+          "send email",
+          "reply to email",
+          "search gmail",
+          "list emails",
+          "read email",
+          "check inbox",
+          "find email",
+          "mark email as read",
+          "mark email as unread",
+          "add label to email",
+          "remove label from email",
+          "list gmail labels"
+        ],
+        "files": [
+          "execute.sh",
+          "instructions.md",
+          "skill.json",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "gmail-reader",
+      "type": "skill",
+      "name": "Gmail Reader",
+      "description": "List unread emails from a Google account's inbox. Requires a google-oauth credential bound to the 'gmail' slot with gmail.readonly scope.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "communication",
+      "tags": [
+        "gmail",
+        "email",
+        "oauth",
+        "google"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-09-24T19:40:56.903Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/gmail-reader",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/gmail-reader",
+        "checksum": "",
+        "sizeBytes": 7703
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "orchestrator",
+          "assistant"
+        ],
+        "triggers": [
+          "read gmail",
+          "unread emails",
+          "check inbox",
+          "list emails",
+          "my unread messages"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "marketplace-publish",
+      "type": "skill",
+      "name": "Marketplace Publish",
+      "description": "Package and submit skills to the Crewly marketplace. Validates, archives, and submits for review to both local and remote registries.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "automation",
+      "tags": [
+        "marketplace",
+        "publish",
+        "submit",
+        "package",
+        "skills"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/marketplace-publish",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/marketplace-publish",
+        "checksum": "",
+        "sizeBytes": 10263
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "developer",
+          "backend-developer",
+          "fullstack-dev",
+          "architect",
+          "generalist"
+        ],
+        "triggers": [
+          "publish skill",
+          "submit skill",
+          "marketplace publish",
+          "package skill",
+          "share skill"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "nano-banana-image",
+      "type": "skill",
+      "name": "Nano Banana Image Generation",
+      "description": "Generate images using Google's Gemini Nano Banana API. Supports standard (flash) and pro models. Use --pro flag for higher quality output with gemini-3-pro-image-preview.",
+      "author": "Crewly Team",
+      "version": "1.1.0",
+      "category": "design",
+      "tags": [
+        "image",
+        "generation",
+        "ai",
+        "gemini",
+        "api",
+        "pro"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-29T01:43:29.904Z",
+      "source": "config/skills/agent/marketplace/nano-banana-image",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/nano-banana-image",
+        "checksum": "",
+        "sizeBytes": 3944
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "designer"
+        ],
+        "triggers": [
+          "generate image",
+          "create image",
+          "nano banana",
+          "gemini image",
+          "ai image"
+        ],
+        "files": [
+          ".env.example",
+          "generate.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "notebooklm",
+      "type": "skill",
+      "name": "NotebookLM",
+      "description": "Interact with Google NotebookLM to create notebooks, add sources, and generate audio overviews. Requires NotebookLM MCP server to be configured.",
+      "author": "Crewly Team",
+      "version": "0.1.0",
+      "category": "research",
+      "tags": [
+        "notebooklm",
+        "research",
+        "audio",
+        "notebook",
+        "google",
+        "mcp"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-28T00:00:00.000Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/notebooklm",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/notebooklm",
+        "checksum": "",
+        "sizeBytes": 2702
+      },
+      "metadata": {
+        "skillType": "mcp-skill",
+        "assignableRoles": [
+          "researcher",
+          "developer",
+          "generalist",
+          "fullstack-dev",
+          "qa",
+          "qa-engineer"
+        ],
+        "triggers": [
+          "notebooklm",
+          "notebook lm",
+          "create notebook",
+          "audio overview",
+          "research notebook"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "pdf-tools",
+      "type": "skill",
+      "name": "pdf-tools",
+      "description": "Make polished PDFs from Markdown or styled HTML (headless Chrome preferred, WeasyPrint fallback, CJK-ready default stylesheet), merge several parts into one PDF, and read the text of a PDF someone sent you. When a dependency is missing it returns `needsSetup:true` — run `install-skill --id pdf-tools`.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "content-creation",
+      "tags": [
+        "pdf",
+        "document",
+        "report",
+        "markdown",
+        "html",
+        "chrome",
+        "weasyprint",
+        "merge",
+        "read-pdf",
+        "extract-text",
+        "pypdf",
+        "cjk",
+        "中文",
+        "文档"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-09-25T00:00:00.000Z",
+      "updatedAt": "2026-09-25T15:02:05.840Z",
+      "source": "config/skills/agent/pdf-tools",
+      "assets": {
+        "archive": "config/skills/agent/pdf-tools",
+        "checksum": "",
+        "sizeBytes": 47819
+      },
+      "metadata": {
+        "assignableRoles": [
+          "*"
+        ],
+        "triggers": [
+          "make a pdf",
+          "generate pdf",
+          "markdown to pdf",
+          "html to pdf",
+          "merge pdfs",
+          "read this pdf",
+          "extract text from pdf"
+        ],
+        "files": [
+          "execute.sh",
+          "instructions.md",
+          "pdf_tools.py",
+          "skill.json",
+          "SKILL.md",
+          "style.css"
+        ],
+        "setup": {
+          "estimatedMinutes": 3,
+          "steps": [
+            {
+              "id": "jq",
+              "type": "command",
+              "description": "jq — parses the skill's JSON input and output",
+              "check": {
+                "commands": [
+                  "jq"
+                ]
+              },
+              "install": {
+                "darwin": {
+                  "brew": [
+                    "jq"
+                  ]
+                },
+                "debian": {
+                  "apt": [
+                    "jq"
+                  ]
+                }
+              }
+            },
+            {
+              "id": "python3",
+              "type": "command",
+              "description": "Python 3 with venv support",
+              "check": {
+                "shell": "python3 -c 'import venv, ensurepip' >/dev/null 2>&1"
+              },
+              "install": {
+                "darwin": {
+                  "brew": [
+                    "python"
+                  ]
+                },
+                "debian": {
+                  "apt": [
+                    "python3",
+                    "python3-venv"
+                  ]
+                }
+              },
+              "manualHint": "Install Python 3 (with the venv module) and put python3 on PATH."
+            },
+            {
+              "id": "python-packages",
+              "type": "python",
+              "description": "pypdf (merge/read), markdown and weasyprint in ~/.crewly/venv/pdf-tools",
+              "venv": "pdf-tools",
+              "packages": [
+                "pypdf>=4",
+                "markdown>=3.5",
+                "weasyprint>=60"
+              ],
+              "imports": [
+                "pypdf",
+                "markdown"
+              ]
+            },
+            {
+              "id": "weasyprint-libs",
+              "type": "command",
+              "optional": true,
+              "description": "Pango for WeasyPrint (the fallback engine when there is no Chrome)",
+              "check": {
+                "shell": "\"$CREWLY_HOME/venv/pdf-tools/bin/python3\" -c 'import weasyprint' >/dev/null 2>&1"
+              },
+              "install": {
+                "darwin": {
+                  "brew": [
+                    "pango"
+                  ]
+                },
+                "debian": {
+                  "apt": [
+                    "libpango-1.0-0",
+                    "libpangoft2-1.0-0",
+                    "libharfbuzz-subset0"
+                  ]
+                }
+              }
+            },
+            {
+              "id": "chrome",
+              "type": "command",
+              "optional": true,
+              "description": "Chrome/Chromium — the preferred engine (headless print-to-pdf)",
+              "check": {
+                "commands": [
+                  "google-chrome",
+                  "google-chrome-stable",
+                  "chromium",
+                  "chromium-browser"
+                ],
+                "paths": [
+                  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                  "~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                  "/Applications/Chromium.app/Contents/MacOS/Chromium"
+                ]
+              },
+              "install": {
+                "debian": {
+                  "apt": [
+                    "chromium"
+                  ]
+                }
+              },
+              "manualHint": "Install Google Chrome; until then PDFs are rendered with WeasyPrint."
+            },
+            {
+              "id": "cjk-fonts",
+              "type": "command",
+              "optional": true,
+              "description": "Chinese/Japanese/Korean fonts (Noto CJK) so CJK text is not blank boxes",
+              "check": {
+                "shell": "[ \"$(uname -s)\" = Darwin ] || fc-list :lang=zh 2>/dev/null | grep -q ."
+              },
+              "install": {
+                "debian": {
+                  "apt": [
+                    "fonts-noto-cjk"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "playwright-chrome-browser",
+      "type": "skill",
+      "name": "Playwright Chrome Browser",
+      "description": "Fallback only: use the remote-browser skill (Crewly in Chrome) first; use this only when Crewly in Chrome is not drivable. Enable browser automation capabilities using Playwright MCP server. This allows agents to interact with web pages, take screenshots, fill forms, and perform automated browser tasks through the Playwright automation framework.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "automation",
+      "tags": [
+        "browser",
+        "automation",
+        "playwright",
+        "mcp",
+        "web",
+        "headless",
+        "testing"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-10-16T16:52:24.796Z",
+      "source": "config/skills/agent/marketplace/playwright-chrome-browser",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/playwright-chrome-browser",
+        "checksum": "",
+        "sizeBytes": 4792
+      },
+      "metadata": {
+        "skillType": "mcp",
+        "triggers": [
+          "playwright",
+          "browser",
+          "web automation",
+          "screenshot",
+          "click",
+          "fill form",
+          "navigate",
+          "headless"
+        ],
+        "files": [
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "readme-generator",
+      "type": "skill",
+      "name": "README Generator",
+      "description": "Auto-generate a README.md from package.json and project structure.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "readme",
+        "documentation",
+        "markdown",
+        "project-setup"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/readme-generator",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/readme-generator",
+        "checksum": "",
+        "sizeBytes": 4574
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "developer",
+          "frontend-developer",
+          "backend-developer",
+          "fullstack-dev",
+          "product-manager",
+          "generalist"
+        ],
+        "triggers": [
+          "generate readme",
+          "create readme",
+          "readme",
+          "project docs"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "rednote-reader",
+      "type": "skill",
+      "name": "RedNote (小红书) Reader",
+      "description": "Read content from 小红书 (RedNote) iPad app on macOS via Accessibility API + screencapture. Actions: feed (read posts), scroll-feed, nav, screenshot (capture window), search (type keyword), tap (click coordinates), read-detail (screenshot + text), goto-profile (navigate to user profile by username). Zero network requests — cannot trigger account bans.",
+      "author": "Crewly Team",
+      "version": "3.1.0",
+      "category": "automation",
+      "tags": [
+        "automation",
+        "rednote",
+        "xiaohongshu",
+        "accessibility",
+        "content-reading",
+        "macos",
+        "screenshot"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-10-18T12:46:33.984Z",
+      "source": "config/skills/agent/marketplace/rednote-reader",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/rednote-reader",
+        "checksum": "",
+        "sizeBytes": 64321
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "generalist",
+          "product-manager"
+        ],
+        "triggers": [
+          "rednote",
+          "小红书",
+          "xiaohongshu",
+          "red note",
+          "discover app",
+          "read rednote"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "remotion-video",
+      "type": "skill",
+      "name": "Remotion Video Generator",
+      "description": "Generate motion graphic videos programmatically using Remotion and React. Supports template-based video creation with customizable text, colors, images, and transitions. Renders to MP4 locally.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "video",
+        "remotion",
+        "react",
+        "motion-graphics",
+        "animation",
+        "mp4",
+        "content"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-28T00:00:00.000Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/remotion-video",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/remotion-video",
+        "checksum": "",
+        "sizeBytes": 11133
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "developer",
+          "designer",
+          "content",
+          "generalist",
+          "product-manager"
+        ],
+        "triggers": [
+          "create video",
+          "generate video",
+          "motion graphics",
+          "remotion",
+          "launch video",
+          "promo video",
+          "video animation"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "seo-blog-writer",
+      "type": "skill",
+      "name": "SEO Blog Writer",
+      "description": "Generate an SEO-optimized blog post structure with title, meta description, headers, and keyword placement guide.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "seo",
+        "blog",
+        "content",
+        "writing",
+        "marketing"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/seo-blog-writer",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/seo-blog-writer",
+        "checksum": "",
+        "sizeBytes": 10386
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "product-manager",
+          "generalist",
+          "designer",
+          "support"
+        ],
+        "triggers": [
+          "write blog",
+          "blog post",
+          "seo blog",
+          "content writing",
+          "blog outline"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "seo-ops",
+      "type": "skill",
+      "name": "SEO Ops",
+      "description": "Search Console-driven SEO operations for any site: query patterns (low-CTR top-3, near-miss 4-20, rising queries, keyword cannibalization), per-URL report cards, pre-publish SEO/AEO checks, a gated programmatic-page queue, and a live-diff gate that stops agents from removing things from live pages. Use when auditing organic search, deciding what to rewrite, or before changing a live page. For writing posts use seo-blog-writer instead.",
+      "author": "Crewly",
+      "version": "1.2.0",
+      "category": "development",
+      "tags": [
+        "seo",
+        "aeo",
+        "search-console",
+        "marketing",
+        "content"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-09-29T01:43:29.904Z",
+      "updatedAt": "2026-10-03T01:12:43.309Z",
+      "source": "config/skills/agent/marketplace/seo-ops",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/seo-ops",
+        "checksum": "",
+        "sizeBytes": 149452
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "marketing",
+          "content-strategist",
+          "generalist",
+          "developer",
+          "fullstack-dev"
+        ],
+        "triggers": [
+          "seo report",
+          "search console",
+          "keyword cannibalization",
+          "pre-publish seo check",
+          "programmatic seo pages",
+          "live page diff",
+          "experiment metric",
+          "url inspection"
+        ],
+        "files": [
+          "execute.sh",
+          "pattern-template.example.md",
+          "seo_ops.py",
+          "seo-ops.config.example.json",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "social-media-post",
+      "type": "skill",
+      "name": "Social Media Draft Generator",
+      "description": "Generate platform-optimized social media drafts for Twitter/X, LinkedIn, and Reddit. It only writes drafts — you review each one and publish it yourself.",
+      "author": "Crewly Team",
+      "version": "1.1.0",
+      "category": "development",
+      "tags": [
+        "social-media",
+        "content",
+        "twitter",
+        "linkedin",
+        "reddit",
+        "marketing"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-10-14T03:53:59.392Z",
+      "source": "config/skills/agent/marketplace/social-media-post",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/social-media-post",
+        "checksum": "",
+        "sizeBytes": 11076
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "product-manager",
+          "generalist",
+          "designer",
+          "sales"
+        ],
+        "triggers": [
+          "social media post",
+          "tweet",
+          "linkedin post",
+          "social post",
+          "create post"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "test-runner",
+      "type": "skill",
+      "name": "Test Runner",
+      "description": "Detect the test framework and run tests with coverage reporting.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "testing",
+        "jest",
+        "vitest",
+        "pytest",
+        "coverage",
+        "ci"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-02-22T23:57:06.027Z",
+      "updatedAt": "2026-09-24T19:55:44.195Z",
+      "source": "config/skills/agent/marketplace/test-runner",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/test-runner",
+        "checksum": "",
+        "sizeBytes": 4794
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "developer",
+          "qa",
+          "qa-engineer",
+          "frontend-developer",
+          "backend-developer",
+          "fullstack-dev",
+          "generalist"
+        ],
+        "triggers": [
+          "run tests",
+          "test",
+          "test runner",
+          "execute tests",
+          "check tests"
+        ],
+        "files": [
+          "execute.sh",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "transcribe-audio",
+      "type": "skill",
+      "name": "transcribe-audio",
+      "description": "Transcribe a local audio (or video) file — Slack voice messages / audio clips, meetings, podcasts, interviews — to text with timestamps using Whisper. Defaults to local whisper.cpp (free, offline) and falls back to the OpenAI Whisper API (whisper-1) when the local engine is not installed. When a dependency is missing it returns `needsSetup:true` — run `install-skill --id transcribe-audio` instead of telling the user it cannot be done.",
+      "author": "Crewly Team",
+      "version": "1.1.0",
+      "category": "content-creation",
+      "tags": [
+        "audio",
+        "voice",
+        "voice-message",
+        "speech-to-text",
+        "transcribe",
+        "transcription",
+        "whisper",
+        "whisper.cpp",
+        "openai",
+        "timestamps",
+        "m4a",
+        "mp3",
+        "video",
+        "语音",
+        "录音",
+        "转文字"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-09-25T00:00:00.000Z",
+      "updatedAt": "2026-10-03T15:59:43.271Z",
+      "source": "config/skills/agent/transcribe-audio",
+      "assets": {
+        "archive": "config/skills/agent/transcribe-audio",
+        "checksum": "",
+        "sizeBytes": 44649
+      },
+      "metadata": {
+        "assignableRoles": [
+          "*"
+        ],
+        "triggers": [
+          "transcribe audio",
+          "transcribe voice message",
+          "speech to text",
+          "what does this recording say",
+          "audio clip"
+        ],
+        "files": [
+          "execute.sh",
+          "install-whisper-cpp.sh",
+          "instructions.md",
+          "skill.json",
+          "SKILL.md"
+        ],
+        "setup": {
+          "estimatedMinutes": 6,
+          "steps": [
+            {
+              "id": "jq",
+              "type": "command",
+              "description": "jq — parses the skill's JSON input and output",
+              "check": {
+                "commands": [
+                  "jq"
+                ]
+              },
+              "install": {
+                "darwin": {
+                  "brew": [
+                    "jq"
+                  ]
+                },
+                "debian": {
+                  "apt": [
+                    "jq"
+                  ]
+                }
+              },
+              "manualHint": "Install jq with your package manager."
+            },
+            {
+              "id": "ffmpeg",
+              "type": "command",
+              "description": "ffmpeg — decodes audio/video into 16 kHz mono WAV",
+              "check": {
+                "commands": [
+                  "ffmpeg"
+                ]
+              },
+              "install": {
+                "darwin": {
+                  "brew": [
+                    "ffmpeg"
+                  ]
+                },
+                "debian": {
+                  "apt": [
+                    "ffmpeg"
+                  ]
+                }
+              },
+              "manualHint": "Install ffmpeg with your package manager and put it on PATH."
+            },
+            {
+              "id": "whisper-cli",
+              "type": "command",
+              "description": "whisper.cpp — the local, offline speech-to-text engine",
+              "check": {
+                "commands": [
+                  "whisper-cli"
+                ],
+                "paths": [
+                  "~/.flopost/whisper/whisper-cli",
+                  "$CREWLY_HOME/bin/whisper-cli"
+                ]
+              },
+              "install": {
+                "darwin": {
+                  "brew": [
+                    "whisper-cpp"
+                  ]
+                },
+                "linux": {
+                  "script": "install-whisper-cpp.sh"
+                }
+              },
+              "manualHint": "Build whisper.cpp from https://github.com/ggml-org/whisper.cpp and put whisper-cli on PATH."
+            },
+            {
+              "id": "whisper-model",
+              "type": "file",
+              "description": "Whisper large-v3-turbo model (q5_0, 547 MB)",
+              "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+              "sha256": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+              "sizeBytes": 574041195,
+              "dest": "~/.cache/whisper-models/ggml-large-v3-turbo-q5_0.bin",
+              "alternatives": [
+                "~/.flopost/whisper/ggml-large-v3-turbo-q5_0.bin"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "video-clip-judge",
+      "type": "skill",
+      "name": "video-clip-judge",
+      "description": "Decide whether an AI-generated video clip (Veo, Flow and similar) is usable before it goes into a film. Runs automatic checks for ghost/dissolve, jump cuts, freezes, keyframe mismatch, look drift and audio, then a fixed visual checklist against the prompt. Use after every generated clip and before stitching. Generation is a lottery; this is the gate.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "video",
+        "qa",
+        "veo",
+        "generated-video"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-10-17T12:34:09.391Z",
+      "updatedAt": "2026-10-17T12:37:31.553Z",
+      "source": "config/skills/agent/marketplace/video-clip-judge",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/video-clip-judge",
+        "checksum": "",
+        "sizeBytes": 14250
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "*"
+        ],
+        "triggers": [
+          "judge generated clip",
+          "check AI video clip",
+          "Veo clip quality",
+          "ghost or dissolve in clip"
+        ],
+        "files": [
+          "clipkit.py",
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "video-seamless-stitch",
+      "type": "skill",
+      "name": "video-seamless-stitch",
+      "description": "Join generated video clips so the seams are invisible. Picks, by pixel comparison, the last frame of clip A and the first frame of clip B that are the same picture and move at the same speed, trims both there, hard-cuts, and crossfades audio for 80 ms. Use instead of a plain ffmpeg concat for clips generated from first/last frames.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": [
+        "video",
+        "ffmpeg",
+        "stitch",
+        "generated-video"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-10-17T12:34:09.391Z",
+      "updatedAt": "2026-10-17T12:37:31.553Z",
+      "source": "config/skills/agent/marketplace/video-seamless-stitch",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/video-seamless-stitch",
+        "checksum": "",
+        "sizeBytes": 2536
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "*"
+        ],
+        "triggers": [
+          "stitch generated clips",
+          "seamless join clips",
+          "join Veo clips",
+          "concat without jump"
+        ],
+        "files": [
+          "SKILL.md"
+        ]
+      }
+    },
+    {
+      "id": "xhs-downloader",
+      "type": "skill",
+      "name": "XHS (小红书) Note Downloader",
+      "description": "Download images and videos from 小红书 (RedNote/XHS) share links. Pass a URL or xhslink.com short link; returns downloaded file paths + metadata (title, author, type). Uses XHS-Downloader Python library — no account login required.",
+      "author": "Crewly Team",
+      "version": "1.0.0",
+      "category": "automation",
+      "tags": [
+        "automation",
+        "rednote",
+        "xiaohongshu",
+        "download",
+        "media",
+        "images",
+        "video"
+      ],
+      "license": "MIT",
+      "downloads": 0,
+      "rating": 0,
+      "createdAt": "2026-09-24T19:40:56.903Z",
+      "updatedAt": "2026-10-14T03:53:59.392Z",
+      "source": "config/skills/agent/marketplace/xhs-downloader",
+      "assets": {
+        "archive": "config/skills/agent/marketplace/xhs-downloader",
+        "checksum": "",
+        "sizeBytes": 9337
+      },
+      "metadata": {
+        "skillType": "claude-skill",
+        "assignableRoles": [
+          "generalist",
+          "researcher"
+        ],
+        "triggers": [
+          "download xhs",
+          "download rednote",
+          "下载小红书",
+          "xhs download",
+          "save rednote note",
+          "保存小红书笔记"
+        ],
+        "files": [
+          "download.py",
+          "execute.sh",
+          "instructions.md",
+          "skill.json"
+        ]
+      }
+    }
+  ]
+}

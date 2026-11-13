@@ -1,0 +1,1847 @@
+/**
+ * Terminal Controller
+ *
+ * Handles terminal session management endpoints for the API.
+ * Uses ISessionBackend for PTY-based session operations.
+ *
+ * @module terminal-controller
+ */
+
+import { Request, Response } from 'express';
+import { ApiResponse } from '../../types/index.js';
+import { getSessionBackendSync, getSessionBackend, createSessionCommandHelper } from '../../services/session/index.js';
+import { TuiInputGuardError, TuiPasteHoldError } from '../../services/session/tui-input-guard.js';
+import { LoggerService, ComponentLogger } from '../../services/core/logger.service.js';
+import { TERMINAL_CONTROLLER_CONSTANTS, ORCHESTRATOR_SESSION_NAME, CREWLY_CONSTANTS, EVENT_DELIVERY_CONSTANTS, AGENT_MESSAGE_DELIVERY_CONSTANTS, RuntimeType, RUNTIME_TYPES, SPEND_CAP_CONSTANTS, TEAM_PAUSE_CONSTANTS } from '../../constants.js';
+import {
+	validateTerminalInput,
+	sanitizeTerminalInput,
+	validateSessionName,
+} from '../../utils/security.js';
+import { StorageService } from '../../services/core/storage.service.js';
+import { SubAgentMessageQueue } from '../../services/messaging/sub-agent-message-queue.service.js';
+import {
+	queueForOfflineAgent,
+	getOfflineAgentWaker,
+	type OfflineAgentMessageResult,
+} from '../../services/messaging/offline-agent-message.js';
+import { AgentSuspendService } from '../../services/agent/agent-suspend.service.js';
+import type { ApiContext } from '../types.js';
+import { existsSync } from 'fs';
+import { readFile } from 'fs/promises';
+import { PtySessionBackend } from '../../services/session/pty/pty-session-backend.js';
+import { InProcessLogBuffer } from '../../services/agent/crewly-agent/in-process-log-buffer.js';
+import {
+	getInProcessRuntime,
+	isInProcessRuntimeActive,
+} from '../../services/agent/crewly-agent/in-process-runtime-registry.js';
+import type { PendingWorkSummary, HeartbeatState } from '../../services/agent/adaptive-heartbeat.service.js';
+import { ADAPTIVE_HEARTBEAT_DEFAULTS } from '../../services/agent/adaptive-heartbeat.service.js';
+import { getAgentBehaviorLogService } from '../../services/observability/agent-behavior-log.singleton.js';
+import { FreshTaskConversationService, freshConversationNote } from '../../services/agent/fresh-task-conversation.service.js';
+import type { WorkItem } from '../../types/v2/work-item.types.js';
+import { effectiveRuntimeType } from '../../services/runtime-fallback/effective-runtime.js';
+import { queueIfSpendCapped } from '../../services/messaging/spend-capped-delivery.js';
+import { queueIfRestartDraining } from '../../services/messaging/drain-queued-delivery.js';
+import { getInProcessTurnFailureService } from '../../services/agent/in-process-turn-failure.service.js';
+import { getActingFor } from '../../services/people/acting-for.service.js';
+import { getOwnerRequestContext } from '../../services/orc/owner-request-context.js';
+import { readAgentSessionHeader } from '../../utils/agent-caller.utils.js';
+import { getTurnTriggerTracker } from '../../services/trace/turn-trigger.js';
+import { getAgentAskLedger } from '../../services/messaging/agent-ask-ledger.service.js';
+import { getCallerIdentity, isOwnerCaller } from '../../middleware/caller-identity.middleware.js';
+import { pausedRefusalMessage, pausedTeamOfSession } from '../../services/team/team-pause.registry.js';
+import { noteTurnDelivery, withWorkItemTraceMarker } from '../../services/trace/trace-recorder.js';
+import { noteOutsideInput } from '../../services/session/input-ledger.js';
+import { describeAgentSender, wrapAgentMessage, type AgentMessageSender } from '../../services/messaging/agent-message-envelope.js';
+
+/** Logger instance for terminal controller */
+const logger: ComponentLogger = LoggerService.getInstance().createComponentLogger('TerminalController');
+
+/**
+ * List all active terminal sessions.
+ *
+ * @param req - Express request object
+ * @param res - Express response object
+ * @returns Promise that resolves when response is sent
+ *
+ * @example
+ * GET /api/terminal/sessions
+ * Response: { success: true, data: { sessions: ["session1", "session2"] } }
+ */
+export async function listTerminalSessions(req: Request, res: Response): Promise<void> {
+	try {
+		// Use async getSessionBackend to ensure backend is initialized
+		// This prevents race conditions when sessions are queried before orchestrator setup completes
+		const backend = await getSessionBackend();
+
+		const ptySessions = backend.listSessions();
+
+		// Include in-process Crewly Agent sessions (AI SDK runtime, no PTY)
+		const inProcessBuffer = InProcessLogBuffer.getInstance();
+		const inProcessSessionNames = inProcessBuffer.getSessionNames();
+
+		// Merge and deduplicate (in case a session name appears in both)
+		const allSessions = [...new Set([...ptySessions, ...inProcessSessionNames])];
+
+		res.json({
+			success: true,
+			data: {
+				sessions: allSessions,
+				inProcessSessions: inProcessSessionNames,
+			},
+		} as ApiResponse);
+	} catch (error) {
+		logger.error('Error listing terminal sessions', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		res.status(500).json({
+			success: false,
+			error: 'Failed to list terminal sessions',
+		} as ApiResponse);
+	}
+}
+
+/**
+ * Check if a terminal session exists.
+ *
+ * @param req - Express request object with sessionName param
+ * @param res - Express response object
+ * @returns Promise that resolves when response is sent
+ *
+ * @example
+ * GET /api/terminal/my-session/exists
+ * Response: { success: true, data: { exists: true, sessionName: "my-session" } }
+ */
+export async function sessionExists(req: Request, res: Response): Promise<void> {
+	try {
+		const { sessionName } = req.params;
+
+		if (!sessionName) {
+			res.status(400).json({
+				success: false,
+				error: 'Session name is required',
+			} as ApiResponse);
+			return;
+		}
+
+		// Validate session name for security
+		const sessionValidation = validateSessionName(sessionName);
+		if (!sessionValidation.isValid) {
+			res.status(400).json({
+				success: false,
+				error: sessionValidation.error,
+			} as ApiResponse);
+			return;
+		}
+
+		const backend = getSessionBackendSync();
+		if (!backend) {
+			res.status(503).json({
+				success: false,
+				error: 'Session backend not initialized',
+			} as ApiResponse);
+			return;
+		}
+
+		const exists = backend.sessionExists(sessionName);
+		res.json({
+			success: true,
+			data: { exists, sessionName },
+		} as ApiResponse);
+	} catch (error) {
+		logger.error('Error checking session existence', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		res.status(500).json({
+			success: false,
+			error: 'Failed to check session existence',
+		} as ApiResponse);
+	}
+}
+
+/**
+ * Capture terminal output from a session.
+ *
+ * @param req - Express request object with sessionName param and lines query
+ * @param res - Express response object
+ * @returns Promise that resolves when response is sent
+ *
+ * @example
+ * GET /api/terminal/my-session/output?lines=50
+ * Response: { success: true, data: { output: "...", sessionName: "my-session", lines: 50, truncated: false } }
+ */
+export async function captureTerminal(req: Request, res: Response): Promise<void> {
+	try {
+		const { sessionName } = req.params;
+		const { lines } = req.query;
+
+		if (!sessionName) {
+			res.status(400).json({
+				success: false,
+				error: 'Session name is required',
+			} as ApiResponse);
+			return;
+		}
+
+		// Validate session name for security
+		const sessionValidation = validateSessionName(sessionName);
+		if (!sessionValidation.isValid) {
+			res.status(400).json({
+				success: false,
+				error: sessionValidation.error,
+			} as ApiResponse);
+			return;
+		}
+
+		const backend = getSessionBackendSync();
+		if (!backend) {
+			res.status(503).json({
+				success: false,
+				error: 'Session backend not initialized',
+			} as ApiResponse);
+			return;
+		}
+
+		// Limit lines to prevent memory issues
+		const requestedLines = parseInt(lines as string) || TERMINAL_CONTROLLER_CONSTANTS.DEFAULT_CAPTURE_LINES;
+		const maxLines = Math.min(requestedLines, TERMINAL_CONTROLLER_CONSTANTS.MAX_CAPTURE_LINES);
+
+		// Check if session exists (PTY or in-process)
+		const inProcessBuffer = InProcessLogBuffer.getInstance();
+		const isPtySession = backend.sessionExists(sessionName);
+		const isInProcessSession = !isPtySession && inProcessBuffer.hasSession(sessionName);
+
+		if (!isPtySession && !isInProcessSession) {
+			res.status(404).json({
+				success: false,
+				error: `Session '${sessionName}' not found`,
+			} as ApiResponse);
+			return;
+		}
+
+		// Capture output from PTY session or in-process log buffer
+		const output = isPtySession
+			? backend.captureOutput(sessionName, maxLines)
+			: inProcessBuffer.capture(sessionName, maxLines);
+
+		// Limit output size to prevent memory issues
+		const wasTruncated = output.length > TERMINAL_CONTROLLER_CONSTANTS.MAX_OUTPUT_SIZE;
+		const trimmedOutput = wasTruncated
+			? `[TRUNCATED: output exceeded ${Math.round(output.length / 1024)}KB, showing last ${Math.round(TERMINAL_CONTROLLER_CONSTANTS.MAX_OUTPUT_SIZE / 1024)}KB]\n...` +
+				output.substring(output.length - TERMINAL_CONTROLLER_CONSTANTS.MAX_OUTPUT_SIZE + 3)
+			: output;
+
+		res.json({
+			success: true,
+			data: {
+				output: trimmedOutput,
+				sessionName,
+				lines: maxLines,
+				truncated: wasTruncated,
+			},
+		} as ApiResponse);
+	} catch (error) {
+		logger.error('Error capturing terminal', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		res.status(500).json({
+			success: false,
+			error: 'Failed to capture terminal output',
+		} as ApiResponse);
+	}
+}
+
+/**
+ * Coordinate a write with the fresh-conversation-per-task clear: wait
+ * (bounded) while a `/clear` is running for the session so this message is
+ * not wiped by it, then note the write so a clear right after it (before the
+ * agent has read it) is skipped. Never throws.
+ *
+ * @param sessionName - Session about to be written to
+ * @returns Call when the write has finished (ends the in-progress mark that
+ *   keeps a context-cap clear from starting during it)
+ */
+async function coordinateWithFreshConversation(sessionName: string): Promise<() => void> {
+	try {
+		const fresh = FreshTaskConversationService.getInstance();
+		await fresh.waitIfClearing(sessionName);
+		fresh.noteDelivery(sessionName);
+		return fresh.beginDelivery(sessionName);
+	} catch {
+		// Best-effort: delivery must proceed regardless.
+		return () => undefined;
+	}
+}
+
+/** A direct task hand-over prepared by {@link prepareWorkItemHandOver}. */
+interface WorkItemHandOver {
+	/** Text to write (fresh-conversation note + WorkItem id added when cleared) */
+	message: string;
+	/** Call after a successful write */
+	delivered: () => void;
+	/** Call after a failed write: the dispatcher may then deliver it */
+	failed: () => void;
+	/**
+	 * The dispatcher already delivered (or is delivering) this WorkItem to
+	 * this session — its dedup key was taken. A brief held by the restart
+	 * drain is then dropped instead of arriving twice (crewly#1015 follow-up M1).
+	 */
+	alreadyDispatched: boolean;
+}
+
+/** Fresh-conversation notes not yet delivered, by `${workItemId}::${session}` (a retry reuses it). */
+const pendingFreshNotes = new Map<string, string>();
+
+/**
+ * Prepare a write that hands a WorkItem's task to an agent directly (e.g.
+ * team-leader delegate-task delivering the brief with its `workItemId`).
+ *
+ *  - Claims the dispatcher's dedup key for (WorkItem, session), so its
+ *    `workitem:queued` push does not deliver the same task again.
+ *  - Runs the fresh-conversation prepare for the WorkItem — a new root on an
+ *    idle Claude Code member saves and clears the old conversation BEFORE
+ *    this first delivery. Same root, busy agent, orchestrator, unknown
+ *    WorkItem or one targeted at another session: no clear.
+ *  - When it cleared, puts the handover note in front and makes sure the text
+ *    carries the WorkItem id (the new conversation id is found by it).
+ *
+ * Without a `workItemId` the write is left alone (no claim, no clear).
+ * Never throws.
+ *
+ * @param sessionName - Session written to
+ * @param workItemId - WorkItem handed over, if the caller named one
+ * @param message - Text to write
+ * @returns The (possibly prefixed) text and the completion callbacks
+ */
+export async function prepareWorkItemHandOver(
+	sessionName: string,
+	workItemId: unknown,
+	message: string,
+): Promise<WorkItemHandOver> {
+	const noop: WorkItemHandOver = { message, delivered: () => undefined, failed: () => undefined, alreadyDispatched: false };
+	if (typeof workItemId !== 'string' || workItemId.trim() === '') return noop;
+	const id = workItemId.trim();
+	const key = `${id}::${sessionName}`;
+	try {
+		const { TaskPoolService } = await import('../../services/task-pool/task-pool.service.js');
+		const wi: WorkItem | null = await TaskPoolService.getInstance().findWorkItem(id).catch(() => null);
+		if (!wi || (wi.target && wi.target !== sessionName)) {
+			logger.debug('Hand-over names a WorkItem that is not this session\'s — delivering as is', {
+				sessionName,
+				workItemId: id,
+				found: !!wi,
+			});
+			return noop;
+		}
+
+		const { WorkItemDispatchSubscriber } = await import('../../services/v3/workitem-dispatch.subscriber.js');
+		const dispatcher = WorkItemDispatchSubscriber.getInstance();
+		const tookKey = dispatcher.claimDirectDelivery(id, sessionName);
+
+		const result = await FreshTaskConversationService.getInstance().prepareForTask(sessionName, wi);
+		if (result.cleared && result.handoverPath) pendingFreshNotes.set(key, freshConversationNote(result.handoverPath));
+
+		const note = pendingFreshNotes.get(key);
+		let text = withWorkItemTraceMarker(message, wi);
+		if (note) {
+			const idLine = message.includes(id) ? '' : `[WorkItem ${id}]\n`;
+			text = `${note}\n${idLine}${text}`;
+		}
+		return {
+			message: text,
+			alreadyDispatched: !tookKey,
+			delivered: () => {
+				pendingFreshNotes.delete(key);
+			},
+			failed: () => {
+				if (tookKey) dispatcher.releaseDirectDelivery(id, sessionName);
+			},
+		};
+	} catch (err) {
+		logger.debug('Work-item hand-over prepare failed (non-fatal) — delivering as is', {
+			sessionName,
+			workItemId: id,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return noop;
+	}
+}
+
+/**
+ * The sender of an agent-to-agent message written through this route
+ * (`send-message`), when its text should carry the sender header
+ * (crewly#1375). Null for the owner / dashboard, the orchestrator, raw
+ * keystrokes, WorkItem hand-overs, an agent writing to itself, and harness
+ * services that write with an agent badge but are not team members.
+ *
+ * @param target - Receiving session
+ * @param req - The request (caller identity, body)
+ * @returns The sender, or null when the text goes as it is
+ */
+async function agentMessageSenderOf(target: string, req: Request): Promise<AgentMessageSender | null> {
+	try {
+		if (req.body?.mode !== 'message' || req.body?.workItemId) return null;
+		if (isOwnerCaller(req)) return null;
+		const sender = readAgentSessionHeader(req);
+		if (!sender || sender === target) return null;
+		// The orchestrator frames its own messages on this route.
+		if (sender === ORCHESTRATOR_SESSION_NAME) return null;
+		const found = await describeAgentSender(sender, (session) => StorageService.getInstance().findMemberBySessionName(session));
+		return found ? await withSenderRoute(found) : null;
+	} catch {
+		// The header is a courtesy: never block the delivery over it.
+		return null;
+	}
+}
+
+/**
+ * The sender header of an agent's `/deliver` message (`orchestrator/send-message`,
+ * crewly#1381 item 1): the orchestrator or a team member, never a WorkItem
+ * hand-over (the dispatch frames that) or the owner. The recipient's answer
+ * then goes back to the sender, not into the recipient's last owner thread.
+ *
+ * @param target - Receiving session
+ * @param req - The request (caller identity, body)
+ * @returns The sender, or null when the text goes as it is
+ */
+async function agentDeliverSenderOf(target: string, req: Request): Promise<AgentMessageSender | null> {
+	try {
+		if (req.body?.workItemId) return null;
+		if (isOwnerCaller(req)) return null;
+		const sender = readAgentSessionHeader(req);
+		if (!sender || sender === target) return null;
+		if (sender === ORCHESTRATOR_SESSION_NAME) return await withSenderRoute({ session: sender, name: 'Orc', team: 'Crewly orchestrator' });
+		const found = await describeAgentSender(sender, (session) => StorageService.getInstance().findMemberBySessionName(session));
+		return found ? await withSenderRoute(found) : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The sender with the route it is answering (message-routing audit
+ * 2026-10-18): the owner thread or work item travels with the message.
+ *
+ * @param sender - The sender
+ * @returns The sender, with its route when it has one
+ */
+async function withSenderRoute(sender: AgentMessageSender): Promise<AgentMessageSender> {
+	try {
+		const { currentRouteOf } = await import('../../services/orc/reply-destination.wiring.js');
+		const route = await currentRouteOf(sender.session);
+		return route ? { ...sender, route } : sender;
+	} catch {
+		// The route is a courtesy here: the header still names the sender.
+		return sender;
+	}
+}
+
+/**
+ * A message from one agent to a team member whose session is down: queue it
+ * and start the agent instead of answering 404 (#929).
+ *
+ * Agent-to-agent messages take this path (the caller's `X-Agent-Session`
+ * is the orchestrator or a team member), with a start. A scheduled command's
+ * note (the scheduler credential) is queued too but starts nobody (CREW-362).
+ * A raw write that hands over a WorkItem is left to the pool, which already wakes offline targets for queued work (a
+ * `deliver` that hands one over takes this path too, #1135), and
+ * internal notifiers (the WorkItem dispatcher, worktree notices, …) keep their
+ * 404 — a system notice is not a reason to start an agent.
+ *
+ * @param req - The request (for the caller header)
+ * @param sessionName - Target session (no live session)
+ * @param data - Message text
+ * @returns The queue outcome, or null when this path does not apply
+ */
+async function queueMessageForOfflineMember(
+	req: Request,
+	sessionName: string,
+	data: string,
+): Promise<OfflineAgentMessageResult | null> {
+	// A scheduled command's note (the crewly-web release line, CREW-362) to a
+	// member who is down: queued, never waking the agent. It is delivered when the
+	// agent next starts. A system notice is not a reason to start one.
+	if (getCallerIdentity(req).kind === 'scheduler') {
+		return queueForOfflineAgent(sessionName, data, {
+			findMember: (name) => StorageService.getInstance().findMemberBySessionName(name),
+			enqueue: (name, text) => SubAgentMessageQueue.getInstance().enqueue(name, text),
+			wake: null,
+		});
+	}
+	const caller = req.headers?.['x-agent-session'];
+	if (typeof caller !== 'string' || !caller) return null;
+	if (caller !== ORCHESTRATOR_SESSION_NAME) {
+		const callerMember = await StorageService.getInstance().findMemberBySessionName(caller).catch(() => null);
+		if (!callerMember) return null;
+	}
+	return queueForOfflineAgent(sessionName, data, {
+		findMember: (name) => StorageService.getInstance().findMemberBySessionName(name),
+		enqueue: (name, text) => SubAgentMessageQueue.getInstance().enqueue(name, text),
+		wake: getOfflineAgentWaker(),
+	});
+}
+
+/**
+ * The 202 body for a message queued for an agent that is down.
+ *
+ * @param outcome - What {@link queueMessageForOfflineMember} did
+ * @returns Response body
+ */
+function offlineQueuedResponse(outcome: OfflineAgentMessageResult): ApiResponse {
+	return {
+		success: true,
+		queued: true,
+		waking: outcome.waking,
+		message: outcome.waking
+			? 'The agent is not running. The message is queued and the agent is being started; it is delivered when the agent is ready.'
+			: `The agent is not running. The message is queued. ${outcome.reason ?? ''}`.trim(),
+	} as ApiResponse;
+}
+
+/**
+ * Write data to a terminal session.
+ *
+ * @param req - Express request object with sessionName param and data in body
+ * @param res - Express response object
+ * @returns Promise that resolves when response is sent
+ *
+ * @example
+ * POST /api/terminal/my-session/write
+ * Body: { data: "hello\r" }
+ * Response: { success: true, message: "Data written successfully" }
+ */
+export async function writeToSession(this: unknown, req: Request, res: Response): Promise<void> {
+	// Set once the write is under way; run in `finally`.
+	let endDelivery: () => void = () => undefined;
+	let handOver: WorkItemHandOver | null = null;
+	try {
+		const { sessionName } = req.params;
+		const { data } = req.body;
+
+		if (!sessionName) {
+			res.status(400).json({
+				success: false,
+				error: 'Session name is required',
+			} as ApiResponse);
+			return;
+		}
+
+		// Validate session name for security
+		const sessionValidation = validateSessionName(sessionName);
+		if (!sessionValidation.isValid) {
+			res.status(400).json({
+				success: false,
+				error: sessionValidation.error,
+			} as ApiResponse);
+			return;
+		}
+		// A paused team takes no messages from other agents (specs/2026-10-04-team-pause.md).
+		if (rejectMessageToPausedTeam(sessionName, req, res)) return;
+		// From another agent: the target acts for the sender's person (issue #968).
+		noteAgentToAgent(sessionName, req);
+
+		// =====================================================================
+		// Orc-namespace gate telemetry (4-piece skill-mistake fix piece #4).
+		// =====================================================================
+		// When an orc-role caller hits this raw /terminal/{session}/write path,
+		// emit a warn-log naming the namespace mistake. This is observability —
+		// the request still succeeds — so we can catch backsliding from the
+		// prompt-builder (piece #2) + soul (piece #3) + skill-frontmatter
+		// (piece #1) discipline.
+		//
+		// Caller is identified via X-Agent-Session header (set canonically by
+		// every agent skill that calls api_call() — see config/skills/_common/lib.sh:103).
+		// Caller role is resolved via StorageService.findMemberBySessionName.
+		// We deliberately skip the log when caller is unknown (registration
+		// race, ad-hoc curl) to avoid false positives.
+		//
+		// Spec provenance: 4-piece skill-mistake fix dispatch piece #4
+		// (Sam→Quinn, post-PR #446 merge). PR #449.
+		const callerSessionName = req.headers?.['x-agent-session'] as string | undefined;
+		if (callerSessionName) {
+			try {
+				const callerMember = await StorageService.getInstance().findMemberBySessionName(callerSessionName);
+				if (callerMember && callerMember.member.role === 'orchestrator') {
+					logger.warn(
+						'[orc-namespace-gate] orc-role caller wrote to terminal via agent-side /write — should use orc-namespaced wrapper',
+						{
+							callerSession: callerSessionName,
+							targetSession: sessionName,
+							skillPath: 'config/skills/agent/core/send-message',
+							canonicalAlternative: 'config/skills/orchestrator/send-message',
+							endpointHit: '/terminal/{session}/write',
+							canonicalEndpoint: '/terminal/{session}/deliver',
+							specProvenance: '4-piece skill-mistake fix piece #4 (PR #449)',
+						},
+					);
+				}
+			} catch (err) {
+				// Lookup failure is non-fatal — telemetry is best-effort, the actual
+				// write must proceed. Log at debug so noisy lookup errors don't
+				// pollute the warn channel.
+				logger.debug('orc-namespace-gate caller lookup failed (non-fatal)', {
+					callerSessionName,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+
+		if (data === undefined || data === null) {
+			res.status(400).json({
+				success: false,
+				error: 'Data is required',
+			} as ApiResponse);
+			return;
+		}
+
+		// Convert data to string and validate for dangerous control sequences
+		// (before anything below can clear the agent's conversation).
+		// A scheduled command's note says who sent it, `[scheduler:<name>] …`: it
+		// is neither the owner nor an agent, and the recipient must not take it for either.
+		const caller = getCallerIdentity(req);
+		const fromScheduler = caller.kind === 'scheduler';
+		// Another agent's message names its sender and reply route (crewly#1375):
+		// the recipient must not take it for the owner, nor answer it in an owner thread.
+		const agentSender = !fromScheduler ? await agentMessageSenderOf(sessionName, req) : null;
+		const rawDataStr = fromScheduler
+			? `[${caller.sender ?? 'scheduler:unknown'}] ${String(data)}`
+			: agentSender
+				? wrapAgentMessage(String(data), agentSender)
+				: String(data);
+		const validation = validateTerminalInput(rawDataStr);
+		if (!validation.isValid) {
+			logger.warn('Terminal input validation failed', {
+				sessionName,
+				error: validation.error,
+				dataLength: rawDataStr.length,
+			});
+			res.status(400).json({
+				success: false,
+				error: `Invalid terminal input: ${validation.error}`,
+			} as ApiResponse);
+			return;
+		}
+
+		// Safe restart: a message (not raw keystrokes) written during the
+		// shutdown drain would start a turn the drain does not know about. It
+		// waits on the persistent queue instead (crewly#1015 §6). Checked
+		// before the hand-over, which may /clear the agent.
+		if (req.body?.mode === 'message' || getInProcessRuntime(sessionName)) {
+			const held = queueIfRestartDraining(sessionName, rawDataStr, { workItemId: req.body?.workItemId });
+			if (held) {
+				res.status(202).json(held);
+				return;
+			}
+		}
+
+		// A write that hands over a WorkItem (`workItemId` in the body) gets the
+		// fresh-conversation prepare and the dispatcher dedup; others do not.
+		handOver = await prepareWorkItemHandOver(sessionName, req.body?.workItemId, rawDataStr);
+		const dataStr = handOver.message;
+		endDelivery = await coordinateWithFreshConversation(sessionName);
+
+		const backend = getSessionBackendSync();
+		if (!backend) {
+			res.status(503).json({
+				success: false,
+				error: 'Session backend not initialized',
+			} as ApiResponse);
+			return;
+		}
+
+		const session = backend.getSession(sessionName);
+		if (!session) {
+			// No PTY session. Before returning 404, check for an in-process Crewly
+			// Agent runtime (e.g. an in-process orchestrator): crewly-agent runs
+			// in-process with NO PTY session, so backend.getSession() is always
+			// null for it. The WorkItem dispatch subscriber and Hybrid-Wake
+			// redeliver both POST to this endpoint; without this branch they
+			// 404-loop against a live in-process target and the WI is never
+			// delivered (issue #693 follow-up bug (a)). The module-scoped
+			// in-process-runtime-registry is populated in this (API-server)
+			// process by AgentRegistrationService.registerAgent(), so the lookup
+			// is reliable here without an AgentRegistrationService reference.
+			const inProcessRuntime = getInProcessRuntime(sessionName);
+			if (inProcessRuntime && isInProcessRuntimeActive(sessionName)) {
+				// Every write to an in-process runtime is a turn (there are no
+				// keystrokes to pass through), so the token cap gates it in any mode.
+				const capped = queueIfSpendCapped(sessionName, dataStr);
+				if (capped) {
+					res.status(202).json(capped);
+					return;
+				}
+				// Fire-and-forget to preserve the /write contract's non-blocking
+				// semantics: a PTY session.write() returns immediately, whereas
+				// handleMessage() resolves only when the full agent run completes.
+				// Awaiting it here would stall the caller (the subscriber uses a
+				// 5s timeout) for the duration of a full agent turn. Delivery
+				// errors are logged, not surfaced — the caller's retry path (the
+				// subscriber leaves the WI undispatched on failure) handles
+				// redelivery. Bracketed-paste / two-step write is a PTY/TUI
+				// concern and is intentionally skipped for the in-process path.
+				noteTurnDelivery(sessionName, dataStr, 'in-process');
+				void inProcessRuntime
+					.handleMessage(dataStr)
+					.then(() => getInProcessTurnFailureService()?.onTurnSucceeded(sessionName))
+					.catch((err) => {
+						logger.warn('In-process runtime message delivery failed', {
+							sessionName,
+							error: err instanceof Error ? err.message : String(err),
+						});
+						// Not dropped: delivered once more, then reported (crewly#1015 §2).
+						getInProcessTurnFailureService()?.onTurnFailed(sessionName, dataStr, err);
+					});
+				logger.debug('Data delivered to in-process runtime', {
+					sessionName,
+					dataLength: dataStr.length,
+				});
+				res.json({
+					success: true,
+					message: 'Data delivered to in-process runtime',
+				} as ApiResponse);
+				return;
+			}
+			if (req.body.mode === 'message' && !req.body.workItemId) {
+				const queued = await queueMessageForOfflineMember(req, sessionName, dataStr);
+				if (queued) {
+					res.status(202).json(offlineQueuedResponse(queued));
+					return;
+				}
+			}
+			res.status(404).json({
+				success: false,
+				error: `Session '${sessionName}' not found`,
+			} as ApiResponse);
+			return;
+		}
+
+		// Check for "message" mode: uses two-step write pattern for TUI
+		// runtimes where bracketed paste mode swallows an inline \r.
+		// Step 1: Write text only (triggers bracketed paste)
+		// Step 2: Delay based on message length (paste processing time)
+		// Step 3: Write \r separately (submits the message)
+		const mode = req.body.mode as string | undefined;
+
+		if (mode === 'message') {
+			// Daily token cap (#937): a capped agent takes no new turn from this
+			// path either. Checked before the readiness queue so a capped,
+			// suspended agent is not rehydrated just to sit idle.
+			const capped = queueIfSpendCapped(sessionName, dataStr);
+			if (capped) {
+				res.status(202).json(capped);
+				return;
+			}
+
+			// Queue messages for sub-agents that haven't completed initialization.
+			// Skip for orchestrator (it has its own queue via QueueProcessorService)
+			// and for sessions not tracked as team members (plain shell sessions).
+			if (sessionName !== ORCHESTRATOR_SESSION_NAME) {
+				try {
+					const memberResult = await StorageService.getInstance().findMemberBySessionName(sessionName);
+					if (memberResult && memberResult.member.agentStatus !== CREWLY_CONSTANTS.AGENT_STATUSES.ACTIVE) {
+						SubAgentMessageQueue.getInstance().enqueue(sessionName, dataStr);
+
+						// If agent is suspended, trigger auto-rehydration
+						if (memberResult.member.agentStatus === CREWLY_CONSTANTS.AGENT_STATUSES.SUSPENDED) {
+							const suspendService = AgentSuspendService.getInstance();
+							if (!suspendService.isRehydrating(sessionName)) {
+								// Fire-and-forget: rehydration happens in background
+								suspendService.rehydrateAgent(sessionName).catch(err => {
+									logger.error('Auto-rehydration failed', {
+										sessionName,
+										error: err instanceof Error ? err.message : String(err),
+									});
+								});
+							}
+						}
+
+						logger.info('Message queued until agent is ready', {
+							sessionName,
+							agentStatus: memberResult.member.agentStatus,
+							queueSize: SubAgentMessageQueue.getInstance().getQueueSize(sessionName),
+						});
+						res.status(202).json({
+							success: true,
+							queued: true,
+							message: 'Message queued until agent is ready',
+						} as ApiResponse);
+						return;
+					}
+				} catch (lookupError) {
+					// If lookup fails, deliver normally rather than blocking the message
+					logger.warn('Agent status lookup failed, delivering message directly', {
+						sessionName,
+						error: lookupError instanceof Error ? lookupError.message : String(lookupError),
+					});
+				}
+			}
+
+			// Another agent's message to a Claude Code agent that is mid-turn is
+			// queued, not pasted into the running turn: the sender gets a 202 at
+			// once and the message goes out when the recipient is idle
+			// (2026-10-05). A WorkItem hand-over keeps its own dispatch path.
+			const registration = (this as Partial<ApiContext> | undefined)?.agentRegistrationService;
+			if (registration && !req.body?.workItemId && (readAgentSessionHeader(req) || fromScheduler)) {
+				const held = await registration.holdIfMidTurn(sessionName, dataStr);
+				if (held) {
+					logger.info('Recipient mid-turn — message queued, sender not kept waiting', { sessionName, ...held });
+					res.status(202).json({
+						success: true,
+						queued: true,
+						position: held.position,
+						queueSize: held.queueSize,
+						message: `[AGENT_BUSY] ${sessionName} is busy: message queued at position ${held.position} of ${held.queueSize}; it is delivered when ${sessionName} is idle`,
+					} as ApiResponse);
+					return;
+				}
+			}
+
+			// Guarded two-step write (bracketed paste, then Enter) — the input box
+			// must be empty before we type and hold exactly our text when Enter is
+			// pressed. No blind backup Enter: once our text is submitted the box
+			// is empty, and Enter there could submit a prompt suggestion as the
+			// owner (2026-10-03 phantom owner input).
+			try {
+				await createSessionCommandHelper(backend).sendMessage(sessionName, dataStr);
+			} catch (guardErr) {
+				if (guardErr instanceof TuiInputGuardError) {
+					res.status(409).json({
+						success: false,
+						code: 'input_not_ours',
+						error: guardErr.message,
+					} as ApiResponse);
+					return;
+				}
+				if (guardErr instanceof TuiPasteHoldError) {
+					queuePasteHeldMessage(res, sessionName, dataStr, registration, guardErr.reason);
+					return;
+				}
+				throw guardErr;
+			}
+			noteTurnDelivery(sessionName, dataStr, 'pty');
+		} else {
+			// Default: single write with carriage return appended (for shell commands).
+			// Not gated by the daily token cap (#937, decided): raw keystrokes are
+			// how the owner and the services manage a session (Enter, Ctrl-C,
+			// shell commands). Every message sender uses `mode: "message"`.
+			noteOutsideInput(sessionName); // raw keystrokes: outside input (input-ledger)
+			session.write(dataStr + '\r');
+		}
+
+		logger.debug('Data written to session', {
+			sessionName,
+			dataLength: dataStr.length,
+			mode: mode || 'default',
+		});
+
+		res.json({
+			success: true,
+			message: 'Data written successfully',
+		} as ApiResponse);
+	} catch (error) {
+		logger.error('Error writing to session', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		res.status(500).json({
+			success: false,
+			error: 'Failed to write to session',
+		} as ApiResponse);
+	} finally {
+		endDelivery();
+		if (handOver) {
+			if (res.statusCode < 400) handOver.delivered();
+			else handOver.failed();
+		}
+	}
+}
+
+/**
+ * Send terminal input to a session (legacy endpoint).
+ *
+ * @param req - Express request object with sessionName param and input in body
+ * @param res - Express response object
+ * @returns Promise that resolves when response is sent
+ *
+ * @example
+ * POST /api/terminal/my-session/input
+ * Body: { input: "echo hello" }
+ * Response: { success: true, message: "Input sent successfully" }
+ */
+export async function sendTerminalInput(req: Request, res: Response): Promise<void> {
+	try {
+		const { sessionName } = req.params;
+		const { input } = req.body;
+
+		if (!sessionName) {
+			res.status(400).json({
+				success: false,
+				error: 'Session name is required',
+			} as ApiResponse);
+			return;
+		}
+
+		// Validate session name for security
+		const sessionValidation = validateSessionName(sessionName);
+		if (!sessionValidation.isValid) {
+			res.status(400).json({
+				success: false,
+				error: sessionValidation.error,
+			} as ApiResponse);
+			return;
+		}
+
+		if (!input) {
+			res.status(400).json({
+				success: false,
+				error: 'Input is required',
+			} as ApiResponse);
+			return;
+		}
+
+		// Convert input to string and validate for dangerous control sequences
+		const inputStr = String(input);
+		const validation = validateTerminalInput(inputStr);
+		if (!validation.isValid) {
+			logger.warn('Terminal input validation failed', {
+				sessionName,
+				error: validation.error,
+				inputLength: inputStr.length,
+			});
+			res.status(400).json({
+				success: false,
+				error: `Invalid terminal input: ${validation.error}`,
+			} as ApiResponse);
+			return;
+		}
+
+		const backend = getSessionBackendSync();
+		if (!backend) {
+			res.status(503).json({
+				success: false,
+				error: 'Session backend not initialized',
+			} as ApiResponse);
+			return;
+		}
+
+		const session = backend.getSession(sessionName);
+		if (!session) {
+			res.status(404).json({
+				success: false,
+				error: `Session '${sessionName}' not found`,
+			} as ApiResponse);
+			return;
+		}
+
+		// Write input to session (add carriage return for command execution)
+		noteOutsideInput(sessionName); // raw input: outside input (input-ledger)
+		session.write(inputStr + '\r');
+
+		logger.debug('Input sent to session', {
+			sessionName,
+			inputLength: inputStr.length,
+		});
+
+		res.json({
+			success: true,
+			message: 'Input sent successfully',
+		} as ApiResponse);
+	} catch (error) {
+		logger.error('Error sending terminal input', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		res.status(500).json({
+			success: false,
+			error: 'Failed to send terminal input',
+		} as ApiResponse);
+	}
+}
+
+/**
+ * Send a special key to a terminal session.
+ *
+ * @param req - Express request object with sessionName param and key in body
+ * @param res - Express response object
+ * @returns Promise that resolves when response is sent
+ *
+ * @example
+ * POST /api/terminal/my-session/key
+ * Body: { key: "Enter" }
+ * Response: { success: true, message: "Key sent successfully" }
+ */
+export async function sendTerminalKey(req: Request, res: Response): Promise<void> {
+	try {
+		const { sessionName } = req.params;
+		const { key } = req.body;
+
+		if (!sessionName) {
+			res.status(400).json({
+				success: false,
+				error: 'Session name is required',
+			} as ApiResponse);
+			return;
+		}
+
+		// Validate session name for security
+		const sessionValidation = validateSessionName(sessionName);
+		if (!sessionValidation.isValid) {
+			res.status(400).json({
+				success: false,
+				error: sessionValidation.error,
+			} as ApiResponse);
+			return;
+		}
+
+		if (!key) {
+			res.status(400).json({
+				success: false,
+				error: 'Key is required',
+			} as ApiResponse);
+			return;
+		}
+
+		// Validate key name - only allow known safe key names
+		const allowedKeys = [
+			'Enter', 'Return', 'Escape', 'Tab', 'Backspace', 'Delete',
+			'Up', 'Down', 'Right', 'Left', 'Home', 'End', 'PageUp', 'PageDown',
+			'C-c', 'C-d', 'C-z', 'C-l', 'C-u'
+		];
+		if (!allowedKeys.includes(key)) {
+			res.status(400).json({
+				success: false,
+				error: `Invalid key name. Allowed keys: ${allowedKeys.join(', ')}`,
+			} as ApiResponse);
+			return;
+		}
+
+		const backend = getSessionBackendSync();
+		if (!backend) {
+			res.status(503).json({
+				success: false,
+				error: 'Session backend not initialized',
+			} as ApiResponse);
+			return;
+		}
+
+		const session = backend.getSession(sessionName);
+		if (!session) {
+			res.status(404).json({
+				success: false,
+				error: `Session '${sessionName}' not found`,
+			} as ApiResponse);
+			return;
+		}
+
+		// Map key names to their escape sequences
+		const keySequence = mapKeyToSequence(key);
+		noteOutsideInput(sessionName); // a key from outside (input-ledger)
+		session.write(keySequence);
+
+		logger.debug('Key sent to session', {
+			sessionName,
+			key,
+		});
+
+		res.json({
+			success: true,
+			message: 'Key sent successfully',
+		} as ApiResponse);
+	} catch (error) {
+		logger.error('Error sending terminal key', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		res.status(500).json({
+			success: false,
+			error: 'Failed to send terminal key',
+		} as ApiResponse);
+	}
+}
+
+/**
+ * Kill a terminal session.
+ *
+ * @param req - Express request object with sessionName param
+ * @param res - Express response object
+ * @returns Promise that resolves when response is sent
+ *
+ * @example
+ * DELETE /api/terminal/my-session
+ * Response: { success: true, message: "Session killed successfully" }
+ */
+export async function killSession(req: Request, res: Response): Promise<void> {
+	try {
+		const { sessionName } = req.params;
+
+		if (!sessionName) {
+			res.status(400).json({
+				success: false,
+				error: 'Session name is required',
+			} as ApiResponse);
+			return;
+		}
+
+		// Validate session name for security
+		const sessionValidation = validateSessionName(sessionName);
+		if (!sessionValidation.isValid) {
+			res.status(400).json({
+				success: false,
+				error: sessionValidation.error,
+			} as ApiResponse);
+			return;
+		}
+
+		const backend = getSessionBackendSync();
+		if (!backend) {
+			res.status(503).json({
+				success: false,
+				error: 'Session backend not initialized',
+			} as ApiResponse);
+			return;
+		}
+
+		if (!backend.sessionExists(sessionName)) {
+			res.status(404).json({
+				success: false,
+				error: `Session '${sessionName}' not found`,
+			} as ApiResponse);
+			return;
+		}
+
+		await backend.killSession(sessionName);
+
+		logger.info('Session killed', { sessionName });
+
+		res.json({
+			success: true,
+			message: 'Session killed successfully',
+		} as ApiResponse);
+	} catch (error) {
+		logger.error('Error killing session', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		res.status(500).json({
+			success: false,
+			error: 'Failed to kill session',
+		} as ApiResponse);
+	}
+}
+
+/**
+ * Map a key name to its terminal escape sequence.
+ *
+ * @param key - The key name (e.g., "Enter", "Escape", "C-c")
+ * @returns The corresponding escape sequence
+ */
+function mapKeyToSequence(key: string): string {
+	const keyMap: Record<string, string> = {
+		Enter: '\r',
+		Return: '\r',
+		Escape: '\x1b',
+		Tab: '\t',
+		Backspace: '\x7f',
+		Delete: '\x1b[3~',
+		Up: '\x1b[A',
+		Down: '\x1b[B',
+		Right: '\x1b[C',
+		Left: '\x1b[D',
+		Home: '\x1b[H',
+		End: '\x1b[F',
+		PageUp: '\x1b[5~',
+		PageDown: '\x1b[6~',
+		'C-c': '\x03', // Ctrl+C
+		'C-d': '\x04', // Ctrl+D
+		'C-z': '\x1a', // Ctrl+Z
+		'C-l': '\x0c', // Ctrl+L (clear)
+		'C-u': '\x15', // Ctrl+U (clear the input line)
+	};
+
+	return keyMap[key] ?? key;
+}
+
+/**
+ * Deliver a message to an agent session with reliable retry and verification.
+ *
+ * Uses AgentRegistrationService.sendMessageToAgent() — the same battle-tested
+ * delivery path that chat-to-orchestrator uses (prompt check + 3-attempt retry
+ * + stuck detection). This replaces the fire-and-forget `/write` endpoint for
+ * sub-agent message delivery from skill scripts.
+ *
+ * Must be called with `.call(apiController, req, res)` so `this` is an ApiContext.
+ *
+ * @param req - Express request with sessionName param and message in body
+ * @param res - Express response object
+ *
+ * @example
+ * POST /api/terminal/my-agent/deliver
+ * Body: { message: "Hello agent", waitForReady: true }
+ * Response: { success: true, verified: true }
+ */
+/**
+ * Queue a message whose guarded write was held because an earlier paste of
+ * ours is still settling in the recipient's input box (`TuiPasteHoldError`).
+ *
+ * Before 2026-10-26 the hold fell through to the generic 500 ("Failed to
+ * write to session") and the sender resent by hand (Quinn → Sam 14:21).
+ * The hold is the same condition as a mid-turn hold — the box is not ours
+ * to type into right now — so it answers the same way: 202 with the queue
+ * position, and the busy-hold recheck (or the next idle) delivers it.
+ *
+ * @param res - Response to answer with 202
+ * @param sessionName - Recipient session
+ * @param message - Message text to queue
+ * @param registration - Registration service when the context has one; it
+ *   schedules the recheck. Without it the message goes straight to the
+ *   sub-agent queue and is drained on the recipient's next idle.
+ * @param reason - Why the write was held
+ */
+function queuePasteHeldMessage(
+	res: Response,
+	sessionName: string,
+	message: string,
+	registration: ApiContext['agentRegistrationService'] | undefined,
+	reason: TuiPasteHoldError['reason'],
+): void {
+	let held: { position: number; queueSize: number };
+	if (registration) {
+		held = registration.holdForBusyAgent(sessionName, message);
+	} else {
+		const queue = SubAgentMessageQueue.getInstance();
+		queue.enqueue(sessionName, message);
+		const queueSize = queue.getQueueSize(sessionName);
+		held = { position: queueSize, queueSize };
+	}
+	logger.info('Recipient input box still settling — message queued', { sessionName, reason, ...held });
+	res.status(202).json({
+		success: true,
+		queued: true,
+		position: held.position,
+		queueSize: held.queueSize,
+		message: `[AGENT_BUSY] ${sessionName}'s input box is still settling: message queued at position ${held.position} of ${held.queueSize}; it is delivered once the box is clear`,
+	} as ApiResponse);
+}
+
+export async function deliverMessage(this: ApiContext, req: Request, res: Response): Promise<void> {
+	// Set once the delivery is under way; run in `finally`.
+	let endDelivery: () => void = () => undefined;
+	let handOver: WorkItemHandOver | null = null;
+	try {
+		const { sessionName } = req.params;
+		const { message: rawMessage, runtimeType, waitForReady, waitTimeout, force, senderSessionName, workItemId, queueIfBusy } = req.body;
+
+		if (!sessionName) {
+			res.status(400).json({
+				success: false,
+				error: 'Session name is required',
+			} as ApiResponse);
+			return;
+		}
+
+		// Validate session name for security
+		const sessionValidation = validateSessionName(sessionName);
+		if (!sessionValidation.isValid) {
+			res.status(400).json({
+				success: false,
+				error: sessionValidation.error,
+			} as ApiResponse);
+			return;
+		}
+
+		if (!rawMessage || typeof rawMessage !== 'string') {
+			res.status(400).json({
+				success: false,
+				error: 'Message is required and must be a string',
+			} as ApiResponse);
+			return;
+		}
+		// Replaced below by the hand-over text for a local WorkItem hand-over.
+		// An agent's message names its sender and the route it carries.
+		const deliverSender = await agentDeliverSenderOf(sessionName, req);
+		let message: string = deliverSender ? wrapAgentMessage(rawMessage, deliverSender) : rawMessage;
+		// A paused team takes no messages from other agents (specs/2026-10-04-team-pause.md).
+		if (rejectMessageToPausedTeam(sessionName, req, res)) return;
+		// A message from one agent to another: the target now acts for whoever
+		// the sender acts for (issue #968).
+		noteAgentToAgent(sessionName, req);
+
+		// Resolve runtime type: prefer request body, fall back to storage lookup,
+		// then check in-process runtimes (crewly-agent has no PTY session)
+		let resolvedRuntimeType: RuntimeType | undefined = runtimeType as RuntimeType | undefined;
+		if (!resolvedRuntimeType) {
+			try {
+				const memberResult = await StorageService.getInstance().findMemberBySessionName(sessionName);
+				if (memberResult?.member?.runtimeType) {
+					resolvedRuntimeType = effectiveRuntimeType(sessionName, memberResult.member.runtimeType as RuntimeType);
+				}
+			} catch {
+				// Non-fatal: sendMessageToAgent will use its default
+			}
+		}
+		// Fallback: if still unresolved, check if an in-process crewly-agent exists for this session
+		if (!resolvedRuntimeType) {
+			const inProcessRuntime = this.agentRegistrationService.getInProcessRuntime(sessionName);
+			if (inProcessRuntime) {
+				resolvedRuntimeType = RUNTIME_TYPES.CREWLY_AGENT;
+			}
+		}
+
+		// Check if the session exists locally (PTY or in-process) before attempting delivery.
+		// If not found locally, try remote routing via CloudSync before returning 404.
+		const localBackend = getSessionBackendSync();
+		const inProcessRuntimeCheck = this.agentRegistrationService.getInProcessRuntime(sessionName);
+		const hasLocalSession = !!(localBackend?.sessionExists(sessionName)) || !!inProcessRuntimeCheck;
+
+		if (!hasLocalSession) {
+			// Session not found locally — attempt remote routing via Cloud
+			try {
+				const { MessageRouterService } = await import('../../services/messaging/message-router.service.js');
+				const router = MessageRouterService.getInstance();
+				const routeResult = await router.routeRemote(sessionName, message);
+				if (routeResult.routed) {
+					logger.info('Message routed to remote device', {
+						sessionName,
+						deviceId: routeResult.deviceId,
+						deviceName: routeResult.deviceName,
+						messageLength: message.length,
+					});
+					res.json({
+						success: true,
+						remote: true,
+						deviceId: routeResult.deviceId,
+						deviceName: routeResult.deviceName,
+					} as ApiResponse);
+					return;
+				}
+				// Remote routing also failed — fall through to 404
+			} catch (routeError) {
+				logger.warn('Remote routing attempt failed', {
+					sessionName,
+					error: routeError instanceof Error ? routeError.message : String(routeError),
+				});
+			}
+
+			// A team member that is down: queue the message and start the agent.
+			// Also when the delivery hands over a WorkItem (delegate-task): the
+			// brief is queued and the start deferred behind the running-agent
+			// cap is retried when a slot frees, instead of a 404 (#1135).
+			// The queued brief IS this WorkItem's delivery: take the dispatcher's
+			// key so its own push does not deliver the task a second time.
+			let tookKey = false;
+			const handedItem = typeof workItemId === 'string' ? workItemId.trim() : '';
+			if (handedItem) {
+				try {
+					const { WorkItemDispatchSubscriber } = await import('../../services/v3/workitem-dispatch.subscriber.js');
+					tookKey = WorkItemDispatchSubscriber.getInstance().claimDirectDelivery(handedItem, sessionName);
+				} catch {
+					/* best effort: a duplicate push is better than a lost task */
+				}
+			}
+			const queued = await queueMessageForOfflineMember(req, sessionName, message);
+			if (queued) {
+				res.status(202).json(offlineQueuedResponse(queued));
+				return;
+			}
+			if (tookKey) {
+				const { WorkItemDispatchSubscriber } = await import('../../services/v3/workitem-dispatch.subscriber.js');
+				WorkItemDispatchSubscriber.getInstance().releaseDirectDelivery(handedItem, sessionName);
+			}
+
+			// Neither local nor remote — return 404
+			res.status(404).json({
+				success: false,
+				error: `Session '${sessionName}' not found (local or remote)`,
+			} as ApiResponse);
+			return;
+		}
+
+		// Safe restart: nothing new is written into a local agent once the
+		// shutdown drain has started — a forced write skips sendMessageToAgent,
+		// whose own gate would otherwise catch it (crewly#1015 §6). Checked
+		// before the hand-over, which may /clear the agent.
+		const held = queueIfRestartDraining(sessionName, message, { workItemId });
+		if (held) {
+			res.status(202).json(held);
+			return;
+		}
+
+		// A delivery that hands over a WorkItem (`workItemId` in the body — the
+		// team-leader delegate-task brief) starts a fresh conversation for a
+		// new task BEFORE this first delivery and takes the dispatcher's dedup
+		// key so the `workitem:queued` push does not deliver it again. Without
+		// a `workItemId` nothing is cleared.
+		handOver = await prepareWorkItemHandOver(sessionName, workItemId, message);
+		message = handOver.message;
+		endDelivery = await coordinateWithFreshConversation(sessionName);
+
+		// Force mode: write directly to PTY, skipping waitForReady and verification.
+		// Use when the agent is busy and waitForReady would time out (#113).
+		if (force) {
+			// `force` skips readiness, not the daily token cap (#937): a forced
+			// write is still a new turn for a capped agent.
+			const capped = queueIfSpendCapped(sessionName, message);
+			if (capped) {
+				res.status(202).json(capped);
+				return;
+			}
+
+			// In-process Crewly Agent: route via handleMessage (no PTY)
+			if (resolvedRuntimeType === RUNTIME_TYPES.CREWLY_AGENT) {
+				const inProcessRuntime = this.agentRegistrationService.getInProcessRuntime(sessionName);
+				if (!inProcessRuntime || !inProcessRuntime.isReady()) {
+					res.status(404).json({
+						success: false,
+						error: `In-process agent '${sessionName}' not found or not ready`,
+					} as ApiResponse);
+					return;
+				}
+				try {
+					await inProcessRuntime.handleMessage(message);
+					res.json({ success: true, verified: true, force: true } as ApiResponse);
+				} catch (agentErr) {
+					res.status(500).json({
+						success: false,
+						error: `Crewly Agent error: ${agentErr instanceof Error ? agentErr.message : String(agentErr)}`,
+					} as ApiResponse);
+				}
+				return;
+			}
+
+			const { getSessionBackendSync } = await import('../../services/session/index.js');
+			const backend = getSessionBackendSync();
+			const session = backend?.getSession(sessionName);
+			if (!backend || !session) {
+				res.status(404).json({
+					success: false,
+					error: `Session '${sessionName}' not found`,
+				} as ApiResponse);
+				return;
+			}
+			// For TUI runtimes (Gemini CLI, Codex CLI), use two-step write:
+			// text first (in bracketed paste mode), then Enter separately.
+			// Bracketed paste markers prevent TUI runtimes from interpreting
+			// special characters like (), $, ` as shell commands (#130, #293).
+			// Guarded two-step write for every runtime (see writeToSession): the
+			// box must be empty before we type and hold exactly our text when
+			// Enter is pressed; no blind backup Enter.
+			try {
+				await createSessionCommandHelper(backend).sendMessage(sessionName, message);
+			} catch (guardErr) {
+				if (guardErr instanceof TuiInputGuardError) {
+					res.status(409).json({
+						success: false,
+						code: 'input_not_ours',
+						error: guardErr.message,
+					} as ApiResponse);
+					return;
+				}
+				if (guardErr instanceof TuiPasteHoldError) {
+					queuePasteHeldMessage(res, sessionName, message, this?.agentRegistrationService, guardErr.reason);
+					return;
+				}
+				throw guardErr;
+			}
+			logger.info('Message force-delivered via direct PTY write', {
+				sessionName,
+				messageLength: message.length,
+				twoStepWrite: true,
+			});
+			res.json({
+				success: true,
+				verified: false,
+				force: true,
+			} as ApiResponse);
+			return;
+		}
+
+		// Optionally wait for agent to be at prompt before delivering.
+		//
+		// WI dae79289: this fallback was an inlined 30000 while an
+		// identically-valued EVENT_DELIVERY_CONSTANTS.TOTAL_DELIVERY_TIMEOUT
+		// sat unused in constants.ts. Substituting it is behaviour-identical.
+		//
+		// Recorded because it is NOT obvious and nobody should have to
+		// re-derive it: this value is passed as the agent-READY timeout, and
+		// `waitForAgentReady` has its own dedicated default for that —
+		// EVENT_DELIVERY_CONSTANTS.AGENT_READY_TIMEOUT, which is 120000, not
+		// 30000. So this endpoint deliberately waits a quarter as long as the
+		// service would on its own. Whether that divergence is intentional
+		// fail-fast or accumulated drift is NOT established, so the value is
+		// left exactly as it was; only the magic number is removed.
+		//
+		// `queueIfBusy` (agent-to-agent messages, 2026-10-05): the sender never
+		// waits for a busy recipient. The wait is capped at
+		// QUEUE_IF_BUSY_MAX_WAIT_MS; a recipient still busy then gets the
+		// message on its queue (delivered when it is idle) and the caller a 202
+		// with its queue position at once, instead of a 408 after minutes.
+		const holdIfBusy = queueIfBusy === true && !workItemId;
+		if (waitForReady) {
+			const requested =
+				typeof waitTimeout === 'number'
+					? waitTimeout
+					: EVENT_DELIVERY_CONSTANTS.TOTAL_DELIVERY_TIMEOUT;
+			const timeout = holdIfBusy
+				? Math.min(requested, AGENT_MESSAGE_DELIVERY_CONSTANTS.QUEUE_IF_BUSY_MAX_WAIT_MS)
+				: requested;
+			const ready = await this.agentRegistrationService.waitForAgentReady(
+				sessionName,
+				timeout,
+				resolvedRuntimeType
+			);
+			if (!ready && holdIfBusy) {
+				const { position, queueSize } = this.agentRegistrationService.holdForBusyAgent(sessionName, message);
+				logger.info('Recipient busy — message queued, sender not kept waiting', {
+					sessionName,
+					position,
+					queueSize,
+					waitedMs: timeout,
+				});
+				res.status(202).json({
+					success: true,
+					queued: true,
+					verified: false,
+					position,
+					queueSize,
+					message: `[AGENT_BUSY] ${sessionName} is busy: message queued at position ${position} of ${queueSize}; it is delivered when ${sessionName} is idle`,
+				} as ApiResponse);
+				return;
+			}
+			if (!ready) {
+				res.status(408).json({
+					success: false,
+					error: `Agent '${sessionName}' not ready within ${timeout}ms`,
+				} as ApiResponse);
+				return;
+			}
+		}
+
+		// Use the reliable delivery path with retry and verification
+		const result = await this.agentRegistrationService.sendMessageToAgent(
+			sessionName,
+			message,
+			resolvedRuntimeType
+		);
+
+		if (!result.success) {
+			res.status(502).json({
+				success: false,
+				error: result.error || 'Message delivery failed',
+			} as ApiResponse);
+			return;
+		}
+
+		// Queued rather than written (daily token cap `[SPEND_CAP]`, agent
+		// busy, restart drain, …): say so instead of claiming `verified`.
+		if (result.queued) {
+			logger.info('Message queued via reliable endpoint', {
+				sessionName,
+				messageLength: message.length,
+				reason: result.message,
+			});
+			const position = SubAgentMessageQueue.getInstance().positionOf(sessionName, message);
+			res.status(202).json({
+				success: true,
+				queued: true,
+				verified: false,
+				...(position !== null ? { position, queueSize: SubAgentMessageQueue.getInstance().getQueueSize(sessionName) } : {}),
+				...(result.message?.startsWith(SPEND_CAP_CONSTANTS.QUEUED_MARKER) ? { spendCapped: true } : {}),
+				message: result.message,
+			} as ApiResponse);
+			return;
+		}
+
+		logger.info('Message delivered via reliable endpoint', {
+			sessionName,
+			messageLength: message.length,
+			runtimeType: resolvedRuntimeType,
+		});
+
+		// F14: record `agent.action` with actionType='delegate' on
+		// successful delivery via the canonical /deliver endpoint. This
+		// is the path used by the `delegate-task` skill for both
+		// orchestrator→TL and TL→worker dispatches. The `agent` field is
+		// sourced from an OPTIONAL `senderSessionName` body param —
+		// callers that omit it (legacy / non-delegate writes) record an
+		// empty agent string, which downstream digests can filter out.
+		// Best-effort — never blocks the success response.
+		try {
+			getAgentBehaviorLogService()?.record({
+				type: 'agent.action',
+				agent: typeof senderSessionName === 'string' ? senderSessionName : '',
+				actionType: 'delegate',
+				details: {
+					recipient: sessionName,
+					messageLength: message.length,
+					runtimeType: resolvedRuntimeType,
+				},
+			});
+		} catch {
+			/* observability is best-effort */
+		}
+
+		res.json({
+			success: true,
+			verified: true,
+		} as ApiResponse);
+	} catch (error) {
+		logger.error('Error delivering message', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		res.status(500).json({
+			success: false,
+			error: 'Failed to deliver message',
+		} as ApiResponse);
+	} finally {
+		endDelivery();
+		if (handOver) {
+			if (res.statusCode < 400) handOver.delivered();
+			else handOver.failed();
+		}
+	}
+}
+
+/**
+ * Get persistent session log file content.
+ *
+ * Reads the ANSI-stripped session log file (distinct from live PTY buffer).
+ * Includes output from before session restarts.
+ *
+ * @param req - Express request with sessionName param and optional lines query
+ * @param res - Express response object
+ *
+ * @example
+ * GET /api/sessions/crewly-orc/logs?lines=200
+ * Response: { success: true, data: { lines: [...], sessionName: "crewly-orc", count: 200 } }
+ */
+export async function getSessionLogs(req: Request, res: Response): Promise<void> {
+	try {
+		const { sessionName } = req.params;
+		const lines = parseInt(req.query.lines as string) || 100;
+
+		if (!sessionName) {
+			res.status(400).json({
+				success: false,
+				error: 'Session name is required',
+			} as ApiResponse);
+			return;
+		}
+
+		const sessionValidation = validateSessionName(sessionName);
+		if (!sessionValidation.isValid) {
+			res.status(400).json({
+				success: false,
+				error: sessionValidation.error,
+			} as ApiResponse);
+			return;
+		}
+
+		const backend = getSessionBackendSync();
+		if (!backend || !(backend instanceof PtySessionBackend)) {
+			res.status(503).json({
+				success: false,
+				error: 'Session backend not available',
+			} as ApiResponse);
+			return;
+		}
+
+		const logPath = backend.getSessionLogPath(sessionName);
+		if (!existsSync(logPath)) {
+			res.status(404).json({
+				success: false,
+				error: `No log file found for session '${sessionName}'`,
+			} as ApiResponse);
+			return;
+		}
+
+		const content = await readFile(logPath, 'utf-8');
+		const allLines = content.split('\n');
+		const lastLines = allLines.slice(-lines);
+
+		res.json({
+			success: true,
+			data: {
+				lines: lastLines,
+				sessionName,
+				count: lastLines.length,
+				totalLines: allLines.length,
+			},
+		} as ApiResponse);
+	} catch (error) {
+		logger.error('Error reading session logs', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		res.status(500).json({
+			success: false,
+			error: 'Failed to read session logs',
+		} as ApiResponse);
+	}
+}
+
+/**
+ * Get pending work for an agent session (#172 Adaptive Heartbeat).
+ *
+ * Returns pending tasks, undelivered messages, and a recommended
+ * heartbeat state so agents can self-schedule their next check-in.
+ *
+ * @param req - Express request with sessionName param
+ * @param res - Express response with PendingWorkSummary
+ *
+ * @example
+ * GET /api/agents/crewly-product-sam/pending-work
+ * Response: { success: true, data: { hasPendingWork: true, pendingTasks: [...], ... } }
+ */
+export async function getPendingWork(this: ApiContext, req: Request, res: Response): Promise<void> {
+	try {
+		const { sessionName } = req.params;
+
+		if (!sessionName) {
+			res.status(400).json({ success: false, error: 'sessionName is required' } as ApiResponse);
+			return;
+		}
+
+		const sessionValidation = validateSessionName(sessionName);
+		if (!sessionValidation.isValid) {
+			res.status(400).json({ success: false, error: sessionValidation.error } as ApiResponse);
+			return;
+		}
+
+		// 1. Get pending tasks from the V3 task-pool (spec
+		// 2026-05-06-task-management-v1-deprecation.md). Replaces the v1
+		// TaskTrackingService read so the agent activation path doesn't
+		// hit two stores — V3 WorkItems queued/accepted for this session.
+		const { TaskPoolService } = await import('../../services/task-pool/task-pool.service.js');
+		const { projectWorkItemToInProgressTask } = await import(
+			'../../services/v3/work-item-projection.js'
+		);
+		const pool = TaskPoolService.getInstance();
+		const allItems = await pool.getAllItems();
+		const pendingTasks = allItems
+			.filter(wi => wi.target === sessionName)
+			.filter(wi => wi.status === 'queued' || wi.status === 'accepted')
+			.map(wi => projectWorkItemToInProgressTask(wi))
+			.map(t => ({
+				id: t.id,
+				taskName: t.taskName,
+				priority: t.priority,
+				assignedAt: t.assignedAt,
+			}));
+
+		// 2. Get pending message count from SubAgentMessageQueue
+		const messageQueue = SubAgentMessageQueue.getInstance();
+		const pendingMessageCount = messageQueue.getQueueSize(sessionName);
+		const pendingMessages: Array<{ id: string; from: string; preview: string; queuedAt: string }> = [];
+		// Note: SubAgentMessageQueue doesn't expose individual messages for privacy.
+		// We report the count; agents can fetch actual messages via the deliver endpoint.
+
+		// 3. Check if the agent's team is active
+		const teams = await this.storageService.getTeams();
+		let teamActive = false;
+		for (const team of teams) {
+			const member = team.members?.find((m: any) => m.sessionName === sessionName);
+			if (member) {
+				// Team is active if any member besides this one is active
+				teamActive = team.members.some((m: any) =>
+					m.sessionName !== sessionName && m.agentStatus === 'active'
+				);
+				break;
+			}
+		}
+
+		// 4. Determine recommended state
+		const hasPendingWork = pendingTasks.length > 0 || pendingMessageCount > 0;
+		let recommendedState: HeartbeatState;
+		if (hasPendingWork) {
+			recommendedState = 'busy';
+		} else if (teamActive) {
+			recommendedState = 'idle';
+		} else {
+			recommendedState = 'dormant';
+		}
+
+		const recommendedIntervalMs = recommendedState === 'busy'
+			? ADAPTIVE_HEARTBEAT_DEFAULTS.busyIntervalMs
+			: recommendedState === 'idle'
+				? ADAPTIVE_HEARTBEAT_DEFAULTS.idleIntervalMs
+				: ADAPTIVE_HEARTBEAT_DEFAULTS.dormantIntervalMs;
+
+		const summary: PendingWorkSummary = {
+			hasPendingWork,
+			pendingTasks,
+			pendingMessages,
+			teamActive,
+			recommendedState,
+			recommendedIntervalMs,
+		};
+
+		res.json({ success: true, data: summary } as ApiResponse<PendingWorkSummary>);
+
+	} catch (error) {
+		logger.error('Error getting pending work', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		res.status(500).json({ success: false, error: 'Failed to get pending work' } as ApiResponse);
+	}
+}
+
+/**
+ * Refuse a message to a member of a paused team from anyone but the owner
+ * or the team's own members (specs/2026-10-04-team-pause.md). Internal
+ * services sending as an agent are refused too: automation does not reach a
+ * paused team.
+ *
+ * @param target - Receiving session
+ * @param req - The request
+ * @param res - The response (409 written when refused)
+ * @returns True when refused
+ */
+export function rejectMessageToPausedTeam(target: string, req: Request, res: Response): boolean {
+	const paused = pausedTeamOfSession(target);
+	if (!paused || isOwnerCaller(req)) return false;
+	const sender = readAgentSessionHeader(req);
+	if (sender && paused.sessions.includes(sender)) return false;
+	logger.info('Refused a message to a paused team', { target, team: paused.teamName, sender });
+	res.status(409).json({
+		success: false,
+		error: pausedRefusalMessage(paused, { callerIsOrc: sender === ORCHESTRATOR_SESSION_NAME }),
+		code: TEAM_PAUSE_CONSTANTS.ERROR_CODE,
+		...(paused.issueRepo ? { issueRepo: paused.issueRepo } : {}),
+	} as ApiResponse);
+	return true;
+}
+
+/**
+ * After a message from one agent to another, the target acts for the same
+ * person the sender acts for (issue #968). The sender comes from the request's
+ * agent session (corrected by the agent-origin middleware), never the body.
+ * The text is noted as that sender's, for the reply's "Triggered by" line.
+ *
+ * @param target - Receiving session
+ * @param req - The request (headers; body for the message text)
+ */
+export function noteAgentToAgent(target: string, req: Pick<Request, 'headers'> & { body?: unknown }): void {
+	try {
+		const sender = readAgentSessionHeader(req);
+		if (!sender || sender === target) return;
+		// Who sent it, so the reply the target posts can say "Triggered by <sender>'s message".
+		const body = (req.body ?? {}) as Record<string, unknown>;
+		const text = typeof body.message === 'string' ? body.message : body.mode === 'message' && typeof body.data === 'string' ? body.data : null;
+		if (text) getTurnTriggerTracker().noteSender(target, text, sender);
+		// Writing to the agent whose message this one is answering answers it:
+		// a later bare reply does not go back there (crewly#1381 item 3).
+		getTurnTriggerTracker().noteAnsweredAgent(sender, target);
+		// Writing to an agent answers what that agent asked this one.
+		try {
+			getAgentAskLedger()?.noteAnswered(sender, target);
+		} catch {
+			/* best effort */
+		}
+		// A hand-over of the owner's request: work the target creates from it
+		// keeps the owner origin, so its completion is reported to the owner.
+		try {
+			getOwnerRequestContext().relay(sender, target);
+		} catch {
+			/* best effort */
+		}
+		getActingFor().inherit(target, sender);
+	} catch {
+		/* best effort: never blocks the delivery */
+	}
+}

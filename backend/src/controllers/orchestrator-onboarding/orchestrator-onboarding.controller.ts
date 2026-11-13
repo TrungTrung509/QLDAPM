@@ -1,0 +1,411 @@
+/**
+ * Orchestrator-Onboarding REST Controller
+ *
+ * HTTP surface for the two onboarding-only skills orc invokes during
+ * the v3 cold-start conversation flow:
+ *
+ *   - POST /api/orchestrator/onboarding/recommend-team
+ *   - POST /api/orchestrator/onboarding/materialize-team
+ *
+ * Both endpoints are thin wrappers around the pure logic in
+ * `services/orchestrator/onboarding/{recommend,materialize}-team.ts`.
+ * The controller validates request shape, calls the logic, and shapes
+ * the JSON response.
+ *
+ * @module controllers/orchestrator-onboarding/orchestrator-onboarding.controller
+ */
+
+import type { Request, Response, NextFunction } from 'express';
+import * as path from 'node:path';
+
+import {
+  recommendTeam,
+  type BusinessContext,
+  type FeasibilityTier,
+  type BusinessScale,
+} from '../../services/orchestrator/onboarding/recommend-team.js';
+import {
+  materializeTeam,
+  type MaterializeOptions,
+} from '../../services/orchestrator/onboarding/materialize-team.js';
+import {
+  synthesizeHierarchyPlan,
+  materializeHierarchy,
+  type HierarchyPlan,
+} from '../../services/orchestrator/onboarding/synthesize-hierarchy.js';
+import type { TeamRecommendation } from '../../services/orchestrator/onboarding/recommend-team.js';
+import type { TeamTemplate } from '../../types/team-template.types.js';
+import { LoggerService } from '../../services/core/logger.service.js';
+import { getCrewlyHomePath } from '../../services/core/crewly-home.utils.js';
+
+const logger = LoggerService.getInstance().createComponentLogger(
+  'OrchestratorOnboardingController',
+);
+
+const VALID_TIERS: ReadonlySet<FeasibilityTier> = new Set([
+  'yes-today',
+  'collaborative',
+  'roadmap',
+  'out-of-scope',
+]);
+const VALID_SCALES: ReadonlySet<BusinessScale> = new Set([
+  'solo',
+  'small-team',
+  'company',
+]);
+
+/**
+ * Default teams directory used when the request does not override it.
+ * Mirrors the convention used by team config storage (`<crewlyHome>/teams`).
+ *
+ * Honours the `CREWLY_HOME` environment variable via
+ * {@link getCrewlyHomePath} so test profiles (ESTestNode, KR3
+ * walkthroughs, dry-run kits) actually land under the override path
+ * instead of the developer's real `~/.crewly`.
+ */
+function defaultTeamsDir(): string {
+  return path.join(getCrewlyHomePath(), 'teams');
+}
+
+/**
+ * Default project flag path (Mon-EOD stub: a tiny JSON file under the
+ * Crewly home dir). Wed–Fri this will move into the orchestrator state
+ * persistence file proper.
+ *
+ * Honours the `CREWLY_HOME` environment variable via
+ * {@link getCrewlyHomePath} for the same reason as
+ * {@link defaultTeamsDir}.
+ */
+function defaultProjectFlagPath(): string {
+  return path.join(getCrewlyHomePath(), 'onboarding-complete.json');
+}
+
+/**
+ * POST /api/orchestrator/onboarding/recommend-team
+ *
+ * Body: { industry: string, scale: BusinessScale, tasks: NamedTask[] }
+ *
+ * Returns 200 with the {@link TeamRecommendation} on success, 400 on
+ * malformed input. The function never falls back to a 500 — recommend
+ * itself is total.
+ */
+export async function recommendTeamRoute(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const ctx = parseBusinessContext(req.body);
+    if (!ctx.ok) {
+      res.status(400).json({ success: false, error: ctx.error });
+      return;
+    }
+    const recommendation = recommendTeam(ctx.value, await usableExtraTemplates());
+    res.status(200).json({ success: true, recommendation });
+  } catch (err) {
+    logger.error('recommend-team route failed', { err });
+    next(err);
+  }
+}
+
+/**
+ * The `CREWLY_TEMPLATE_DIRS` templates (Crewly Pro's) the current plan can
+ * create a team from — onboarding never proposes one it would then refuse.
+ *
+ * @returns Catalog for {@link recommendTeam}
+ */
+async function usableExtraTemplates(): Promise<TeamTemplate[]> {
+  const { TemplateService } = await import('../../services/template/template.service.js');
+  const { CloudClientService } = await import('../../services/cloud/cloud-client.service.js');
+  const { SkillTierService } = await import('../../services/skill/skill-tier.service.js');
+  try {
+    const tier = CloudClientService.getInstance().getTier();
+    const tiers = SkillTierService.getInstance();
+    return TemplateService.getInstance()
+      .listExtraTemplates()
+      .filter((t) => !t.requiredTier || tiers.isTierSufficient(tier, t.requiredTier));
+  } catch (err) {
+    // Recommending stays total: without the catalog, the built-in mappings answer.
+    logger.warn('Could not read extra templates for onboarding', { err });
+    return [];
+  }
+}
+
+/**
+ * POST /api/orchestrator/onboarding/materialize-team
+ *
+ * Body: { recommendation: TeamRecommendation, teamsDir?: string, projectFlagPath?: string }
+ *
+ * Writes the team config + flips `onboardingComplete`. v0 stub —
+ * the real provisioning lands Wed–Fri.
+ *
+ * Returns 200 with the materialize result on success; 400 if the
+ * recommendation body is malformed; 500 only on actual filesystem
+ * errors (orc surfaces those honestly to the user).
+ */
+export async function materializeTeamRoute(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const parsed = parseRecommendation(req.body?.recommendation);
+    if (!parsed.ok) {
+      res.status(400).json({ success: false, error: parsed.error });
+      return;
+    }
+
+    const opts: MaterializeOptions = {
+      teamsDir:
+        typeof req.body?.teamsDir === 'string' && req.body.teamsDir.length > 0
+          ? req.body.teamsDir
+          : defaultTeamsDir(),
+      projectFlagPath:
+        typeof req.body?.projectFlagPath === 'string' &&
+        req.body.projectFlagPath.length > 0
+          ? req.body.projectFlagPath
+          : defaultProjectFlagPath(),
+      log: (m: string) => logger.info(m),
+    };
+
+    const result = await materializeTeam(parsed.value, opts);
+    res.status(200).json({ success: true, result });
+  } catch (err) {
+    logger.error('materialize-team route failed', { err });
+    res.status(500).json({
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * POST /api/orchestrator/onboarding/synthesize-hierarchy
+ *
+ * Body: `{ industry, scale, tasks, maxSubteams? }` (a {@link BusinessContext}
+ * plus an optional branching cap).
+ *
+ * Returns the {@link HierarchyPlan} for the goal — either a single flat team
+ * (no children, <2 parallel streams) or a parent coordination team plus one
+ * child team per detected stream. PURE — nothing is created; the orc shows the
+ * plan to the user for approval and then calls `materialize-hierarchy`.
+ *
+ * Returns 200 with `{ success, plan }`; 400 on malformed input.
+ */
+export async function synthesizeHierarchyRoute(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const ctx = parseBusinessContext(req.body);
+    if (!ctx.ok) {
+      res.status(400).json({ success: false, error: ctx.error });
+      return;
+    }
+    const maxSubteams =
+      typeof req.body?.maxSubteams === 'number' ? req.body.maxSubteams : undefined;
+    const plan = synthesizeHierarchyPlan(ctx.value, {
+      maxSubteams,
+      catalog: await usableExtraTemplates(),
+    });
+    res.status(200).json({ success: true, plan });
+  } catch (err) {
+    logger.error('synthesize-hierarchy route failed', { err });
+    next(err);
+  }
+}
+
+/**
+ * POST /api/orchestrator/onboarding/materialize-hierarchy
+ *
+ * Body: `{ plan: HierarchyPlan, teamsDir?, projectFlagPath? }` — the plan the
+ * user approved (echoed back from `synthesize-hierarchy`).
+ *
+ * Instantiates the parent team, then each child team linked to the parent via
+ * `parentTeamId`, all through the live P0 provisioning path. Returns 200 with
+ * the created team ids; 400 on a malformed plan; 500 on a hard failure
+ * creating the PARENT (a child fallback is surfaced via `provisioned:false`,
+ * not an error).
+ */
+export async function materializeHierarchyRoute(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const parsed = parseHierarchyPlan(req.body?.plan);
+    if (!parsed.ok) {
+      res.status(400).json({ success: false, error: parsed.error });
+      return;
+    }
+    const opts: MaterializeOptions = {
+      teamsDir:
+        typeof req.body?.teamsDir === 'string' && req.body.teamsDir.length > 0
+          ? req.body.teamsDir
+          : defaultTeamsDir(),
+      projectFlagPath:
+        typeof req.body?.projectFlagPath === 'string' && req.body.projectFlagPath.length > 0
+          ? req.body.projectFlagPath
+          : defaultProjectFlagPath(),
+      log: (m: string) => logger.info(m),
+    };
+    const result = await materializeHierarchy(parsed.value, opts);
+    res.status(200).json({ success: true, result });
+  } catch (err) {
+    logger.error('materialize-hierarchy route failed', { err });
+    res.status(500).json({
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+// =============================================================================
+// Parsers
+// =============================================================================
+
+type ParseResult<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function parseBusinessContext(
+  body: unknown,
+): ParseResult<BusinessContext> {
+  if (!body || typeof body !== 'object') {
+    return { ok: false, error: 'request body must be an object' };
+  }
+  const b = body as Record<string, unknown>;
+
+  if (typeof b.industry !== 'string') {
+    return { ok: false, error: 'industry must be a string' };
+  }
+  if (typeof b.scale !== 'string' || !VALID_SCALES.has(b.scale as BusinessScale)) {
+    return {
+      ok: false,
+      error: `scale must be one of: ${[...VALID_SCALES].join(', ')}`,
+    };
+  }
+  if (!Array.isArray(b.tasks)) {
+    return { ok: false, error: 'tasks must be an array' };
+  }
+
+  const tasks: { name: string; tier: FeasibilityTier }[] = [];
+  for (let i = 0; i < b.tasks.length; i++) {
+    const t = b.tasks[i] as Record<string, unknown> | undefined;
+    if (!t || typeof t.name !== 'string') {
+      return { ok: false, error: `tasks[${i}].name must be a string` };
+    }
+    if (typeof t.tier !== 'string' || !VALID_TIERS.has(t.tier as FeasibilityTier)) {
+      return {
+        ok: false,
+        error: `tasks[${i}].tier must be one of: ${[...VALID_TIERS].join(', ')}`,
+      };
+    }
+    tasks.push({ name: t.name, tier: t.tier as FeasibilityTier });
+  }
+
+  return {
+    ok: true,
+    value: {
+      industry: b.industry,
+      scale: b.scale as BusinessScale,
+      tasks,
+    },
+  };
+}
+
+function parseRecommendation(body: unknown): ParseResult<TeamRecommendation> {
+  if (!body || typeof body !== 'object') {
+    return { ok: false, error: 'recommendation must be an object' };
+  }
+  const r = body as Record<string, unknown>;
+  if (typeof r.templateId !== 'string' || r.templateId.length === 0) {
+    return { ok: false, error: 'recommendation.templateId must be a non-empty string' };
+  }
+  if (!Array.isArray(r.agents) || r.agents.length === 0) {
+    return { ok: false, error: 'recommendation.agents must be a non-empty array' };
+  }
+  if (typeof r.reasoning !== 'string') {
+    return { ok: false, error: 'recommendation.reasoning must be a string' };
+  }
+  if (typeof r.source !== 'string') {
+    return { ok: false, error: 'recommendation.source must be a string' };
+  }
+
+  const agents: { role: string; responsibilities: string; skillIds: string[] }[] = [];
+  for (let i = 0; i < r.agents.length; i++) {
+    const a = r.agents[i] as Record<string, unknown> | undefined;
+    if (!a || typeof a.role !== 'string') {
+      return { ok: false, error: `recommendation.agents[${i}].role must be a string` };
+    }
+    if (typeof a.responsibilities !== 'string') {
+      return {
+        ok: false,
+        error: `recommendation.agents[${i}].responsibilities must be a string`,
+      };
+    }
+    if (!Array.isArray(a.skillIds)) {
+      return {
+        ok: false,
+        error: `recommendation.agents[${i}].skillIds must be an array`,
+      };
+    }
+    agents.push({
+      role: a.role,
+      responsibilities: a.responsibilities,
+      skillIds: a.skillIds.map((s) => String(s)),
+    });
+  }
+
+  return {
+    ok: true,
+    value: {
+      templateId: r.templateId,
+      agents,
+      reasoning: r.reasoning,
+      source: r.source,
+    },
+  };
+}
+
+/**
+ * Validate a {@link HierarchyPlan} round-tripped from `synthesize-hierarchy`:
+ * a parent recommendation plus zero or more `{stream, recommendation}` child
+ * nodes, each validated with {@link parseRecommendation}.
+ *
+ * @param body - The `plan` field of the request body.
+ * @returns The validated plan or a descriptive parse error.
+ */
+function parseHierarchyPlan(body: unknown): ParseResult<HierarchyPlan> {
+  if (!body || typeof body !== 'object') {
+    return { ok: false, error: 'plan must be an object' };
+  }
+  const p = body as Record<string, unknown>;
+
+  const parent = parseRecommendation(p.parent);
+  if (!parent.ok) {
+    return { ok: false, error: `plan.parent: ${parent.error}` };
+  }
+
+  const rawChildren = Array.isArray(p.children) ? p.children : [];
+  const children: { stream: string; recommendation: TeamRecommendation }[] = [];
+  for (let i = 0; i < rawChildren.length; i++) {
+    const node = rawChildren[i] as Record<string, unknown> | undefined;
+    if (!node || typeof node.stream !== 'string' || node.stream.length === 0) {
+      return { ok: false, error: `plan.children[${i}].stream must be a non-empty string` };
+    }
+    const rec = parseRecommendation(node.recommendation);
+    if (!rec.ok) {
+      return { ok: false, error: `plan.children[${i}].recommendation: ${rec.error}` };
+    }
+    children.push({ stream: node.stream, recommendation: rec.value });
+  }
+
+  return {
+    ok: true,
+    value: {
+      parent: parent.value,
+      children,
+      rationale: typeof p.rationale === 'string' ? p.rationale : '',
+    },
+  };
+}

@@ -1,0 +1,265 @@
+#!/bin/bash
+# transcribe-audio — General-purpose Whisper speech-to-text for a local file.
+#
+# Engines:
+#   local  : whisper.cpp (large-v3-turbo) — free, offline, segment timestamps.
+#   openai : OpenAI Whisper API (whisper-1) — zero-install, pay-per-use.
+#   auto   : prefer local if installed, else fall back to openai (default).
+#
+# Engine detection + key resolution lift the proven logic from Flopost
+# (desktop/server/whisperModule.ts, service/lib/video/transcriptionService.ts).
+#
+# Usage:
+#   bash execute.sh '{"audioFile":"/path/to/recording.m4a"}'
+#   bash execute.sh '{"audioFile":"/x.mp3","outputFile":"./t.md","language":"zh"}'
+#   bash execute.sh '{"audioFile":"/x.wav","engine":"openai"}'
+#
+# Requires: ffmpeg, jq, curl. Local engine also needs whisper-cli + a model file.
+# All of it is declared in skill.json's `setup` block. When something is
+# missing the error JSON carries `"needsSetup": true, "skill": "transcribe-audio"`
+# so an agent can go straight to `install-skill --id transcribe-audio`
+# instead of telling the user "whisper.cpp is not installed".
+
+set -euo pipefail
+
+# ── Constants (no hardcoded magic spread through the body) ───────────────────────
+MODEL_FILENAME="ggml-large-v3-turbo-q5_0.bin"
+FLOPOST_WHISPER_DIR="${HOME}/.flopost/whisper"
+WHISPER_CACHE_DIR="${HOME}/.cache/whisper-models"
+OPENAI_TRANSCRIBE_URL="https://api.openai.com/v1/audio/transcriptions"
+OPENAI_MODEL="whisper-1"
+# The key route, not GET /api/settings: that one masks keys (#1012).
+KEY_URL="${CREWLY_API_URL:-http://localhost:${WEB_PORT:-8787}}/api/settings/api-key/openai"
+SKILL_ID="transcribe-audio"
+# Crewly-managed binaries (the Linux whisper.cpp install lands here).
+CREWLY_BIN_DIR="${CREWLY_HOME:-${HOME}/.crewly}/bin"
+
+err_json() { printf '{"success":false,"error":%s}\n' "$(printf '%s' "$1" | jq -Rsa .)"; exit 1; }
+
+# needs_setup_json <message> <missing...> — a failure an install can fix.
+# Works without jq (jq itself may be the missing piece).
+needs_setup_json() {
+  local msg="$1"; shift
+  local missing="" item esc
+  for item in "$@"; do missing="${missing:+${missing},}\"${item}\""; done
+  esc=$(printf '%s' "$msg" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' ')
+  printf '{"success":false,"error":"%s","needsSetup":true,"skill":"%s","missing":[%s],"hint":"Run install-skill --id %s (it installs the missing pieces in the background and messages you when done), then retry."}\n' \
+    "$esc" "$SKILL_ID" "$missing" "$SKILL_ID"
+  exit 1
+}
+
+# ── Input parsing ───────────────────────────────────────────────────────────────
+INPUT="${1:-}"
+[ -z "$INPUT" ] && err_json "Usage: execute.sh '{\"audioFile\":\"/path/to/audio.m4a\"}'"
+
+command -v jq >/dev/null 2>&1 || needs_setup_json "jq is required but not installed" jq
+
+AUDIO_FILE=$(printf '%s' "$INPUT" | jq -r '.audioFile // empty')
+OUTPUT_FILE=$(printf '%s' "$INPUT" | jq -r '.outputFile // empty')
+LANGUAGE=$(printf '%s' "$INPUT" | jq -r '.language // "auto"')
+ENGINE=$(printf '%s' "$INPUT" | jq -r '.engine // "auto"')
+
+[ -z "$AUDIO_FILE" ] && err_json "audioFile is required (path to a local audio or video file)"
+[ -f "$AUDIO_FILE" ] || err_json "audioFile not found: ${AUDIO_FILE}"
+case "$ENGINE" in auto|local|openai) ;; *) err_json "engine must be one of: auto, local, openai (got: ${ENGINE})";; esac
+
+command -v ffmpeg >/dev/null 2>&1 || needs_setup_json "ffmpeg is required but not installed" ffmpeg
+
+# ── Local whisper.cpp detection (lifted from whisperModule.ts) ───────────────────
+resolve_whisper_binary() {
+  if [ -n "${FLOPOST_WHISPER_BIN:-}" ] && [ -x "${FLOPOST_WHISPER_BIN}" ]; then echo "${FLOPOST_WHISPER_BIN}"; return; fi
+  if [ -x "${FLOPOST_WHISPER_DIR}/whisper-cli" ]; then echo "${FLOPOST_WHISPER_DIR}/whisper-cli"; return; fi
+  if [ -x "${CREWLY_BIN_DIR}/whisper-cli" ]; then echo "${CREWLY_BIN_DIR}/whisper-cli"; return; fi
+  if command -v whisper-cli >/dev/null 2>&1; then command -v whisper-cli; return; fi
+  # Homebrew locations (a backend started by launchd may lack them on PATH).
+  # TRANSCRIBE_WHISPER_BIN_CANDIDATES overrides the list (tests).
+  local candidates="${TRANSCRIBE_WHISPER_BIN_CANDIDATES-/opt/homebrew/bin/whisper-cli /usr/local/bin/whisper-cli}"
+  for p in $candidates; do
+    [ -x "$p" ] && { echo "$p"; return; }
+  done
+  echo ""
+}
+resolve_whisper_model() {
+  if [ -n "${FLOPOST_WHISPER_MODEL:-}" ] && [ -f "${FLOPOST_WHISPER_MODEL}" ]; then echo "${FLOPOST_WHISPER_MODEL}"; return; fi
+  if [ -f "${FLOPOST_WHISPER_DIR}/${MODEL_FILENAME}" ]; then echo "${FLOPOST_WHISPER_DIR}/${MODEL_FILENAME}"; return; fi
+  if [ -f "${WHISPER_CACHE_DIR}/${MODEL_FILENAME}" ]; then echo "${WHISPER_CACHE_DIR}/${MODEL_FILENAME}"; return; fi
+  echo ""
+}
+# Names of the local-engine pieces that are missing (for needsSetup JSON).
+missing_local_parts() {
+  [ -n "$WHISPER_BIN" ] || printf '%s\n' whisper-cli
+  [ -n "$WHISPER_MODEL" ] || printf '%s\n' whisper-model
+}
+
+WHISPER_BIN="$(resolve_whisper_binary)"
+WHISPER_MODEL="$(resolve_whisper_model)"
+LOCAL_AVAILABLE=false
+[ -n "$WHISPER_BIN" ] && [ -n "$WHISPER_MODEL" ] && LOCAL_AVAILABLE=true
+
+# ── OpenAI key resolution (env → Crewly key route; never hardcoded) ─────────────
+# The key route answers this agent (by its badge) and the owner, nobody else
+# (#1012). A masked value is never used as a key.
+resolve_openai_key() {
+  if [ -n "${OPENAI_API_KEY:-}" ]; then echo "${OPENAI_API_KEY}"; return; fi
+  local hdr=() key
+  [ -n "${CREWLY_AGENT_BADGE:-}" ] && hdr+=(-H "X-Agent-Badge: ${CREWLY_AGENT_BADGE}")
+  [ -n "${CREWLY_SESSION_NAME:-}" ] && hdr+=(-H "X-Agent-Session: ${CREWLY_SESSION_NAME}")
+  # ${hdr[@]+…}: an empty array under `set -u` is an error in bash 3.2 (macOS).
+  key=$(curl -sf ${hdr[@]+"${hdr[@]}"} "${KEY_URL}?skill=${SKILL_ID}" 2>/dev/null | jq -r '.data.key // empty' 2>/dev/null || true)
+  case "$key" in "•"*) key="" ;; esac
+  echo "$key"
+}
+
+# ── Choose engine ────────────────────────────────────────────────────────────────
+CHOSEN=""
+if [ "$ENGINE" = "local" ]; then
+  if [ "$LOCAL_AVAILABLE" != true ]; then
+    # shellcheck disable=SC2046 # word-splitting the list of missing parts is intended
+    needs_setup_json "engine=local requested but the local whisper.cpp engine is not set up (binary: $( [ -n "$WHISPER_BIN" ] && echo found || echo missing ); model ${MODEL_FILENAME}: $( [ -n "$WHISPER_MODEL" ] && echo found || echo missing ))" $(missing_local_parts)
+  fi
+  CHOSEN="local"
+elif [ "$ENGINE" = "openai" ]; then
+  CHOSEN="openai"
+else
+  if [ "$LOCAL_AVAILABLE" = true ]; then CHOSEN="local"; else CHOSEN="openai"; fi
+fi
+
+# ── Working dir with auto-cleanup ────────────────────────────────────────────────
+WORK=$(mktemp -d /tmp/transcribe-audio-XXXXXX)
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+# Normalize to 16kHz mono PCM WAV (what both engines want).
+WAV="${WORK}/audio.wav"
+echo '{"status":"extracting","message":"Normalizing audio to 16kHz mono WAV..."}' >&2
+if ! ffmpeg -y -i "$AUDIO_FILE" -vn -ac 1 -ar 16000 -c:a pcm_s16le "$WAV" >/dev/null 2>"${WORK}/ffmpeg.err"; then
+  err_json "ffmpeg failed to extract audio: $(tail -c 400 "${WORK}/ffmpeg.err" 2>/dev/null)"
+fi
+
+# Duration (best-effort).
+DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$WAV" 2>/dev/null || echo "null")
+[ -z "$DURATION" ] && DURATION="null"
+
+RESULT_FILE="${WORK}/result.json"   # holds {language, segments:[{start,end,text,speaker}]}
+# Engine functions write RESULT_FILE on success, return non-zero (with message in
+# engine.err) on failure — never exit, so auto-mode can fall back cleanly.
+fail() { printf '%s' "$1" > "${WORK}/engine.err"; return 1; }
+
+# ── Engine: local whisper.cpp ────────────────────────────────────────────────────
+run_local() {
+  echo "{\"status\":\"transcribing\",\"engine\":\"whisper.cpp\",\"message\":\"Running local whisper.cpp...\"}" >&2
+  local prefix="${WORK}/out"
+  local lang_arg="auto"; [ "$LANGUAGE" != "auto" ] && lang_arg="$LANGUAGE"
+  local threads; threads=$(( $(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4) - 2 )); [ "$threads" -lt 4 ] && threads=4
+  if ! "$WHISPER_BIN" -m "$WHISPER_MODEL" -f "$WAV" -l "$lang_arg" -oj -of "$prefix" -t "$threads" >/dev/null 2>"${WORK}/whisper.err"; then
+    fail "whisper-cli failed: $(tail -c 400 "${WORK}/whisper.err" 2>/dev/null)"; return 1
+  fi
+  [ -f "${prefix}.json" ] || { fail "whisper-cli produced no JSON output"; return 1; }
+  # whisper.cpp JSON: { result:{language}, transcription:[{offsets:{from,to(ms)}, text}] }
+  jq '{
+    language: (.result.language // "auto"),
+    segments: [ .transcription[]
+      | { start: ((.offsets.from // 0) / 1000),
+          end:   ((.offsets.to   // 0) / 1000),
+          text:  (.text | gsub("^[[:space:]]+|[[:space:]]+$";"")),
+          speaker: "Unknown" }
+      | select(.text | test("^\\[.*\\]$") | not)   # drop [BLANK_AUDIO] / [Music] tags
+      | select(.text | length > 0) ]
+  }' "${prefix}.json" > "$RESULT_FILE" || { fail "failed to parse whisper.cpp output"; return 1; }
+  return 0
+}
+
+# ── Engine: OpenAI Whisper API ───────────────────────────────────────────────────
+run_openai() {
+  local key; key="$(resolve_openai_key)"
+  [ -z "$key" ] && { fail "OpenAI engine selected but no OpenAI API key found. Set OPENAI_API_KEY (Crewly secrets) or configure Settings > API Keys."; : > "${WORK}/no-openai-key"; return 1; }
+  echo "{\"status\":\"transcribing\",\"engine\":\"openai-whisper-1\",\"message\":\"Uploading to OpenAI Whisper API...\"}" >&2
+  local resp="${WORK}/openai.json"
+  local lang_args=(); [ "$LANGUAGE" != "auto" ] && lang_args=(-F "language=${LANGUAGE}")
+  local http
+  http=$(curl -sS -w '%{http_code}' -o "$resp" \
+    -X POST "$OPENAI_TRANSCRIBE_URL" \
+    -H "Authorization: Bearer ${key}" \
+    -F "file=@${WAV};type=audio/wav" \
+    -F "model=${OPENAI_MODEL}" \
+    -F "response_format=verbose_json" \
+    -F "timestamp_granularities[]=segment" \
+    ${lang_args[@]+"${lang_args[@]}"} 2>"${WORK}/curl.err" || echo "000")
+  if [ "$http" != "200" ]; then
+    local apierr; apierr=$(jq -r '.error.message // empty' "$resp" 2>/dev/null || true)
+    fail "OpenAI Whisper API error (HTTP ${http}): ${apierr:-$(tail -c 300 "$resp" 2>/dev/null)}"; return 1
+  fi
+  jq '{
+    language: (.language // "auto"),
+    segments: [ (.segments // [])[]
+      | { start: (.start // 0),
+          end:   (.end   // 0),
+          text:  ((.text // "") | gsub("^[[:space:]]+|[[:space:]]+$";"")),
+          speaker: "Unknown" }
+      | select(.text | length > 0) ]
+  }' "$resp" > "$RESULT_FILE" || { fail "failed to parse OpenAI output"; return 1; }
+  return 0
+}
+
+# Run chosen engine; auto-mode falls back local→openai on local failure.
+if [ "$CHOSEN" = "local" ]; then
+  if run_local; then
+    :
+  elif [ "$ENGINE" = "auto" ]; then
+    echo '{"status":"fallback","message":"Local engine failed; falling back to OpenAI..."}' >&2
+    CHOSEN="openai"
+    run_openai || err_json "$(cat "${WORK}/engine.err" 2>/dev/null)"
+  else
+    err_json "$(cat "${WORK}/engine.err" 2>/dev/null)"
+  fi
+else
+  if ! run_openai; then
+    # auto mode with no local engine and no OpenAI key: installing the local
+    # engine fixes it, so say so in a way an agent can act on.
+    if [ "$ENGINE" = "auto" ] && [ -f "${WORK}/no-openai-key" ]; then
+      # shellcheck disable=SC2046
+      needs_setup_json "No transcription engine is available: the local whisper.cpp engine is not set up and there is no OpenAI API key" $(missing_local_parts)
+    fi
+    err_json "$(cat "${WORK}/engine.err" 2>/dev/null)"
+  fi
+fi
+
+[ -f "$RESULT_FILE" ] || err_json "Transcription produced no result"
+RESULT_JSON=$(cat "$RESULT_FILE")
+
+ENGINE_LABEL="whisper.cpp"; [ "$CHOSEN" = "openai" ] && ENGINE_LABEL="openai-whisper-1"
+FULL_TEXT=$(printf '%s' "$RESULT_JSON" | jq -r '[.segments[].text] | join(" ")')
+LANG_OUT=$(printf '%s' "$RESULT_JSON" | jq -r '.language')
+SEG_COUNT=$(printf '%s' "$RESULT_JSON" | jq '.segments | length')
+
+# ── Optional output file (Markdown or JSON by extension) ─────────────────────────
+SAVED_PATH=""
+if [ -n "$OUTPUT_FILE" ]; then
+  mkdir -p "$(dirname "$OUTPUT_FILE")" 2>/dev/null || true
+  case "$OUTPUT_FILE" in
+    *.json)
+      printf '%s' "$RESULT_JSON" | jq --arg engine "$ENGINE_LABEL" --argjson dur "$DURATION" \
+        '{engine:$engine, language:.language, durationSec:$dur, segments:.segments}' > "$OUTPUT_FILE"
+      ;;
+    *)
+      {
+        printf '# Transcript\n\n'
+        printf -- '- **Engine:** %s\n- **Language:** %s\n- **Duration:** %ss\n\n' "$ENGINE_LABEL" "$LANG_OUT" "$DURATION"
+        printf '## Full Text\n\n%s\n\n## Segments\n\n' "$FULL_TEXT"
+        printf '%s' "$RESULT_JSON" | jq -r '.segments[] | "- [\(.start | (. * 100 | round / 100))s → \(.end | (. * 100 | round / 100))s] \(.text)"'
+      } > "$OUTPUT_FILE"
+      ;;
+  esac
+  SAVED_PATH="$OUTPUT_FILE"
+fi
+
+# ── Final JSON to stdout ─────────────────────────────────────────────────────────
+printf '%s' "$RESULT_JSON" | jq \
+  --arg engine "$ENGINE_LABEL" \
+  --arg text "$FULL_TEXT" \
+  --argjson dur "$DURATION" \
+  --argjson segCount "$SEG_COUNT" \
+  --arg saved "$SAVED_PATH" \
+  '{ success:true, engine:$engine, language:.language, durationSec:$dur,
+     text:$text, segments:.segments, segmentCount:$segCount }
+   + (if $saved == "" then {} else {outputFile:$saved} end)'

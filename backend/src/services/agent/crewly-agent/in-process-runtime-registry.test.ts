@@ -1,0 +1,115 @@
+/**
+ * In-Process Runtime Registry tests
+ *
+ * @module services/agent/crewly-agent/in-process-runtime-registry.test
+ */
+
+import { describe, it, expect, beforeEach } from '@jest/globals';
+import {
+  registerInProcessRuntime,
+  unregisterInProcessRuntime,
+  getInProcessRuntime,
+  isInProcessRuntimeActive,
+  _resetInProcessRuntimeRegistryForTesting,
+  _getInProcessRuntimeRegistrySize,
+  inProcessRuntimePids,
+} from './in-process-runtime-registry.js';
+import type { CrewlyAgentExternalRuntimeService } from './crewly-agent-external-runtime.service.js';
+
+/**
+ * Build a minimal CrewlyAgentExternalRuntimeService stub for registry tests.
+ *
+ * @param ready - Value `isReady()` should return
+ * @param throws - When true, `isReady()` throws an error to exercise the
+ *                 defensive try/catch path
+ */
+function makeFakeRuntime(ready: boolean, throws = false): CrewlyAgentExternalRuntimeService {
+  return {
+    isReady: () => {
+      if (throws) {
+        throw new Error('boom');
+      }
+      return ready;
+    },
+  } as unknown as CrewlyAgentExternalRuntimeService;
+}
+
+describe('in-process-runtime-registry', () => {
+  beforeEach(() => {
+    _resetInProcessRuntimeRegistryForTesting();
+  });
+
+  describe('registerInProcessRuntime', () => {
+    it('stores a runtime under its session name', () => {
+      const runtime = makeFakeRuntime(true);
+      registerInProcessRuntime('crewly-orc', runtime);
+
+      expect(getInProcessRuntime('crewly-orc')).toBe(runtime);
+      expect(_getInProcessRuntimeRegistrySize()).toBe(1);
+    });
+
+    it('replaces an existing entry when called twice for the same session', () => {
+      const first = makeFakeRuntime(true);
+      const second = makeFakeRuntime(true);
+      registerInProcessRuntime('crewly-orc', first);
+      registerInProcessRuntime('crewly-orc', second);
+
+      expect(getInProcessRuntime('crewly-orc')).toBe(second);
+      expect(_getInProcessRuntimeRegistrySize()).toBe(1);
+    });
+  });
+
+  describe('unregisterInProcessRuntime', () => {
+    it('removes a registered runtime and returns true', () => {
+      registerInProcessRuntime('crewly-orc', makeFakeRuntime(true));
+      const removed = unregisterInProcessRuntime('crewly-orc');
+      expect(removed).toBe(true);
+      expect(getInProcessRuntime('crewly-orc')).toBeUndefined();
+    });
+
+    it('returns false when the session is not registered', () => {
+      expect(unregisterInProcessRuntime('does-not-exist')).toBe(false);
+    });
+  });
+
+  describe('isInProcessRuntimeActive', () => {
+    it('returns false when no runtime is registered', () => {
+      expect(isInProcessRuntimeActive('crewly-orc')).toBe(false);
+    });
+
+    it('returns true when the runtime reports ready', () => {
+      registerInProcessRuntime('crewly-orc', makeFakeRuntime(true));
+      expect(isInProcessRuntimeActive('crewly-orc')).toBe(true);
+    });
+
+    it('returns false when the runtime reports not ready', () => {
+      registerInProcessRuntime('crewly-orc', makeFakeRuntime(false));
+      expect(isInProcessRuntimeActive('crewly-orc')).toBe(false);
+    });
+
+    it('returns false when isReady throws (defensive)', () => {
+      registerInProcessRuntime('crewly-orc', makeFakeRuntime(true, true));
+      expect(isInProcessRuntimeActive('crewly-orc')).toBe(false);
+    });
+  });
+
+  describe('_resetInProcessRuntimeRegistryForTesting', () => {
+    it('clears every registered runtime', () => {
+      registerInProcessRuntime('a', makeFakeRuntime(true));
+      registerInProcessRuntime('b', makeFakeRuntime(true));
+      expect(_getInProcessRuntimeRegistrySize()).toBe(2);
+
+      _resetInProcessRuntimeRegistryForTesting();
+      expect(_getInProcessRuntimeRegistrySize()).toBe(0);
+      expect(getInProcessRuntime('a')).toBeUndefined();
+      expect(getInProcessRuntime('b')).toBeUndefined();
+    });
+  });
+  describe('inProcessRuntimePids (#1024)', () => {
+    it('maps each live child pid to its session and skips runtimes without one', () => {
+      registerInProcessRuntime('crewly-orc', { ...makeFakeRuntime(true), childPid: 4321 } as unknown as CrewlyAgentExternalRuntimeService);
+      registerInProcessRuntime('crewly-dev-a', makeFakeRuntime(true));
+      expect([...inProcessRuntimePids()]).toEqual([[4321, 'crewly-orc']]);
+    });
+  });
+});

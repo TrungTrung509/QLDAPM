@@ -1,0 +1,184 @@
+import os from 'os';
+import path from 'path';
+import { promises as fs } from 'fs';
+import http from 'http';
+import type { AddressInfo } from 'net';
+import express from 'express';
+import { createStandingRouter } from './standing.controller.js';
+import { StandingAnswersService } from '../../services/memory/standing-answers.service.js';
+import { setCallerIdentity } from '../../middleware/caller-identity.middleware.js';
+
+/**
+ * Exercises the router over real HTTP with a real service on a temp dir.
+ */
+describe('standing controller', () => {
+	let tmp: string;
+	let projectPath: string;
+	let server: http.Server;
+	let base: string;
+
+	const call = async (method: string, url: string, body?: unknown, asOwner = false): Promise<{ status: number; json: Record<string, unknown> }> => {
+		const res = await fetch(`${base}${url}`, {
+			method,
+			headers: { 'Content-Type': 'application/json', ...(asOwner ? { 'x-test-owner': '1' } : {}) },
+			body: body === undefined ? undefined : JSON.stringify(body),
+		});
+		return { status: res.status, json: (await res.json()) as Record<string, unknown> };
+	};
+
+	beforeAll(async () => {
+		tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'standing-ctl-'));
+		projectPath = path.join(tmp, 'proj');
+		await fs.mkdir(path.join(projectPath, '.crewly', 'knowledge'), { recursive: true });
+		await fs.writeFile(path.join(projectPath, '.crewly', 'knowledge', 'decisions.json'), JSON.stringify([
+			{ id: 'd1', title: 'Modules', decision: 'use modules', decidedAt: '2026-09-20T00:00:00.000Z', status: 'active' },
+		]));
+		const app = express();
+		app.use(express.json());
+		// Stand-in for the caller-identity middleware: a test header makes the caller the owner.
+		app.use((req, _res, next) => {
+			if (req.headers['x-test-owner'] === '1') setCallerIdentity(req, { kind: 'owner', via: 'api-token' });
+			next();
+		});
+		app.use('/api/standing', createStandingRouter(
+			new StandingAnswersService({ crewlyHome: path.join(tmp, 'home') }),
+			async () => [projectPath, path.join(tmp, 'home')],
+		));
+		server = app.listen(0, '127.0.0.1');
+		await new Promise((r) => server.once('listening', r));
+		base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+	});
+
+	afterAll(async () => {
+		await new Promise((r) => server.close(r));
+		await fs.rm(tmp, { recursive: true, force: true });
+	});
+
+	it('GET requires a project or a session', async () => {
+		expect((await call('GET', '/api/standing')).status).toBe(400);
+	});
+
+	it('GET lists page statuses with a count of what it examined', async () => {
+		const { status, json } = await call('GET', `/api/standing?projectPath=${encodeURIComponent(projectPath)}`);
+		expect(status).toBe(200);
+		const data = json.data as { pagesExamined: number; pages: Array<Record<string, unknown>> };
+		expect(data.pagesExamined).toBe(4); // three built-in pages + owner rules
+		expect(data.pages[0]).toMatchObject({ pageId: 'decisions-in-force', exists: false, stale: true, entriesInScope: 1, newerEntries: 1 });
+	});
+
+	it('PUT writes a section; GET then reports the page fresh', async () => {
+		const put = await call('PUT', '/api/standing/decisions-in-force/section', { projectPath, heading: 'Prompts', body: 'Use modules.', cites: ['dec:d1'] });
+		expect(put.status).toBe(200);
+		expect(put.json.data).toMatchObject({ removed: false, watermark: '2026-09-20T00:00:00.000Z' });
+
+		const { json } = await call('GET', `/api/standing?projectPath=${encodeURIComponent(projectPath)}`);
+		const page = (json.data as { pages: Array<Record<string, unknown>> }).pages[0];
+		expect(page).toMatchObject({ exists: true, stale: false, sections: [{ heading: 'Prompts', cites: ['dec:d1'] }] });
+	});
+
+	it('PUT accepts cites as a comma-separated string (the skill sends an array; hand calls may not)', async () => {
+		const put = await call('PUT', '/api/standing/decisions-in-force/section', { projectPath, heading: 'Other', body: 'x', cites: 'dec:d1' });
+		expect(put.status).toBe(200);
+	});
+
+	it.each([
+		['missing body', { heading: 'H' }, 'invalid_input'],
+		['an unknown citation', { heading: 'H', body: 'b', cites: ['dec:nope'] }, 'unknown_cite'],
+		['no citation', { heading: 'H', body: 'b', cites: [] }, 'missing_cite'],
+	])('PUT returns 400 with a code for %s', async (_label, body, code) => {
+		const { status, json } = await call('PUT', '/api/standing/decisions-in-force/section', { projectPath, ...body });
+		expect(status).toBe(400);
+		expect(json.code).toBe(code);
+	});
+
+	it('PUT owner-rules: 403 owner_only for an agent, 200 without citations for the owner (#914 P2)', async () => {
+		const agent = await call('PUT', '/api/standing/owner-rules/section', { projectPath, heading: 'Replies', body: 'Always in Chinese.', cites: [] });
+		expect(agent.status).toBe(403);
+		expect(agent.json.code).toBe('owner_only');
+
+		const owner = await call('PUT', '/api/standing/owner-rules/section', { projectPath, heading: 'Replies', body: 'Always in Chinese.', cites: [] }, true);
+		expect(owner.status).toBe(200);
+		expect(owner.json.data).toMatchObject({ op: 'added', watermark: null });
+
+		const { json } = await call('GET', `/api/standing?projectPath=${encodeURIComponent(projectPath)}`);
+		const rules = (json.data as { pages: Array<Record<string, unknown>> }).pages.find((p) => p.pageId === 'owner-rules');
+		expect(rules).toMatchObject({ exists: true, stale: false, sections: [{ heading: 'Replies', cites: [] }] });
+	});
+
+	it('PUT writes a custom question page defined in standing-questions.json (#914 P2)', async () => {
+		await fs.writeFile(path.join(projectPath, '.crewly', 'standing-questions.json'), JSON.stringify({ questions: [
+			{ id: 'module-rules', question: 'How are prompts built?', source: 'decisions', match: ['modules'] },
+		] }));
+		const put = await call('PUT', '/api/standing/module-rules/section', { projectPath, heading: 'Prompts', body: 'Modules.', cites: ['dec:d1'] });
+		expect(put.status).toBe(200);
+		const { json } = await call('GET', `/api/standing?projectPath=${encodeURIComponent(projectPath)}`);
+		const data = json.data as { pagesExamined: number; pages: Array<Record<string, unknown>> };
+		expect(data.pagesExamined).toBe(5);
+		expect(data.pages.find((p) => p.pageId === 'module-rules')).toMatchObject({ question: 'How are prompts built?', exists: true, stale: false });
+		await fs.rm(path.join(projectPath, '.crewly', 'standing-questions.json'));
+	});
+
+	it('PUT returns 400 unknown_page for a page that does not exist', async () => {
+		const { status, json } = await call('PUT', '/api/standing/nope/section', { projectPath, heading: 'H', body: 'b', cites: ['dec:d1'] });
+		expect(status).toBe(400);
+		expect(json.code).toBe('unknown_page');
+	});
+
+	it('returns 500 when the service fails unexpectedly', async () => {
+		const broken = { listPageStatuses: jest.fn().mockRejectedValue(new Error('EIO')), writeSection: jest.fn().mockRejectedValue(new Error('EIO')) } as unknown as StandingAnswersService;
+		const app = express();
+		app.use(express.json());
+		app.use('/s', createStandingRouter(broken, async () => ['/x']));
+		const s = app.listen(0, '127.0.0.1');
+		await new Promise((r) => s.once('listening', r));
+		const url = `http://127.0.0.1:${(s.address() as AddressInfo).port}`;
+		try {
+			expect((await fetch(`${url}/s?projectPath=/x`)).status).toBe(500);
+			const put = await fetch(`${url}/s/decisions-in-force/section`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ heading: 'h', body: 'b' }) });
+			expect(put.status).toBe(500);
+		} finally {
+			await new Promise((r) => s.close(r));
+		}
+	});
+
+	describe('projectPath must be a registered project (#822)', () => {
+		it.each([
+			['an unregistered absolute path', () => path.join(tmp, 'elsewhere')],
+			['a .. traversal out of a registered project', () => `${projectPath}/../elsewhere`],
+			['a relative path', () => 'proj'],
+		])('PUT rejects %s with 400 unknown_project and writes nothing', async (_label, target) => {
+			const dir = target();
+			// An empty body removes a section and needs no citation: the one
+			// write that previously succeeded in an arbitrary directory.
+			const { status, json } = await call('PUT', '/api/standing/decisions-in-force/section', { projectPath: dir, heading: 'H', body: '', cites: [] });
+			expect(status).toBe(400);
+			expect(json.code).toBe('unknown_project');
+			await expect(fs.access(path.join(tmp, 'elsewhere'))).rejects.toThrow();
+		});
+
+		it('GET rejects an unregistered path with 400 unknown_project', async () => {
+			const { status, json } = await call('GET', `/api/standing?projectPath=${encodeURIComponent(path.join(tmp, 'elsewhere'))}`);
+			expect(status).toBe(400);
+			expect(json.code).toBe('unknown_project');
+		});
+
+		it('rejects a symlink that points out of the registered projects', async () => {
+			const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'standing-out-'));
+			const link = path.join(tmp, 'link-out');
+			await fs.symlink(outside, link);
+			try {
+				const { status, json } = await call('PUT', '/api/standing/decisions-in-force/section', { projectPath: link, heading: 'H', body: '', cites: [] });
+				expect(status).toBe(400);
+				expect(json.code).toBe('unknown_project');
+				expect(await fs.readdir(outside)).toEqual([]);
+			} finally {
+				await fs.rm(outside, { recursive: true, force: true });
+			}
+		});
+
+		it('accepts a registered path written with a trailing slash and a no-op ..', async () => {
+			const { status } = await call('GET', `/api/standing?projectPath=${encodeURIComponent(`${projectPath}/../proj/`)}`);
+			expect(status).toBe(200);
+		});
+	});
+});

@@ -1,0 +1,2499 @@
+/**
+ * Task Pool Controller Tests — HTTP handlers for Task Pool API
+ *
+ * @module controllers/task-pool/task-pool.controller.test
+ */
+
+import {
+  listAvailable,
+  claimItem,
+  releaseItem,
+  getStats,
+  heartbeat,
+  extendLease,
+  scanExpired,
+  revokeAndRelease,
+  deleteItem,
+  completeItem,
+  addItem,
+  cancelQueuedItem,
+  listAllItems,
+  blockItem,
+  scoreItem,
+  renderVerdict,
+  getGiveUpStats,
+  setGiveUpRecoveryService,
+  setClaimTargetWaker,
+  handoffItem,
+  appendItemNote,
+} from './task-pool.controller.js';
+import { actingForOfCreator } from './task-pool.controller.js';
+import { ActingForService, setActingForForTesting } from '../../services/people/acting-for.service.js';
+import { ForbiddenTransitionError } from '../../types/v2/work-item.types.js';
+import { TaskPoolService, WorkItemClaimedError } from '../../services/task-pool/task-pool.service.js';
+import { StorageService } from '../../services/core/storage.service.js';
+import { TeamBudgetExceededError } from '../../services/budget/team-budget-gate.service.js';
+import { setTicketIntakeService, type TicketIntakeService } from '../../services/v3/ticket-intake.service.js';
+import { ProjectTicketWorkflowService } from '../../services/project-tickets/project-ticket-workflow.service.js';
+import { ProjectTicketError } from '../../services/project-tickets/project-ticket.service.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { markOwner, ownerAuthHeaders } from '../../middleware/caller-identity.testing.js';
+import { notePausedTeam, resetTeamPauseRegistryForTesting } from '../../services/team/team-pause.registry.js';
+import * as replyWiring from '../../services/orc/reply-destination.wiring.js';
+// Express types used for mock helpers below
+
+// ---------------------------------------------------------------------------
+// Mocks
+// ---------------------------------------------------------------------------
+
+// Auto-mock the service module BUT preserve the real WorkItemClaimedError
+// class so `instanceof` checks across the test/import and controller/import
+// boundary still match (auto-mocked classes are distinct constructors per
+// import site).
+jest.mock('../../services/task-pool/task-pool.service.js', () => {
+  const actual = jest.requireActual('../../services/task-pool/task-pool.service.js');
+  return {
+    ...actual,
+    TaskPoolService: { getInstance: jest.fn() },
+  };
+});
+
+// #615: addItem now validates the target session via StorageService. Mock it
+// so target resolution is controllable per-test.
+jest.mock('../../services/core/storage.service.js', () => ({
+  StorageService: { getInstance: jest.fn() },
+}));
+
+// Task timing writes under $HOME; keep tests off the real store.
+const mockRecordCompletion = jest.fn().mockReturnValue(null);
+jest.mock('../../services/ai/self-improvement/task-timing.service.js', () => {
+  const actual = jest.requireActual('../../services/ai/self-improvement/task-timing.service.js');
+  return { ...actual, getTaskTimingService: () => ({ recordCompletion: (...args: unknown[]) => mockRecordCompletion(...args) }) };
+});
+
+const mockService = {
+  getAvailableItems: jest.fn(),
+  claimFromPool: jest.fn(),
+  claimSpecificItem: jest.fn(),
+  releaseBack: jest.fn(),
+  getPoolStatus: jest.fn(),
+  heartbeat: jest.fn(),
+  extendLease: jest.fn(),
+  scanExpiredClaims: jest.fn(),
+  revokeAndRelease: jest.fn(),
+  removeFromPool: jest.fn(),
+  completeItem: jest.fn(),
+  findWorkItem: jest.fn(),
+  setOutput: jest.fn(),
+  appendNote: jest.fn(),
+  patchMetadata: jest.fn(),
+  addToPool: jest.fn(),
+  isOwnerThreadUnreadable: jest.fn().mockResolvedValue(false),
+  agentAnswersInOwnerThread: jest.fn().mockResolvedValue([]),
+  getAllItems: jest.fn().mockResolvedValue([]),
+  cancelQueued: jest.fn(),
+  updateItemStatus: jest.fn(),
+  blockItem: jest.fn(),
+  scoreItem: jest.fn(),
+  verifyItem: jest.fn(),
+  // #841 give-up recovery goes through these
+  failItem: jest.fn(),
+  mergeItemMetadata: jest.fn().mockResolvedValue(null),
+  transitionStatus: jest.fn().mockResolvedValue(null),
+  disposeFailedWorkItem: jest.fn().mockResolvedValue(null),
+};
+
+(TaskPoolService.getInstance as any) = jest.fn().mockReturnValue(mockService);
+
+// #615: StorageService.findMemberBySessionName backs addItem's target check.
+const mockStorage = {
+  findMemberBySessionName: jest.fn(),
+  getTeams: jest.fn().mockResolvedValue([]),
+};
+(StorageService.getInstance as any) = jest.fn().mockReturnValue(mockStorage);
+
+function mockReq(overrides: Record<string, any> = {}): any {
+  return {
+    query: {},
+    params: {},
+    body: {},
+    ...overrides,
+  };
+}
+
+function mockRes(): any {
+  const res: any = {};
+  res.json = jest.fn().mockReturnValue(res);
+  res.status = jest.fn().mockReturnValue(res);
+  return res;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// Most completion tests here are about other contracts (summary, shape,
+// actors, give-up) and send no evidence; they run in warn mode. The evidence
+// describe clears this and tests the enforce default itself (#1312).
+beforeEach(() => {
+  process.env.CREWLY_EVIDENCE_MODE = 'warn';
+});
+afterAll(() => {
+  delete process.env.CREWLY_EVIDENCE_MODE;
+});
+
+describe('TaskPoolController', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  // -----------------------------------------------------------------------
+  // GET / — listAvailable
+  // -----------------------------------------------------------------------
+
+  describe('listAvailable', () => {
+    it('returns available items', async () => {
+      const items = [{ id: 'wi-1', title: 'Test', status: 'queued' }];
+      mockService.getAvailableItems.mockResolvedValue(items);
+
+      const req = mockReq();
+      const res = mockRes();
+      await listAvailable(req, res);
+
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: items,
+        count: 1,
+      });
+    });
+
+    it('passes query filters to service', async () => {
+      mockService.getAvailableItems.mockResolvedValue([]);
+
+      const req = mockReq({
+        query: { types: 'delegate,check', owner: 'agent', missionId: 'm-1' } as Record<string, string>,
+      });
+      const res = mockRes();
+      await listAvailable(req, res);
+
+      expect(mockService.getAvailableItems).toHaveBeenCalledWith({
+        types: ['delegate', 'check'],
+        owner: 'agent',
+        missionId: 'm-1',
+      });
+    });
+
+    it('returns 500 on error', async () => {
+      mockService.getAvailableItems.mockRejectedValue(new Error('disk fail'));
+
+      const req = mockReq();
+      const res = mockRes();
+      await listAvailable(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(500);
+      expect(res.json).toHaveBeenCalledWith({
+        success: false,
+        error: 'disk fail',
+      });
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // POST /claim — claimItem
+  // -----------------------------------------------------------------------
+
+  describe('claimItem', () => {
+    it('returns claimed item on success', async () => {
+      const claimResult = {
+        workItem: { id: 'wi-1', status: 'running' },
+        claim: { id: 'cl-1', agentId: 'agent-leo' },
+      };
+      mockService.claimFromPool.mockResolvedValue(claimResult);
+
+      const req = mockReq({ body: { agentId: 'agent-leo' } });
+      const res = mockRes();
+      await claimItem(req, res);
+
+      expect(mockService.claimFromPool).toHaveBeenCalledWith('agent-leo', undefined);
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: claimResult,
+      });
+    });
+
+    it('returns 400 when agentId missing', async () => {
+      const req = mockReq({ body: {} });
+      const res = mockRes();
+      await claimItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+    });
+
+    it('returns 400 for empty agentId', async () => {
+      const req = mockReq({ body: { agentId: '  ' } });
+      const res = mockRes();
+      await claimItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+    });
+
+    it('returns 404 when no items available', async () => {
+      mockService.claimFromPool.mockResolvedValue(null);
+
+      const req = mockReq({ body: { agentId: 'agent-leo' } });
+      const res = mockRes();
+      await claimItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+    });
+
+    it('returns 429 with reason team_budget_exceeded when the team is over budget', async () => {
+      const check = {
+        allowed: false,
+        reason: 'team_budget_exceeded' as const,
+        detail: 'Team "T" (t1) is over budget: 1000 tokens today ≥ 1000/day',
+        level: 'blocked' as const,
+        teamId: 't1',
+        teamName: 'T',
+        usage: { tokensToday: 1000, usdThisMonth: 0, maxTokensPerDay: 1000, sessions: ['agent-leo'] },
+      };
+      mockService.claimFromPool.mockRejectedValue(new TeamBudgetExceededError(check));
+
+      const req = mockReq({ body: { agentId: 'agent-leo' } });
+      const res = mockRes();
+      await claimItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(429);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: false,
+          reason: 'team_budget_exceeded',
+          error: check.detail,
+          usage: check.usage,
+        }),
+      );
+    });
+
+    it('passes filters from body', async () => {
+      mockService.claimFromPool.mockResolvedValue(null);
+
+      const filters = { types: ['delegate'] };
+      const req = mockReq({ body: { agentId: 'agent-leo', filters } });
+      const res = mockRes();
+      await claimItem(req, res);
+
+      expect(mockService.claimFromPool).toHaveBeenCalledWith('agent-leo', filters);
+    });
+
+    // #679 (sub): an explicit workItemId targets a specific queued item
+    // instead of taking next-available — needed to drain a specific stuck WI.
+    it('claims a specific WorkItem when workItemId is provided (targeted claim)', async () => {
+      const claimResult = {
+        workItem: { id: 'wi-stuck', status: 'running' },
+        claim: { id: 'cl-9', agentId: 'agent-leo' },
+      };
+      mockService.claimSpecificItem.mockResolvedValue(claimResult);
+
+      const req = mockReq({ body: { agentId: 'agent-leo', workItemId: 'wi-stuck' } });
+      const res = mockRes();
+      await claimItem(req, res);
+
+      expect(mockService.claimSpecificItem).toHaveBeenCalledWith('agent-leo', 'wi-stuck');
+      // Must NOT fall back to FIFO next-available.
+      expect(mockService.claimFromPool).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith({ success: true, data: claimResult });
+    });
+
+    it('returns 404 with a targeted message when the specific WorkItem is not claimable', async () => {
+      mockService.claimSpecificItem.mockResolvedValue(null);
+
+      const req = mockReq({ body: { agentId: 'agent-leo', workItemId: 'wi-stuck' } });
+      const res = mockRes();
+      await claimItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+      const body = res.json.mock.calls[0][0];
+      expect(body.error).toMatch(/wi-stuck/);
+      expect(mockService.claimFromPool).not.toHaveBeenCalled();
+    });
+
+    describe('targeted claim for an agent that is down (#929)', () => {
+      const wake = jest.fn();
+
+      beforeEach(() => {
+        wake.mockReset();
+        setClaimTargetWaker(wake);
+        mockService.claimSpecificItem.mockResolvedValue(null);
+        mockService.findWorkItem.mockResolvedValue({ id: 'wi-00c29a2d', status: 'queued', target: 'crewly-marketing-dana-45506487' });
+        mockStorage.findMemberBySessionName.mockResolvedValue({ team: { id: 'marketing' }, member: { id: 'dana' } });
+      });
+
+      afterEach(() => {
+        setClaimTargetWaker(null);
+        mockService.findWorkItem.mockReset();
+        mockStorage.findMemberBySessionName.mockReset();
+      });
+
+      it('starts the target for the WorkItem instead of only refusing', async () => {
+        wake.mockResolvedValue({ outcome: 'started' });
+        const req = mockReq({
+          headers: { 'x-agent-session': 'crewly-orc' },
+          body: { agentId: 'crewly-marketing-dana-45506487', workItemId: 'wi-00c29a2d' },
+        });
+        const res = mockRes();
+        await claimItem(req, res);
+
+        expect(wake).toHaveBeenCalledWith({
+          teamId: 'marketing',
+          memberId: 'dana',
+          session: 'crewly-marketing-dana-45506487',
+          workItemId: 'wi-00c29a2d',
+          callerSession: 'crewly-orc',
+        });
+        expect(res.status).toHaveBeenCalledWith(202);
+        expect(res.json.mock.calls[0][0]).toMatchObject({ success: false, waking: true });
+      });
+
+      it('reports a start gate refusal instead of a bare 404', async () => {
+        wake.mockResolvedValue({ outcome: 'blocked', code: 'commitment_requires_owner_approval', detail: 'team is dormant' });
+        const req = mockReq({ body: { agentId: 'crewly-marketing-dana-45506487', workItemId: 'wi-00c29a2d' } });
+        const res = mockRes();
+        await claimItem(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(409);
+        expect(res.json.mock.calls[0][0]).toMatchObject({ success: false, waking: false, code: 'commitment_requires_owner_approval' });
+      });
+
+      it('does not start anyone when the item is not queued for that agent', async () => {
+        mockService.findWorkItem.mockResolvedValue({ id: 'wi-00c29a2d', status: 'queued', target: 'someone-else' });
+        const req = mockReq({ body: { agentId: 'crewly-marketing-dana-45506487', workItemId: 'wi-00c29a2d' } });
+        const res = mockRes();
+        await claimItem(req, res);
+
+        expect(wake).not.toHaveBeenCalled();
+        expect(res.status).toHaveBeenCalledWith(404);
+      });
+    });
+
+    it('falls back to FIFO when workItemId is blank/whitespace', async () => {
+      mockService.claimFromPool.mockResolvedValue(null);
+
+      const req = mockReq({ body: { agentId: 'agent-leo', workItemId: '   ' } });
+      const res = mockRes();
+      await claimItem(req, res);
+
+      expect(mockService.claimSpecificItem).not.toHaveBeenCalled();
+      expect(mockService.claimFromPool).toHaveBeenCalledWith('agent-leo', undefined);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // POST /release/:workItemId — releaseItem
+  // -----------------------------------------------------------------------
+
+  describe('releaseItem', () => {
+    it('releases item successfully', async () => {
+      mockService.releaseBack.mockResolvedValue(undefined);
+
+      const req = mockReq({
+        params: { workItemId: 'wi-1' } as Record<string, string>,
+        body: { reason: 'agent busy' },
+      });
+      const res = mockRes();
+      await releaseItem(req, res);
+
+      expect(mockService.releaseBack).toHaveBeenCalledWith('wi-1', 'agent busy', {
+        unassign: false,
+      });
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        message: 'WorkItem wi-1 released back to pool',
+      });
+    });
+
+    it('forwards an explicit unassign request', async () => {
+      // Un-assignment must be opt-in and explicit — never a silent side
+      // effect of releasing. See WI 25aadd30.
+      mockService.releaseBack.mockResolvedValue(undefined);
+
+      const req = mockReq({
+        params: { workItemId: 'wi-1' } as Record<string, string>,
+        body: { reason: 'agent declined', unassign: true },
+      });
+      const res = mockRes();
+
+      await releaseItem(req, res);
+
+      expect(mockService.releaseBack).toHaveBeenCalledWith('wi-1', 'agent declined', {
+        unassign: true,
+      });
+    });
+
+    it('uses default reason when none provided', async () => {
+      mockService.releaseBack.mockResolvedValue(undefined);
+
+      const req = mockReq({
+        params: { workItemId: 'wi-1' } as Record<string, string>,
+        body: {},
+      });
+      const res = mockRes();
+      await releaseItem(req, res);
+
+      expect(mockService.releaseBack).toHaveBeenCalledWith('wi-1', 'released via API', {
+        unassign: false,
+      });
+    });
+
+    it('returns 404 when item not found', async () => {
+      mockService.releaseBack.mockRejectedValue(new Error('WorkItem not found: ghost'));
+
+      const req = mockReq({
+        params: { workItemId: 'ghost' } as Record<string, string>,
+        body: {},
+      });
+      const res = mockRes();
+      await releaseItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+    });
+
+    it('returns 409 when item in wrong status', async () => {
+      mockService.releaseBack.mockRejectedValue(
+        new Error("Cannot release WorkItem: status must be 'running', got 'queued'"),
+      );
+
+      const req = mockReq({
+        params: { workItemId: 'wi-1' } as Record<string, string>,
+        body: {},
+      });
+      const res = mockRes();
+      await releaseItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // GET /stats — getStats
+  // -----------------------------------------------------------------------
+
+  describe('getStats', () => {
+    it('returns pool statistics', async () => {
+      const snapshot = {
+        total: 5,
+        available: 3,
+        claimed: 2,
+        avgWaitTimeMs: 1500,
+        byType: { delegate: 3, check: 2 },
+        byStatus: { queued: 3, running: 2 },
+        timestamp: '2026-04-05T00:00:00Z',
+      };
+      mockService.getPoolStatus.mockResolvedValue(snapshot);
+
+      const req = mockReq();
+      const res = mockRes();
+      await getStats(req, res);
+
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: snapshot,
+      });
+    });
+
+    it('returns 500 on error', async () => {
+      mockService.getPoolStatus.mockRejectedValue(new Error('oops'));
+
+      const req = mockReq();
+      const res = mockRes();
+      await getStats(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(500);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // POST /heartbeat — heartbeat
+  // -----------------------------------------------------------------------
+
+  describe('heartbeat', () => {
+    it('returns updated claim on success', async () => {
+      const claim = { id: 'cl-1', agentId: 'agent-leo', status: 'active' };
+      mockService.heartbeat.mockResolvedValue({ success: true, claim });
+
+      const req = mockReq({ body: { claimId: 'cl-1', agentId: 'agent-leo' } });
+      const res = mockRes();
+      await heartbeat(req, res);
+
+      expect(mockService.heartbeat).toHaveBeenCalledWith('cl-1', 'agent-leo');
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: { claim },
+      });
+    });
+
+    it('returns 400 when claimId missing', async () => {
+      const req = mockReq({ body: { agentId: 'agent-leo' } });
+      const res = mockRes();
+      await heartbeat(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+    });
+
+    it('returns 400 when agentId missing', async () => {
+      const req = mockReq({ body: { claimId: 'cl-1' } });
+      const res = mockRes();
+      await heartbeat(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+    });
+
+    it('returns 409 on heartbeat failure', async () => {
+      mockService.heartbeat.mockResolvedValue({
+        success: false,
+        reason: 'Agent does not own claim',
+      });
+
+      const req = mockReq({ body: { claimId: 'cl-1', agentId: 'agent-max' } });
+      const res = mockRes();
+      await heartbeat(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // POST /extend-lease — extendLease
+  // -----------------------------------------------------------------------
+
+  describe('extendLease', () => {
+    it('returns extended claim on success', async () => {
+      const claim = { id: 'cl-1', extensionCount: 1 };
+      mockService.extendLease.mockResolvedValue({ success: true, claim });
+
+      const req = mockReq({ body: { claimId: 'cl-1', agentId: 'agent-leo' } });
+      const res = mockRes();
+      await extendLease(req, res);
+
+      expect(mockService.extendLease).toHaveBeenCalledWith('cl-1', 'agent-leo');
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: { claim },
+      });
+    });
+
+    it('returns 400 when required params missing', async () => {
+      const req = mockReq({ body: {} });
+      const res = mockRes();
+      await extendLease(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+    });
+
+    it('returns 409 when extension rejected', async () => {
+      mockService.extendLease.mockResolvedValue({
+        success: false,
+        reason: 'Max extensions reached',
+      });
+
+      const req = mockReq({ body: { claimId: 'cl-1', agentId: 'agent-leo' } });
+      const res = mockRes();
+      await extendLease(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // GET /claims/expired — scanExpired
+  // -----------------------------------------------------------------------
+
+  describe('scanExpired', () => {
+    it('returns expired claims summary', async () => {
+      const summary = {
+        expiring: [{ id: 'cl-1' }],
+        graceExceeded: [{ id: 'cl-2' }],
+      };
+      mockService.scanExpiredClaims.mockResolvedValue(summary);
+
+      const req = mockReq();
+      const res = mockRes();
+      await scanExpired(req, res);
+
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: {
+          expiring: summary.expiring,
+          graceExceeded: summary.graceExceeded,
+          expiringCount: 1,
+          graceExceededCount: 1,
+        },
+      });
+    });
+
+    it('returns 500 on error', async () => {
+      mockService.scanExpiredClaims.mockRejectedValue(new Error('scan failed'));
+
+      const req = mockReq();
+      const res = mockRes();
+      await scanExpired(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(500);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // POST /revoke/:claimId — revokeAndRelease
+  // -----------------------------------------------------------------------
+
+  describe('revokeAndRelease', () => {
+    it('revokes claim successfully', async () => {
+      mockService.revokeAndRelease.mockResolvedValue(undefined);
+
+      const req = mockReq({
+        params: { claimId: 'cl-1' } as Record<string, string>,
+        body: { reason: 'grace exceeded' },
+      });
+      const res = mockRes();
+      await revokeAndRelease(req, res);
+
+      expect(mockService.revokeAndRelease).toHaveBeenCalledWith('cl-1', 'grace exceeded');
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        message: 'Claim cl-1 revoked and work item released',
+      });
+    });
+
+    it('uses default reason when none provided', async () => {
+      mockService.revokeAndRelease.mockResolvedValue(undefined);
+
+      const req = mockReq({
+        params: { claimId: 'cl-1' } as Record<string, string>,
+        body: {},
+      });
+      const res = mockRes();
+      await revokeAndRelease(req, res);
+
+      expect(mockService.revokeAndRelease).toHaveBeenCalledWith('cl-1', 'revoked via API');
+    });
+
+    it('returns 404 when claim not found', async () => {
+      mockService.revokeAndRelease.mockRejectedValue(new Error('Claim not found: ghost'));
+
+      const req = mockReq({
+        params: { claimId: 'ghost' } as Record<string, string>,
+        body: {},
+      });
+      const res = mockRes();
+      await revokeAndRelease(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // P1 1ffffb84(a) — DELETE /api/task-pool/:workItemId
+  // -------------------------------------------------------------------------
+
+  describe('deleteItem (P1 1ffffb84 component a)', () => {
+    it('returns 200 + removed:true on a successful delete', async () => {
+      mockService.removeFromPool.mockResolvedValue({
+        removed: true,
+        workItem: { id: 'wi-1', status: 'queued' },
+        hadActiveClaim: false,
+      });
+
+      const req = mockReq({ params: { workItemId: 'wi-1' } });
+      const res = mockRes();
+      await deleteItem(req, res);
+
+      expect(mockService.removeFromPool).toHaveBeenCalledWith('wi-1', { force: false });
+      expect(res.status).not.toHaveBeenCalled(); // default 200 from res.json
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          removed: true,
+          workItem: { id: 'wi-1', status: 'queued' },
+          hadActiveClaim: false,
+        }),
+      );
+    });
+
+    it('returns 200 + removed:false + reason=not_found (idempotent on missing id)', async () => {
+      mockService.removeFromPool.mockResolvedValue({
+        removed: false,
+        reason: 'not_found',
+      });
+
+      const req = mockReq({ params: { workItemId: 'ghost' } });
+      const res = mockRes();
+      await deleteItem(req, res);
+
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          removed: false,
+          reason: 'not_found',
+        }),
+      );
+    });
+
+    it('returns 409 with structured payload when WI is claimed (no force)', async () => {
+      mockService.removeFromPool.mockRejectedValue(
+        new WorkItemClaimedError({
+          workItemId: 'wi-2',
+          claimId: 'claim-99',
+          claimedBy: 'agent-leo',
+        }),
+      );
+
+      const req = mockReq({ params: { workItemId: 'wi-2' } });
+      const res = mockRes();
+      await deleteItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: false,
+          code: 'work_item_claimed',
+          workItemId: 'wi-2',
+          claimId: 'claim-99',
+          claimedBy: 'agent-leo',
+        }),
+      );
+    });
+
+    it('passes force=true through when ?force=1 query is supplied', async () => {
+      mockService.removeFromPool.mockResolvedValue({
+        removed: true,
+        workItem: { id: 'wi-3' },
+        hadActiveClaim: true,
+      });
+
+      const req = mockReq({
+        params: { workItemId: 'wi-3' },
+        query: { force: '1' },
+      });
+      const res = mockRes();
+      await deleteItem(req, res);
+
+      expect(mockService.removeFromPool).toHaveBeenCalledWith('wi-3', { force: true });
+    });
+
+    it('also accepts ?force=true (string-flag fallback)', async () => {
+      mockService.removeFromPool.mockResolvedValue({
+        removed: true,
+        workItem: { id: 'wi-4' },
+        hadActiveClaim: true,
+      });
+
+      const req = mockReq({
+        params: { workItemId: 'wi-4' },
+        query: { force: 'true' },
+      });
+      const res = mockRes();
+      await deleteItem(req, res);
+
+      expect(mockService.removeFromPool).toHaveBeenCalledWith('wi-4', { force: true });
+    });
+
+    it('returns 400 when workItemId param is missing', async () => {
+      const req = mockReq({ params: {} });
+      const res = mockRes();
+      await deleteItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(mockService.removeFromPool).not.toHaveBeenCalled();
+    });
+
+    it('returns 500 on a generic service error', async () => {
+      mockService.removeFromPool.mockRejectedValue(new Error('disk on fire'));
+
+      const req = mockReq({ params: { workItemId: 'wi-5' } });
+      const res = mockRes();
+      await deleteItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(500);
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // completeItem (2026-05-08): require non-empty `summary` (Done Definition)
+  // ---------------------------------------------------------------------
+  describe('completeItem (require summary)', () => {
+    beforeEach(() => {
+      mockService.findWorkItem.mockResolvedValue({ id: 'wi-1', output: null });
+      mockService.setOutput.mockResolvedValue(undefined);
+      mockService.completeItem.mockResolvedValue(undefined);
+    });
+
+    it('returns 400 when result is missing entirely (fake-completion regression)', async () => {
+      // 2026-05-08 dogfood: Sam and Leo both marked WIs done_by_worker
+      // with `output=null, notes=null`. The Request Contract Done
+      // Definition requires "what artifact/result must be produced". The
+      // gate enforces it at the API boundary so workers can't claim
+      // completion without producing artefacts.
+      const req = mockReq({
+        params: { workItemId: 'wi-1' },
+        body: { agentId: 'agent-1' },
+      });
+      const res = mockRes();
+      await completeItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: false,
+          code: 'complete_requires_summary',
+        }),
+      );
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when summary is an empty string', async () => {
+      const req = mockReq({
+        params: { workItemId: 'wi-2' },
+        body: { agentId: 'agent-1', result: { summary: '' } },
+      });
+      const res = mockRes();
+      await completeItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when summary is only whitespace', async () => {
+      const req = mockReq({
+        params: { workItemId: 'wi-3' },
+        body: { agentId: 'agent-1', result: { summary: '   \n\t  ' } },
+      });
+      const res = mockRes();
+      await completeItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+    });
+
+    it('accepts a non-empty summary and persists it onto WorkItem.output', async () => {
+      const req = mockReq({
+        params: { workItemId: 'wi-4' },
+        body: {
+          agentId: 'leo',
+          result: { summary: 'Designed schema for users table; 4 fields finalized.' },
+        },
+      });
+      const res = mockRes();
+      await completeItem(req, res);
+
+      expect(mockService.completeItem).toHaveBeenCalledWith(
+        'wi-4',
+        expect.objectContaining({ summary: expect.stringContaining('Designed schema') }),
+        expect.objectContaining({ role: 'agent' }),
+      );
+      // Output is persisted with the summary.
+      expect(mockService.setOutput).toHaveBeenCalledWith(
+        'wi-4',
+        expect.objectContaining({ summary: expect.stringContaining('Designed schema') }),
+      );
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ success: true }),
+      );
+    });
+
+    it('preserves caller-supplied non-summary result fields on output', async () => {
+      const req = mockReq({
+        params: { workItemId: 'wi-5' },
+        body: {
+          agentId: 'leo',
+          result: { summary: 'Shipped PR #123', prNumber: 123, links: ['github.com/foo'] },
+        },
+      });
+      const res = mockRes();
+      await completeItem(req, res);
+
+      expect(mockService.setOutput).toHaveBeenCalledWith(
+        'wi-5',
+        expect.objectContaining({
+          summary: 'Shipped PR #123',
+          prNumber: 123,
+          links: ['github.com/foo'],
+        }),
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // completeItem — Hygiene #4 (2026-05-09): strict-shape lock
+  //
+  // Quinn surfaced this on the #499 verify-WI dogfood. Five callsites
+  // (3 skills + 2 TS in tool-registry.ts) were emitting top-level
+  // `{summary}` instead of `{agentId, result:{summary}}`. Decision was
+  // to keep the controller STRICT and fix all callers in the same PR
+  // rather than ship a backward-compat resolver. These tests lock that
+  // contract — broken-shape variants must 400, canonical shape must
+  // succeed, and the broken-shape rejection messages must be specific
+  // enough to point a human caller at the fix.
+  // ---------------------------------------------------------------------
+  describe('task timing', () => {
+    beforeEach(() => {
+      mockService.setOutput.mockResolvedValue(undefined);
+      mockService.completeItem.mockResolvedValue(undefined);
+      mockRecordCompletion.mockReset();
+    });
+
+    it('records the completion and returns the timing line', async () => {
+      const wi = { id: 'wi-t1', title: 'Revise EP03 subtitles', type: 'decision', startedAt: '2026-10-18T10:00:00.000Z', output: null };
+      mockService.findWorkItem.mockResolvedValue(wi);
+      mockRecordCompletion.mockReturnValue("This was a 'revision'. It took 18 min.");
+      const res = mockRes();
+      await completeItem(mockReq({ params: { workItemId: 'wi-t1' }, body: { agentId: 'dex', result: { summary: 'done', taskKind: 'revision' } } }), res);
+
+      expect(mockRecordCompletion).toHaveBeenCalledWith(expect.objectContaining({ agent: 'dex', workItem: wi, taskKind: 'revision' }));
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, timing: "This was a 'revision'. It took 18 min." }));
+    });
+
+    it('completes normally when timing recording throws', async () => {
+      mockService.findWorkItem.mockResolvedValue({ id: 'wi-t2', title: 'x', type: 'decision', startedAt: '2026-10-18T10:00:00.000Z' });
+      mockRecordCompletion.mockImplementation(() => { throw new Error('disk full'); });
+      const res = mockRes();
+      await completeItem(mockReq({ params: { workItemId: 'wi-t2' }, body: { agentId: 'dex', result: { summary: 'done' } } }), res);
+
+      const body = res.json.mock.calls[0][0];
+      expect(body.success).toBe(true);
+      expect(body.timing).toBeUndefined();
+    });
+
+    it('stores the first ETA and the named kind from a progress note', async () => {
+      mockService.appendNote.mockResolvedValue({ id: 'wi-t3', metadata: {} });
+      mockService.patchMetadata.mockResolvedValue({ id: 'wi-t3', metadata: { etaMinutes: 20, taskKind: 'revision' } });
+      const res = mockRes();
+      await appendItemNote(mockReq({ params: { workItemId: 'wi-t3' }, body: { author: 'dex', note: 'starting', etaMinutes: 20, taskKind: 'Revision' } }), res);
+
+      expect(mockService.patchMetadata).toHaveBeenCalledWith('wi-t3', 'etaMinutes', 20);
+      expect(mockService.patchMetadata).toHaveBeenCalledWith('wi-t3', 'taskKind', 'revision');
+    });
+
+    it('keeps an ETA already stated (the first one is measured)', async () => {
+      mockService.patchMetadata.mockReset();
+      mockService.appendNote.mockResolvedValue({ id: 'wi-t4', metadata: { etaMinutes: 20 } });
+      const res = mockRes();
+      await appendItemNote(mockReq({ params: { workItemId: 'wi-t4' }, body: { author: 'dex', note: 'later', etaMinutes: 90 } }), res);
+
+      expect(mockService.patchMetadata).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    });
+  });
+
+  describe('completeItem (Hygiene #4 strict-shape lock)', () => {
+    beforeEach(() => {
+      mockService.findWorkItem.mockResolvedValue({ id: 'wi-h4', output: null });
+      mockService.setOutput.mockResolvedValue(undefined);
+      mockService.completeItem.mockResolvedValue(undefined);
+    });
+
+    it('rejects legacy top-level `{summary}` shape with 400 (no agentId)', async () => {
+      // The exact broken shape that 3 skills + 2 TS callsites used to
+      // emit. The agentId-required check fires FIRST (before the
+      // result.summary check), so the error here is `agentId is required`.
+      const req = mockReq({
+        params: { workItemId: 'wi-h4' },
+        body: { summary: 'Top-level summary, no agentId, no result wrapper' },
+      });
+      const res = mockRes();
+      await completeItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: false,
+          error: 'agentId is required',
+        }),
+      );
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+    });
+
+    it('rejects `{agentId, summary}` (top-level summary missing result wrapper) with 400', async () => {
+      // Caller has agentId but still puts summary at top level instead
+      // of inside `result`. This is the second-most-likely "fixed it
+      // halfway" mistake — passes the agentId gate, fails the
+      // result.summary gate.
+      const req = mockReq({
+        params: { workItemId: 'wi-h4' },
+        body: { agentId: 'agent-1', summary: 'Top-level summary, no result wrapper' },
+      });
+      const res = mockRes();
+      await completeItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: false,
+          code: 'complete_requires_summary',
+        }),
+      );
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+    });
+
+    it('error message on missing summary points caller at body.result', async () => {
+      // Discoverability check — the 400 message must contain the string
+      // "body.result" so a human caller (or LLM agent) reading the
+      // response can fix the shape without diving into source.
+      const req = mockReq({
+        params: { workItemId: 'wi-h4' },
+        body: { agentId: 'agent-1', result: {} },
+      });
+      const res = mockRes();
+      await completeItem(req, res);
+
+      const jsonCall = (res.json as jest.Mock).mock.calls[0][0];
+      expect(jsonCall.error).toEqual(expect.stringContaining('body.result'));
+    });
+
+    it('accepts the canonical shape `{agentId, result:{summary}}` and returns success', async () => {
+      // The smoke-replay assertion. Mirror exactly what the 5 fixed
+      // callsites emit post-Hygiene #4 — controller must accept it.
+      const req = mockReq({
+        params: { workItemId: 'wi-h4' },
+        body: {
+          agentId: 'crewly-product-quinn-47ce967d',
+          result: { summary: 'Hygiene #4 strict-shape lock — 5 callsites fixed.' },
+        },
+      });
+      const res = mockRes();
+      await completeItem(req, res);
+
+      expect(mockService.completeItem).toHaveBeenCalledWith(
+        'wi-h4',
+        expect.objectContaining({ summary: expect.stringContaining('Hygiene #4') }),
+        expect.objectContaining({ role: 'agent' }),
+      );
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ success: true }),
+      );
+    });
+
+    it('canonical shape with extra result fields preserves them onto output', async () => {
+      // The complete-task skill's `output` parameter is now merged into
+      // `result` alongside `summary` (per the fixed body in
+      // config/skills/agent/core/complete-task/execute.sh). Verify the
+      // controller accepts that merged shape and persists every field.
+      const req = mockReq({
+        params: { workItemId: 'wi-h4' },
+        body: {
+          agentId: 'crewly-product-quinn-47ce967d',
+          result: {
+            summary: 'Shipped Hygiene #4',
+            prNumber: 999,
+            callsiteCount: 5,
+            decision: 'strict',
+          },
+        },
+      });
+      const res = mockRes();
+      await completeItem(req, res);
+
+      expect(mockService.setOutput).toHaveBeenCalledWith(
+        'wi-h4',
+        expect.objectContaining({
+          summary: 'Shipped Hygiene #4',
+          prNumber: 999,
+          callsiteCount: 5,
+          decision: 'strict',
+        }),
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // completeItem — evidence contract (#873)
+  //
+  // "done" needs evidence: artifacts that exist, commands with exit codes,
+  // or a `blocked` entry (which records the item as blocked, not done).
+  // ---------------------------------------------------------------------
+  describe('completeItem (evidence contract #873)', () => {
+    let dir: string;
+    let artifact: string;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'tp-evidence-'));
+      artifact = join(dir, 'report.md');
+      writeFileSync(artifact, '# report');
+      delete process.env.CREWLY_EVIDENCE_MODE;
+      setGiveUpRecoveryService(null);
+      mockService.findWorkItem.mockResolvedValue({ id: 'wi-ev', status: 'running', output: null, metadata: { projectPath: dir } });
+      mockService.setOutput.mockResolvedValue(undefined);
+      mockService.completeItem.mockResolvedValue(undefined);
+      mockService.blockItem.mockResolvedValue(undefined);
+    });
+
+    afterEach(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    /** Run completeItem with the given result and return the response mock. */
+    async function complete(result: Record<string, unknown>, extraBody: Record<string, unknown> = {}) {
+      const req = mockReq({ params: { workItemId: 'wi-ev' }, body: { agentId: 'dev-1', result, ...extraBody } });
+      const res = mockRes();
+      await completeItem(req, res);
+      return res;
+    }
+
+    it('enforce mode (default): no evidence returns 400 telling the worker what to send', async () => {
+      const res = await complete({ summary: 'Did the thing', evidence: [] });
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        success: false,
+        code: 'evidence_required',
+        error: expect.stringContaining('body.result.evidence'),
+      }));
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+      expect(mockService.setOutput).not.toHaveBeenCalled();
+    });
+
+    it('warn mode (CREWLY_EVIDENCE_MODE=warn): no evidence is accepted with a warning', async () => {
+      process.env.CREWLY_EVIDENCE_MODE = 'warn';
+      const res = await complete({ summary: 'Did the thing' });
+
+      expect(res.status).not.toHaveBeenCalled();
+      expect(mockService.completeItem).toHaveBeenCalledWith('wi-ev', expect.anything(), expect.anything());
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        success: true,
+        evidenceMode: 'warn',
+        warning: expect.stringContaining('WITHOUT evidence'),
+      }));
+    });
+
+    it('enforce mode: bookkeeping types complete without evidence; deliverables do not (#1312)', async () => {
+      for (const type of ['goal_replan', 'ticket_triage', 'autopilot_retro']) {
+        mockService.completeItem.mockClear();
+        mockService.findWorkItem.mockResolvedValue({ id: 'wi-ev', type, status: 'running', output: null, metadata: {} });
+        const res = await complete({ summary: 'Replanned' });
+        expect(res.status).not.toHaveBeenCalled();
+        expect(mockService.completeItem).toHaveBeenCalled();
+      }
+      for (const type of ['delegate', 'project_task', 'review']) {
+        mockService.completeItem.mockClear();
+        mockService.findWorkItem.mockResolvedValue({ id: 'wi-ev', type, status: 'running', output: null, metadata: {} });
+        const res = await complete({ summary: 'Did it' });
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(mockService.completeItem).not.toHaveBeenCalled();
+      }
+    });
+
+    describe('review accept needs a check record (#1314)', () => {
+      const review = { id: 'wi-ev', type: 'review', status: 'running', output: null, metadata: { verifyOf: 'wi-src' } };
+      const source = {
+        id: 'wi-src',
+        status: 'done_by_worker',
+        output: { evidence: [{ type: 'artifact', path: '/out/a.md' }] },
+        metadata: {},
+      };
+      beforeEach(() => {
+        delete process.env.CREWLY_EVIDENCE_MODE;
+        mockService.mergeItemMetadata.mockClear();
+        mockService.findWorkItem.mockImplementation(async (id: string) => (id === 'wi-src' ? source : review));
+      });
+
+      it('an accept without checks is refused and nothing is completed', async () => {
+        const res = await complete({ summary: 'LGTM', verdict: 'verified' });
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'review_unchecked' }));
+        expect(mockService.completeItem).not.toHaveBeenCalled();
+      });
+
+      it('an accept with checks completes, stores them and stamps the worker item', async () => {
+        const checks = [{ entry: 0, did: 'opened a.md: covers all 3 asks', outcome: 'pass' }];
+        const res = await complete({ summary: 'LGTM', verdict: 'verified', checks });
+        expect(res.status).not.toHaveBeenCalled();
+        expect(mockService.completeItem).toHaveBeenCalled();
+        expect(mockService.setOutput).toHaveBeenCalledWith('wi-ev', expect.objectContaining({ checks }));
+        expect(mockService.mergeItemMetadata).toHaveBeenCalledWith('wi-src', {
+          reviewChecks: expect.objectContaining({ reviewItemId: 'wi-ev', reviewer: 'dev-1', checks }),
+        });
+      });
+
+      it('sending it back needs no checks', async () => {
+        const res = await complete({ summary: 'wrong file', verdict: 'rejected', feedback: 'wrong file' });
+        expect(res.status).not.toHaveBeenCalled();
+        expect(mockService.completeItem).toHaveBeenCalled();
+        expect(mockService.mergeItemMetadata).not.toHaveBeenCalled();
+      });
+
+      it('warn mode accepts without checks and flags the worker item unchecked', async () => {
+        process.env.CREWLY_EVIDENCE_MODE = 'warn';
+        const res = await complete({ summary: 'LGTM', verdict: 'verified' });
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, warning: expect.stringContaining('unchecked') }));
+        expect(mockService.mergeItemMetadata).toHaveBeenCalledWith('wi-src', { reviewChecks: expect.objectContaining({ unchecked: true }) });
+      });
+
+      it('a review whose source is no longer awaiting review is not checked', async () => {
+        mockService.findWorkItem.mockImplementation(async (id: string) => (id === 'wi-src' ? { ...source, status: 'verified' } : review));
+        const res = await complete({ summary: 'LGTM', verdict: 'verified' });
+        expect(res.status).not.toHaveBeenCalled();
+        expect(mockService.mergeItemMetadata).not.toHaveBeenCalled();
+      });
+    });
+
+    it('enforce mode: a review verdict completion needs no evidence', async () => {
+      process.env.CREWLY_EVIDENCE_MODE = 'enforce';
+      const res = await complete({ summary: 'Looks right', verdict: 'verified' });
+
+      expect(res.status).not.toHaveBeenCalled();
+      expect(mockService.completeItem).toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith(expect.not.objectContaining({ warning: expect.anything() }));
+    });
+
+    it('malformed evidence returns 400 naming the bad entry (warn mode too)', async () => {
+      const res = await complete({ summary: 'Did it', evidence: [{ type: 'artifact', path: artifact }, { type: 'command', command: 'npm test' }] });
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        code: 'evidence_malformed',
+        error: expect.stringContaining('evidence[1]'),
+      }));
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+    });
+
+    it('top-level evidence (outside result) returns 400 instead of being ignored', async () => {
+      const res = await complete({ summary: 'Did it' }, { evidence: [{ type: 'artifact', path: artifact }] });
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'evidence_misplaced' }));
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+    });
+
+    it('a missing artifact path returns 400 naming it and does not complete', async () => {
+      const res = await complete({ summary: 'Wrote the report', evidence: [{ type: 'artifact', path: 'docs/missing.md' }] });
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        code: 'evidence_artifact_not_found',
+        error: expect.stringContaining('"docs/missing.md" does not exist'),
+      }));
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+      expect(mockService.setOutput).not.toHaveBeenCalled();
+    });
+
+    it('a failing command returns 400 and does not complete', async () => {
+      const res = await complete({
+        summary: 'Tests done',
+        evidence: [{ type: 'command', command: 'npm test', exitCode: 1, outputTail: '2 failed' }],
+      });
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        code: 'evidence_command_failed',
+        error: expect.stringContaining('a failing command is not evidence of done'),
+      }));
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+    });
+
+    it('a blocked entry records the WorkItem as blocked (same path as /block), never done', async () => {
+      const evidence = [{ type: 'blocked', step: 'npm test', reason: 'staging DB unreachable' }];
+      const res = await complete({ summary: 'Could not finish', evidence });
+
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+      expect(mockService.blockItem).toHaveBeenCalledWith('wi-ev', {
+        agentId: 'dev-1',
+        reason: 'Blocked at "npm test": staging DB unreachable',
+      });
+      expect(res.status).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, recordedAs: 'blocked' }));
+      // The evidence is kept for the reviewer.
+      expect(mockService.setOutput).toHaveBeenCalledWith('wi-ev', expect.objectContaining({ evidence }));
+    });
+
+    it('a blocked entry on an item that is not running maps to 409 (state-machine conflict)', async () => {
+      mockService.blockItem.mockRejectedValue(new Error('Invalid status transition for WorkItem wi-ev: queued → blocked'));
+      const res = await complete({ summary: 'Could not finish', evidence: [{ type: 'blocked', step: 's', reason: 'r' }] });
+
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+    });
+
+    it('valid evidence completes the item and persists the evidence on output', async () => {
+      process.env.CREWLY_EVIDENCE_MODE = 'enforce';
+      const evidence = [
+        { type: 'artifact', path: artifact },
+        { type: 'artifact', path: 'report.md' },
+        { type: 'artifact', path: 'https://github.com/o/r/pull/7' },
+        { type: 'command', command: 'npm test', exitCode: 0, outputTail: '42 passed' },
+      ];
+      const res = await complete({ summary: 'Report written and tested', evidence });
+
+      expect(res.status).not.toHaveBeenCalled();
+      // Local files carry the size and mtime the server checked (#1313).
+      const checked = { sizeBytes: expect.any(Number), mtime: expect.any(String) };
+      expect(mockService.setOutput).toHaveBeenCalledWith('wi-ev', expect.objectContaining({
+        summary: 'Report written and tested',
+        evidence: [{ ...evidence[0], ...checked }, { ...evidence[1], ...checked }, evidence[2], evidence[3]],
+      }));
+      expect(mockService.completeItem).toHaveBeenCalledWith(
+        'wi-ev',
+        expect.objectContaining({ evidence }),
+        expect.objectContaining({ role: 'agent' }),
+      );
+      const body = (res.json as jest.Mock).mock.calls[0][0];
+      expect(body).toEqual(expect.objectContaining({ success: true }));
+      expect(body.warning).toBeUndefined();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // POST /add — addItem
+  //
+  // 2026-05-12 dogfood: the orchestrator's delegate-task shell skill (and 3
+  // sibling skills) all send a minimal `CreateWorkItemInput` shape — no id,
+  // no status, no createdAt. The previous validator required all of those
+  // and 400'd every shell-driven delegation. Fix: accept the minimal shape
+  // and let the server build the full WI via `createWorkItem`. Preserve
+  // legacy full-WI shape for callers that construct ids locally (e.g.
+  // `break-down-request`).
+  // -----------------------------------------------------------------------
+
+  describe('addItem', () => {
+    beforeEach(() => {
+      mockService.addToPool.mockResolvedValue(undefined);
+      mockService.getAllItems.mockResolvedValue([]);
+      // Default: any targeted session resolves to a real member, so the
+      // #615 target guard passes. Individual tests override to return null.
+      mockStorage.findMemberBySessionName.mockResolvedValue({
+        team: { id: 'team-1' },
+        member: { id: 'm-1', sessionName: 'crewly-product-leo' },
+      });
+    });
+
+    it('accepts a minimal CreateWorkItemInput body and generates id + status + createdAt', async () => {
+      const req = mockReq({
+        body: {
+          type: 'delegate',
+          owner: 'orchestrator',
+          target: 'crewly-product-leo',
+          title: 'Implement feature X',
+          description: 'Short summary',
+          briefMarkdown: 'Long-form brief...',
+        },
+      });
+      const res = mockRes();
+
+      await addItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(201);
+      expect(mockService.addToPool).toHaveBeenCalledTimes(1);
+
+      const addedWI = mockService.addToPool.mock.calls[0][0];
+      expect(typeof addedWI.id).toBe('string');
+      expect(addedWI.id.length).toBeGreaterThan(0);
+      expect(addedWI.status).toBe('queued');
+      expect(typeof addedWI.createdAt).toBe('string');
+      expect(addedWI.retryCount).toBe(0);
+      expect(addedWI.maxRetries).toBeGreaterThan(0);
+      expect(addedWI.title).toBe('Implement feature X');
+      expect(addedWI.type).toBe('delegate');
+      expect(addedWI.owner).toBe('orchestrator');
+      expect(addedWI.target).toBe('crewly-product-leo');
+      expect(addedWI.briefMarkdown).toBe('Long-form brief...');
+
+      // Response must echo the generated id so the skill can record it.
+      const body = res.json.mock.calls[0][0];
+      expect(body.success).toBe(true);
+      expect(body.data.workItemId).toBe(addedWI.id);
+      expect(body.data.id).toBe(addedWI.id);
+      expect(body.data.status).toBe('queued');
+    });
+
+    it('refuses a delegation whose --thread Crewly cannot read, instead of dropping the owner place (2026-10-18)', async () => {
+      mockService.isOwnerThreadUnreadable.mockResolvedValueOnce(true);
+      const req = mockReq({
+        body: { type: 'delegate', owner: 'team_lead', target: 'crewly-product-leo', title: 'Assess', metadata: { delegatedBy: 'atlas', ownerThread: 'room:not-a-thread' } },
+      });
+      const res = mockRes();
+
+      await addItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json.mock.calls[0][0]).toEqual(expect.objectContaining({ success: false, code: 'owner_thread_unreadable' }));
+      expect(mockService.isOwnerThreadUnreadable).toHaveBeenCalledWith('room:not-a-thread', expect.anything());
+      expect(mockService.addToPool).not.toHaveBeenCalled();
+    });
+
+    describe('thread already answered by another agent (CREW-878)', () => {
+      const THREAD = 'C0MKT:1792400000.000100';
+      const body = (metadata: Record<string, unknown> = {}) => ({
+        type: 'delegate', owner: 'team_lead', target: 'crewly-product-leo', title: 'Assess',
+        metadata: { delegatedBy: 'ella', ownerThread: THREAD, ...metadata },
+      });
+
+      it('refuses with 409 and lists the post when an agent answered after the owner', async () => {
+        mockService.agentAnswersInOwnerThread.mockResolvedValueOnce([{ agent: 'luna', at: 1, preview: 'Here is the answer' }]);
+        const res = mockRes();
+        await addItem(mockReq({ body: body() }), res);
+        expect(res.status).toHaveBeenCalledWith(409);
+        const sent = res.json.mock.calls[0][0];
+        expect(sent).toEqual(expect.objectContaining({ success: false, code: 'thread_already_answered' }));
+        expect(sent.error).toContain('luna');
+        expect(sent.error).toContain('Here is the answer');
+        expect(sent.error).toContain('--force-after-answer');
+        expect(mockService.agentAnswersInOwnerThread).toHaveBeenCalledWith(THREAD, expect.anything(), 'crewly-product-leo');
+        expect(mockService.addToPool).not.toHaveBeenCalled();
+      });
+
+      it('delegates normally when nobody answered', async () => {
+        const res = mockRes();
+        await addItem(mockReq({ body: body() }), res);
+        expect(res.status).not.toHaveBeenCalledWith(409);
+        expect(mockService.addToPool).toHaveBeenCalledTimes(1);
+      });
+
+      it('--force-after-answer delegates anyway and does not even look', async () => {
+        mockService.agentAnswersInOwnerThread.mockResolvedValue([{ agent: 'luna', at: 1, preview: 'x' }]);
+        const res = mockRes();
+        await addItem(mockReq({ body: body({ forceAfterAnswer: true }) }), res);
+        expect(res.status).not.toHaveBeenCalledWith(409);
+        expect(mockService.agentAnswersInOwnerThread).not.toHaveBeenCalled();
+        expect(mockService.addToPool).toHaveBeenCalledTimes(1);
+        mockService.agentAnswersInOwnerThread.mockResolvedValue([]);
+      });
+
+      it('a delegation without --thread is never checked', async () => {
+        const res = mockRes();
+        await addItem(mockReq({ body: { type: 'delegate', owner: 'team_lead', target: 'crewly-product-leo', title: 'Assess', metadata: { delegatedBy: 'ella' } } }), res);
+        expect(mockService.agentAnswersInOwnerThread).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('project tickets (delegation through tickets)', () => {
+      const routeDelegation = jest.fn();
+      beforeEach(() => {
+        routeDelegation.mockReset();
+        ProjectTicketWorkflowService.setInstance({ routeDelegation } as unknown as ProjectTicketWorkflowService);
+      });
+      afterEach(() => ProjectTicketWorkflowService.setInstance(null));
+
+      const body = () => ({ type: 'delegate', owner: 'team_lead', target: 'crewly-product-leo', title: 'Do X', projectTicketId: 'APP-3' });
+
+      it('lets the workflow add a routed item and reports the ticket', async () => {
+        routeDelegation.mockImplementation(async ({ workItem }) => ({
+          workItem: { ...workItem, metadata: { projectTicket: { projectPath: '/p', id: 'APP-3' } } },
+          ticket: { id: 'APP-3', status: 'in_progress' },
+          project: { path: '/p', name: 'App' },
+          createdTicket: false,
+        }));
+        const res = mockRes();
+        await addItem(mockReq({ headers: { 'x-agent-session': 'tl-sam' }, body: body() }), res);
+        expect(res.status).toHaveBeenCalledWith(201);
+        expect(mockService.addToPool).not.toHaveBeenCalled();
+        const input = routeDelegation.mock.calls[0][0];
+        expect(input).toMatchObject({ callerSession: 'tl-sam', ticketId: 'APP-3', addOptions: { creatorSession: 'tl-sam' } });
+        expect(input.workItem).not.toHaveProperty('projectTicketId');
+        expect(res.json.mock.calls[0][0].data.projectTicket).toEqual({ id: 'APP-3', status: 'in_progress', projectPath: '/p', project: 'App', created: false });
+      });
+
+      it('adds the item itself when the workflow does not route it; falls back to metadata.delegatedBy', async () => {
+        routeDelegation.mockResolvedValue(null);
+        const res = mockRes();
+        await addItem(mockReq({ body: { ...body(), projectTicketId: undefined, metadata: { delegatedBy: 'tl-sam' } } }), res);
+        expect(res.status).toHaveBeenCalledWith(201);
+        expect(routeDelegation.mock.calls[0][0].callerSession).toBe('tl-sam');
+        expect(mockService.addToPool).toHaveBeenCalledTimes(1);
+        expect(res.json.mock.calls[0][0].data.projectTicket).toBeUndefined();
+      });
+
+      it('names the owner thread for the member when the stored item came from one (crewly#1083)', async () => {
+        const origin = { kind: 'owner', conversationId: 'room-think', slackChannelId: 'C0THINK', threadTs: '1790000000.000100' };
+        routeDelegation.mockImplementation(async ({ workItem }) => ({
+          workItem: { ...workItem, metadata: { ...(workItem.metadata ?? {}), origin, projectTicket: { projectPath: '/p', id: 'APP-3' } } },
+          ticket: { id: 'APP-3', status: 'in_progress' },
+          project: { path: '/p', name: 'App' },
+          createdTicket: true,
+        }));
+        const res = mockRes();
+        await addItem(mockReq({ body: { ...body(), metadata: { delegatedBy: 'tl-sam' } } }), res);
+        const data = res.json.mock.calls[0][0].data;
+        expect(data.ownerThread.key).toBe('C0THINK:1790000000.000100');
+        expect(data.ownerThread.note).toContain('[SLACK-THREAD:C0THINK:1790000000.000100]');
+        expect(data.ownerThread.note).toContain(`reply --work-item ${data.id}`);
+      });
+
+      it('no owner thread → no ownerThread in the answer', async () => {
+        routeDelegation.mockResolvedValue(null);
+        const res = mockRes();
+        await addItem(mockReq({ body: { ...body(), projectTicketId: undefined, metadata: { delegatedBy: 'tl-sam' } } }), res);
+        expect(res.json.mock.calls[0][0].data.ownerThread).toBeUndefined();
+        expect(res.json.mock.calls[0][0].data.resultRoute).toBeUndefined();
+      });
+
+      // crewly#1357: a delegation the owner did not ask for in any thread.
+      it('names the delegator as where the result goes when the stored item carries an agent origin', async () => {
+        routeDelegation.mockResolvedValue(null);
+        mockService.addToPool.mockImplementationOnce(async (wi: Record<string, unknown>) => {
+          wi.metadata = { ...((wi.metadata as Record<string, unknown>) ?? {}), origin: { kind: 'agent', sessionName: 'tl-sam' } };
+        });
+        const res = mockRes();
+        await addItem(mockReq({ headers: { 'x-agent-session': 'tl-sam' }, body: { ...body(), projectTicketId: undefined } }), res);
+        expect(res.status).toHaveBeenCalledWith(201);
+        const data = res.json.mock.calls[0][0].data;
+        expect(data.ownerThread).toBeUndefined();
+        expect(data.resultRoute.to).toBe('tl-sam');
+        expect(data.resultRoute.note).toContain(`reply --work-item ${data.id}`);
+        expect(data.resultRoute.note).toContain('Do not post it to the owner.');
+      });
+
+      it('a self-targeted item gets neither note', async () => {
+        routeDelegation.mockResolvedValue(null);
+        mockService.addToPool.mockImplementationOnce(async (wi: Record<string, unknown>) => {
+          wi.metadata = { ...((wi.metadata as Record<string, unknown>) ?? {}), origin: { kind: 'agent', sessionName: 'tl-sam' } };
+        });
+        const res = mockRes();
+        await addItem(mockReq({ headers: { 'x-agent-session': 'crewly-product-leo' }, body: { ...body(), projectTicketId: undefined } }), res);
+        expect(res.json.mock.calls[0][0].data.resultRoute).toBeUndefined();
+      });
+
+      it('refuses with project_ticket_refused and adds nothing', async () => {
+        routeDelegation.mockRejectedValue(new ProjectTicketError(409, 'APP-3 is already being worked in WorkItem wi-1'));
+        const res = mockRes();
+        await addItem(mockReq({ headers: { 'x-agent-session': 'tl-sam' }, body: body() }), res);
+        expect(res.status).toHaveBeenCalledWith(409);
+        expect(res.json.mock.calls[0][0]).toMatchObject({ success: false, code: 'project_ticket_refused', error: expect.stringContaining('already being worked') });
+        expect(mockService.addToPool).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('ticket loop', () => {
+      afterEach(() => setTicketIntakeService(null));
+
+      describe('routes (message-routing audit 2026-10-18)', () => {
+        const route = { kind: 'owner' as const, conversationId: 'room-brief', thread: 'C0BRIEF01:1790856242.596149' };
+        let spy: jest.SpyInstance;
+        beforeEach(() => {
+          spy = jest.spyOn(replyWiring, 'currentRouteOf').mockResolvedValue(route);
+        });
+        afterEach(() => spy.mockRestore());
+
+        it("a delegation carries the delegator's current route as metadata.parentRoute", async () => {
+          const req = mockReq({
+            headers: { 'x-agent-session': 'think-tank-atlas-b4e166f6' },
+            body: { type: 'delegate', owner: 'team_lead', target: 'crewly-product-leo', title: 'Starship note' },
+          });
+          await addItem(req, mockRes());
+          expect(spy).toHaveBeenCalledWith('think-tank-atlas-b4e166f6');
+          expect(mockService.addToPool.mock.calls[0][0].metadata.parentRoute).toEqual(route);
+          expect(mockService.addToPool.mock.calls[0][1]).toEqual({ creatorSession: 'think-tank-atlas-b4e166f6' });
+        });
+
+        it("a self-assigned item gets no parent route and does not inherit the creator's turn", async () => {
+          const req = mockReq({
+            headers: { 'x-agent-session': 'crewly-product-leo' },
+            body: { type: 'delegate', owner: 'team_lead', target: 'crewly-product-leo', title: 'My own follow-up' },
+          });
+          await addItem(req, mockRes());
+          expect(spy).not.toHaveBeenCalled();
+          expect(mockService.addToPool.mock.calls[0][0].metadata?.parentRoute).toBeUndefined();
+          expect(mockService.addToPool.mock.calls[0][1]).toEqual({ creatorSession: 'crewly-product-leo', inheritCreatorTurn: false });
+        });
+
+        it('a route lookup failure never blocks the delegation', async () => {
+          spy.mockRejectedValueOnce(new Error('boom'));
+          const req = mockReq({
+            headers: { 'x-agent-session': 'think-tank-atlas-b4e166f6' },
+            body: { type: 'delegate', owner: 'team_lead', target: 'crewly-product-leo', title: 'Starship note' },
+          });
+          const res = mockRes();
+          await addItem(req, res);
+          expect(res.status).toHaveBeenCalledWith(201);
+          expect(mockService.addToPool.mock.calls[0][0].metadata?.parentRoute).toBeUndefined();
+        });
+      });
+
+      it('passes the calling agent to addToPool so it can link the turn’s ticket', async () => {
+        const req = mockReq({
+          headers: { 'x-agent-session': 'crewly-orc' },
+          body: { type: 'delegate', owner: 'orchestrator', target: 'crewly-product-leo', title: 'Do X' },
+        });
+        await addItem(req, mockRes());
+        expect(mockService.addToPool.mock.calls[0][1]).toEqual({ creatorSession: 'crewly-orc' });
+      });
+
+      it('resolves a TKT-123 requestId to the ticket id', async () => {
+        setTicketIntakeService({
+          resolve: async (ref: string) => (ref === 'TKT-012' ? { id: 'req-uuid-12' } : null),
+        } as unknown as TicketIntakeService);
+        const res = mockRes();
+        await addItem(mockReq({ body: { type: 'delegate', owner: 'agent', title: 'Do X', requestId: 'TKT-012' } }), res);
+        expect(res.status).toHaveBeenCalledWith(201);
+        expect(mockService.addToPool.mock.calls[0][0].requestId).toBe('req-uuid-12');
+      });
+
+      it('400s on a TKT reference that names no ticket', async () => {
+        setTicketIntakeService({ resolve: async () => null } as unknown as TicketIntakeService);
+        const res = mockRes();
+        await addItem(mockReq({ body: { type: 'delegate', owner: 'agent', title: 'Do X', requestId: 'TKT-404' } }), res);
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(res.json.mock.calls[0][0].code).toBe('unknown_ticket');
+        expect(mockService.addToPool).not.toHaveBeenCalled();
+      });
+
+      it('leaves a uuid requestId alone', async () => {
+        await addItem(mockReq({ body: { type: 'delegate', owner: 'agent', title: 'Do X', requestId: 'plain-id' } }), mockRes());
+        expect(mockService.addToPool.mock.calls[0][0].requestId).toBe('plain-id');
+      });
+    });
+
+    it('rejects a minimal body missing required CreateWorkItemInput fields', async () => {
+      // No type, no owner, no title — three errors expected.
+      const req = mockReq({ body: { description: 'orphan' } });
+      const res = mockRes();
+
+      await addItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      const body = res.json.mock.calls[0][0];
+      expect(body.success).toBe(false);
+      expect(Array.isArray(body.errors)).toBe(true);
+      expect(mockService.addToPool).not.toHaveBeenCalled();
+    });
+
+    it('accepts a legacy full-WorkItem body and preserves the client-supplied id', async () => {
+      // break-down-request constructs WIs locally with deterministic ids it
+      // then records in `Request.workItemIds[]`. This path must keep working.
+      const req = mockReq({
+        body: {
+          id: 'wi_locally_minted_42',
+          type: 'delegate',
+          owner: 'orchestrator',
+          target: 'crewly-product-leo',
+          title: 'Pre-built WI',
+          status: 'queued',
+          createdAt: '2026-05-12T00:00:00.000Z',
+          retryCount: 0,
+          maxRetries: 3,
+          inputTokens: 0,
+          outputTokens: 0,
+          cost: 0,
+        },
+      });
+      const res = mockRes();
+
+      await addItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(201);
+      const addedWI = mockService.addToPool.mock.calls[0][0];
+      expect(addedWI.id).toBe('wi_locally_minted_42');
+      expect(addedWI.status).toBe('queued');
+    });
+
+    it('rejects a duplicate id against the existing pool (legacy path)', async () => {
+      mockService.getAllItems.mockResolvedValue([
+        { id: 'wi-dup', status: 'running', requestId: undefined },
+      ]);
+
+      const req = mockReq({
+        body: {
+          id: 'wi-dup',
+          type: 'delegate',
+          owner: 'orchestrator',
+          title: 'Dup',
+          status: 'queued',
+          createdAt: '2026-05-12T00:00:00.000Z',
+        },
+      });
+      const res = mockRes();
+
+      await addItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      const body = res.json.mock.calls[0][0];
+      expect(body.errors.join(' ')).toMatch(/already exists/);
+      expect(mockService.addToPool).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the parent Request already holds MAX active WIs (per-request cap)', async () => {
+      // 25 active WIs sharing a requestId is the documented cap. A 26th
+      // should be refused as an "infinite decomposition" guardrail.
+      const existing = Array.from({ length: 25 }, (_, i) => ({
+        id: `wi-existing-${i}`,
+        status: 'queued',
+        requestId: 'req-runaway',
+      }));
+      mockService.getAllItems.mockResolvedValue(existing);
+
+      const req = mockReq({
+        body: {
+          type: 'delegate',
+          owner: 'orchestrator',
+          title: 'one more',
+          requestId: 'req-runaway',
+        },
+      });
+      const res = mockRes();
+
+      await addItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      const body = res.json.mock.calls[0][0];
+      expect(body.errors.join(' ')).toMatch(/active WorkItems/);
+      expect(mockService.addToPool).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 if body is not an object', async () => {
+      const req = mockReq({ body: 'not-an-object' });
+      const res = mockRes();
+
+      await addItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(mockService.addToPool).not.toHaveBeenCalled();
+    });
+
+    it('initial status for a minimal body with dependsOn is `blocked`, not `queued`', async () => {
+      // createWorkItem promotes dependency-gated items to `blocked`. The
+      // endpoint must propagate that — otherwise an item with unresolved
+      // deps would be claimable immediately, defeating the gate.
+      const req = mockReq({
+        body: {
+          type: 'delegate',
+          owner: 'orchestrator',
+          title: 'Has upstream deps',
+          dependsOn: ['wi-upstream-1', 'wi-upstream-2'],
+        },
+      });
+      const res = mockRes();
+
+      await addItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(201);
+      const addedWI = mockService.addToPool.mock.calls[0][0];
+      expect(addedWI.status).toBe('blocked');
+      expect(addedWI.dependsOn).toEqual(['wi-upstream-1', 'wi-upstream-2']);
+    });
+
+    // #615: an agent (Don) invented teammates "Leo"/"Noah" with plausible
+    // session names and dispatched WorkItems that orphaned forever. The target
+    // must resolve to a real member or known virtual agent, else reject.
+    it('rejects a WorkItem whose target session does not resolve to any member (#615)', async () => {
+      mockStorage.findMemberBySessionName.mockResolvedValue(null); // fabricated target
+
+      const req = mockReq({
+        body: {
+          type: 'delegate',
+          owner: 'orchestrator',
+          target: 'stock-ops-team-noah-cbe74bbd', // looks real, does not exist
+          title: 'Distribute report',
+        },
+      });
+      const res = mockRes();
+
+      await addItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      const body = res.json.mock.calls[0][0];
+      expect(body.success).toBe(false);
+      expect(body.code).toBe('unknown_target_session');
+      expect(body.error).toMatch(/does not exist/);
+      // Crucially, the orphan WI must NOT enter the pool.
+      expect(mockService.addToPool).not.toHaveBeenCalled();
+    });
+
+    it('allows a known virtual agent target (orchestrator) even without a member record (#615)', async () => {
+      // findMemberBySessionName returns null for virtual sessions, but the
+      // orchestrator is an allowed dispatch target via the virtual allowlist.
+      mockStorage.findMemberBySessionName.mockResolvedValue(null);
+
+      const req = mockReq({
+        body: {
+          type: 'delegate',
+          owner: 'orchestrator',
+          target: 'crewly-orc',
+          title: 'Escalate to orchestrator',
+        },
+      });
+      const res = mockRes();
+
+      await addItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(201);
+      expect(mockService.addToPool).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows an unassigned WorkItem (no target) — hybrid-wake picks it up (#615)', async () => {
+      mockStorage.findMemberBySessionName.mockResolvedValue(null);
+
+      const req = mockReq({
+        body: {
+          type: 'delegate',
+          owner: 'orchestrator',
+          title: 'Unassigned work',
+          // no target
+        },
+      });
+      const res = mockRes();
+
+      await addItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(201);
+      expect(mockService.addToPool).toHaveBeenCalledTimes(1);
+      // The target validator must not even consult storage for an absent target.
+      expect(mockStorage.findMemberBySessionName).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // GET /api/task-pool/items — listAllItems (status/target filters, #679)
+  // -------------------------------------------------------------------------
+
+  describe('blockItem status-code mapping', () => {
+    it('delegates to the pool\'s explicit block (claim released, stays blocked) with agent and reason', async () => {
+      mockService.blockItem.mockResolvedValue(undefined);
+      const req = mockReq({
+        params: { workItemId: 'wi-1' } as Record<string, string>,
+        body: { agentId: 'dev-1', reason: 'waiting on Steve' },
+      });
+      const res = mockRes();
+      await blockItem(req, res);
+
+      expect(mockService.blockItem).toHaveBeenCalledWith('wi-1', { agentId: 'dev-1', reason: 'waiting on Steve' });
+      expect(mockService.updateItemStatus).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    });
+
+    it('forwards `until` (block-task until) to the pool', async () => {
+      mockService.blockItem.mockResolvedValue(undefined);
+      const until = new Date(Date.now() + 60 * 60_000).toISOString();
+      const req = mockReq({
+        params: { workItemId: 'wi-1' } as Record<string, string>,
+        body: { agentId: 'dev-1', reason: 'needs the full 7-day window', until },
+      });
+      const res = mockRes();
+      await blockItem(req, res);
+
+      expect(mockService.blockItem).toHaveBeenCalledWith('wi-1', { agentId: 'dev-1', reason: 'needs the full 7-day window', until });
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    });
+
+    it('refuses an `until` that does not parse or is already past with 400, before touching the pool', async () => {
+      for (const until of ['tomorrow 8:30', new Date(Date.now() - 60_000).toISOString(), 42]) {
+        mockService.blockItem.mockClear();
+        const req = mockReq({
+          params: { workItemId: 'wi-1' } as Record<string, string>,
+          body: { agentId: 'dev-1', reason: 'x', until },
+        });
+        const res = mockRes();
+        await blockItem(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: false, error: expect.stringContaining('until') }));
+        expect(mockService.blockItem).not.toHaveBeenCalled();
+      }
+    });
+
+    it('maps an invalid status transition to 409, not 500', async () => {
+      // WORK_ITEM_TRANSITIONS allows `blocked` only from `running`, so
+      // blocking a queued item throws. That is a CLIENT error — the caller
+      // asked for something the state machine forbids. Reporting it as a 500
+      // makes retry logic treat a PERMANENT failure as transient and hammer
+      // the endpoint.
+      mockService.blockItem.mockRejectedValue(
+        new Error('Invalid status transition for WorkItem wi-1: queued → blocked'),
+      );
+
+      const req = mockReq({
+        params: { workItemId: 'wi-1' } as Record<string, string>,
+        body: { agentId: 'dev-1', reason: 'missing creds' },
+      });
+      const res = mockRes();
+      await blockItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(res.status).not.toHaveBeenCalledWith(500);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: false,
+          error: expect.stringContaining('queued → blocked'),
+        }),
+      );
+    });
+
+    it('still maps a missing WorkItem to 404', async () => {
+      mockService.blockItem.mockRejectedValue(new Error('WorkItem wi-nope not found'));
+
+      const req = mockReq({
+        params: { workItemId: 'wi-nope' } as Record<string, string>,
+        body: { agentId: 'dev-1', reason: 'r' },
+      });
+      const res = mockRes();
+      await blockItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+    });
+
+    it('still maps a genuine server fault to 500', async () => {
+      // The 409 mapping must not swallow real failures.
+      mockService.blockItem.mockRejectedValue(new Error('ENOSPC: disk full'));
+
+      const req = mockReq({
+        params: { workItemId: 'wi-1' } as Record<string, string>,
+        body: { agentId: 'dev-1', reason: 'r' },
+      });
+      const res = mockRes();
+      await blockItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(500);
+    });
+
+    it('still rejects a missing agentId with 400', async () => {
+      const req = mockReq({
+        params: { workItemId: 'wi-1' } as Record<string, string>,
+        body: { reason: 'r' },
+      });
+      const res = mockRes();
+      await blockItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(mockService.updateItemStatus).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listAllItems (#679 status/target filters)', () => {
+    const items = [
+      { id: 'wi-run-a', status: 'running', target: 'agent-a' },
+      { id: 'wi-run-b', status: 'running', target: 'agent-b' },
+      { id: 'wi-queued-a', status: 'queued', target: 'agent-a' },
+      { id: 'wi-done-a', status: 'done', target: 'agent-a' },
+    ];
+
+    beforeEach(() => {
+      mockService.getAllItems.mockResolvedValue(items);
+    });
+
+    it('returns every item when no filters are given', async () => {
+      const req = mockReq();
+      const res = mockRes();
+      await listAllItems(req, res);
+
+      const body = res.json.mock.calls[0][0];
+      expect(body.count).toBe(4);
+      expect(body.data.map((w: any) => w.id)).toEqual(
+        ['wi-run-a', 'wi-run-b', 'wi-queued-a', 'wi-done-a'],
+      );
+    });
+
+    // The complete-task fallback query: ?status=running&target=<session>.
+    // It must resolve to ONLY that session's running WI — previously it
+    // received all items and [0] could be another agent's / a terminal WI.
+    it('filters by status AND target (the complete-task resolution path)', async () => {
+      const req = mockReq({ query: { status: 'running', target: 'agent-a' } });
+      const res = mockRes();
+      await listAllItems(req, res);
+
+      const body = res.json.mock.calls[0][0];
+      expect(body.count).toBe(1);
+      expect(body.data[0].id).toBe('wi-run-a');
+    });
+
+    it('supports a comma-separated status list', async () => {
+      const req = mockReq({ query: { status: 'running,queued' } });
+      const res = mockRes();
+      await listAllItems(req, res);
+
+      const body = res.json.mock.calls[0][0];
+      expect(body.data.map((w: any) => w.id).sort()).toEqual(
+        ['wi-queued-a', 'wi-run-a', 'wi-run-b'],
+      );
+    });
+
+    it('returns an empty list when the session has no matching item (no misdirection)', async () => {
+      const req = mockReq({ query: { status: 'running', target: 'agent-ghost' } });
+      const res = mockRes();
+      await listAllItems(req, res);
+
+      const body = res.json.mock.calls[0][0];
+      expect(body.count).toBe(0);
+      expect(body.data).toEqual([]);
+    });
+
+    it('filters by target alone', async () => {
+      const req = mockReq({ query: { target: 'agent-a' } });
+      const res = mockRes();
+      await listAllItems(req, res);
+
+      const body = res.json.mock.calls[0][0];
+      expect(body.data.map((w: any) => w.id)).toEqual(['wi-run-a', 'wi-queued-a', 'wi-done-a']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // POST /api/task-pool/items/:workItemId/cancel (#609 explicit cancel)
+  // -------------------------------------------------------------------------
+
+  describe('cancelQueuedItem (#609)', () => {
+    beforeEach(() => {
+      mockService.cancelQueued.mockReset();
+      mockService.findWorkItem.mockReset();
+    });
+
+    it('returns 200 + cancelledFrom on a successful queued cancel', async () => {
+      mockService.findWorkItem.mockResolvedValue({ id: 'wi-1', status: 'queued' });
+      mockService.cancelQueued.mockResolvedValue(undefined);
+
+      const req = mockReq({ params: { workItemId: 'wi-1' }, body: { reason: 'stuck fallback' } });
+      const res = mockRes();
+      await cancelQueuedItem(req, res);
+
+      expect(mockService.cancelQueued).toHaveBeenCalledWith('wi-1', 'stuck fallback', { supersededBy: [] });
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ success: true, workItemId: 'wi-1', cancelledFrom: 'queued', reason: 'stuck fallback' }),
+      );
+    });
+
+    it('passes supersededBy (string or array) through to the service', async () => {
+      mockService.findWorkItem.mockResolvedValue({ id: 'wi-1', status: 'queued' });
+      mockService.cancelQueued.mockResolvedValue(undefined);
+
+      await cancelQueuedItem(
+        mockReq({ params: { workItemId: 'wi-1' }, body: { reason: 'duplicate', supersededBy: ' 806dc528 ' } }),
+        mockRes(),
+      );
+      expect(mockService.cancelQueued).toHaveBeenLastCalledWith('wi-1', 'duplicate', { supersededBy: ['806dc528'] });
+
+      await cancelQueuedItem(
+        mockReq({ params: { workItemId: 'wi-1' }, body: { reason: 'duplicate', supersededBy: ['a', '', 7, 'b'] } }),
+        mockRes(),
+      );
+      expect(mockService.cancelQueued).toHaveBeenLastCalledWith('wi-1', 'duplicate', { supersededBy: ['a', 'b'] });
+    });
+
+    it('records which agent session cancelled the item (crewly#1015 §10)', async () => {
+      mockService.findWorkItem.mockResolvedValue({ id: 'wi-1', status: 'blocked' });
+      mockService.cancelQueued.mockResolvedValue(undefined);
+      await cancelQueuedItem(
+        mockReq({ params: { workItemId: 'wi-1' }, body: { reason: 'cleanup' }, headers: { 'x-agent-session': 'sam-1' } }),
+        mockRes(),
+      );
+      expect(mockService.cancelQueued).toHaveBeenLastCalledWith('wi-1', 'cleanup', { supersededBy: [], cancelledBy: 'sam-1' });
+    });
+
+    it('returns 400 when reason is missing or empty', async () => {
+      const req = mockReq({ params: { workItemId: 'wi-1' }, body: {} });
+      const res = mockRes();
+      await cancelQueuedItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ success: false, error: expect.stringMatching(/reason is required/) }),
+      );
+      expect(mockService.cancelQueued).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when reason is only whitespace', async () => {
+      const req = mockReq({ params: { workItemId: 'wi-1' }, body: { reason: '   ' } });
+      const res = mockRes();
+      await cancelQueuedItem(req, res);
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(mockService.cancelQueued).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when WI does not exist', async () => {
+      mockService.findWorkItem.mockResolvedValue(null);
+      const req = mockReq({ params: { workItemId: 'ghost' }, body: { reason: 'why' } });
+      const res = mockRes();
+      await cancelQueuedItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+      expect(mockService.cancelQueued).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 with the service error message when WI is in a non-cancellable state', async () => {
+      mockService.findWorkItem.mockResolvedValue({ id: 'wi-2', status: 'running' });
+      mockService.cancelQueued.mockRejectedValue(
+        new Error(
+          "cancelQueued: WorkItem status must be 'queued', 'blocked', or 'scheduled' (got 'running'). Use a status-appropriate API for other states — e.g. failItem for running, or DELETE for terminal-state cleanup.",
+        ),
+      );
+
+      const req = mockReq({ params: { workItemId: 'wi-2' }, body: { reason: 'oops' } });
+      const res = mockRes();
+      await cancelQueuedItem(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ success: false, error: expect.stringMatching(/status must be 'queued'/) }),
+      );
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /tasks/score — scoreItem (auditor score-task skill)
+// ---------------------------------------------------------------------------
+
+describe('scoreItem', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('stores the quality score via the service and returns the updated item', async () => {
+    const updated = {
+      id: 'wi-1',
+      status: 'done',
+      metadata: { qualityScore: 87, qualityScoredBy: 'auditor-1', qualityScoredAt: '2026-09-18T00:00:00.000Z' },
+    };
+    mockService.scoreItem.mockResolvedValue(updated);
+
+    const req = mockReq({ body: { taskId: 'wi-1', qualityScore: 87, scoredBy: 'auditor-1' } });
+    const res = mockRes();
+    await scoreItem(req, res);
+
+    expect(mockService.scoreItem).toHaveBeenCalledWith('wi-1', 87, 'auditor-1');
+    expect(res.json).toHaveBeenCalledWith({ success: true, data: updated });
+  });
+
+  it('accepts workItemId as an alias for taskId', async () => {
+    mockService.scoreItem.mockResolvedValue({ id: 'wi-2', metadata: { qualityScore: 50 } });
+    const req = mockReq({ body: { workItemId: 'wi-2', qualityScore: 50 } });
+    const res = mockRes();
+    await scoreItem(req, res);
+    expect(mockService.scoreItem).toHaveBeenCalledWith('wi-2', 50, expect.any(String));
+  });
+
+  it('returns 404 for an unknown work item', async () => {
+    mockService.scoreItem.mockResolvedValue(null);
+    const req = mockReq({ body: { taskId: 'nope', qualityScore: 10, scoredBy: 'a' } });
+    const res = mockRes();
+    await scoreItem(req, res);
+    expect(res.status).toHaveBeenCalledWith(404);
+  });
+
+  it('returns 400 when taskId is missing', async () => {
+    const req = mockReq({ body: { qualityScore: 10 } });
+    const res = mockRes();
+    await scoreItem(req, res);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(mockService.scoreItem).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['non-numeric', 'high'],
+    ['NaN', Number.NaN],
+    ['below range', -1],
+    ['above range', 101],
+    ['missing', undefined],
+  ])('returns 400 when qualityScore is %s', async (_label, value) => {
+    const req = mockReq({ body: { taskId: 'wi-1', qualityScore: value } });
+    const res = mockRes();
+    await scoreItem(req, res);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(mockService.scoreItem).not.toHaveBeenCalled();
+  });
+
+  it('accepts the boundary values 0 and 100', async () => {
+    mockService.scoreItem.mockResolvedValue({ id: 'wi-1' });
+    for (const value of [0, 100]) {
+      const res = mockRes();
+      await scoreItem(mockReq({ body: { taskId: 'wi-1', qualityScore: value } }), res);
+      expect(res.json).toHaveBeenCalledWith({ success: true, data: { id: 'wi-1' } });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // #813 — the actor comes from the request's session, not from the body
+  // -------------------------------------------------------------------------
+  describe('#813 transition actor resolution', () => {
+    const forbidden = () =>
+      new ForbiddenTransitionError('wi-src', 'done_by_worker', 'verified', { role: 'team_lead', session: 'tl-other' }, {
+        allowed: false,
+        reason: 'not_reviewer',
+        detail: 'only the reviewer (tl-sam) may render this verdict',
+      });
+
+    beforeEach(() => {
+      mockService.findWorkItem.mockResolvedValue({ id: 'wi-1', output: null });
+      mockService.setOutput.mockResolvedValue(undefined);
+      mockService.completeItem.mockResolvedValue(undefined);
+      mockService.verifyItem.mockReset();
+    });
+
+    it('complete: uses X-Agent-Session as the actor, ignoring a different body agentId', async () => {
+      const req = mockReq({
+        params: { workItemId: 'wi-1' },
+        headers: { 'x-agent-session': 'tl-sam' },
+        body: { agentId: 'someone-else', result: { summary: 'reviewed' } },
+      });
+      await completeItem(req, mockRes());
+      expect(mockService.completeItem).toHaveBeenCalledWith('wi-1', expect.anything(), {
+        role: 'agent',
+        session: 'tl-sam',
+        via: 'POST /task-pool/complete',
+      });
+    });
+
+    it('complete: with no session header the actor has no identity (never the body agentId)', async () => {
+      const req = mockReq({ params: { workItemId: 'wi-1' }, body: { agentId: 'tl-sam', result: { summary: 'x' } } });
+      await completeItem(req, mockRes());
+      const actor = mockService.completeItem.mock.calls.at(-1)[2];
+      expect(actor).toEqual({ role: 'agent', via: 'POST /task-pool/complete' });
+    });
+
+    it('complete: the orchestrator session resolves to the orchestrator role', async () => {
+      const req = mockReq({
+        params: { workItemId: 'wi-1' },
+        headers: { 'x-agent-session': 'crewly-orc' },
+        body: { agentId: 'crewly-orc', result: { summary: 'x' } },
+      });
+      await completeItem(req, mockRes());
+      expect(mockService.completeItem.mock.calls.at(-1)[2]).toMatchObject({ role: 'orchestrator', session: 'crewly-orc' });
+    });
+
+    it('complete: a refused verdict is a 403 with a machine-readable code and a hint', async () => {
+      mockService.completeItem.mockRejectedValueOnce(forbidden());
+      const res = mockRes();
+      await completeItem(
+        mockReq({ params: { workItemId: 'wi-1' }, headers: { 'x-agent-session': 'tl-other' }, body: { agentId: 'tl-other', result: { summary: 'x' } } }),
+        res,
+      );
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ success: false, code: 'transition_not_reviewer', hint: expect.stringContaining('CREWLY_SESSION_NAME') }),
+      );
+    });
+
+    it('verdict: rejects an invalid verdict with 400', async () => {
+      const res = mockRes();
+      await renderVerdict(mockReq({ params: { workItemId: 'wi-src' }, body: { verdict: 'done' } }), res);
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(mockService.verifyItem).not.toHaveBeenCalled();
+    });
+
+    it('verdict: an agent session renders it as a reviewer (team_lead + that session)', async () => {
+      mockService.verifyItem.mockResolvedValue({ id: 'wi-src', status: 'verified' });
+      const res = mockRes();
+      await renderVerdict(
+        mockReq({ params: { workItemId: 'wi-src' }, headers: { 'x-agent-session': 'tl-sam' }, body: { verdict: 'verified', comment: ' ok ' } }),
+        res,
+      );
+      expect(mockService.verifyItem).toHaveBeenCalledWith(
+        'wi-src',
+        expect.objectContaining({ role: 'team_lead', session: 'tl-sam' }),
+        'verified',
+        'ok',
+      );
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    });
+
+    it('verdict: the dashboard (owner session) is the owner', async () => {
+      mockService.verifyItem.mockResolvedValue({ id: 'wi-src', status: 'rejected' });
+      await renderVerdict(
+        mockReq({ params: { workItemId: 'wi-src' }, headers: ownerAuthHeaders(), body: { verdict: 'rejected' } }),
+        mockRes(),
+      );
+      expect(mockService.verifyItem).toHaveBeenCalledWith('wi-src', expect.objectContaining({ role: 'owner' }), 'rejected', undefined);
+    });
+
+    it('verdict: a bare X-Crewly-Caller: dashboard marker is not the owner (#999)', async () => {
+      mockService.verifyItem.mockResolvedValue({ id: 'wi-src', status: 'rejected' });
+      await renderVerdict(
+        mockReq({ params: { workItemId: 'wi-src' }, headers: { 'x-crewly-caller': 'dashboard' }, body: { verdict: 'rejected' } }),
+        mockRes(),
+      );
+      expect(mockService.verifyItem).not.toHaveBeenCalledWith('wi-src', expect.objectContaining({ role: 'owner' }), 'rejected', undefined);
+    });
+
+    describe('verdict: check record (#1314)', () => {
+      const worker = { id: 'wi-src', status: 'done_by_worker', output: { evidence: [{ type: 'artifact', path: '/a.md' }] }, metadata: {} };
+      beforeEach(() => {
+        delete process.env.CREWLY_EVIDENCE_MODE;
+        mockService.findWorkItem.mockResolvedValue(worker);
+        mockService.verifyItem.mockResolvedValue({ id: 'wi-src', status: 'verified' });
+        mockService.verifyItem.mockClear();
+        mockService.mergeItemMetadata.mockClear();
+      });
+
+      it('an agent accept without checks is refused before anything is verified', async () => {
+        const res = mockRes();
+        await renderVerdict(mockReq({ params: { workItemId: 'wi-src' }, headers: { 'x-agent-session': 'crewly-orc' }, body: { verdict: 'verified' } }), res);
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'review_unchecked' }));
+        expect(mockService.verifyItem).not.toHaveBeenCalled();
+      });
+
+      it('an agent accept with checks is verified and the checks are stamped', async () => {
+        const checks = [{ entry: 0, did: 'read a.md', outcome: 'pass' }];
+        await renderVerdict(mockReq({ params: { workItemId: 'wi-src' }, headers: { 'x-agent-session': 'crewly-orc' }, body: { verdict: 'verified', checks } }), mockRes());
+        expect(mockService.verifyItem).toHaveBeenCalled();
+        expect(mockService.mergeItemMetadata).toHaveBeenCalledWith('wi-src', { reviewChecks: expect.objectContaining({ reviewer: 'crewly-orc', checks }) });
+      });
+
+      it('the owner and rejections need no checks', async () => {
+        await renderVerdict(mockReq({ params: { workItemId: 'wi-src' }, headers: ownerAuthHeaders(), body: { verdict: 'verified' } }), mockRes());
+        await renderVerdict(mockReq({ params: { workItemId: 'wi-src' }, headers: { 'x-agent-session': 'crewly-orc' }, body: { verdict: 'rejected', comment: 'no' } }), mockRes());
+        expect(mockService.verifyItem).toHaveBeenCalledTimes(2);
+        expect(mockService.mergeItemMetadata).not.toHaveBeenCalled();
+      });
+    });
+
+    it('verdict: a caller that is not the reviewer gets 403', async () => {
+      mockService.verifyItem.mockRejectedValue(forbidden());
+      const res = mockRes();
+      await renderVerdict(
+        mockReq({ params: { workItemId: 'wi-src' }, headers: { 'x-agent-session': 'tl-other' }, body: { verdict: 'verified' } }),
+        res,
+      );
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'transition_not_reviewer' }));
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // #841 give-up recovery through the stop endpoints
+  // -----------------------------------------------------------------------
+
+  describe('give-up recovery (#841)', () => {
+    const running = { id: 'wi-g', type: 'delegate', owner: 'agent', title: 'Beat the record', description: 'brief', status: 'running', target: 'dev-1', retryCount: 0, maxRetries: 3, createdAt: '', inputTokens: 0, outputTokens: 0, cost: 0 };
+
+    beforeEach(() => {
+      setGiveUpRecoveryService(null);
+      // Earlier suites leave rejecting implementations on these shared mocks.
+      for (const fn of [mockService.blockItem, mockService.failItem, mockService.completeItem, mockService.addToPool, mockService.setOutput]) {
+        fn.mockReset().mockResolvedValue(undefined);
+      }
+      mockService.findWorkItem.mockReset().mockResolvedValue(running);
+      mockStorage.getTeams.mockResolvedValue([]);
+    });
+
+    it('a give-up block reports the queued retry in the response', async () => {
+      const res = mockRes();
+      await blockItem(mockReq({ params: { workItemId: 'wi-g' }, body: { agentId: 'dev-1', reason: 'It is impossible to beat the record.' } }), res);
+      expect(mockService.addToPool).toHaveBeenCalledWith(expect.objectContaining({ id: 'wi-g:giveup:1', target: 'dev-1' }));
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        success: true,
+        giveUp: expect.objectContaining({ action: 'retry_queued', retryWorkItemId: 'wi-g:giveup:1' }),
+      }));
+    });
+
+    it('a give-up completion is NOT completed: it is failed + retried, and the response says so', async () => {
+      const res = mockRes();
+      await completeItem(mockReq({ params: { workItemId: 'wi-g' }, body: { agentId: 'dev-1', result: { summary: 'Could not get under the target. Gave up.' } } }), res);
+      expect(mockService.completeItem).not.toHaveBeenCalled();
+      expect(mockService.failItem).toHaveBeenCalledWith('wi-g', 'Could not get under the target. Gave up.');
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        success: true,
+        message: expect.stringContaining('recorded as a give-up'),
+        giveUp: expect.objectContaining({ action: 'retry_queued' }),
+      }));
+    });
+
+    it('a normal completion is unchanged and carries no giveUp field', async () => {
+      const res = mockRes();
+      await completeItem(mockReq({ params: { workItemId: 'wi-g' }, body: { agentId: 'dev-1', result: { summary: 'Implemented and tested.' } } }), res);
+      expect(mockService.completeItem).toHaveBeenCalled();
+      const body = res.json.mock.calls[0][0];
+      expect(body).toMatchObject({ success: true, message: 'WorkItem wi-g completed' });
+      expect(body.giveUp).toBeUndefined();
+    });
+
+    it('GET /give-up-stats returns per-team counts and what was examined', async () => {
+      mockService.getAllItems.mockResolvedValue([
+        { ...running, status: 'cancelled', metadata: { stop: { decision: 'retry', category: 'feasibility' } } },
+      ]);
+      const res = mockRes();
+      await getGiveUpStats(mockReq({ query: {} }), res);
+      expect(res.json).toHaveBeenCalledWith({
+        success: true,
+        data: expect.objectContaining({ examined: 1, teams: [expect.objectContaining({ teamId: 'unassigned', giveUps: 1 })] }),
+      });
+    });
+  });
+});
+
+describe('actingForOfCreator (issue #968)', () => {
+  afterEach(() => setActingForForTesting(null));
+
+  it('a WorkItem is done for the person its creating agent acts for; the owner from the dashboard', () => {
+    const people = { isOwner: (id: string) => id === 'owner', ownerId: () => 'owner', roleOf: () => 'member', displayName: (id: string) => id };
+    // tests/setup.ts gives each test file its own throwaway CREWLY_HOME; a root
+    // path like /nonexistent is writable when tests run as root.
+    const actingFor = new ActingForService({ filePath: `${process.env.CREWLY_HOME}/acting-for.json`, people: () => people as never });
+    actingFor.record('lead-1', 'UINFO001', 'slack');
+    setActingForForTesting(actingFor);
+    expect(actingForOfCreator({ headers: { 'x-agent-session': 'lead-1' } })).toBe('UINFO001');
+    expect(actingForOfCreator({ headers: {} })).toBe('owner');
+  });
+});
+
+describe('team pause (specs/2026-10-04-team-pause.md)', () => {
+  const PAUSED_TEAM = {
+    id: 'team-crewly',
+    name: 'Crewly',
+    issueRepo: 'stevehuang0115/crewly',
+    members: [
+      { id: 'leo-1', name: 'Leo', sessionName: 'crewly-product-leo', role: 'developer' },
+      { id: 'sam-1', name: 'Sam', sessionName: 'crewly-product-sam', role: 'team-leader' },
+    ],
+    projectIds: [],
+    createdAt: '',
+    updatedAt: '',
+    paused: { pausedAt: '2026-10-04T00:00:00.000Z', by: 'owner' },
+  };
+  const body = (over: Record<string, unknown> = {}) => ({
+    type: 'delegate',
+    owner: 'orchestrator',
+    target: 'crewly-product-leo',
+    title: 'Implement feature X',
+    description: 'Short summary',
+    ...over,
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    notePausedTeam(PAUSED_TEAM as never);
+    mockService.addToPool.mockResolvedValue(undefined);
+    mockService.getAllItems.mockResolvedValue([]);
+    mockStorage.findMemberBySessionName.mockResolvedValue({ team: { id: 'team-crewly' }, member: { id: 'leo-1', sessionName: 'crewly-product-leo' } });
+  });
+  afterEach(() => resetTeamPauseRegistryForTesting());
+
+  it('refuses an agent handing work to a paused member (409 team_paused, gh issue hint)', async () => {
+    const res = mockRes();
+    await addItem(mockReq({ headers: { 'x-agent-session': 'mkt-ann' }, body: body() }), res);
+    expect(res.status).toHaveBeenCalledWith(409);
+    const sent = res.json.mock.calls[0][0];
+    expect(sent).toMatchObject({ success: false, code: 'team_paused', issueRepo: 'stevehuang0115/crewly' });
+    expect(sent.error).toBe(
+      'Crewly is paused by the owner. File a GitHub issue instead: `gh issue create -R stevehuang0115/crewly --title "<short title>" --body "<what is needed and why>"`',
+    );
+    expect(mockService.addToPool).not.toHaveBeenCalled();
+  });
+
+  it('refuses work naming the paused team by metadata.teamId', async () => {
+    const res = mockRes();
+    await addItem(mockReq({ headers: { 'x-agent-session': 'crewly-orc' }, body: body({ target: undefined, metadata: { teamId: 'team-crewly' } }) }), res);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(mockService.addToPool).not.toHaveBeenCalled();
+  });
+
+  it('lets the owner queue work for a paused team, and its own member act within it', async () => {
+    const ownerRes = mockRes();
+    await addItem(markOwner(mockReq({ body: body() })), ownerRes);
+    expect(ownerRes.status).toHaveBeenCalledWith(201);
+
+    const memberRes = mockRes();
+    await addItem(mockReq({ headers: { 'x-agent-session': 'crewly-product-sam' }, body: body() }), memberRes);
+    expect(memberRes.status).toHaveBeenCalledWith(201);
+  });
+
+  it('refuses claiming on behalf of a paused member', async () => {
+    const res = mockRes();
+    await claimItem(mockReq({ headers: { 'x-agent-session': 'crewly-orc' }, body: { agentId: 'crewly-product-leo', workItemId: 'wi-1' } }), res);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json.mock.calls[0][0]).toMatchObject({ code: 'team_paused' });
+    expect(mockService.claimSpecificItem).not.toHaveBeenCalled();
+  });
+
+  it('refuses a hand-off to a paused member', async () => {
+    const res = mockRes();
+    await handoffItem(mockReq({ headers: { 'x-agent-session': 'mkt-ann' }, params: { workItemId: 'wi-1' }, body: { newTarget: 'crewly-product-leo', fromAgent: 'mkt-ann' } }), res);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json.mock.calls[0][0]).toMatchObject({ code: 'team_paused' });
+  });
+});

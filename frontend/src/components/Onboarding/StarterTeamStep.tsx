@@ -1,0 +1,170 @@
+/**
+ * StarterTeamStep
+ *
+ * First-run step "Create your first team": pick a starter — Personal Assistant
+ * (recommended, pre-selected), Marketing, a solution bundle, or Blank (the
+ * orchestrator only). Templates are created through
+ * `POST /api/onboarding/starter-team`; a solution bundle opens
+ * {@link BundleDeployStep} (its questions, then the one-step deploy).
+ *
+ * Phone-width first: the choices stack as full-width tappable cards.
+ *
+ * @module components/Onboarding/StarterTeamStep
+ */
+
+import React, { useEffect, useState } from 'react';
+import { Check, RefreshCw, Users } from 'lucide-react';
+import { Alert, Badge, Button, Card, LoadingSpinner } from '@crewly/ui';
+import { onboardingChecklistService } from '../../services/onboarding-checklist.service';
+import { BundleDeployStep } from './BundleDeployStep';
+import type { OnboardingStarter, StarterTeamResult } from '../../types/onboarding-checklist.types';
+
+/** What the parent learns once the team step is done. */
+export interface StarterTeamDone {
+  starterId: string;
+  /** The created team (null for Blank) */
+  teamId: string | null;
+  teamName: string | null;
+  /** Example first tasks for this starter */
+  suggestions: string[];
+  /** Set when a solution bundle was deployed (its first week is already planned) */
+  bundle?: boolean;
+}
+
+export interface StarterTeamStepProps {
+  /** Called after the team was created (or Blank recorded) */
+  onDone: (done: StarterTeamDone) => void;
+}
+
+/**
+ * Starter-team picker.
+ *
+ * @param props - {@link StarterTeamStepProps}
+ * @returns Step body
+ */
+export const StarterTeamStep: React.FC<StarterTeamStepProps> = ({ onDone }) => {
+  const [starters, setStarters] = useState<OnboardingStarter[] | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [deployingBundle, setDeployingBundle] = useState<string | null>(null);
+
+  /** Load the starters and pre-select the recommended one. */
+  const load = async (): Promise<void> => {
+    setLoadError(null);
+    try {
+      const list = await onboardingChecklistService.getStarters();
+      setStarters(list);
+      setSelected((cur) => cur ?? (list.find((s) => s.recommended) ?? list[0])?.id ?? null);
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  /** Create the selected starter (a bundle opens its questions instead). */
+  const create = async (): Promise<void> => {
+    const starter = starters?.find((s) => s.id === selected);
+    if (!starter) return;
+    if (starter.kind === 'bundle') {
+      setDeployingBundle(starter.id);
+      return;
+    }
+    setCreating(true);
+    setError(null);
+    try {
+      const result: StarterTeamResult = await onboardingChecklistService.createStarterTeam(starter.id);
+      onDone({
+        starterId: starter.id,
+        teamId: result.team?.id ?? null,
+        teamName: result.team?.name ?? null,
+        suggestions: starter.suggestions,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  if (loadError) {
+    return (
+      <Alert variant="error" title="Couldn't load team templates">
+        <div className="space-y-2">
+          <p>{loadError}</p>
+          <Button type="button" size="sm" variant="secondary" icon={RefreshCw} onClick={() => void load()}>
+            Retry
+          </Button>
+        </div>
+      </Alert>
+    );
+  }
+  if (!starters) return <LoadingSpinner centered text="Loading team templates…" />;
+  if (deployingBundle) {
+    return <BundleDeployStep templateId={deployingBundle} onBack={() => setDeployingBundle(null)} onDone={onDone} />;
+  }
+
+  const chosen = starters.find((s) => s.id === selected) ?? null;
+
+  return (
+    <div className="space-y-3" data-testid="starter-team-step">
+      <div role="radiogroup" aria-label="First team" className="space-y-3">
+        {starters.map((starter) => {
+          const active = starter.id === selected;
+          return (
+            <Card
+              key={starter.id}
+              role="radio"
+              aria-checked={active}
+              tabIndex={0}
+              interactive
+              padding="md"
+              data-testid={`starter-${starter.id}`}
+              className={active ? 'border-primary ring-1 ring-primary cursor-pointer' : 'cursor-pointer'}
+              onClick={() => setSelected(starter.id)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  setSelected(starter.id);
+                }
+              }}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-semibold text-text-primary-dark">{starter.label}</span>
+                    <span className="text-xs text-text-secondary-dark">{starter.name}</span>
+                    {starter.recommended && <Badge variant="primary">Recommended</Badge>}
+                    {starter.kind === 'bundle' && <Badge variant="info">Bundle</Badge>}
+                  </div>
+                  <p className="mt-1 text-sm text-text-secondary-dark">{starter.tagline}</p>
+                  {starter.members.length > 0 && (
+                    <p className="mt-2 flex items-center gap-1 text-xs text-text-secondary-dark">
+                      <Users className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                      {starter.members.map((m) => m.name).join(', ')}
+                    </p>
+                  )}
+                </div>
+                {active && <Check className="h-5 w-5 shrink-0 text-primary" aria-hidden />}
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+      {error && (
+        <Alert variant="error" size="sm">
+          {error}
+        </Alert>
+      )}
+      <Button type="button" fullWidth loading={creating} disabled={!chosen} onClick={() => void create()} data-testid="starter-create">
+        {chosen?.members.length === 0 ? 'Start with just the Orc' : chosen?.kind === 'bundle' ? `Next: details for "${chosen.label}"` : `Create "${chosen?.label ?? ''}"`}
+      </Button>
+    </div>
+  );
+};
+
+export default StarterTeamStep;

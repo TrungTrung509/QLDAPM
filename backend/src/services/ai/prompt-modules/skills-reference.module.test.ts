@@ -1,0 +1,461 @@
+import { SkillsReferenceModule } from './skills-reference.module.js';
+import { ModuleConfig } from './prompt-module.interface.js';
+
+describe('SkillsReferenceModule', () => {
+	let module: SkillsReferenceModule;
+
+	const baseConfig: ModuleConfig = {
+		sessionName: 'crewly-dev-001',
+		memberId: 'member-001',
+		role: 'developer',
+		agentSkillsPath: '/path/to/skills/agent',
+		tlSkillsPath: '/path/to/skills/team-leader',
+		projectRoot: '/path/to/project',
+	};
+
+	beforeEach(() => {
+		module = new SkillsReferenceModule();
+	});
+
+	it('should have correct metadata', () => {
+		expect(module.name).toBe('skills_references');
+		expect(module.priority).toBe(5);
+		expect(module.maxTokens).toBe(800);
+		expect(module.compactable).toBe(false);
+	});
+
+	it('should always be included', () => {
+		expect(module.shouldInclude(baseConfig)).toBe(true);
+	});
+
+	it('should include skill paths in output', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain('/path/to/skills/agent/');
+	});
+
+	it('should reference core skills for all roles', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain('core/recall');
+		expect(result).toContain('core/remember');
+		expect(result).toContain('core/record-learning');
+		expect(result).toContain('core/report-status');
+		expect(result).toContain('core/set-focus');
+		expect(result).toContain('core/suppress-noise');
+		expect(result).toContain('core/record-prediction');
+		expect(result).toContain('core/resolve-prediction');
+		expect(result).toContain('core/experiment-card');
+		expect(result).toContain('core/trace-read');
+	});
+
+	describe('missing-capability rule (skill auto-install)', () => {
+		it.each(['developer', 'orchestrator', 'team-leader'])('tells a %s to find and install a skill instead of giving up', async (role) => {
+			const result = await module.build({ ...baseConfig, role, canDelegate: role === 'team-leader' });
+			expect(result).toContain('never stop at "X is not installed"');
+			expect(result).toContain('/path/to/skills/agent/core/find-skill/execute.sh --query');
+			expect(result).toContain('/path/to/skills/agent/core/install-skill/execute.sh --id <id> --resume');
+			expect(result).toContain('"needsSetup": true');
+			expect(result).toContain('tell the user in ONE line that you are installing it');
+			expect(result).toContain('[SKILL INSTALLED]');
+			expect(result).toContain('[SKILL INSTALL FAILED]');
+			expect(result).toContain('--approved-by-owner');
+			expect(result).toContain('`transcribe-audio`');
+			expect(result).toContain('`pdf-tools`');
+		});
+
+		it('comes right after the core skills list', async () => {
+			const result = await module.build(baseConfig);
+			expect(result.indexOf('## Missing a capability?')).toBeGreaterThan(result.indexOf('## Available Skills'));
+			expect(result.indexOf('## Missing a capability?')).toBeLessThan(result.indexOf('## Available Capabilities'));
+		});
+	});
+
+	it('should include skill catalog reference', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain('AGENT_SKILLS_CATALOG.md');
+	});
+
+	it('should include capabilities section', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain('Available Capabilities');
+		expect(result).toContain('Crewly in Chrome first');
+	});
+
+	it('puts Crewly in Chrome ahead of headless browsers and sends blocked fallbacks back to it', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain('Browser order — Crewly in Chrome first');
+		expect(result.indexOf('1. **Crewly in Chrome**')).toBeLessThan(result.indexOf('2. **Only if Crewly in Chrome is not drivable**'));
+		expect(result).toContain('Hit a wall in a fallback browser?');
+	});
+
+	it('should include memory tool instructions', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain('agentId');
+		expect(result).toContain('projectPath');
+		expect(result).toContain('IMPORTANT for memory tools');
+	});
+
+	describe('role-based capabilities (#225)', () => {
+		it('should give workers narrow scope (no TL skills path)', async () => {
+			const result = await module.build(baseConfig);
+
+			expect(result).toContain('Read/Write');
+			expect(result).toContain('agent core skills');
+			expect(result).not.toContain('team leader skills');
+			expect(result).not.toContain('orchestrator skill');
+			expect(result).not.toContain('delegate-task');
+			// Crewly channels span teams: every agent can find and post in its own.
+			expect(result).toContain('core/list-channels');
+			expect(result).toContain("reply-channel --channel '#name'");
+			// Before saying "I can't find it", look in the chat log.
+			expect(result).toContain('core/search-chat');
+			expect(result).toContain('search chat history');
+		});
+
+		it('sends the orchestrator to harness-login and forbids interactive logins in bash', async () => {
+			// 2026-09-26: the orc ran `claude setup-token` in its one-shot bash
+			// tool; the login died with the call and every pasted code went stale.
+			const orc = await module.build({ ...baseConfig, role: 'orchestrator' });
+			expect(orc).toContain('`harness-login`');
+			expect(orc).toMatch(/NEVER run `claude setup-token`/);
+			expect(orc).toContain('`codex login`');
+			const worker = await module.build(baseConfig);
+			expect(worker).not.toContain('harness-login');
+		});
+
+		it('should give orchestrators coordination scope', async () => {
+			const orchConfig: ModuleConfig = { ...baseConfig, role: 'orchestrator' };
+			const result = await module.build(orchConfig);
+
+			expect(result).toContain('orchestrator skill scripts');
+			expect(result).toContain('schedule-check');
+			expect(result).toContain('subscribe-event');
+			expect(result).toContain('reply-slack');
+			expect(result).toContain('delegate-task');
+			expect(result).toContain('delegated to agents');
+			// Cross-machine collaboration goes through Slack; the Cloud-queue skills are legacy.
+			expect(result).toContain('shared Slack team channel');
+			expect(result).toContain('list-colleagues');
+			expect(result).toContain('deprecated');
+		});
+
+		it('should give TLs delegation scope', async () => {
+			const tlConfig: ModuleConfig = { ...baseConfig, role: 'team-leader', canDelegate: true };
+			const result = await module.build(tlConfig);
+
+			expect(result).toContain('team leader skills');
+			expect(result).toContain('delegate-task');
+			expect(result).toContain('verify-output');
+			expect(result).toContain('schedule-check');
+			expect(result).toContain(baseConfig.tlSkillsPath);
+		});
+
+		it('should not include blanket authorization language', async () => {
+			for (const role of ['developer', 'orchestrator']) {
+				const config: ModuleConfig = { ...baseConfig, role };
+				const result = await module.build(config);
+
+				expect(result).not.toContain('pre-approved');
+				expect(result).not.toContain('Authorized Operations');
+				expect(result).not.toContain('authorized to');
+				expect(result).not.toContain('adopt');
+			}
+		});
+
+		it('should distinguish read vs write for orchestrator', async () => {
+			const orchConfig: ModuleConfig = { ...baseConfig, role: 'orchestrator' };
+			const result = await module.build(orchConfig);
+
+			expect(result).toContain('**Read** project files');
+			expect(result).not.toContain('Read/Write');
+		});
+	});
+
+	describe('sending files', () => {
+		it('names attach-file, which no agent could previously discover', async () => {
+			// reply-channel carries text only, so an agent asked for a PDF
+			// uploaded it to Drive and pasted a link — then correctly said the
+			// interface it had been told to use could not send attachments.
+			const out = await module.build(baseConfig);
+			expect(out).toContain('attach-file');
+		});
+
+		it('says to send the file rather than a link to it', async () => {
+			const out = await module.build(baseConfig);
+			expect(out).toMatch(/When someone asks for a file, send the file/i);
+			expect(out).toMatch(/pasting\s+\na?\s*link is not the same thing|a link is not the same thing/i);
+		});
+
+		it('gives the reasons, so it is a judgement and not a rule to route around', async () => {
+			const out = await module.build(baseConfig);
+			expect(out).toMatch(/makes them leave\s+Slack/i);
+			expect(out).toMatch(/without access to that Drive/i);
+		});
+
+		it('tells the agent which channel id to pass, and not to ask for a Slack one', async () => {
+			// It has a chat channel id, not a Slack one. Asked for a PDF, an
+			// agent offered to attach it "if you give me the Slack channel ID"
+			// — a question the owner should never be asked.
+			const out = await module.build(baseConfig);
+			expect(out).toMatch(/--channel <the id from your prompt>/);
+			expect(out).toMatch(/not\*{0,2}\s+need a Slack channel id/i);
+		});
+
+		it('covers both reply paths, since the agent cannot tell which it is on', async () => {
+			// A DM routes through reply-chat and a team channel through
+			// reply-channel; naming only one leaves the other case unaddressed,
+			// and the DM is the case that actually came up.
+			const out = await module.build(baseConfig);
+			expect(out).toContain('reply-chat');
+			expect(out).toContain('reply-channel');
+			expect(out).toMatch(/team channel or a\s*\n?\s*one-to-one DM/i);
+		});
+
+		it('is shown to every role', async () => {
+			for (const role of ['orchestrator', 'team-leader', 'qa', 'developer']) {
+				const out = await module.build({ ...baseConfig, role });
+				expect(out).toContain('attach-file');
+			}
+		});
+	});
+
+	describe('reading Slack files', () => {
+		it('tells every role to fetch a Slack file it cannot open instead of asking for a paste', async () => {
+			// Rex could not read Ella's longform-en.md (posted in a channel his
+			// bot is not in) and asked her to paste the text (2026-10-08).
+			for (const role of ['orchestrator', 'team-leader', 'developer']) {
+				const out = await module.build({ ...baseConfig, role });
+				expect(out).toContain('slack-file get <link>');
+				expect(out).toMatch(/never ask a colleague to paste it/);
+			}
+		});
+	});
+
+	describe('connected accounts (Google Workspace)', () => {
+		it('names the Drive skills, which no agent could previously discover', async () => {
+			// These shipped weeks ago and the prompt never mentioned them, so an
+			// agent asked to read a Drive folder reached for the browser, found
+			// the extension disconnected, and reported it could not do the job —
+			// with the capability installed and the account connected.
+			const out = await module.build(baseConfig);
+
+			expect(out).toContain('drive-search');
+			expect(out).toContain('drive-read');
+			expect(out).toContain('drive-upload');
+		});
+
+		it('points agents at send-file / receive-file for large files instead of Drive or Slack', async () => {
+			const out = await module.build(baseConfig);
+
+			expect(out).toContain('core/send-file');
+			expect(out).toContain('receive-file');
+			expect(out).toContain('prefer these over Drive or Slack');
+		});
+
+		it('points agents at request-file when the owner\'s file is too large, never at compression or Drive', async () => {
+			const out = await module.build(baseConfig);
+
+			expect(out).toContain('core/request-file');
+			expect(out).toContain('Never ask the owner to compress a file or put it in Drive');
+		});
+
+		it('points agents at share-file to give the owner a big deliverable as a private link', async () => {
+			const out = await module.build(baseConfig);
+
+			expect(out).toContain('core/share-file');
+			expect(out).toContain('watch it in the page and download it');
+		});
+
+		it('names every connector family, not just Drive', async () => {
+			const out = await module.build(baseConfig);
+
+			for (const skill of ['docs-read', 'docs-comment', 'sheets-read', 'slides-read', 'gmail-search', 'calendar-list']) {
+				expect(out).toContain(skill);
+			}
+		});
+
+		it('tells agents to register MCP servers with Crewly, not a runtime CLI', async () => {
+			const out = await module.build(baseConfig);
+
+			expect(out).toContain('POST /api/connectors/remote-mcp');
+			expect(out).toContain('PUT /api/connectors/access/mcp:<id>');
+			expect(out).toContain('claude mcp add');
+		});
+
+		it('names the Crewly Apps skills and the wake marker', async () => {
+			const out = await module.build(baseConfig);
+
+			expect(out).toContain('core/publish-app');
+			expect(out).toContain('core/app-data');
+			expect(out).toContain('core/app-comments');
+			expect(out).toContain('[APP CHANGES]');
+			expect(out).toContain('--public` only ASKS the owner');
+		});
+
+		it('tells agents to look for a Marketplace template before building a new Crewly App', async () => {
+			const out = await module.build(baseConfig);
+
+			expect(out).toContain('Before building a new Crewly App, run `/path/to/skills/agent/core/find-app-template');
+			expect(out).toContain('core/use-app-template <templateId> --dir');
+			expect(out).toContain('tell the owner in\none line which template you started from');
+			expect(out).toContain('--as-template` only ASKS the owner');
+		});
+
+		it('says a Crewly App is always published with publish-app, never runtime hosting', async () => {
+			const out = await module.build(baseConfig);
+
+			expect(out).toContain('ALWAYS published with');
+			expect(out).toContain('chatgpt.site');
+		});
+
+		it('lists the WhatsApp inbox skills with the owner-confirmation rule', async () => {
+			const out = await module.build(baseConfig);
+
+			for (const skill of ['whatsapp-inbox', 'whatsapp-read', 'whatsapp-draft', 'whatsapp-send']) {
+				expect(out).toContain(skill);
+			}
+			expect(out).toContain('「发 W12」');
+			expect(out).toMatch(/never auto-reply/i);
+		});
+
+		it('says these come first and the browser is the fallback', async () => {
+			// The ordering is the whole point: the prompt described
+			// remote-browser at length and these not at all, so the browser won
+			// by default for anything behind a login.
+			const out = await module.build(baseConfig);
+
+			expect(out).toMatch(/reach for these first/i);
+			expect(out).toMatch(/fallback/i);
+		});
+
+		it('tells the agent what to do when the account is not connected', async () => {
+			// Otherwise "not_connected" gets reported to the owner as an
+			// incapability, which is what it looks like from the inside.
+			const out = await module.build(baseConfig);
+
+			expect(out).toContain('not_connected');
+			expect(out).toContain('google-connect');
+			expect(out).toMatch(/Do not report that as/i);
+		});
+
+		it('is honest that gmail-send only drafts', async () => {
+			const out = await module.build(baseConfig);
+			expect(out).toMatch(/draft/i);
+			expect(out).toMatch(/only the owner sends it/i);
+		});
+
+		it('warns that consent is per product', async () => {
+			const out = await module.build(baseConfig);
+			expect(out).toMatch(/per product/i);
+		});
+
+		it('shows them to every role, not just developers', async () => {
+			for (const role of ['orchestrator', 'team-leader', 'qa']) {
+				const out = await module.build({ ...baseConfig, role });
+				expect(out).toContain('drive-search');
+			}
+		});
+	});
+
+	describe('Crewly in Chrome documentation', () => {
+		it('should include remote-browser skill documentation for all roles', async () => {
+			const result = await module.build(baseConfig);
+
+			expect(result).toContain('Crewly in Chrome');
+			expect(result).toContain('remote-browser');
+			expect(result).toContain('NOT Playwright');
+			expect(result).toContain('NOT Chrome DevTools');
+			expect(result).toContain('NOT computer-use');
+			expect(result).toContain(`${baseConfig.agentSkillsPath}/remote-browser/execute.sh`);
+		});
+
+		it('should include usage examples', async () => {
+			const result = await module.build(baseConfig);
+
+			expect(result).toContain('"action":"navigate"');
+			expect(result).toContain('"action":"screenshot"');
+			expect(result).toContain('"action":"status"');
+		});
+
+		it('should mention Chrome Extension and Cloud Relay', async () => {
+			const result = await module.build(baseConfig);
+
+			expect(result).toContain('Chrome Extension');
+			expect(result).toContain('Cloud Relay');
+		});
+	});
+
+	describe('safe skill calling guide (#EOF-fix)', () => {
+		it('should include CLI flags guide for gemini-cli runtime', async () => {
+			const geminiConfig: ModuleConfig = { ...baseConfig, runtimeType: 'gemini-cli' };
+			const result = await module.build(geminiConfig);
+
+			expect(result).toContain('Safe Skill Calling');
+			expect(result).toContain('CLI flags');
+			expect(result).toContain('NEVER');
+			// Should show CLI flag examples
+			expect(result).toContain('--session');
+			expect(result).toContain('--status');
+			expect(result).toContain('--summary');
+			expect(result).toContain('--agent');
+			expect(result).toContain('--content');
+			expect(result).toContain('--category');
+		});
+
+		it('should include stdin pipe pattern for long text', async () => {
+			const geminiConfig: ModuleConfig = { ...baseConfig, runtimeType: 'gemini-cli' };
+			const result = await module.build(geminiConfig);
+
+			expect(result).toContain('stdin');
+			expect(result).toContain('--summary-file');
+		});
+
+		it('should NOT include guide for claude-code runtime', async () => {
+			const claudeConfig: ModuleConfig = { ...baseConfig, runtimeType: 'claude-code' };
+			const result = await module.build(claudeConfig);
+
+			expect(result).not.toContain('Safe Skill Calling');
+		});
+
+		it('should NOT include guide when runtimeType is not set', async () => {
+			const result = await module.build(baseConfig);
+
+			expect(result).not.toContain('Safe Skill Calling');
+		});
+
+		it('should reference the agent skills path in examples', async () => {
+			const geminiConfig: ModuleConfig = { ...baseConfig, runtimeType: 'gemini-cli' };
+			const result = await module.build(geminiConfig);
+
+			expect(result).toContain(baseConfig.agentSkillsPath);
+			expect(result).toContain('report-status');
+		});
+
+		it('should include TL skills CLI flags example for gemini-cli TLs', async () => {
+			const geminiTLConfig: ModuleConfig = { ...baseConfig, runtimeType: 'gemini-cli', canDelegate: true };
+			const result = await module.build(geminiTLConfig);
+
+			expect(result).toContain('Team Leader Skills');
+			expect(result).toContain(`${baseConfig.tlSkillsPath}/delegate-task/execute.sh --to`);
+		});
+
+		it('should NOT include TL skills example for non-TL gemini agents', async () => {
+			const geminiConfig: ModuleConfig = { ...baseConfig, runtimeType: 'gemini-cli' };
+			const result = await module.build(geminiConfig);
+
+			expect(result).not.toContain('Team Leader Skills');
+		});
+
+		it('should include --help instruction in rules', async () => {
+			const geminiConfig: ModuleConfig = { ...baseConfig, runtimeType: 'gemini-cli' };
+			const result = await module.build(geminiConfig);
+
+			expect(result).toContain('--help');
+		});
+	});
+});

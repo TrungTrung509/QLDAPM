@@ -1,0 +1,1647 @@
+/**
+ * Tests for Browser Controller
+ *
+ * Covers the original 503-when-disconnected surface AND the M2 per-tab
+ * dispatch handlers (`/bind`, `/unbind`, `/bindings`) plus the tabId
+ * resolution priority threading agentSession through to the bridge.
+ *
+ * @module controllers/browser/browser.controller.test
+ */
+
+import express from 'express';
+import request from 'supertest';
+import { createBrowserRouter } from './browser.routes.js';
+import { classifyDispatchFailure, classifyExtensionFailure, clearOwnerViewportCache } from './browser.controller.js';
+import {
+	BrowserBridgeService,
+	type BrowserCommandResponse,
+} from '../../services/browser/browser-bridge.service.js';
+import { TaskPoolService } from '../../services/task-pool/task-pool.service.js';
+import { ownerUnlessAgentForTests } from '../../middleware/caller-identity.testing.js';
+
+// Mock the task pool so agentGoal auto-derive is deterministic: by default no
+// active claim → no derived goal (keeps tests that don't care unaffected).
+// Individual tests override getInstance to simulate a claimed work item.
+jest.mock('../../services/task-pool/task-pool.service.js', () => ({
+	TaskPoolService: {
+		getInstance: jest.fn(() => ({
+			getClaimService: () => ({ getActiveClaimByAgent: jest.fn().mockResolvedValue(undefined) }),
+			findWorkItem: jest.fn().mockResolvedValue(null),
+		})),
+	},
+}));
+
+// Mock logger. `info` is shared so the dispatch log line can be asserted.
+const mockLogInfo = jest.fn();
+const mockLogWarn = jest.fn();
+jest.mock('../../services/core/logger.service.js', () => ({
+	LoggerService: {
+		getInstance: () => ({
+			createComponentLogger: () => ({
+				info: (...args: unknown[]) => mockLogInfo(...args),
+				warn: (...args: unknown[]) => mockLogWarn(...args),
+				error: jest.fn(),
+				debug: jest.fn(),
+			}),
+		}),
+	},
+}));
+
+// Mock ws module (not needed for controller tests but required by service import)
+jest.mock('ws', () => ({
+	WebSocketServer: jest.fn(() => ({
+		on: jest.fn(),
+		close: jest.fn(),
+	})),
+	WebSocket: { OPEN: 1, CLOSED: 3 },
+}));
+
+describe('Browser Controller', () => {
+	let app: express.Application;
+
+	beforeEach(() => {
+		BrowserBridgeService.resetInstance();
+		app = express();
+		app.use(ownerUnlessAgentForTests);
+		app.use(express.json());
+		app.use('/api/browser', createBrowserRouter());
+	});
+
+	afterEach(() => {
+		BrowserBridgeService.resetInstance();
+	});
+
+	describe('GET /api/browser/status', () => {
+		it('should return disconnected status when no Chrome Extension is connected', async () => {
+			const res = await request(app).get('/api/browser/status');
+			expect(res.status).toBe(200);
+			expect(res.body).toMatchObject({
+				connected: false,
+				clientCount: 0,
+				wsPath: '/ws/browser',
+			});
+		});
+
+		// REGRESSION (2026-05-28 browser-relay fix): TRANSPORT-HONESTY +
+		// STATUS-DISTINCTION invariants. The status payload must name the
+		// browser transport ('cloud-relay-ws') and report a single canonical
+		// `drivable` predicate, so a caller can never read "cloud connected"
+		// as "a browser is drivable". With no browser registered, drivable is
+		// false even though the response is otherwise well-formed.
+		it('reports transport-tagged, honest drivability (drivable=false with no browser)', async () => {
+			const res = await request(app).get('/api/browser/status');
+			expect(res.status).toBe(200);
+			expect(res.body.transport).toBe('cloud-relay-ws');
+			expect(res.body.drivable).toBe(false);
+			// drivable must mirror proxy.available — one source of truth.
+			expect(res.body.drivable).toBe(res.body.proxy.available);
+			// No browser → no instances surfaced.
+			expect(res.body.instances).toEqual([]);
+		});
+	});
+
+	describe('POST /api/browser/navigate', () => {
+		it('should return 503 when no Chrome Extension is connected', async () => {
+			const res = await request(app)
+				.post('/api/browser/navigate')
+				.send({ url: 'https://example.com' });
+			expect(res.status).toBe(503);
+			expect(res.body.code).toBe('NO_BROWSER_CLIENT');
+		});
+	});
+
+	describe('POST /api/browser/screenshot', () => {
+		it('should return 503 when no Chrome Extension is connected', async () => {
+			const res = await request(app).post('/api/browser/screenshot');
+			expect(res.status).toBe(503);
+			expect(res.body.code).toBe('NO_BROWSER_CLIENT');
+		});
+	});
+
+	describe('screenshot timeouts and honest failure reasons (crewly#1080)', () => {
+		it('gives screenshots a longer command timeout than the default', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			const sendSpy = jest
+				.spyOn(bridge, 'sendCommand')
+				.mockResolvedValue({ id: 's1', success: true, result: {} } as Awaited<ReturnType<typeof bridge.sendCommand>>);
+			await request(app).post('/api/browser/screenshot');
+			expect(sendSpy.mock.calls[0][2]).toBe(90000);
+			await request(app).post('/api/browser/full-page-screenshot');
+			expect(sendSpy.mock.calls[1][2]).toBe(90000);
+		});
+
+		it('answers 504 BROWSER_COMMAND_TIMEOUT, not NO_BROWSER_CLIENT, when a connected browser times out', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			jest.spyOn(bridge, 'sendCommand').mockRejectedValue(new Error("Command 'screenshot' timed out after 90000ms"));
+			const res = await request(app).post('/api/browser/screenshot');
+			expect(res.status).toBe(504);
+			expect(res.body.code).toBe('BROWSER_COMMAND_TIMEOUT');
+			expect(res.body.error).toMatch(/connected but did not answer/);
+		});
+
+		it('classifies dispatch failures', () => {
+			expect(classifyDispatchFailure('click', [])).toMatchObject({ status: 503, code: 'NO_BROWSER_CLIENT' });
+			expect(classifyDispatchFailure('screenshot', ["direct-ws: Command 'screenshot' timed out after 1ms", "proxy-relay: Browser command 'screenshot' timed out after 1ms"])).toMatchObject({
+				status: 504,
+				code: 'BROWSER_COMMAND_TIMEOUT',
+			});
+			expect(classifyDispatchFailure('screenshot', ['proxy-relay: Max payload size exceeded'])).toMatchObject({ status: 413, code: 'BROWSER_PAYLOAD_TOO_LARGE' });
+			expect(classifyDispatchFailure('screenshot', ["proxy-relay: Browser extension disconnected while capturing 'screenshot': the result was probably too large for the relay's 1 MiB frame limit."])).toMatchObject({ status: 413, code: 'BROWSER_PAYLOAD_TOO_LARGE' });
+			expect(classifyDispatchFailure('screenshot', ['direct-ws: socket closed'])).toMatchObject({ status: 503, code: 'NO_BROWSER_CLIENT' });
+		});
+
+		it('status says how a browser is drivable', async () => {
+			const res = await request(app).get('/api/browser/status');
+			expect(res.body.drivableVia).toBeNull();
+			expect(res.body.drivableNote).toMatch(/clientCount/);
+		});
+	});
+
+	describe('POST /api/browser/read-text', () => {
+		it('should return 503 when not connected', async () => {
+			const res = await request(app)
+				.post('/api/browser/read-text')
+				.send({});
+			expect(res.status).toBe(503);
+			expect(res.body.code).toBe('NO_BROWSER_CLIENT');
+		});
+	});
+
+	describe('GET /api/browser/tabs', () => {
+		it('should return 503 when not connected', async () => {
+			const res = await request(app).get('/api/browser/tabs');
+			expect(res.status).toBe(503);
+			expect(res.body.code).toBe('NO_BROWSER_CLIENT');
+		});
+	});
+
+	describe('POST /api/browser/click', () => {
+		it('should return 503 when not connected', async () => {
+			const res = await request(app)
+				.post('/api/browser/click')
+				.send({ selector: '#btn' });
+			expect(res.status).toBe(503);
+			expect(res.body.code).toBe('NO_BROWSER_CLIENT');
+		});
+
+		// -------------------------------------------------------------------
+		// Fix B / Layered Click Dispatch — backend response-shape audit (T5)
+		// -------------------------------------------------------------------
+		//
+		// Trace findings (Max, 2026-05-02):
+		//
+		// PATH:  remote-browser skill → POST /api/browser/click
+		//          → browser.controller.ts::click (L393)
+		//            → sendToolCommand(req, res, 'click', req.body)
+		//              → BrowserBridgeService.sendCommand (direct WS)
+		//                | OR BrowserProxyService.sendCommand (proxy)
+		//                | OR BrowserRelayAdapter.sendViaRelay (relay)
+		//          → Chrome Extension processes layeredClick(...)
+		//          → Extension WS reply → handleMessage / handleRelayPayload
+		//            → pending.resolve(msg as BrowserCommandResponse)
+		//          → res.json(result) in sendToolCommand
+		//
+		// CONCLUSION: the backend is a transparent pass-through.
+		//
+		//   1. browser.controller.ts forwards req.body verbatim — no field
+		//      whitelist on the request side.
+		//   2. BrowserBridgeService.handleMessage (L355–362) calls
+		//      `pending.resolve(msg as BrowserCommandResponse)` — the `as`
+		//      cast is type-only; JS preserves all extra fields on the
+		//      parsed JSON object.
+		//   3. BrowserProxyService.handleRelayPayload (L683–704) and
+		//      BrowserRelayAdapter.handleRelayResponse (L192–212) use the
+		//      same pattern.
+		//   4. sendToolCommand calls `res.json(result)` with the whole
+		//      BrowserCommandResponse object on every successful path.
+		//
+		// Therefore the new fields introduced by layeredClick — `layer`,
+		// `verified`, `attempts[]`, `totalDurationMs` — flow end-to-end
+		// without modification. There is NO `messaging/relay-bridge.service.ts`
+		// allowlist as the spec suspected; that file does not exist (the
+		// suspected path is the WS-relay path through the three services
+		// listed above, none of which strip fields).
+		//
+		// CAPS: per spec §7 risks, `attempts.length ≤ 3` and `error` strings
+		// truncated to 200 chars are enforced at the EXTENSION boundary, not
+		// here. The backend trusts whatever the extension sends.
+		describe('Fix B layered-click response shape', () => {
+			it('preserves layer / verified / attempts / totalDurationMs end-to-end', async () => {
+				const bridge = BrowserBridgeService.getInstance();
+				markBridgeConnected(bridge);
+
+				// Realistic layered-click result nested under .result, matching
+				// the existing extension wrapper pattern (see selectOption test).
+				const layeredResult = {
+					clicked: true,
+					verified: true,
+					layer: 'L1_CDP_POINTER' as const,
+					attempts: [
+						{
+							layer: 'L1_CDP_POINTER' as const,
+							verifierResult: 'pass' as const,
+							durationMs: 47,
+						},
+					],
+					totalDurationMs: 252,
+					selector: '[data-qa="manifest-textarea"]',
+					tag: 'BUTTON',
+				};
+
+				jest.spyOn(bridge, 'sendCommand').mockResolvedValue({
+					id: 'click-1',
+					success: true,
+					result: layeredResult,
+				} as Awaited<ReturnType<typeof bridge.sendCommand>>);
+
+				const res = await request(app)
+					.post('/api/browser/click')
+					.send({
+						selector: '[data-qa="manifest-textarea"]',
+						expectAfter: '[data-qa="manifest-modal-open"]',
+					});
+
+				expect(res.status).toBe(200);
+				expect(res.body).toMatchObject({
+					id: 'click-1',
+					success: true,
+					result: {
+						clicked: true,
+						verified: true,
+						layer: 'L1_CDP_POINTER',
+						totalDurationMs: 252,
+					},
+				});
+				// attempts array preserved with full shape — this is the
+				// canonical regression: relay/bridge MUST NOT strip array fields.
+				expect(Array.isArray(res.body.result.attempts)).toBe(true);
+				expect(res.body.result.attempts).toHaveLength(1);
+				expect(res.body.result.attempts[0]).toEqual({
+					layer: 'L1_CDP_POINTER',
+					verifierResult: 'pass',
+					durationMs: 47,
+				});
+				// Other optional fields preserved
+				expect(res.body.result.selector).toBe('[data-qa="manifest-textarea"]');
+				expect(res.body.result.tag).toBe('BUTTON');
+			});
+
+			it('preserves a multi-attempt failure shape with error strings', async () => {
+				const bridge = BrowserBridgeService.getInstance();
+				markBridgeConnected(bridge);
+
+				// Worst case: all three layers ran, all failed. Verifies that
+				// the backend forwards every attempt and the error strings.
+				const layeredResult = {
+					clicked: false,
+					verified: false,
+					layer: null,
+					attempts: [
+						{ layer: 'L1_CDP_POINTER', verifierResult: 'fail', durationMs: 250 },
+						{ layer: 'L2_MAIN_WORLD', error: 'tab not focused', durationMs: 30 },
+						{ layer: 'L3_RAW_DOM_BURST', verifierResult: 'fail', durationMs: 120 },
+					],
+					totalDurationMs: 412,
+					selector: '#nope',
+				};
+
+				jest.spyOn(bridge, 'sendCommand').mockResolvedValue({
+					id: 'click-2',
+					success: true, // domain failure — transport still succeeded
+					result: layeredResult,
+				} as Awaited<ReturnType<typeof bridge.sendCommand>>);
+
+				const res = await request(app)
+					.post('/api/browser/click')
+					.send({ selector: '#nope', verifier: { kind: 'mutation' } });
+
+				expect(res.status).toBe(200); // domain failure ≠ HTTP error
+				expect(res.body.result.clicked).toBe(false);
+				expect(res.body.result.verified).toBe(false);
+				expect(res.body.result.layer).toBeNull();
+				expect(res.body.result.attempts).toHaveLength(3);
+				// Layer order preserved
+				expect(res.body.result.attempts.map((a: { layer: string }) => a.layer)).toEqual([
+					'L1_CDP_POINTER',
+					'L2_MAIN_WORLD',
+					'L3_RAW_DOM_BURST',
+				]);
+				// Error string from L2 preserved verbatim
+				expect(res.body.result.attempts[1].error).toBe('tab not focused');
+				expect(res.body.result.totalDurationMs).toBe(412);
+			});
+
+			it('forwards new opt-in params (expectAfter / verifier / layers / reactIdleQuietMs) verbatim to the extension', async () => {
+				const bridge = BrowserBridgeService.getInstance();
+				markBridgeConnected(bridge);
+				const sendSpy = jest
+					.spyOn(bridge, 'sendCommand')
+					.mockResolvedValue({
+						id: 'click-3',
+						success: true,
+						result: { clicked: true, verified: true, layer: 'L2_MAIN_WORLD', attempts: [], totalDurationMs: 80 },
+					} as Awaited<ReturnType<typeof bridge.sendCommand>>);
+
+				const reqBody = {
+					selector: '#combo',
+					expectAfter: '[role="listbox"]',
+					verifier: { kind: 'selector', expectAfter: '[role="listbox"]', timeoutMs: 500 },
+					layers: ['L2_MAIN_WORLD', 'L3_RAW_DOM_BURST'],
+					reactIdleQuietMs: 250,
+					reactIdleMaxWaitMs: 1500,
+				};
+
+				const res = await request(app).post('/api/browser/click').send(reqBody);
+
+				expect(res.status).toBe(200);
+				expect(sendSpy).toHaveBeenCalledTimes(1);
+				expect(sendSpy.mock.calls[0][0]).toBe('click');
+				// All new params reach the extension untouched.
+				expect(sendSpy.mock.calls[0][1]).toEqual(expect.objectContaining(reqBody));
+			});
+		});
+	});
+
+	describe('POST /api/browser/execute', () => {
+		it('should return 503 when not connected', async () => {
+			const res = await request(app)
+				.post('/api/browser/execute')
+				.send({ code: 'document.title' });
+			expect(res.status).toBe(503);
+			expect(res.body.code).toBe('NO_BROWSER_CLIENT');
+		});
+	});
+
+	describe('GET /api/browser/cookies', () => {
+		it('should return 503 when not connected', async () => {
+			const res = await request(app).get('/api/browser/cookies');
+			expect(res.status).toBe(503);
+			expect(res.body.code).toBe('NO_BROWSER_CLIENT');
+		});
+	});
+
+	describe('GET /api/browser/console', () => {
+		it('should return 503 when not connected', async () => {
+			const res = await request(app).get('/api/browser/console');
+			expect(res.status).toBe(503);
+			expect(res.body.code).toBe('NO_BROWSER_CLIENT');
+		});
+	});
+
+	describe('POST /api/browser/fill', () => {
+		it('should return 503 when not connected', async () => {
+			const res = await request(app)
+				.post('/api/browser/fill')
+				.send({ selector: '#input', value: 'hello' });
+			expect(res.status).toBe(503);
+		});
+	});
+
+	describe('POST /api/browser/hover', () => {
+		it('should return 503 when not connected', async () => {
+			const res = await request(app)
+				.post('/api/browser/hover')
+				.send({ selector: '#link' });
+			expect(res.status).toBe(503);
+		});
+	});
+
+	describe('POST /api/browser/full-page-screenshot', () => {
+		it('should return 503 when not connected', async () => {
+			const res = await request(app).post('/api/browser/full-page-screenshot');
+			expect(res.status).toBe(503);
+		});
+	});
+
+	describe('POST /api/browser/search-text', () => {
+		it('should return 503 when not connected', async () => {
+			const res = await request(app)
+				.post('/api/browser/search-text')
+				.send({ text: 'hello' });
+			expect(res.status).toBe(503);
+		});
+	});
+
+	describe('POST /api/browser/select-option', () => {
+		it('should return 503 when not connected', async () => {
+			const res = await request(app)
+				.post('/api/browser/select-option')
+				.send({ selector: '#level', value: 'opt2' });
+			expect(res.status).toBe(503);
+		});
+
+		it('forwards selector + value through sendCommand as the selectOption tool', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			const sendSpy = jest
+				.spyOn(bridge, 'sendCommand')
+				.mockResolvedValue({
+					id: 'sel-1',
+					success: true,
+					result: { selectedValue: 'opt2', selectedText: 'Option 2' },
+				} as Awaited<ReturnType<typeof bridge.sendCommand>>);
+
+			const res = await request(app)
+				.post('/api/browser/select-option')
+				.send({ selector: '#level', value: 'opt2' });
+
+			expect(res.status).toBe(200);
+			expect(sendSpy).toHaveBeenCalledTimes(1);
+			expect(sendSpy.mock.calls[0][0]).toBe('selectOption');
+			expect(sendSpy.mock.calls[0][1]).toEqual(
+				expect.objectContaining({ selector: '#level', value: 'opt2' }),
+			);
+		});
+
+		it('accepts label / index / strategy alternatives in the body', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			const sendSpy = jest
+				.spyOn(bridge, 'sendCommand')
+				.mockResolvedValue({
+					id: 'sel-2',
+					success: true,
+					result: { selectedValue: '', selectedText: '' },
+				} as Awaited<ReturnType<typeof bridge.sendCommand>>);
+
+			await request(app)
+				.post('/api/browser/select-option')
+				.send({ selector: '#level', label: 'Beginner', strategy: 'aria' });
+			expect(sendSpy.mock.calls[0][1]).toEqual(
+				expect.objectContaining({
+					selector: '#level',
+					label: 'Beginner',
+					strategy: 'aria',
+				}),
+			);
+
+			await request(app)
+				.post('/api/browser/select-option')
+				.send({ selector: '#level', index: 2 });
+			expect(sendSpy.mock.calls[1][1]).toEqual(
+				expect.objectContaining({ selector: '#level', index: 2 }),
+			);
+		});
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Per-tab dispatch (M2) — bind / unbind / bindings + tabId resolution priority
+// ---------------------------------------------------------------------------
+
+/**
+ * Mark the bridge as connected so `sendToolCommand` enters Path 2 (the
+ * direct-WS branch) where per-tab routing lives. We only need
+ * `isConnected()` to return true; the actual WS plumbing is irrelevant
+ * because we stub the methods that would have hit it.
+ */
+function markBridgeConnected(bridge: BrowserBridgeService): void {
+	jest.spyOn(bridge, 'isConnected').mockReturnValue(true);
+}
+
+describe('Browser Controller — per-tab dispatch (M2)', () => {
+	let app: express.Application;
+
+	beforeEach(() => {
+		BrowserBridgeService.resetInstance();
+		app = express();
+		app.use(ownerUnlessAgentForTests);
+		app.use(express.json());
+		app.use('/api/browser', createBrowserRouter());
+		jest.restoreAllMocks();
+	});
+
+	afterEach(() => {
+		BrowserBridgeService.resetInstance();
+		jest.restoreAllMocks();
+	});
+
+	// -------------------------------------------------------------------------
+	// POST /api/browser/bind
+	// -------------------------------------------------------------------------
+
+	describe('POST /api/browser/bind', () => {
+		it('returns 400 when X-Agent-Session header is missing', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			const res = await request(app).post('/api/browser/bind').send({});
+			expect(res.status).toBe(400);
+			expect(res.body.error).toBe('agent_session_required');
+		});
+
+		it('returns 503 NO_BROWSER_CLIENT when extension not connected', async () => {
+			// bridge.isConnected() returns false by default — no Extension wired.
+			const res = await request(app)
+				.post('/api/browser/bind')
+				.set('X-Agent-Session', 'agent-A')
+				.send({});
+			expect(res.status).toBe(503);
+			expect(res.body.code).toBe('NO_BROWSER_CLIENT');
+		});
+
+		// Regression: over the Cloud relay there is no direct WS client; the
+		// bridge learns the Extension is reachable only through the proxy. The
+		// old bridge→proxy lookup was a bare `require()` that threw in the ESM
+		// build (swallowed → null), so /bind answered 503 with a browser plainly
+		// registered on the relay while /status reported drivable:true from the
+		// same proxy. The registry makes the proxy visible without require().
+		it('binds over the relay path when only the proxy reports a browser (no direct WS client)', async () => {
+			const { BrowserProxyService } = await import('../../services/browser/browser-proxy.service.js');
+			const proxy = BrowserProxyService.getInstance();
+			jest.spyOn(proxy, 'isAvailable').mockReturnValue(true);
+
+			const bridge = BrowserBridgeService.getInstance();
+			expect(bridge.isConnected()).toBe(true);
+			jest.spyOn(bridge, 'bindAgentTab').mockResolvedValue({
+				agentSession: 'agent-relay',
+				tabId: 7,
+				windowId: 1,
+				boundAt: new Date(),
+				lastActivityAt: new Date(),
+			});
+
+			const res = await request(app)
+				.post('/api/browser/bind')
+				.set('X-Agent-Session', 'agent-relay')
+				.send({});
+
+			expect(res.status).toBe(200);
+			expect(res.body).toMatchObject({ success: true, data: { tabId: 7, windowId: 1 } });
+		});
+
+		it('returns the new tabId on success and increments bindingCount', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			jest.spyOn(bridge, 'bindAgentTab').mockResolvedValue({
+				agentSession: 'agent-A',
+				tabId: 42,
+				windowId: 9,
+				boundAt: new Date(),
+				lastActivityAt: new Date(),
+			});
+
+			const res = await request(app)
+				.post('/api/browser/bind')
+				.set('X-Agent-Session', 'agent-A')
+				.send({});
+
+			expect(res.status).toBe(200);
+			expect(res.body).toMatchObject({
+				success: true,
+				data: { tabId: 42, windowId: 9 },
+			});
+			// bindAgentTab called with foreground=false by default
+			expect(bridge.bindAgentTab).toHaveBeenCalledWith(
+				'agent-A',
+				expect.objectContaining({ foreground: false })
+			);
+		});
+
+		it('forwards foreground:true when body.active === true', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			const spy = jest.spyOn(bridge, 'bindAgentTab').mockResolvedValue({
+				agentSession: 'agent-A',
+				tabId: 7,
+				boundAt: new Date(),
+				lastActivityAt: new Date(),
+			});
+
+			await request(app)
+				.post('/api/browser/bind')
+				.set('X-Agent-Session', 'agent-A')
+				.send({ active: true });
+
+			expect(spy).toHaveBeenCalledWith(
+				'agent-A',
+				expect.objectContaining({ foreground: true })
+			);
+		});
+
+		it('returns 503 with retryAfterMs when tab pool is full', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			const err = new Error('tab_pool_full: 50 bindings at hard cap 50');
+			(err as Error & { code?: string }).code = 'tab_pool_full';
+			jest.spyOn(bridge, 'bindAgentTab').mockRejectedValue(err);
+
+			const res = await request(app)
+				.post('/api/browser/bind')
+				.set('X-Agent-Session', 'agent-A')
+				.send({});
+
+			expect(res.status).toBe(503);
+			expect(res.body.error).toBe('tab_pool_full');
+			expect(typeof res.body.retryAfterMs).toBe('number');
+			expect(res.body.retryAfterMs).toBeGreaterThan(0);
+		});
+
+		it('returns 502 bind_failed for other Extension errors', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			jest.spyOn(bridge, 'bindAgentTab').mockRejectedValue(
+				new Error('Extension refused: permission_denied')
+			);
+
+			const res = await request(app)
+				.post('/api/browser/bind')
+				.set('X-Agent-Session', 'agent-A')
+				.send({});
+
+			expect(res.status).toBe(502);
+			expect(res.body.error).toBe('bind_failed');
+			expect(res.body.details).toMatch(/permission_denied/);
+		});
+	});
+
+	// -------------------------------------------------------------------------
+	// POST /api/browser/unbind
+	// -------------------------------------------------------------------------
+
+	describe('POST /api/browser/unbind', () => {
+		it('returns 400 when X-Agent-Session header is missing', async () => {
+			const res = await request(app).post('/api/browser/unbind').send({});
+			expect(res.status).toBe(400);
+			expect(res.body.error).toBe('agent_session_required');
+		});
+
+		it('returns 200 with released:true when unbind succeeded', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			jest.spyOn(bridge, 'unbindAgentTab').mockResolvedValue({
+				released: true,
+				tabClosed: true,
+			});
+
+			const res = await request(app)
+				.post('/api/browser/unbind')
+				.set('X-Agent-Session', 'agent-A')
+				.send({});
+
+			expect(res.status).toBe(200);
+			expect(res.body).toMatchObject({
+				success: true,
+				data: { released: true, tabClosed: true },
+			});
+			expect(bridge.unbindAgentTab).toHaveBeenCalledWith(
+				'agent-A',
+				expect.objectContaining({ closeTab: true })
+			);
+		});
+
+		it('returns released:false when no binding existed', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			jest.spyOn(bridge, 'unbindAgentTab').mockResolvedValue({
+				released: false,
+				tabClosed: false,
+			});
+
+			const res = await request(app)
+				.post('/api/browser/unbind')
+				.set('X-Agent-Session', 'agent-no-binding')
+				.send({});
+
+			expect(res.status).toBe(200);
+			expect(res.body.data.released).toBe(false);
+		});
+
+		it('forwards closeTab:false when body.closeTab === false', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			const spy = jest.spyOn(bridge, 'unbindAgentTab').mockResolvedValue({
+				released: true,
+				tabClosed: false,
+			});
+
+			await request(app)
+				.post('/api/browser/unbind')
+				.set('X-Agent-Session', 'agent-A')
+				.send({ closeTab: false });
+
+			expect(spy).toHaveBeenCalledWith(
+				'agent-A',
+				expect.objectContaining({ closeTab: false })
+			);
+		});
+	});
+
+	// -------------------------------------------------------------------------
+	// GET /api/browser/bindings
+	// -------------------------------------------------------------------------
+
+	describe('GET /api/browser/bindings', () => {
+		it('returns the binding snapshot plus cap metadata', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			const fakeBoundAt = new Date('2026-04-25T00:00:00.000Z');
+			const fakeActivity = new Date('2026-04-25T01:00:00.000Z');
+			jest.spyOn(bridge, 'listBindings').mockReturnValue([
+				{
+					agentSession: 'agent-A',
+					tabId: 11,
+					boundAt: fakeBoundAt,
+					lastActivityAt: fakeActivity,
+				},
+				{
+					agentSession: 'agent-B',
+					tabId: 12,
+					boundAt: fakeBoundAt,
+					lastActivityAt: fakeActivity,
+				},
+			]);
+
+			const res = await request(app).get('/api/browser/bindings');
+			expect(res.status).toBe(200);
+			expect(res.body.success).toBe(true);
+			expect(res.body.data.bindings).toHaveLength(2);
+			expect(res.body.data.bindings[0].tabId).toBe(11);
+			expect(res.body.data.bindings[1].tabId).toBe(12);
+			expect(typeof res.body.data.hardCap).toBe('number');
+			expect(typeof res.body.data.softWarn).toBe('number');
+		});
+	});
+
+	// -------------------------------------------------------------------------
+	// tabId resolution priority on data-plane endpoints (§4.2)
+	// -------------------------------------------------------------------------
+
+	describe('tabId resolution priority on POST /api/browser/navigate', () => {
+		const okResponse: BrowserCommandResponse = {
+			id: 'r1',
+			success: true,
+			result: { url: 'https://example.com' },
+		};
+
+		it('routes through sendCommandForAgent when X-Agent-Session is set', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			const spy = jest
+				.spyOn(bridge, 'sendCommandForAgent')
+				.mockResolvedValue(okResponse);
+			jest.spyOn(bridge, 'sendCommand').mockResolvedValue(okResponse);
+
+			await request(app)
+				.post('/api/browser/navigate')
+				.set('X-Agent-Session', 'agent-A')
+				.send({ url: 'https://example.com' });
+
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect(spy).toHaveBeenCalledWith(
+				'agent-A',
+				'navigate',
+				expect.objectContaining({ url: 'https://example.com' }),
+				undefined,
+				expect.any(String),
+				undefined // agentGoal — none supplied on this request
+			);
+			expect(bridge.sendCommand).not.toHaveBeenCalled();
+		});
+
+		it('forwards the X-Agent-Goal header through to sendCommandForAgent', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			const spy = jest
+				.spyOn(bridge, 'sendCommandForAgent')
+				.mockResolvedValue(okResponse);
+			jest.spyOn(bridge, 'sendCommand').mockResolvedValue(okResponse);
+
+			await request(app)
+				.post('/api/browser/navigate')
+				.set('X-Agent-Session', 'agent-A')
+				.set('X-Agent-Goal', 'Verify crewlyai.com DMARC setup')
+				.send({ url: 'https://example.com' });
+
+			expect(spy).toHaveBeenCalledWith(
+				'agent-A',
+				'navigate',
+				expect.objectContaining({ url: 'https://example.com' }),
+				undefined,
+				expect.any(String),
+				'Verify crewlyai.com DMARC setup' // agentGoal threaded from the header
+			);
+		});
+
+		it('decodes a base64 X-Agent-Goal (non-ASCII goals) before forwarding it', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			const spy = jest
+				.spyOn(bridge, 'sendCommandForAgent')
+				.mockResolvedValue(okResponse);
+			jest.spyOn(bridge, 'sendCommand').mockResolvedValue(okResponse);
+
+			await request(app)
+				.post('/api/browser/navigate')
+				.set('X-Agent-Session', 'agent-A')
+				.set('X-Agent-Goal', `b64:${Buffer.from('核对 DMARC 设置', 'utf-8').toString('base64')}`)
+				.send({ url: 'https://example.com' });
+
+			expect(spy).toHaveBeenCalledWith(
+				'agent-A',
+				'navigate',
+				expect.objectContaining({ url: 'https://example.com' }),
+				undefined,
+				expect.any(String),
+				'核对 DMARC 设置',
+			);
+		});
+
+		it('auto-derives agentGoal from the agent\'s active work item when no header is set', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			const spy = jest
+				.spyOn(bridge, 'sendCommandForAgent')
+				.mockResolvedValue(okResponse);
+			jest.spyOn(bridge, 'sendCommand').mockResolvedValue(okResponse);
+
+			// Agent 'agent-A' has an active claim on a work item titled "Fix the login bug".
+			(TaskPoolService.getInstance as jest.Mock).mockReturnValueOnce({
+				getClaimService: () => ({
+					getActiveClaimByAgent: jest.fn().mockResolvedValue({ workItemId: 'wi-9' }),
+				}),
+				findWorkItem: jest.fn().mockResolvedValue({ title: 'Fix the login bug' }),
+			});
+
+			await request(app)
+				.post('/api/browser/navigate')
+				.set('X-Agent-Session', 'agent-A')
+				.send({ url: 'https://example.com' }); // note: NO X-Agent-Goal header
+
+			expect(spy).toHaveBeenCalledWith(
+				'agent-A',
+				'navigate',
+				expect.objectContaining({ url: 'https://example.com' }),
+				undefined,
+				expect.any(String),
+				'Fix the login bug' // auto-derived from the work item title
+			);
+		});
+
+		it('falls back to sendCommand (legacy active-tab) when no agentSession is set', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			const sendSpy = jest.spyOn(bridge, 'sendCommand').mockResolvedValue(okResponse);
+			const forAgentSpy = jest
+				.spyOn(bridge, 'sendCommandForAgent')
+				.mockResolvedValue(okResponse);
+
+			await request(app)
+				.post('/api/browser/navigate')
+				.send({ url: 'https://example.com' });
+
+			expect(sendSpy).toHaveBeenCalledTimes(1);
+			expect(forAgentSpy).not.toHaveBeenCalled();
+		});
+
+		it('returns 403 when explicit tabId is owned by a different agent', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			jest.spyOn(bridge, 'listBindings').mockReturnValue([
+				{
+					agentSession: 'agent-other',
+					tabId: 99,
+					boundAt: new Date(),
+					lastActivityAt: new Date(),
+				},
+			]);
+			jest.spyOn(bridge, 'sendCommandForAgent').mockResolvedValue(okResponse);
+
+			const res = await request(app)
+				.post('/api/browser/navigate')
+				.set('X-Agent-Session', 'agent-mine')
+				.send({ url: 'https://example.com', tabId: 99 });
+
+			expect(res.status).toBe(403);
+			expect(res.body.error).toBe('tab_owned_by_other_agent');
+			expect(bridge.sendCommandForAgent).not.toHaveBeenCalled();
+		});
+
+		it('allows explicit tabId when it belongs to the calling agent', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			jest.spyOn(bridge, 'listBindings').mockReturnValue([
+				{
+					agentSession: 'agent-mine',
+					tabId: 77,
+					boundAt: new Date(),
+					lastActivityAt: new Date(),
+				},
+			]);
+			const spy = jest
+				.spyOn(bridge, 'sendCommandForAgent')
+				.mockResolvedValue(okResponse);
+
+			const res = await request(app)
+				.post('/api/browser/navigate')
+				.set('X-Agent-Session', 'agent-mine')
+				.send({ url: 'https://example.com', tabId: 77 });
+
+			expect(res.status).toBe(200);
+			expect(spy).toHaveBeenCalled();
+		});
+
+		it('allows explicit tabId when no agent owns that tabId yet', async () => {
+			const bridge = BrowserBridgeService.getInstance();
+			markBridgeConnected(bridge);
+			jest.spyOn(bridge, 'listBindings').mockReturnValue([]);
+			const spy = jest
+				.spyOn(bridge, 'sendCommandForAgent')
+				.mockResolvedValue(okResponse);
+
+			const res = await request(app)
+				.post('/api/browser/navigate')
+				.set('X-Agent-Session', 'agent-anon')
+				.send({ url: 'https://example.com', tabId: 33 });
+
+			expect(res.status).toBe(200);
+			expect(spy).toHaveBeenCalled();
+		});
+	});
+});
+
+// =============================================================================
+// Live browser view
+// =============================================================================
+
+describe('live browser view endpoints', () => {
+	/** A fresh app with an empty session registry. */
+	function setup() {
+		const app = express();
+		app.use(ownerUnlessAgentForTests);
+		app.use(express.json());
+		app.use('/api/browser', createBrowserRouter());
+		return app;
+	}
+
+	let sessions: import('../../services/browser/browser-session.service.js').BrowserSessionService;
+
+	beforeEach(async () => {
+		const mod = await import('../../services/browser/browser-session.service.js');
+		mod.BrowserSessionService.resetInstance();
+		sessions = mod.BrowserSessionService.getInstance();
+		sessions.clear();
+	});
+
+	afterEach(async () => {
+		const mod = await import('../../services/browser/browser-session.service.js');
+		mod.BrowserSessionService.resetInstance();
+	});
+
+	it('lists nothing before any agent has used the browser', async () => {
+		const res = await request(setup()).get('/api/browser/sessions');
+
+		expect(res.status).toBe(200);
+		expect(res.body.data.sessions).toEqual([]);
+	});
+
+	it('lists a session once an agent has acted', async () => {
+		sessions.noteAction({ agentSession: 'pia', tool: 'navigate', params: { url: 'https://x.test' } });
+
+		const res = await request(setup()).get('/api/browser/sessions');
+
+		expect(res.body.data.sessions).toHaveLength(1);
+		expect(res.body.data.sessions[0]).toMatchObject({ id: 'pia', status: 'navigating' });
+	});
+
+	it('can leave out finished sessions', async () => {
+		sessions.noteAction({ agentSession: 'pia', tool: 'navigate' });
+		sessions.endSession('pia');
+
+		const res = await request(setup()).get('/api/browser/sessions?active=1');
+
+		expect(res.body.data.sessions).toEqual([]);
+	});
+
+	it('returns one session, or 404 for an agent that has not used the browser', async () => {
+		sessions.noteAction({ agentSession: 'pia', tool: 'navigate' });
+
+		const found = await request(setup()).get('/api/browser/sessions/pia');
+		expect(found.status).toBe(200);
+		expect(found.body.data.session.id).toBe('pia');
+
+		const missing = await request(setup()).get('/api/browser/sessions/nobody');
+		expect(missing.status).toBe(404);
+	});
+
+	it('404s for a frame that has not been captured yet', async () => {
+		sessions.noteAction({ agentSession: 'pia', tool: 'navigate' });
+
+		const res = await request(setup()).get('/api/browser/sessions/pia/frame');
+
+		expect(res.status).toBe(404);
+	});
+
+	it('serves the frame as image bytes that no cache may keep', async () => {
+		// A frame is a picture of whatever the owner happens to be logged into.
+		// It must not linger in a disk cache or an intermediary.
+		sessions.noteAction({ agentSession: 'pia', tool: 'navigate' });
+		sessions.setCapturer(async () => ({ base64: Buffer.from('hello').toString('base64'), format: 'jpeg' }));
+		await sessions.captureFrame('pia');
+
+		const res = await request(setup()).get('/api/browser/sessions/pia/frame');
+
+		expect(res.status).toBe(200);
+		expect(res.headers['content-type']).toContain('image/jpeg');
+		expect(res.headers['cache-control']).toContain('no-store');
+		expect(res.body.toString()).toBe('hello');
+	});
+
+	it('marks a session stopped, and 404s for one that does not exist', async () => {
+		sessions.noteAction({ agentSession: 'pia', tool: 'navigate' });
+
+		const ok = await request(setup()).post('/api/browser/sessions/pia/stop');
+		expect(ok.status).toBe(200);
+		expect(ok.body.data.session.status).toBe('stopped');
+
+		const missing = await request(setup()).post('/api/browser/sessions/nobody/stop');
+		expect(missing.status).toBe(404);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Extension refusals get real statuses (incident 2026-09-23)
+// ---------------------------------------------------------------------------
+
+describe('classifyExtensionFailure', () => {
+	const fail = (error: string) => ({ id: 'x', success: false, error });
+
+	it('maps another connection owning the tab to 403', () => {
+		expect(
+			classifyExtensionFailure(
+				fail('tab_owned_by_other_client: tab 5 belongs to another Crewly connection on this account'),
+			),
+		).toEqual({ code: 'tab_owned_by_other_client', status: 403 });
+	});
+
+	it('maps a closed tab to 404 tab_not_found, in both wordings', () => {
+		expect(classifyExtensionFailure(fail('Tab 5 no longer exists. Bind a new tab instead of reusing this tabId.')))
+			.toEqual({ code: 'tab_not_found', status: 404 });
+		expect(classifyExtensionFailure(fail('No tab with id: 5.'))).toEqual({ code: 'tab_not_found', status: 404 });
+	});
+
+	it('passes everything else through', () => {
+		expect(classifyExtensionFailure(fail('Detached while handling command.'))).toBeNull();
+		expect(classifyExtensionFailure({ id: 'x', success: true, result: {} })).toBeNull();
+	});
+});
+
+describe('Browser Controller — extension refusal statuses', () => {
+	let app: express.Application;
+
+	beforeEach(() => {
+		jest.restoreAllMocks();
+		BrowserBridgeService.resetInstance();
+		app = express();
+		app.use(ownerUnlessAgentForTests);
+		app.use(express.json());
+		app.use('/api/browser', createBrowserRouter());
+	});
+
+	afterEach(() => {
+		BrowserBridgeService.resetInstance();
+	});
+
+	it('answers 403 when the extension says the tab is another connection’s', async () => {
+		const bridge = BrowserBridgeService.getInstance();
+		jest.spyOn(bridge, 'isConnected').mockReturnValue(true);
+		jest.spyOn(bridge, 'sendCommandForAgent').mockResolvedValue({
+			id: 'r',
+			success: false,
+			error: 'tab_owned_by_other_client: tab 5 belongs to another Crewly connection on this account',
+		});
+
+		const res = await request(app)
+			.post('/api/browser/read-text')
+			.set('X-Agent-Session', 'agent-A')
+			.send({ tabId: 5 });
+
+		expect(res.status).toBe(403);
+		expect(res.body.code).toBe('tab_owned_by_other_client');
+		expect(res.body.error).toMatch(/another Crewly connection/);
+	});
+
+	it('answers 404 tab_not_found when the named tab is gone, so the skill can rebind', async () => {
+		const bridge = BrowserBridgeService.getInstance();
+		jest.spyOn(bridge, 'isConnected').mockReturnValue(true);
+		jest.spyOn(bridge, 'sendCommandForAgent').mockResolvedValue({
+			id: 'r',
+			success: false,
+			error: 'No tab with id: 5.',
+		});
+
+		const res = await request(app)
+			.post('/api/browser/read-text')
+			.set('X-Agent-Session', 'agent-A')
+			.send({ tabId: 5 });
+
+		expect(res.status).toBe(404);
+		expect(res.body.code).toBe('tab_not_found');
+	});
+
+	it('still answers 200 for an ordinary extension failure', async () => {
+		const bridge = BrowserBridgeService.getInstance();
+		jest.spyOn(bridge, 'isConnected').mockReturnValue(true);
+		jest.spyOn(bridge, 'sendCommandForAgent').mockResolvedValue({
+			id: 'r',
+			success: false,
+			error: 'Element not found: #a',
+		});
+
+		const res = await request(app)
+			.post('/api/browser/click')
+			.set('X-Agent-Session', 'agent-A')
+			.send({ selector: '#a' });
+
+		expect(res.status).toBe(200);
+		expect(res.body.success).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Dispatch log (incident 2026-09-23): every page command leaves a line naming
+// the agent, the tab it asked for, and the tab it was sent for.
+// ---------------------------------------------------------------------------
+
+describe('Browser Controller — dispatch log', () => {
+	let app: express.Application;
+	const ok: BrowserCommandResponse = { id: 'r', success: true, result: { text: 'x' } };
+
+	/** The dispatch log entries written so far. */
+	const dispatchLines = (): Array<Record<string, unknown>> =>
+		mockLogInfo.mock.calls
+			.filter((c) => c[0] === 'Browser command dispatched')
+			.map((c) => c[1] as Record<string, unknown>);
+
+	beforeEach(() => {
+		jest.restoreAllMocks();
+		mockLogInfo.mockReset();
+		BrowserBridgeService.resetInstance();
+		app = express();
+		app.use(ownerUnlessAgentForTests);
+		app.use(express.json());
+		app.use('/api/browser', createBrowserRouter());
+	});
+
+	afterEach(() => {
+		BrowserBridgeService.resetInstance();
+	});
+
+	it('logs read-text with the requested and dispatched tabId', async () => {
+		const bridge = BrowserBridgeService.getInstance();
+		markBridgeConnected(bridge);
+		jest.spyOn(bridge, 'sendCommandForAgent').mockResolvedValue(ok);
+
+		await request(app)
+			.post('/api/browser/read-text')
+			.set('X-Agent-Session', 'agent-lyra')
+			.send({ tabId: 1383674346 });
+
+		expect(dispatchLines()).toEqual([
+			expect.objectContaining({
+				tool: 'readText',
+				path: 'direct-ws',
+				agentSession: 'agent-lyra',
+				requestedTabId: 1383674346,
+				dispatchedTabId: 1383674346,
+				outcome: 'ok',
+			}),
+		]);
+		expect(dispatchLines()[0]).toHaveProperty('relaySessionId');
+	});
+
+	it('logs the bound tab as dispatched when execute-js names none', async () => {
+		const bridge = BrowserBridgeService.getInstance();
+		markBridgeConnected(bridge);
+		jest.spyOn(bridge, 'sendCommandForAgent').mockResolvedValue(ok);
+		jest.spyOn(bridge, 'getBinding').mockReturnValue({
+			agentSession: 'agent-lyra',
+			tabId: 1383674343,
+			boundAt: new Date(),
+			lastActivityAt: new Date(),
+		});
+
+		await request(app)
+			.post('/api/browser/execute-js')
+			.set('X-Agent-Session', 'agent-lyra')
+			.send({ code: 'location.href' });
+
+		expect(dispatchLines()).toEqual([
+			expect.objectContaining({
+				tool: 'executeJs',
+				requestedTabId: null,
+				dispatchedTabId: 1383674343,
+			}),
+		]);
+	});
+
+	it('logs a null dispatched tab when the extension is left to choose', async () => {
+		const bridge = BrowserBridgeService.getInstance();
+		markBridgeConnected(bridge);
+		jest.spyOn(bridge, 'sendCommand').mockResolvedValue(ok);
+
+		await request(app).post('/api/browser/read-text').send({});
+
+		expect(dispatchLines()).toEqual([
+			expect.objectContaining({ tool: 'readText', agentSession: null, dispatchedTabId: null }),
+		]);
+	});
+
+	it('logs a failed path with its error, not only successes', async () => {
+		const bridge = BrowserBridgeService.getInstance();
+		markBridgeConnected(bridge);
+		jest.spyOn(bridge, 'sendCommandForAgent').mockRejectedValue(new Error('Detached while handling command.'));
+
+		await request(app)
+			.post('/api/browser/read-text')
+			.set('X-Agent-Session', 'agent-lyra')
+			.send({ tabId: 7 });
+
+		expect(dispatchLines()[0]).toEqual(
+			expect.objectContaining({ path: 'direct-ws', outcome: 'Detached while handling command.' }),
+		);
+	});
+
+	it('logs when no browser is connected at all', async () => {
+		await request(app).post('/api/browser/read-text').send({});
+
+		expect(dispatchLines()).toEqual([
+			expect.objectContaining({ path: 'none', outcome: 'no browser connected' }),
+		]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Owner input while the owner holds the wheel
+// ---------------------------------------------------------------------------
+
+describe('POST /api/browser/sessions/:id/input (owner drives)', () => {
+	const SECRET = 'hunter2-Real-Passw0rd!';
+	const TAB = 4242;
+	let app: express.Application;
+	let sessions: import('../../services/browser/browser-session.service.js').BrowserSessionService;
+	let sendCommand: jest.SpyInstance;
+
+	/** Every argument any logger received, flattened to text. */
+	const everythingLogged = (): string =>
+		JSON.stringify([...mockLogInfo.mock.calls, ...mockLogWarn.mock.calls]);
+
+	beforeEach(async () => {
+		jest.restoreAllMocks();
+		mockLogInfo.mockReset();
+		mockLogWarn.mockReset();
+		clearOwnerViewportCache();
+		BrowserBridgeService.resetInstance();
+		const mod = await import('../../services/browser/browser-session.service.js');
+		mod.BrowserSessionService.resetInstance();
+		sessions = mod.BrowserSessionService.getInstance();
+		sessions.clear();
+		sessions.setCapturer(async () => ({ base64: 'RlJBTUU=', format: 'jpeg', devicePixelRatio: 2 }));
+
+		const bridge = BrowserBridgeService.getInstance();
+		markBridgeConnected(bridge);
+		jest.spyOn(bridge, 'getBinding').mockReturnValue({
+			agentSession: 'pia',
+			tabId: TAB,
+			boundAt: new Date(),
+			lastActivityAt: new Date(),
+		});
+		sendCommand = jest.spyOn(bridge, 'sendCommand').mockImplementation(async (tool: string) => {
+			if (tool === 'executeJs') return { id: 'r', success: true, result: { value: { width: 1280, height: 800 } } };
+			if (tool === 'insertText') return { id: 'r', success: true, result: { success: true, length: SECRET.length, method: 'cdp' } };
+			return { id: 'r', success: true, result: {} };
+		});
+
+		app = express();
+		app.use(ownerUnlessAgentForTests);
+		app.use(express.json());
+		app.use('/api/browser', createBrowserRouter());
+
+		sessions.noteAction({ agentSession: 'pia', tool: 'navigate', params: { url: 'https://dmca.copyright.gov/' } });
+	});
+
+	afterEach(async () => {
+		const mod = await import('../../services/browser/browser-session.service.js');
+		mod.BrowserSessionService.resetInstance();
+		BrowserBridgeService.resetInstance();
+	});
+
+	/** Post one input as the owner (no agent header). */
+	const post = (body: unknown) => request(app).post('/api/browser/sessions/pia/input').send(body as object);
+
+	it('refuses an agent, even while the owner holds the wheel', async () => {
+		sessions.takeControl('pia');
+		const res = await request(app)
+			.post('/api/browser/sessions/pia/input')
+			.set('X-Agent-Session', 'pia')
+			.send({ kind: 'key', key: 'Enter' });
+
+		expect(res.status).toBe(403);
+		expect(res.body.code).toBe('agent_not_owner');
+		expect(sendCommand).not.toHaveBeenCalled();
+	});
+
+	it('is a 409 unless the owner has taken control', async () => {
+		const res = await post({ kind: 'key', key: 'Enter' });
+
+		expect(res.status).toBe(409);
+		expect(res.body.code).toBe('not_owner_control');
+		expect(sendCommand).not.toHaveBeenCalled();
+	});
+
+	it('is a 404 for a session that does not exist, and a 400 for bad input', async () => {
+		const missing = await request(app).post('/api/browser/sessions/nobody/input').send({ kind: 'back' });
+		expect(missing.status).toBe(404);
+
+		sessions.takeControl('pia');
+		const bad = await post({ kind: 'key', key: 'F5' });
+		expect(bad.status).toBe(400);
+		expect(bad.body.code).toBe('invalid_input');
+	});
+
+	it('is a 409 when the agent has no tab to drive', async () => {
+		sessions.takeControl('pia');
+		jest.spyOn(BrowserBridgeService.getInstance(), 'getBinding').mockReturnValue(undefined);
+
+		const res = await post({ kind: 'back' });
+
+		expect(res.status).toBe(409);
+		expect(res.body.code).toBe('no_bound_tab');
+	});
+
+	it('maps a tap on the frame to CSS pixels on the bound tab, and clicks there', async () => {
+		sessions.takeControl('pia');
+		// 1x display, half-scale frame: 640x400 frame over a 1280x800 viewport.
+		const res = await post({ kind: 'tap', x: 320, y: 100, frameWidth: 640, frameHeight: 400 });
+
+		expect(res.status).toBe(200);
+		expect(sendCommand).toHaveBeenCalledWith('executeJs', expect.objectContaining({ tabId: TAB }), expect.any(Number));
+		expect(sendCommand).toHaveBeenCalledWith('click', expect.objectContaining({ x: 640, y: 200, tabId: TAB }), expect.any(Number));
+	});
+
+	it('measures the viewport once, not on every tap', async () => {
+		sessions.takeControl('pia');
+		await post({ kind: 'tap', x: 1, y: 1, frameWidth: 640, frameHeight: 400 });
+		await post({ kind: 'tap', x: 2, y: 2, frameWidth: 640, frameHeight: 400 });
+
+		expect(sendCommand.mock.calls.filter((c) => c[0] === 'executeJs')).toHaveLength(1);
+		expect(sendCommand.mock.calls.filter((c) => c[0] === 'click')).toHaveLength(2);
+	});
+
+	it('estimates the viewport from the frame when the page cannot be measured', async () => {
+		sessions.takeControl('pia');
+		sendCommand.mockImplementation(async (tool: string) =>
+			tool === 'executeJs' ? { id: 'r', success: false, error: 'Cannot access a chrome:// URL' } : { id: 'r', success: true, result: {} },
+		);
+		// A scaled (0.5) frame is CSS px x 0.5 whatever the DPR: a 640x400 frame
+		// is a 1280x800 viewport, so its middle is (640, 400).
+		await sessions.captureFrame('pia');
+
+		await post({ kind: 'tap', x: 320, y: 200, frameWidth: 640, frameHeight: 400 });
+
+		expect(sendCommand).toHaveBeenCalledWith('click', expect.objectContaining({ x: 640, y: 400, tabId: TAB }), expect.any(Number));
+	});
+
+	it('types by inserting at the focused element, and never keeps, echoes or logs the text', async () => {
+		sessions.takeControl('pia');
+		const res = await post({ kind: 'type', text: SECRET });
+
+		expect(res.status).toBe(200);
+		expect(sendCommand).toHaveBeenCalledWith('insertText', { text: SECRET, tabId: TAB }, expect.any(Number));
+
+		// Not in the reply, not on the session, not in any log line.
+		expect(JSON.stringify(res.body)).not.toContain(SECRET);
+		const session = sessions.getSession('pia')!;
+		expect(JSON.stringify(session)).not.toContain(SECRET);
+		expect(session.lastAction).toBe(`You typed ${SECRET.length} characters`);
+		expect(everythingLogged()).not.toContain(SECRET);
+		expect(everythingLogged()).toContain(`"length":${SECRET.length}`);
+
+		const listed = await request(app).get('/api/browser/sessions');
+		expect(JSON.stringify(listed.body)).not.toContain(SECRET);
+	});
+
+	it('does not log the text when typing fails either', async () => {
+		sessions.takeControl('pia');
+		sendCommand.mockImplementation(async () => ({
+			id: 'r',
+			success: true,
+			result: { success: false, length: 0, method: 'cdp', error: 'No focused element' },
+		}));
+
+		const res = await post({ kind: 'type', text: SECRET });
+
+		expect(res.status).toBe(502);
+		expect(JSON.stringify(res.body)).not.toContain(SECRET);
+		expect(everythingLogged()).not.toContain(SECRET);
+	});
+
+	it('sends each kind to the right operation', async () => {
+		sessions.takeControl('pia');
+
+		await post({ kind: 'key', key: 'Enter' });
+		await post({ kind: 'scroll', dy: -400 });
+		await post({ kind: 'navigate', url: 'secure.login.gov' });
+		await post({ kind: 'back' });
+
+		const tools = sendCommand.mock.calls.map((c) => [c[0], c[1]]);
+		expect(tools).toEqual([
+			['executeJs', expect.objectContaining({ code: expect.stringContaining('"Enter"'), tabId: TAB })],
+			// The scroll button measures the page once, then wheels at its middle.
+			['executeJs', expect.objectContaining({ code: expect.stringContaining('visualViewport'), tabId: TAB })],
+			['wheel', { x: 640, y: 400, deltaX: 0, deltaY: -400, tabId: TAB }],
+			['navigate', { url: 'https://secure.login.gov/', tabId: TAB }],
+			['executeJs', expect.objectContaining({ code: expect.stringContaining('history.back()'), tabId: TAB })],
+		]);
+		expect(sessions.getSession('pia')!.url).toBe('https://secure.login.gov/');
+		expect(sessions.getSession('pia')!.control).toBe('owner');
+	});
+
+	it('scrolls with a wheel under the finger when the owner swipes the frame', async () => {
+		sessions.takeControl('pia');
+		// 640x400 frame over a 1280x800 viewport; finger dragged 100 frame px up.
+		const res = await post({ kind: 'swipe', x: 320, y: 300, dx: 0, dy: -100, frameWidth: 640, frameHeight: 400 });
+
+		expect(res.status).toBe(200);
+		expect(sendCommand).toHaveBeenCalledWith('wheel', { x: 640, y: 600, deltaX: 0, deltaY: 200, tabId: TAB }, expect.any(Number));
+		expect(sessions.getSession('pia')!.lastAction).toBe('You scrolled down');
+		expect(res.body.data.frame).toMatchObject({ base64: 'RlJBTUU=' });
+	});
+
+	it('falls back to a document scroll on an extension that has no wheel', async () => {
+		sessions.takeControl('pia');
+		sendCommand.mockImplementation(async (tool: string) => {
+			if (tool === 'executeJs') return { id: 'r', success: true, result: { value: { width: 1280, height: 800 } } };
+			if (tool === 'wheel') return { id: 'r', success: false, error: 'Unknown tool: wheel' };
+			return { id: 'r', success: true, result: { scrolled: true } };
+		});
+
+		const res = await post({ kind: 'swipe', x: 320, y: 300, dx: 0, dy: -100, frameWidth: 640, frameHeight: 400 });
+
+		expect(res.status).toBe(200);
+		expect(sendCommand).toHaveBeenCalledWith('scroll', { x: 0, y: 200, tabId: TAB }, expect.any(Number));
+	});
+
+	it('remembers an old extension: no more wheel attempts, and unscaled frames from then on', async () => {
+		sessions.takeControl('pia');
+		const capturer = jest.fn(async (_agent: string, _opts: { format: string; quality: number; scale?: number }) => ({ base64: 'RlJBTUU=', format: 'jpeg', devicePixelRatio: 2 }));
+		sessions.setCapturer(capturer);
+		sendCommand.mockImplementation(async (tool: string) => {
+			if (tool === 'executeJs') return { id: 'r', success: true, result: { value: { width: 1280, height: 800 } } };
+			if (tool === 'wheel') return { id: 'r', success: false, error: 'Unknown tool: wheel' };
+			return { id: 'r', success: true, result: { scrolled: true } };
+		});
+
+		await post({ kind: 'swipe', x: 320, y: 300, dx: 0, dy: -100, frameWidth: 640, frameHeight: 400 });
+		expect(sessions.isLegacyExtension('pia')).toBe(true);
+		// The frame taken right after already came back unscaled.
+		expect(capturer.mock.calls.at(-1)?.[1]).not.toHaveProperty('scale');
+
+		sendCommand.mockClear();
+		await post({ kind: 'swipe', x: 320, y: 300, dx: 0, dy: -100, frameWidth: 640, frameHeight: 400 });
+		await post({ kind: 'scroll', dy: 400 });
+
+		const tools = sendCommand.mock.calls.map((c) => c[0]);
+		expect(tools).not.toContain('wheel');
+		expect(sendCommand).toHaveBeenCalledWith('scroll', { x: 0, y: 200, tabId: TAB }, expect.any(Number));
+		expect(sendCommand).toHaveBeenCalledWith('scroll', { x: 0, y: 400, tabId: TAB }, expect.any(Number));
+	});
+
+	it('reloading the extension lets each session find out again', async () => {
+		sessions.markLegacyExtension('pia');
+		await request(app).post('/api/browser/extension/reload').send({});
+		expect(sessions.isLegacyExtension('pia')).toBe(false);
+	});
+
+	it('the scroll buttons still work when the page cannot be measured', async () => {
+		sessions.takeControl('pia');
+		sendCommand.mockImplementation(async (tool: string) =>
+			tool === 'executeJs' ? { id: 'r', success: false, error: 'Cannot access a chrome:// URL' } : { id: 'r', success: true, result: {} },
+		);
+
+		const res = await post({ kind: 'scroll', dy: 400 });
+
+		expect(res.status).toBe(200);
+		expect(sendCommand).toHaveBeenCalledWith('scroll', { x: 0, y: 400, tabId: TAB }, expect.any(Number));
+	});
+
+	it('bypasses the irreversible-action hold, which exists to stop agents, not the owner', async () => {
+		sessions.takeControl('pia');
+		const res = await post({ kind: 'key', key: 'Enter' });
+
+		expect(res.status).toBe(200);
+		expect(sessions.getSession('pia')!.pending).toBeUndefined();
+	});
+
+	it('returns a fresh frame with the result, so the phone need not wait for a poll', async () => {
+		sessions.takeControl('pia');
+		const res = await post({ kind: 'scroll', dy: 300 });
+
+		expect(res.body.data.frame).toMatchObject({ base64: 'RlJBTUU=', mimeType: 'image/jpeg', devicePixelRatio: 2 });
+		expect(res.headers['cache-control']).toContain('no-store');
+	});
+
+	it('is a 503 when no browser is connected', async () => {
+		sessions.takeControl('pia');
+		jest.spyOn(BrowserBridgeService.getInstance(), 'isConnected').mockReturnValue(false);
+
+		const res = await post({ kind: 'back' });
+
+		expect(res.status).toBe(503);
+		expect(res.body.code).toBe('NO_BROWSER_CLIENT');
+	});
+});
+
+describe('POST /sessions/:id/pending/:pendingId — with browser approval cards', () => {
+	afterEach(async () => {
+		const { BrowserApprovalService } = await import('../../services/browser/browser-approval.service.js');
+		BrowserApprovalService.setInstance(null);
+	});
+
+	it('answers through the approval service, so the Slack card settles too', async () => {
+		const { BrowserApprovalService } = await import('../../services/browser/browser-approval.service.js');
+		const answerFromBrowserPage = jest.fn().mockResolvedValue({ id: 'vera', agentSession: 'vera', status: 'acting' });
+		BrowserApprovalService.setInstance({ answerFromBrowserPage } as unknown as InstanceType<typeof BrowserApprovalService>);
+		const app = express();
+		app.use(ownerUnlessAgentForTests);
+		app.use(express.json());
+		app.use('/api/browser', createBrowserRouter());
+
+		const ok = await request(app).post('/api/browser/sessions/vera/pending/vera:1:1').send({ decision: 'approve' });
+		expect(ok.status).toBe(200);
+		expect(answerFromBrowserPage).toHaveBeenCalledWith('vera', 'vera:1:1', 'approve');
+		expect(ok.body.data.session).toMatchObject({ agentSession: 'vera' });
+
+		answerFromBrowserPage.mockResolvedValueOnce(undefined);
+		const missing = await request(app).post('/api/browser/sessions/vera/pending/nope').send({ decision: 'reject' });
+		expect(missing.status).toBe(404);
+
+		const bad = await request(app).post('/api/browser/sessions/vera/pending/nope').send({ decision: 'maybe' });
+		expect(bad.status).toBe(400);
+	});
+});
+
+describe('owner-only approvals and no-session bypass (2026-10-03 LinkedIn post)', () => {
+	const makeApp = (): express.Application => {
+		const app = express();
+		app.use(express.json());
+		app.use('/api/browser', createBrowserRouter());
+		return app;
+	};
+
+	afterEach(() => {
+		BrowserBridgeService.resetInstance();
+	});
+
+	it('an agent cannot approve its own held action', async () => {
+		const res = await request(makeApp())
+			.post('/api/browser/sessions/ella/pending/ella:1:1')
+			.set('X-Agent-Session', 'ella')
+			.send({ decision: 'approve' });
+		expect(res.status).toBe(403);
+		expect(res.body.code).toBe('agent_not_owner');
+	});
+
+	it('an agent cannot take control (owner input is never held)', async () => {
+		const res = await request(makeApp())
+			.post('/api/browser/sessions/ella/take-control')
+			.set('X-Agent-Session', 'ella')
+			.send({});
+		expect(res.status).toBe(403);
+	});
+
+	it('an irreversible action without X-Agent-Session is refused, not sent', async () => {
+		const bridge = BrowserBridgeService.getInstance();
+		markBridgeConnected(bridge);
+		const send = jest.spyOn(bridge, 'sendCommand').mockResolvedValue({ id: 'r', success: true, result: {} });
+		const res = await request(makeApp())
+			.post('/api/browser/click')
+			.send({ selector: 'button.comments-comment-box__submit-button' });
+		expect(res.status).toBe(403);
+		expect(res.body.code).toBe('agent_session_required');
+		expect(send).not.toHaveBeenCalled();
+	});
+
+	it('a submitting keystroke from an identified agent is held (409), not sent', async () => {
+		const bridge = BrowserBridgeService.getInstance();
+		markBridgeConnected(bridge);
+		const send = jest.spyOn(bridge, 'sendCommandForAgent').mockResolvedValue({ id: 'r', success: true, result: {} });
+		const res = await request(makeApp())
+			.post('/api/browser/press-key')
+			.set('X-Agent-Session', 'ella-held-key')
+			.send({ key: 'Ctrl+Enter' });
+		expect(res.status).toBe(409);
+		expect(res.body.code).toBe('awaiting_owner');
+		// Only the tab-URL lookup reached the browser; the key did not.
+		expect(send.mock.calls.map((c) => c[1])).toEqual(['getTabs']);
+	});
+});
+
+describe('Crewly tab group is known from startup (crewly#1014 review #4)', () => {
+	it('creating the router subscribes to the tab inventory', async () => {
+		const { resetCrewlyTabsForTesting } = await import('./browser.controller.js');
+		resetCrewlyTabsForTesting();
+		BrowserBridgeService.resetInstance();
+		const spy = jest.spyOn(BrowserBridgeService.getInstance(), 'onTabInventory');
+		createBrowserRouter();
+		expect(spy).toHaveBeenCalledTimes(1);
+		BrowserBridgeService.resetInstance();
+	});
+});

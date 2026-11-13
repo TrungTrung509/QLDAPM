@@ -1,0 +1,540 @@
+/**
+ * AgentDetailModal Component
+ *
+ * Modal dialog for viewing agent details including role and skills.
+ *
+ * @module components/TeamDetail/AgentDetailModal
+ */
+
+import React, { useState, useEffect } from 'react';
+import { Briefcase, Wrench, Check, Plus, X } from 'lucide-react';
+import { Badge } from '@crewly/ui/Badge';
+import { Button } from '@crewly/ui/Button';
+import { FormInput, FormSelect } from '@crewly/ui/Form';
+import { Popup } from '@crewly/ui/Popup';
+import { TeamMember, SUPPORTED_MODELS, RUNTIME_MODEL_PRESETS, RUNTIME_EFFORT_LEVELS, RUNTIME_MODEL_HINTS } from '../../types';
+import { rolesService } from '../../services/roles.service';
+import { RoleWithPrompt, ROLE_CATEGORY_DISPLAY_NAMES } from '../../types/role.types';
+import { useSkills } from '../../hooks/useSkills';
+import { usePeople } from '../../hooks/usePeople';
+import { personName } from '../../services/people.service';
+import { ExpertSelector } from '../TeamBuilder/ExpertSelector';
+import { MEMBER_RUNTIME_LABELS, getSelectableRuntimes, runtimeOptionLabel } from '../../utils/runtime-options';
+import type { AIRuntime } from '../../types/settings.types';
+
+interface AgentDetailModalProps {
+  /** The team member to display details for */
+  member: TeamMember;
+  /** Called when the modal should close */
+  onClose: () => void;
+  /** When true, allows editing agent configuration (runtime type) */
+  isEditable?: boolean;
+  /** Called when the user saves edits. Receives the member ID and partial updates. */
+  onSave?: (memberId: string, updates: Partial<TeamMember>) => void;
+}
+
+/**
+ * Skill with basic display information
+ */
+interface SkillDisplayInfo {
+  id: string;
+  name: string;
+}
+
+/**
+ * Modal for displaying agent details (role, skills, etc.)
+ *
+ * @param props - Component props
+ * @returns AgentDetailModal component
+ */
+export const AgentDetailModal: React.FC<AgentDetailModalProps> = ({ member, onClose, isEditable = false, onSave }) => {
+  const [roleDetails, setRoleDetails] = useState<RoleWithPrompt | null>(null);
+  const [loadingRole, setLoadingRole] = useState(true);
+  const [skillDisplayInfos, setSkillDisplayInfos] = useState<SkillDisplayInfo[]>([]);
+  const [editedRuntime, setEditedRuntime] = useState<string>(member.runtimeType || 'claude-code');
+  const [editedModelId, setEditedModelId] = useState<string>(member.modelId || '');
+  const [editedEffort, setEditedEffort] = useState<string>(member.reasoningEffort || '');
+  const [editedExpertId, setEditedExpertId] = useState<string | undefined>(member.expertId);
+  const [editedDedicatedTo, setEditedDedicatedTo] = useState<string>(member.dedicatedTo || '');
+  const [editedSkillOverrides, setEditedSkillOverrides] = useState<string[]>(member.skillOverrides || []);
+  const [selectedSkillToAdd, setSelectedSkillToAdd] = useState<string>('');
+  const [customSkillName, setCustomSkillName] = useState<string>('');
+  const [isAddingCustom, setIsAddingCustom] = useState<boolean>(false);
+  const { people } = usePeople();
+  const { skills: allSkills } = useSkills();
+
+  const handleAddSkillOverride = (skillId: string) => {
+    const trimmed = skillId.trim();
+    if (!trimmed) return;
+    if (!editedSkillOverrides.includes(trimmed)) {
+      setEditedSkillOverrides((prev) => [...prev, trimmed]);
+    }
+    setSelectedSkillToAdd('');
+    setCustomSkillName('');
+    setIsAddingCustom(false);
+  };
+
+  const handleRemoveAdditionalSkill = (skillId: string) => {
+    setEditedSkillOverrides((prev) => prev.filter((id) => id !== skillId));
+  };
+
+  useEffect(() => {
+    const fetchRoleDetails = async () => {
+      if (member.role) {
+        try {
+          const role = await rolesService.getRole(member.role);
+          setRoleDetails(role);
+        } catch (error) {
+          console.error('Failed to fetch role details:', error);
+        } finally {
+          setLoadingRole(false);
+        }
+      } else {
+        setLoadingRole(false);
+      }
+    };
+
+    fetchRoleDetails();
+  }, [member.role]);
+
+  /**
+   * Resolve skill display info from the already-loaded allSkills array
+   * instead of making individual API calls per skill (N+1 problem).
+   */
+  useEffect(() => {
+    if (!roleDetails && !editedSkillOverrides.length) return;
+
+    const roleSkills = (roleDetails?.assignedSkills || [])
+      .filter(skillId => !member.excludedRoleSkills?.includes(skillId));
+    const allSkillIds = [
+      ...roleSkills,
+      ...editedSkillOverrides
+    ];
+
+    if (allSkillIds.length === 0) return;
+
+    const skillDetails = allSkillIds.map((skillId) => {
+      const existing = allSkills.find(s => s.id === skillId);
+      return {
+        id: skillId,
+        name: existing?.name || skillId,
+      };
+    });
+
+    setSkillDisplayInfos(skillDetails);
+  }, [roleDetails, editedSkillOverrides, member.excludedRoleSkills, loadingRole, allSkills]);
+
+  /**
+   * Get skill info by ID
+   */
+  const getSkillInfo = (skillId: string): SkillDisplayInfo | undefined => {
+    return skillDisplayInfos.find(s => s.id === skillId);
+  };
+
+  /**
+   * Get all skills for this agent (from role + overrides, minus excluded)
+   */
+  const getAllSkillIds = (): string[] => {
+    const roleSkills = (roleDetails?.assignedSkills || [])
+      .filter(skillId => !member.excludedRoleSkills?.includes(skillId));
+    return [...new Set([...roleSkills, ...editedSkillOverrides])];
+  };
+
+  /**
+   * Render a skill badge
+   */
+  const renderSkillBadge = (skillId: string, variant: 'role' | 'additional') => {
+    const skillInfo = getSkillInfo(skillId);
+    const name = skillInfo?.name || skillId;
+
+    return (
+      <div key={skillId} className="inline-flex items-center">
+        <Badge variant={variant === 'role' ? 'primary' : 'success'} size="md" className="gap-1.5 pr-1.5">
+          <Check className="w-3 h-3" />
+          <span>{name}</span>
+          {isEditable && variant === 'additional' && (
+            <button
+              type="button"
+              onClick={() => handleRemoveAdditionalSkill(skillId)}
+              className="ml-1 p-0.5 hover:bg-black/30 rounded-full text-text-secondary-dark hover:text-white transition-colors"
+              title={`Remove ${name}`}
+              aria-label={`Remove ${name}`}
+            >
+              <X className="w-3 h-3" />
+            </button>
+          )}
+        </Badge>
+      </div>
+    );
+  };
+
+  /** Persist the edited runtime/model/expert/skills, then close. */
+  const handleSave = async (): Promise<void> => {
+    if (onSave) {
+      const updates: Partial<TeamMember> = {
+        runtimeType: editedRuntime as TeamMember['runtimeType'],
+        expertId: editedExpertId,
+        skillOverrides: editedSkillOverrides,
+      };
+      // '' clears the override server-side (PUT /members/:id treats '' as "unset").
+      updates.modelId = editedModelId || '';
+      updates.reasoningEffort = editedRuntime === 'crewly-agent' ? '' : (editedEffort || '');
+      // Only send it when changed: editing it is owner-only server-side (issue #968).
+      if (editedDedicatedTo !== (member.dedicatedTo || '')) {
+        updates.dedicatedTo = editedDedicatedTo;
+      }
+      await onSave(member.id, updates);
+    }
+    onClose();
+  };
+
+  const footer = isEditable ? (
+    <>
+      <Button variant="secondary" className="flex-1" onClick={onClose}>
+        Cancel
+      </Button>
+      <Button className="flex-1" onClick={handleSave}>
+        Save
+      </Button>
+    </>
+  ) : (
+    <Button fullWidth onClick={onClose}>
+      Close
+    </Button>
+  );
+
+  return (
+    <Popup
+      isOpen
+      onClose={onClose}
+      title={member.name}
+      subtitle={isEditable ? 'Edit Agent' : 'Agent Details'}
+      size="lg"
+      footer={footer}
+    >
+      {/* Content */}
+      <div className="space-y-6 max-h-[65vh] overflow-y-auto">
+        {/* Role Section */}
+        <div>
+          <div className="flex items-center gap-2 text-sm font-medium text-text-secondary-dark uppercase tracking-wide mb-3">
+            <Briefcase className="w-4 h-4" />
+            Role
+          </div>
+          {loadingRole ? (
+            <div className="animate-pulse">
+              <div className="h-6 bg-background-dark rounded w-32 mb-2"></div>
+              <div className="h-4 bg-background-dark rounded w-full"></div>
+            </div>
+          ) : roleDetails ? (
+            <div className="bg-background-dark/50 rounded-lg p-4">
+              <div className="flex items-center justify-between mb-2">
+                <span className="font-semibold text-text-primary-dark">{roleDetails.displayName}</span>
+                <Badge variant="primary">
+                  {ROLE_CATEGORY_DISPLAY_NAMES[roleDetails.category] || roleDetails.category}
+                </Badge>
+              </div>
+              <p className="text-sm text-text-secondary-dark">{roleDetails.description}</p>
+            </div>
+          ) : (
+            <p className="text-sm text-text-secondary-dark italic">No role assigned</p>
+          )}
+        </div>
+
+        {/* Skills Section */}
+        <div>
+          <div className="flex items-center gap-2 text-sm font-medium text-text-secondary-dark uppercase tracking-wide mb-3">
+            <Wrench className="w-4 h-4" />
+            Skills
+          </div>
+          {loadingRole ? (
+            <div className="animate-pulse flex flex-wrap gap-2">
+              <div className="h-7 bg-background-dark rounded-md w-24"></div>
+              <div className="h-7 bg-background-dark rounded-md w-32"></div>
+              <div className="h-7 bg-background-dark rounded-md w-28"></div>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {/* Skills from Role (excluding member-specific exclusions) */}
+              {roleDetails?.assignedSkills && roleDetails.assignedSkills.length > 0 && (
+                <div>
+                  <p className="text-xs text-text-secondary-dark mb-2 font-medium">From Role</p>
+                  <div className="flex flex-wrap gap-2">
+                    {roleDetails.assignedSkills
+                      .filter(skillId => !member.excludedRoleSkills?.includes(skillId))
+                      .map(skillId =>
+                        renderSkillBadge(skillId, 'role')
+                      )}
+                  </div>
+                </div>
+              )}
+
+              {/* Additional Skills (Overrides) */}
+              <div className="bg-background-dark/40 rounded-xl p-3 border border-border-dark/50">
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-xs text-text-secondary-dark font-medium">Additional Skills</p>
+                  <span className="text-[11px] text-text-secondary-dark">
+                    {editedSkillOverrides.length} skill{editedSkillOverrides.length === 1 ? '' : 's'} assigned
+                  </span>
+                </div>
+
+                {editedSkillOverrides.length > 0 ? (
+                  <div className="flex flex-wrap gap-2 mb-3">
+                    {editedSkillOverrides.map(skillId =>
+                      renderSkillBadge(skillId, 'additional')
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-xs text-text-secondary-dark italic mb-3">No additional skills assigned</p>
+                )}
+
+                {/* Add Additional Skill Controls when Editable */}
+                {isEditable && (
+                  <div className="mt-3 pt-3 border-t border-border-dark/40 space-y-2">
+                    {!isAddingCustom ? (
+                      <div className="flex items-center gap-2">
+                        <FormSelect
+                          aria-label="Select skill to add"
+                          value={selectedSkillToAdd}
+                          onChange={(e) => {
+                            if (e.target.value === '__custom__') {
+                              setIsAddingCustom(true);
+                              setSelectedSkillToAdd('');
+                            } else if (e.target.value) {
+                              handleAddSkillOverride(e.target.value);
+                            }
+                          }}
+                          className="flex-1 text-xs"
+                        >
+                          <option value="">+ Add installed skill...</option>
+                          {allSkills
+                            .filter(s => 
+                              !editedSkillOverrides.includes(s.id) && 
+                              !(roleDetails?.assignedSkills || []).includes(s.id)
+                            )
+                            .map(s => (
+                              <option key={s.id} value={s.id}>
+                                {s.name} ({s.id})
+                              </option>
+                            ))
+                          }
+                          <option value="__custom__">➕ Add custom skill by ID/name...</option>
+                        </FormSelect>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <FormInput
+                          type="text"
+                          placeholder="e.g. manage-ticket-spec, post-team-chat..."
+                          value={customSkillName}
+                          onChange={(e) => setCustomSkillName(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              handleAddSkillOverride(customSkillName);
+                            }
+                          }}
+                          className="flex-1 text-xs"
+                          autoFocus
+                        />
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          type="button"
+                          disabled={!customSkillName.trim()}
+                          onClick={() => handleAddSkillOverride(customSkillName)}
+                        >
+                          Add
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          type="button"
+                          onClick={() => {
+                            setIsAddingCustom(false);
+                            setCustomSkillName('');
+                          }}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* No skills */}
+              {getAllSkillIds().length === 0 && (
+                <p className="text-sm text-text-secondary-dark italic">No skills assigned to this agent</p>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Expert Profile Section */}
+        <div>
+          <ExpertSelector
+            value={editedExpertId}
+            onChange={(id) => {
+              if (isEditable) {
+                setEditedExpertId(id);
+              }
+            }}
+            memberRole={member.role}
+            disabled={!isEditable}
+          />
+        </div>
+
+        {/* Runtime Section */}
+        <div>
+          <div className="flex items-center gap-2 text-sm font-medium text-text-secondary-dark uppercase tracking-wide mb-3">
+            Runtime
+          </div>
+          {isEditable ? (
+            <FormSelect
+              aria-label="Runtime"
+              value={editedRuntime}
+              onChange={(e) => {
+                const runtime = e.target.value;
+                setEditedRuntime(runtime);
+                setEditedModelId(runtime === 'codex-cli' ? 'gpt-6-luna' : '');
+                setEditedEffort('');
+              }}
+            >
+              {getSelectableRuntimes(member.runtimeType).map((runtime) => (
+                <option key={runtime} value={runtime}>
+                  {runtimeOptionLabel(runtime)}
+                </option>
+              ))}
+            </FormSelect>
+          ) : (
+            <div className="bg-background-dark/50 rounded-lg px-4 py-2">
+              <span className="text-sm text-text-primary-dark">
+                {member.runtimeType && member.runtimeType in MEMBER_RUNTIME_LABELS
+                  ? runtimeOptionLabel(member.runtimeType as AIRuntime)
+                  : member.runtimeType || MEMBER_RUNTIME_LABELS['claude-code']}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {/* AI Model — PTY runtimes take the harness's own model name (+ optional effort) */}
+        {editedRuntime !== 'crewly-agent' && (
+          <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <div className="flex items-center gap-2 text-sm font-medium text-text-secondary-dark uppercase tracking-wide mb-3">
+                Model
+              </div>
+              {isEditable ? (
+                <>
+                  <FormInput
+                    aria-label="Model"
+                    list="agent-model-presets"
+                    value={editedModelId}
+                    placeholder="Runtime default"
+                    onChange={(e) => setEditedModelId(e.target.value.trim())}
+                  />
+                  <datalist id="agent-model-presets">
+                    {(RUNTIME_MODEL_PRESETS[editedRuntime] || []).map(m => (
+                      <option key={m.id} value={m.id}>{m.label}</option>
+                    ))}
+                  </datalist>
+                  <p className="mt-1 text-xs text-text-secondary-dark">{RUNTIME_MODEL_HINTS[editedRuntime]}</p>
+                </>
+              ) : (
+                <div className="bg-background-dark/50 rounded-lg px-4 py-2">
+                  <span className="text-sm text-text-primary-dark">{member.modelId || 'Runtime default'}</span>
+                </div>
+              )}
+            </div>
+            {(RUNTIME_EFFORT_LEVELS[editedRuntime] || []).length > 0 && (
+              <div>
+                <div className="flex items-center gap-2 text-sm font-medium text-text-secondary-dark uppercase tracking-wide mb-3">
+                  Reasoning effort
+                </div>
+                {isEditable ? (
+                  <FormSelect
+                    aria-label="Reasoning effort"
+                    value={editedEffort}
+                    onChange={(e) => setEditedEffort(e.target.value)}
+                  >
+                    <option value="">Default</option>
+                    {RUNTIME_EFFORT_LEVELS[editedRuntime].map(level => (
+                      <option key={level} value={level}>{level}</option>
+                    ))}
+                  </FormSelect>
+                ) : (
+                  <div className="bg-background-dark/50 rounded-lg px-4 py-2">
+                    <span className="text-sm text-text-primary-dark">{member.reasoningEffort || 'Default'}</span>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* AI Model — crewly-agent picks provider/model */}
+        {editedRuntime === 'crewly-agent' && (
+          <div className="mt-4">
+            <div className="flex items-center gap-2 text-sm font-medium text-text-secondary-dark uppercase tracking-wide mb-3">
+              AI Model
+            </div>
+            {isEditable ? (
+              <FormSelect
+                aria-label="AI Model"
+                value={editedModelId}
+                onChange={(e) => setEditedModelId(e.target.value)}
+              >
+                <option value="">Default</option>
+                {SUPPORTED_MODELS.map(m => (
+                  <option key={m.id} value={m.id}>{m.label}</option>
+                ))}
+              </FormSelect>
+            ) : (
+              <div className="bg-background-dark/50 rounded-lg px-4 py-2">
+                <span className="text-sm text-text-primary-dark">
+                  {member.modelId
+                    ? SUPPORTED_MODELS.find(m => m.id === member.modelId)?.label || member.modelId
+                    : 'Default'}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+        {/* Works for — a dedicated agent politely declines everyone else (issue #968) */}
+        <div className="mt-4">
+          <div className="flex items-center gap-2 text-sm font-medium text-text-secondary-dark uppercase tracking-wide mb-3">
+            Works for
+          </div>
+          {isEditable ? (
+            <>
+              <FormSelect
+                aria-label="Works for"
+                value={editedDedicatedTo}
+                onChange={(e) => setEditedDedicatedTo(e.target.value)}
+              >
+                <option value="">Anyone (shared)</option>
+                {editedDedicatedTo && !people.some(p => p.id === editedDedicatedTo) && (
+                  <option value={editedDedicatedTo}>{editedDedicatedTo}</option>
+                )}
+                {people.filter(p => p.id !== 'owner').map(p => (
+                  <option key={p.id} value={p.id}>{personName(p.id, people)}</option>
+                ))}
+              </FormSelect>
+              <p className="mt-1 text-xs text-text-secondary-dark">
+                A personal assistant only takes requests from its person; anyone else gets a polite pointer to the team lead.
+              </p>
+            </>
+          ) : (
+            <div className="bg-background-dark/50 rounded-lg px-4 py-2">
+              <span className="text-sm text-text-primary-dark">
+                {member.dedicatedTo ? personName(member.dedicatedTo, people) : 'Anyone (shared)'}
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    </Popup>
+  );
+};
+
+export default AgentDetailModal;

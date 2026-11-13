@@ -1,0 +1,324 @@
+import { CommunicationModule } from './communication.module.js';
+import { ModuleConfig } from './prompt-module.interface.js';
+
+// Mock fs for fragment loading
+jest.mock('fs', () => ({
+	existsSync: jest.fn().mockReturnValue(false),
+	readFileSync: jest.fn().mockReturnValue(''),
+}));
+
+describe('CommunicationModule', () => {
+	let module: CommunicationModule;
+
+	const baseConfig: ModuleConfig = {
+		sessionName: 'crewly-product-sam-217bfbbf',
+		memberId: '217bfbbf-9c90-41ec-bf93-b7fca1b5934f',
+		role: 'developer',
+		teamId: '817a1aeb-b04e-45dd-bdbc-be5cbc4345f1',
+		projectPath: '/Users/user/projects/crewly',
+		agentSkillsPath: '/path/to/skills/agent',
+		tlSkillsPath: '/path/to/skills/team-leader',
+		projectRoot: '/path/to/project',
+	};
+
+	beforeEach(() => {
+		module = new CommunicationModule();
+	});
+
+	it('every role gets the one-thread-per-answer Slack rule (2026-09-28)', async () => {
+		for (const config of [
+			baseConfig,
+			{ ...baseConfig, role: 'team-leader', canDelegate: true },
+			{ ...baseConfig, role: 'orchestrator' },
+		] as ModuleConfig[]) {
+			const result = await module.build(config);
+			expect(result).toContain('### Slack Threads');
+			expect(result).toContain('[SLACK-THREAD:<key>]');
+			expect(result).toContain('--thread <key>');
+			expect(result).toContain('Never bundle answers for different threads');
+		}
+	});
+
+	it('Claude Code agents of every role learn that [OWNER MESSAGE] notes are real owner messages; other runtimes do not get it', async () => {
+		for (const config of [
+			baseConfig,
+			{ ...baseConfig, runtimeType: 'claude-code' },
+			{ ...baseConfig, role: 'team-leader', canDelegate: true, runtimeType: 'claude-code' },
+			{ ...baseConfig, role: 'orchestrator', runtimeType: 'claude-code' },
+		] as ModuleConfig[]) {
+			const result = await module.build(config);
+			expect(result.startsWith('### Owner Messages During a Turn')).toBe(true);
+			expect(result).toContain('[OWNER MESSAGE]');
+			expect(result).toContain('Do not wait until the task is finished.');
+		}
+		for (const runtimeType of ['codex', 'gemini-cli', 'crewly-agent'] as const) {
+			expect(await module.build({ ...baseConfig, runtimeType })).not.toContain('[OWNER MESSAGE]');
+		}
+	});
+
+	it('should have correct metadata', () => {
+		expect(module.name).toBe('communication');
+		expect(module.priority).toBe(8);
+		expect(module.maxTokens).toBe(2000);
+		expect(module.compactable).toBe(true);
+	});
+
+	it('should always be included', () => {
+		expect(module.shouldInclude(baseConfig)).toBe(true);
+		expect(module.shouldInclude({ ...baseConfig, role: 'orchestrator' })).toBe(true);
+	});
+
+	describe('worker communication (default)', () => {
+		it('should build compact worker communication', async () => {
+			const result = await module.build(baseConfig);
+
+			expect(result).toContain('## Communication');
+			expect(result).toContain('report-status');
+			expect(result).toContain('send-message');
+			expect(result).toContain(baseConfig.sessionName);
+		});
+
+		it('should include report-status command with correct paths', async () => {
+			const result = await module.build(baseConfig);
+
+			expect(result).toContain(baseConfig.agentSkillsPath);
+			expect(result).toContain('report-status');
+			expect(result).toContain(baseConfig.projectPath);
+		});
+
+		it('should include concise rules', async () => {
+			const result = await module.build(baseConfig);
+
+			expect(result).toContain('Report progress periodically');
+			expect(result).toContain('Report blockers immediately');
+		});
+
+		it('states the completion evidence contract (#873)', async () => {
+			const result = await module.build(baseConfig);
+
+			expect(result).toContain('### Reporting Done — Evidence Contract');
+			expect(result).toContain('--artifact <path>');
+			expect(result).toContain('--exit-code <n>');
+			expect(result).toContain('--blocked-step');
+			expect(result).toContain('a non-zero exit code is not done');
+		});
+
+		it('should not include orchestrator-specific content', async () => {
+			const result = await module.build(baseConfig);
+
+			expect(result).not.toContain('Message Channels');
+			expect(result).not.toContain('Slack mrkdwn');
+			expect(result).not.toContain('NOTIFY');
+		});
+	});
+
+	describe('orchestrator communication', () => {
+		const orchConfig: ModuleConfig = { ...baseConfig, role: 'orchestrator' };
+
+		it('should build full communication protocol', async () => {
+			const result = await module.build(orchConfig);
+
+			expect(result).toContain('## Communication Protocol');
+			expect(result).toContain('### Message Channels');
+			expect(result).toContain('### Message Routing Rules');
+			expect(result).toContain('### Slack Communication');
+			expect(result).toContain('### Google Chat Communication');
+			// [REMOTE:...] is answered, never initiated; new cross-machine talk goes through Slack.
+			expect(result).toContain('legacy cross-machine channel');
+			expect(result).toContain('shared Slack team channel');
+			expect(result).toContain('### Chat UI Communication');
+			expect(result).toContain('### Notification Protocol');
+			expect(result).toContain('### Thread Context');
+		});
+
+		it('should include Slack formatting rules', async () => {
+			const result = await module.build(orchConfig);
+
+			expect(result).toContain('mrkdwn');
+			expect(result).toContain('Bold:');
+			expect(result).toContain('reply-slack');
+		});
+
+		it('should include Google Chat reply routing instructions', async () => {
+			const result = await module.build(orchConfig);
+
+			expect(result).toContain('reply-gchat');
+			expect(result).toContain('[GCHAT:');
+			expect(result).toContain('--thread');
+			expect(result).toContain('--space');
+		});
+
+		it('should include message source prefix routing rules', async () => {
+			const result = await module.build(orchConfig);
+
+			expect(result).toContain('[CHAT:...]');
+			expect(result).toContain('[GCHAT:...]');
+			expect(result).toContain('[SLACK:...]');
+			expect(result).toContain('[REMOTE:...]');
+			expect(result).toContain('Match the reply skill to the message source prefix');
+		});
+
+		it('should include NOTIFY marker handling', async () => {
+			const result = await module.build(orchConfig);
+
+			expect(result).toContain('[NOTIFY]');
+			expect(result).toContain('Never forward raw NOTIFY markers');
+		});
+
+		it('should include communication skills with correct paths', async () => {
+			const result = await module.build(orchConfig);
+
+			expect(result).toContain(`${orchConfig.agentSkillsPath}/core/report-status`);
+			// The orchestrator sends through its own orc-namespaced send-message
+			// wrapper (readiness-aware /deliver), never the agent-side
+			// core/send-message (raw /write) — see buildOrchestratorComms JSDoc.
+			expect(result).toContain(`${orchConfig.projectRoot}/config/skills/orchestrator/send-message/execute.sh`);
+			expect(result).not.toContain(`${orchConfig.agentSkillsPath}/core/send-message`);
+		});
+	});
+
+	describe('team leader communication', () => {
+		const tlConfig: ModuleConfig = { ...baseConfig, role: 'team-leader', canDelegate: true };
+
+		it('tells the TL that done needs evidence and to read it first when verifying (#873)', async () => {
+			const result = await module.build(tlConfig);
+
+			expect(result).toContain('**Done needs evidence**');
+			expect(result).toContain('read its evidence first');
+		});
+
+		it('should build TL communication with delegation focus', async () => {
+			const result = await module.build(tlConfig);
+
+			expect(result).toContain('## Communication Protocol');
+			expect(result).toContain('### Reporting to Orchestrator');
+			expect(result).toContain('### Messaging Workers');
+			expect(result).toContain('### Delegating Tasks');
+			expect(result).toContain('### Communication Rules');
+		});
+
+		it('should include delegate-task example with TL skills path', async () => {
+			const result = await module.build(tlConfig);
+
+			expect(result).toContain('delegate-task');
+			expect(result).toContain(tlConfig.tlSkillsPath);
+			expect(result).toContain('delegate-task/execute.sh');
+		});
+
+		it('should include TL_REPORT tag instruction', async () => {
+			const result = await module.build(tlConfig);
+
+			expect(result).toContain('[TL_REPORT]');
+		});
+
+		it('should include both report-status and send-message', async () => {
+			const result = await module.build(tlConfig);
+
+			expect(result).toContain('report-status');
+			expect(result).toContain('send-message');
+			expect(result).toContain(tlConfig.sessionName);
+		});
+
+		it('should not include orchestrator-only content', async () => {
+			const result = await module.build(tlConfig);
+
+			expect(result).not.toContain('Slack mrkdwn');
+			expect(result).not.toContain('[NOTIFY]');
+			expect(result).not.toContain('Message Channels');
+		});
+	});
+
+	describe('projectPath fallback', () => {
+		it('should use projectRoot when projectPath is undefined', async () => {
+			const noPathConfig: ModuleConfig = {
+				...baseConfig,
+				projectPath: undefined,
+			};
+			const result = await module.build(noPathConfig);
+
+			expect(result).toContain(baseConfig.projectRoot);
+		});
+	});
+
+	describe('gemini-cli safe call pattern (#EOF-fix)', () => {
+		it('should use CLI flags pattern for gemini-cli workers', async () => {
+			const geminiConfig: ModuleConfig = { ...baseConfig, runtimeType: 'gemini-cli' };
+			const result = await module.build(geminiConfig);
+
+			// Should use CLI flags like --session, --status, --summary
+			expect(result).toContain('--session');
+			expect(result).toContain('--status');
+			expect(result).toContain('--summary');
+			expect(result).toContain('--to');
+			expect(result).toContain('--message');
+			// Should NOT use printf pattern
+			expect(result).not.toContain("printf '%s'");
+		});
+
+		it('should use inline JSON for non-gemini workers', async () => {
+			const claudeConfig: ModuleConfig = { ...baseConfig, runtimeType: 'claude-code' };
+			const result = await module.build(claudeConfig);
+
+			expect(result).not.toContain('--file /tmp/crewly_skill_input.json');
+			expect(result).toContain("execute.sh '");
+		});
+
+		it('should use CLI flags for gemini-cli TLs', async () => {
+			const geminiTLConfig: ModuleConfig = { ...baseConfig, role: 'team-leader', canDelegate: true, runtimeType: 'gemini-cli' };
+			const result = await module.build(geminiTLConfig);
+
+			expect(result).toContain('--to');
+			expect(result).toContain('--task');
+			expect(result).toContain('--priority');
+		});
+
+		it('should use CLI flags for delegate-task with TL skills path for gemini-cli TLs', async () => {
+			const geminiTLConfig: ModuleConfig = { ...baseConfig, role: 'team-leader', canDelegate: true, runtimeType: 'gemini-cli' };
+			const result = await module.build(geminiTLConfig);
+
+			expect(result).toContain(`${geminiTLConfig.tlSkillsPath}/delegate-task/execute.sh --to`);
+		});
+
+		it('should use CLI flags for gemini-cli orchestrators', async () => {
+			const geminiOrcConfig: ModuleConfig = { ...baseConfig, role: 'orchestrator', runtimeType: 'gemini-cli' };
+			const result = await module.build(geminiOrcConfig);
+
+			expect(result).toContain('--session');
+			expect(result).toContain('--status');
+		});
+	});
+
+	describe('fragment loading', () => {
+		it('should load fragment for orchestrator when available', async () => {
+			const fs = require('fs');
+			fs.existsSync.mockReturnValueOnce(true);
+			fs.readFileSync.mockReturnValueOnce('# Custom Orchestrator Communication\nLoaded from fragment');
+
+			const orchConfig: ModuleConfig = { ...baseConfig, role: 'orchestrator' };
+			const result = await module.build(orchConfig);
+
+			expect(result).toContain('Custom Orchestrator Communication');
+			expect(result).toContain('Loaded from fragment');
+		});
+
+		it('should fall back to inline content when fragment not found', async () => {
+			const fs = require('fs');
+			fs.existsSync.mockReturnValue(false);
+
+			const orchConfig: ModuleConfig = { ...baseConfig, role: 'orchestrator' };
+			const result = await module.build(orchConfig);
+
+			expect(result).toContain('## Communication Protocol');
+		});
+
+		it('should not attempt fragment loading for non-orchestrator roles', async () => {
+			const fs = require('fs');
+			fs.existsSync.mockClear();
+
+			const result = await module.build(baseConfig);
+
+			expect(result).toContain('## Communication');
+			// Worker path doesn't call loadRoleFragment
+		});
+	});
+});

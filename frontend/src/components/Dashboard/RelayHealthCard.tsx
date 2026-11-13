@@ -1,0 +1,474 @@
+/**
+ * RelayHealthCard Component
+ *
+ * Dashboard card showing live Cloud Relay connection health:
+ * connected devices, real-time latency (ping), last-seen timestamps,
+ * and E2EE encryption status.
+ *
+ * Self-contained — fetches its own data via useEffect polling.
+ *
+ * @module components/Dashboard/RelayHealthCard
+ */
+
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Monitor, Cpu, RefreshCw, Shield, Wifi, WifiOff, Activity } from 'lucide-react';
+import { formatRelativeTimeCompact } from '../../utils/time';
+import { Alert } from '@crewly/ui/Alert';
+import { Badge, type BadgeVariant } from '@crewly/ui/Badge';
+import { Button, IconButton } from '@crewly/ui/Button';
+import { LoadingSpinner } from '@crewly/ui/LoadingSpinner';
+import { setVisibleInterval } from '../../utils/visible-interval';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Relay local status endpoint. */
+const RELAY_STATUS_URL = '/api/relay/devices';
+
+/** Cloud devices endpoint. */
+const CLOUD_DEVICES_URL = '/api/cloud/devices';
+
+/** Legacy cloud devices endpoint used as a fallback when needed. */
+const LEGACY_CLOUD_DEVICES_URL = '/api/relay/cloud-devices';
+
+/** Polling interval for latency pings (ms). */
+const PING_INTERVAL_MS = 5000;
+
+/** Polling interval for device list refresh (ms). */
+const DEVICE_REFRESH_INTERVAL_MS = 30000;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** A relay device returned by the Cloud devices API. */
+interface CloudDevice {
+  sessionId?: string;
+  deviceId?: string;
+  role?: 'orchestrator' | 'agent';
+  state?: 'waiting' | 'paired' | 'disconnected';
+  status?: 'online' | 'offline';
+  pairedWith?: string | null;
+  registeredAt?: string;
+  lastHeartbeatAt?: string;
+  name?: string;
+  deviceName?: string;
+  isLocal?: boolean;
+}
+
+/** Local relay client status. */
+interface RelayStatus {
+  state: string;
+  sessionId: string | null;
+}
+
+/** Overall card state. */
+type CardState = 'loading' | 'disconnected' | 'connected' | 'error';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+
+/** Map device state to status dot color CSS class. */
+const DEVICE_STATE_COLORS: Record<string, string> = {
+  waiting: 'bg-yellow-400',
+  paired: 'bg-emerald-400',
+  disconnected: 'bg-text-secondary-dark',
+  online: 'bg-emerald-400',
+  offline: 'bg-text-secondary-dark',
+};
+
+/** Map device state to human-readable label. */
+const DEVICE_STATE_LABELS: Record<string, string> = {
+  waiting: 'Connecting',
+  paired: 'Connected',
+  disconnected: 'Offline',
+  online: 'Online',
+  offline: 'Offline',
+};
+
+/** Map overall relay state to status badge styling. */
+const RELAY_STATUS_BADGES: Record<string, { label: string; variant: BadgeVariant }> = {
+  paired: { label: 'Connected', variant: 'success' },
+  registered: { label: 'Registered', variant: 'warning' },
+  connecting: { label: 'Connecting', variant: 'warning' },
+  disconnected: { label: 'Offline', variant: 'default' },
+  error: { label: 'Error', variant: 'error' },
+};
+
+/**
+ * Measure round-trip latency to the relay status endpoint.
+ *
+ * @returns Latency in milliseconds, or null if unreachable
+ */
+async function measureLatency(): Promise<number | null> {
+  try {
+    const start = performance.now();
+    const res = await fetch(RELAY_STATUS_URL);
+    const end = performance.now();
+    if (!res.ok) return null;
+    return Math.round(end - start);
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
+
+/**
+ * Individual device row within the relay health card.
+ *
+ * @param props - Device data
+ * @returns DeviceRow component
+ */
+const DeviceRow: React.FC<{ device: CloudDevice }> = ({ device }) => {
+  const Icon = device.role === 'orchestrator' ? Monitor : Cpu;
+  const deviceStatus = device.status || device.state || 'disconnected';
+  const stateColor = DEVICE_STATE_COLORS[deviceStatus] ?? 'bg-text-secondary-dark';
+  const stateLabel = DEVICE_STATE_LABELS[deviceStatus] ?? deviceStatus;
+  const id = device.deviceId || device.sessionId || 'unknown-device';
+  const displayName = device.name || device.deviceName || (device.sessionId ? `${device.role || 'device'} (${device.sessionId.slice(0, 8)}...)` : id);
+  const heartbeatTime = device.lastHeartbeatAt || device.registeredAt;
+
+  return (
+    <div
+      data-testid={`relay-device-${id}`}
+      className={`flex items-center justify-between p-4 rounded-xl border transition-colors ${
+        device.isLocal
+          ? 'bg-primary/5 border-primary/20'
+          : 'border-border-dark bg-background-dark/50 hover:border-primary/20'
+      }`}
+    >
+      <div className="flex items-center gap-3 min-w-0">
+        <div className={`p-2 rounded-lg ${device.isLocal ? 'bg-primary/10' : 'bg-surface-dark'}`}>
+          <Icon className={`w-4 h-4 flex-shrink-0 ${device.isLocal ? 'text-primary' : 'text-text-secondary-dark'}`} />
+        </div>
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-text-primary-dark truncate">
+              {displayName}
+            </span>
+            {device.isLocal && (
+              <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-primary/10 text-primary whitespace-nowrap">
+                You
+              </span>
+            )}
+          </div>
+          <span className="text-xs text-text-secondary-dark">
+            {heartbeatTime ? `Last seen ${formatRelativeTimeCompact(heartbeatTime)}` : 'Status unavailable'}
+          </span>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-1.5 ml-3 flex-shrink-0">
+        <span className={`h-2 w-2 rounded-full ${stateColor}`} />
+        <span className="text-xs text-text-secondary-dark">{stateLabel}</span>
+      </div>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Main Component
+// ---------------------------------------------------------------------------
+
+/**
+ * RelayHealthCard — Dashboard card for Cloud Relay status.
+ *
+ * Features:
+ * - Live device list with role icons and status indicators
+ * - Real-time latency (ping) updated every 5 seconds
+ * - Last-seen timestamps per device
+ * - E2EE shield icon when encryption is active
+ * - Graceful "Not Connected" state when relay is inactive
+ *
+ * @returns RelayHealthCard component
+ */
+export const RelayHealthCard: React.FC = () => {
+  const navigate = useNavigate();
+  const [cardState, setCardState] = useState<CardState>('loading');
+  const [relayStatus, setRelayStatus] = useState<RelayStatus | null>(null);
+  const [devices, setDevices] = useState<CloudDevice[]>([]);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  /** Track intervals for cleanup. */
+  const pingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const deviceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  /** Stop polling when endpoint is unavailable (e.g. 404). */
+  const endpointUnavailableRef = useRef(false);
+
+  /** Clear all polling intervals. */
+  const stopPolling = useCallback(() => {
+    if (pingIntervalRef.current) { clearInterval(pingIntervalRef.current); pingIntervalRef.current = null; }
+    if (deviceIntervalRef.current) { clearInterval(deviceIntervalRef.current); deviceIntervalRef.current = null; }
+  }, []);
+
+  const fetchCloudDevices = useCallback(async (): Promise<CloudDevice[]> => {
+    const response = await fetch(CLOUD_DEVICES_URL);
+    const data = await response.json();
+
+    if (response.ok && data.success && data.data) {
+      if (Array.isArray(data.data.devices) && data.data.devices.length > 0) {
+        return data.data.devices;
+      }
+
+      if (data.data.syncState && data.data.syncState !== 'stopped') {
+        return data.data.devices || [];
+      }
+    }
+
+    const legacyResponse = await fetch(LEGACY_CLOUD_DEVICES_URL);
+    const legacyData = await legacyResponse.json();
+
+    if (legacyResponse.ok && legacyData.success && Array.isArray(legacyData.data?.devices)) {
+      return legacyData.data.devices;
+    }
+
+    return data?.data?.devices || [];
+  }, []);
+
+  /**
+   * Fetch relay status and cloud devices.
+   * Determines overall card state from the relay client state.
+   * Stops polling if the endpoint returns 404 (not registered).
+   */
+  const fetchData = useCallback(async () => {
+    try {
+      setError(null);
+
+      // Fetch local relay status
+      const statusRes = await fetch(RELAY_STATUS_URL);
+
+      // Stop polling if the relay endpoint doesn't exist
+      if (statusRes.status === 404) {
+        endpointUnavailableRef.current = true;
+        stopPolling();
+        setCardState('disconnected');
+        setDevices([]);
+        return;
+      }
+
+      const statusData = await statusRes.json();
+
+      if (!statusRes.ok || !statusData.success) {
+        setCardState('error');
+        setError(statusData.error || 'Failed to fetch relay status');
+        return;
+      }
+
+      const client: RelayStatus = statusData.data.client;
+      setRelayStatus(client);
+
+      // If relay is disconnected, show disconnected state
+      if (client.state === 'disconnected' || !client.sessionId) {
+        setCardState('disconnected');
+        setDevices([]);
+        return;
+      }
+
+      // Fetch cloud devices
+      setDevices(await fetchCloudDevices());
+
+      setCardState('connected');
+    } catch {
+      setCardState('error');
+      setError('Could not reach the server');
+    }
+  }, [fetchCloudDevices, stopPolling]);
+
+  /**
+   * Ping for latency measurement. Skips when endpoint is unavailable.
+   */
+  const pingLatency = useCallback(async () => {
+    if (endpointUnavailableRef.current) return;
+    const ms = await measureLatency();
+    setLatencyMs(ms);
+  }, []);
+
+  /**
+   * Manual refresh handler — fetches data and measures latency.
+   * Re-enables polling if the endpoint has become available again.
+   */
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    endpointUnavailableRef.current = false;
+    await Promise.all([fetchData(), pingLatency()]);
+
+    // Restart polling if the endpoint is now available
+    if (!endpointUnavailableRef.current) {
+      if (!pingIntervalRef.current) pingIntervalRef.current = setVisibleInterval(pingLatency, PING_INTERVAL_MS);
+      if (!deviceIntervalRef.current) deviceIntervalRef.current = setVisibleInterval(fetchData, DEVICE_REFRESH_INTERVAL_MS);
+    }
+    setRefreshing(false);
+  }, [fetchData, pingLatency]);
+
+  /**
+   * Initial data load and polling setup.
+   */
+  useEffect(() => {
+    // Initial fetch
+    fetchData();
+    pingLatency();
+
+    // Set up polling intervals
+    pingIntervalRef.current = setVisibleInterval(pingLatency, PING_INTERVAL_MS);
+    deviceIntervalRef.current = setVisibleInterval(fetchData, DEVICE_REFRESH_INTERVAL_MS);
+
+    return () => {
+      stopPolling();
+    };
+  }, [fetchData, pingLatency, stopPolling]);
+
+  // -------------------------------------------------------------------------
+  // Derived values
+  // -------------------------------------------------------------------------
+
+  const relayState = relayStatus?.state ?? 'disconnected';
+  const statusBadge = RELAY_STATUS_BADGES[relayState] ?? RELAY_STATUS_BADGES.disconnected;
+  const pairedDevices = devices.filter((d) => d.state === 'paired' || d.status === 'online');
+  const isEncrypted = pairedDevices.length > 0; // E2EE is always active when paired
+
+  // -------------------------------------------------------------------------
+  // Render
+  // -------------------------------------------------------------------------
+
+  return (
+    <div
+      data-testid="relay-health-card"
+      className="bg-surface-dark border border-border-dark rounded-xl p-6 transition-all hover:shadow-lg hover:border-primary/50"
+    >
+      {/* Header */}
+      <div className="flex items-start justify-between gap-3 mb-5">
+        <div className="flex items-start gap-3">
+          <div className="p-2 rounded-xl bg-primary/10">
+            <Wifi className="w-4 h-4 text-primary" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h3 className="text-base font-semibold text-text-primary-dark">Cloud Relay</h3>
+              <Badge variant={statusBadge.variant}>
+                {statusBadge.label}
+              </Badge>
+            </div>
+            <p className="text-sm text-text-secondary-dark mt-1">
+              Live device link health, latency, and secure pairing status.
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {isEncrypted && (
+            <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium">
+              <Shield className="w-3.5 h-3.5" />
+              E2EE
+            </div>
+          )}
+          <IconButton
+            icon={RefreshCw}
+            size="sm"
+            onClick={handleRefresh}
+            loading={refreshing}
+            aria-label="Refresh relay status"
+            data-testid="relay-refresh-button"
+          />
+        </div>
+      </div>
+
+      {/* Loading state */}
+      {cardState === 'loading' && (
+        <div className="flex items-center justify-center py-10" data-testid="relay-loading">
+          <LoadingSpinner size="sm" />
+        </div>
+      )}
+
+      {/* Error state */}
+      {cardState === 'error' && error && (
+        <Alert variant="error" size="sm" data-testid="relay-error">
+          {error}
+        </Alert>
+      )}
+
+      {/* Disconnected state */}
+      {cardState === 'disconnected' && (
+        <div className="text-center py-8" data-testid="relay-disconnected">
+          <WifiOff className="w-8 h-8 text-text-secondary-dark/30 mx-auto mb-2" />
+          <p className="text-sm text-text-primary-dark font-medium">Not Connected</p>
+          <p className="text-sm text-text-secondary-dark mt-1 mb-4">
+            Enable Cloud Relay in Settings → Cloud to link another device.
+          </p>
+          <Button
+            type="button"
+            onClick={() => navigate('/settings?tab=cloud')}
+            data-testid="relay-settings-cta"
+          >
+            Open Cloud Settings
+          </Button>
+        </div>
+      )}
+
+      {/* Connected state */}
+      {cardState === 'connected' && (
+        <div className="space-y-4">
+          {/* Stats row: Latency + Encryption + Device count */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
+            {/* Latency */}
+            <div className="flex items-center gap-2 px-3 py-3 rounded-xl bg-background-dark/60 border border-border-dark" data-testid="relay-latency">
+              <Activity className="w-4 h-4 text-text-secondary-dark" />
+              <span className="text-text-secondary-dark">
+                Ping{' '}
+                <span className={`font-medium ${
+                  latencyMs === null
+                    ? 'text-text-secondary-dark'
+                    : latencyMs < 100
+                      ? 'text-emerald-400'
+                      : latencyMs < 300
+                        ? 'text-yellow-400'
+                        : 'text-rose-400'
+                }`}>
+                  {latencyMs !== null ? `${latencyMs}ms` : '—'}
+                </span>
+              </span>
+            </div>
+
+            {/* E2EE indicator */}
+            <div className="flex items-center gap-2 px-3 py-3 rounded-xl bg-background-dark/60 border border-border-dark" data-testid="relay-e2ee">
+              <Shield className={`w-4 h-4 ${isEncrypted ? 'text-emerald-400' : 'text-text-secondary-dark'}`} />
+              <span className={isEncrypted ? 'text-emerald-400 font-medium' : 'text-text-secondary-dark'}>
+                {isEncrypted ? 'E2EE active' : 'Secure standby'}
+              </span>
+            </div>
+
+            {/* Device count */}
+            <div className="flex items-center gap-2 px-3 py-3 rounded-xl bg-background-dark/60 border border-border-dark text-text-secondary-dark">
+              <Wifi className="w-4 h-4" />
+              <span>{devices.length} device{devices.length !== 1 ? 's' : ''}</span>
+            </div>
+          </div>
+
+          {/* Device list */}
+          {devices.length === 0 ? (
+            <div className="text-center py-6 rounded-xl bg-background-dark/40 border border-border-dark" data-testid="relay-no-devices">
+              <Monitor className="w-6 h-6 text-text-secondary-dark/30 mx-auto mb-1" />
+              <p className="text-sm text-text-secondary-dark">No devices found</p>
+            </div>
+          ) : (
+            <div className="space-y-2" data-testid="relay-device-list">
+              {devices.map((device) => (
+                <DeviceRow key={device.deviceId || device.sessionId || `${device.name}-${device.role}`} device={device} />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default RelayHealthCard;

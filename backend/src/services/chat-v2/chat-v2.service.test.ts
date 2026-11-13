@@ -1,0 +1,2833 @@
+/**
+ * Tests for ChatV2Service — wire of stores + authorization + DTO mapping.
+ *
+ * @module services/chat-v2/chat-v2.service.test
+ */
+
+import { ChatV2Service } from './chat-v2.service.js';
+import { openChatDatabase, type ChatDatabase } from './sqlite/chat-db.js';
+import { loadChatV2Config } from './config.js';
+import { ChatError, type ChatPrincipal } from './types.js';
+import { evaluateColdLaunch } from '../orchestrator/commitment-approval-guard.js';
+
+describe('ChatV2Service', () => {
+  let db: ChatDatabase;
+  let service: ChatV2Service;
+
+  const owner: ChatPrincipal = { userId: 'user-a', source: 'oss' };
+  const otherUser: ChatPrincipal = { userId: 'user-b', source: 'oss' };
+  const agentPrincipal: ChatPrincipal = {
+    userId: 'agent-principal', // distinct so we can see agent path vs owner path
+    agentSession: 'sess-a',
+    source: 'oss',
+  };
+
+  beforeEach(() => {
+    db = openChatDatabase({ dbPath: ':memory:', inMemory: true, skipIntegrityCheck: true });
+    service = new ChatV2Service({
+      config: loadChatV2Config({}),
+      db,
+      getPresence: () => ({ status: 'online', lastSeenAt: 1234 }),
+      now: () => 1000,
+    });
+  });
+
+  afterEach(() => {
+    service.close();
+  });
+
+  function createSam() {
+    return service.createChannel({
+      agentSession: 'sess-a',
+      name: 'Sam backend',
+      principal: owner,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // createChannel
+  // -------------------------------------------------------------------------
+
+  describe('createChannel', () => {
+    it('creates a channel owned by the caller, ignoring any client-supplied owner', () => {
+      const dto = createSam();
+      expect(dto.agentSession).toBe('sess-a');
+      expect(dto.name).toBe('Sam backend');
+      expect(dto.agentPresence.status).toBe('online');
+      expect(dto.agentPresence.lastSeenAt).toBe(1234);
+    });
+
+    it.each([
+      ['', 'name is required'],
+      ['   ', 'name is required'],
+    ])('rejects blank name %s', (name, errMsg) => {
+      expect(() =>
+        service.createChannel({ agentSession: 'sess-a', name, principal: owner }),
+      ).toThrow(errMsg);
+    });
+
+    it('rejects names > config.maxChannelNameChars', () => {
+      const long = 'a'.repeat(200);
+      expect(() =>
+        service.createChannel({ agentSession: 'sess-a', name: long, principal: owner }),
+      ).toThrow(/exceeds/);
+    });
+
+    it('rejects empty agentSession', () => {
+      expect(() =>
+        service.createChannel({ agentSession: '   ', name: 'x', principal: owner }),
+      ).toThrow(/agentSession is required/);
+    });
+
+    // The Phase A 1:1 agent<->DM binding (agent_already_bound / 409) was
+    // deliberately dropped by the unified-chat-message-store spec
+    // (2026-05-14, Option B): an agent participates in N concurrent DM
+    // conversations (one per Slack thread / web chat session).
+    it('allows a second active channel for the same agent (no 1:1 binding)', () => {
+      const first = createSam();
+      const second = service.createChannel({
+        agentSession: 'sess-a',
+        name: 'Dup',
+        principal: owner,
+      });
+      expect(second.id).not.toBe(first.id);
+      expect(second.agentSession).toBe('sess-a');
+      const ids = service.listChannels({ principal: owner }).map((c) => c.id);
+      expect(ids).toEqual(expect.arrayContaining([first.id, second.id]));
+    });
+
+    // -----------------------------------------------------------------------
+    // Phase A — type='channel' / Slack-like surfaces (SEALED §3.1)
+    // -----------------------------------------------------------------------
+
+    it("Phase A: creates a type='channel' row with teamId; agentSession is server-erased", () => {
+      const dto = service.createChannel({
+        // Caller may or may not pass agentSession on channel rows; server
+        // discards it either way and stores '' as the wire-binding sentinel.
+        agentSession: 'whatever-this-is-ignored',
+        name: '#general',
+        type: 'channel',
+        teamId: 'team-1',
+        principal: owner,
+      });
+      expect(dto.type).toBe('channel');
+      expect(dto.teamId).toBe('team-1');
+      expect(dto.agentSession).toBe('');
+    });
+
+    it("Phase A: type='channel' without teamId fails validation", () => {
+      try {
+        service.createChannel({
+          name: '#orphan',
+          type: 'channel',
+          principal: owner,
+        });
+        fail('expected ChatError');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ChatError);
+        expect((err as ChatError).code).toBe('validation_error');
+        expect((err as ChatError).httpStatus).toBe(400);
+        expect((err as ChatError).message).toMatch(/teamId is required/);
+      }
+    });
+
+    it("Phase A: type='dm' with teamId fails validation (DMs are not team-scoped)", () => {
+      expect(() =>
+        service.createChannel({
+          agentSession: 'sess-a',
+          name: 'Cross-typed DM',
+          type: 'dm',
+          teamId: 'team-1',
+          principal: owner,
+        }),
+      ).toThrow(/teamId must be omitted/);
+    });
+
+    it("Phase A: type='channel' with targetMemberId fails validation", () => {
+      expect(() =>
+        service.createChannel({
+          name: '#x',
+          type: 'channel',
+          teamId: 'team-1',
+          targetMemberId: 'member-x',
+          principal: owner,
+        }),
+      ).toThrow(/targetMemberId must be omitted/);
+    });
+
+    it("Phase A: type='dm' with targetMemberId persists it", () => {
+      const dto = service.createChannel({
+        agentSession: 'sess-sam',
+        name: 'DM with Sam',
+        type: 'dm',
+        targetMemberId: 'member-sam-uuid',
+        principal: owner,
+      });
+      expect(dto.targetMemberId).toBe('member-sam-uuid');
+      expect(dto.type).toBe('dm');
+    });
+
+    it('Phase A: rejects unknown channel type values', () => {
+      expect(() =>
+        service.createChannel({
+          name: 'x',
+          // Cast through unknown to escape the typed contract for the test.
+          type: 'group' as unknown as 'dm',
+          principal: owner,
+        }),
+      ).toThrow(/unknown channel type/);
+    });
+
+    it("Phase A: type='channel' rows allow multiple per team (no 1:1 binding)", () => {
+      service.createChannel({
+        name: '#general',
+        type: 'channel',
+        teamId: 'team-1',
+        principal: owner,
+      });
+      // Same owner + same teamId, different name — must NOT trip the
+      // dm-scoped unique index. Different team is also fine.
+      expect(() =>
+        service.createChannel({
+          name: '#random',
+          type: 'channel',
+          teamId: 'team-1',
+          principal: owner,
+        }),
+      ).not.toThrow();
+      expect(() =>
+        service.createChannel({
+          name: '#general',
+          type: 'channel',
+          teamId: 'team-2',
+          principal: owner,
+        }),
+      ).not.toThrow();
+    });
+
+    // ---------------------------------------------------------------------
+    // F2b (#333) — outer-ring tenant defense via validateTeamMembership
+    // ---------------------------------------------------------------------
+    describe('F2b validateTeamMembership', () => {
+      function makeServiceWithValidator(
+        validator: ((p: ChatPrincipal, teamId: string) => boolean) | undefined,
+      ) {
+        // Each test gets its own isolated DB so it can construct the
+        // service with the validator wired without leaking state to the
+        // outer beforeEach service.
+        const localDb = openChatDatabase({
+          dbPath: ':memory:',
+          inMemory: true,
+          skipIntegrityCheck: true,
+        });
+        const localService = new ChatV2Service({
+          config: loadChatV2Config({}),
+          db: localDb,
+          getPresence: () => ({ status: 'online', lastSeenAt: 1234 }),
+          now: () => 1000,
+          validateTeamMembership: validator,
+        });
+        return { localDb, localService };
+      }
+
+      it("permits channel creation when the validator returns true (caller is a member)", () => {
+        const validator = jest.fn(
+          (_p: ChatPrincipal, teamId: string) => teamId === 'team-allowed',
+        );
+        const { localDb, localService } = makeServiceWithValidator(validator);
+        try {
+          const dto = localService.createChannel({
+            name: '#general',
+            type: 'channel',
+            teamId: 'team-allowed',
+            principal: owner,
+          });
+          expect(dto.teamId).toBe('team-allowed');
+          // Validator was called exactly once with the principal + teamId.
+          expect(validator).toHaveBeenCalledTimes(1);
+          expect(validator).toHaveBeenCalledWith(owner, 'team-allowed');
+        } finally {
+          localService.close();
+          localDb.close();
+        }
+      });
+
+      it('throws forbidden_team (403) when the validator returns false (foreign team)', () => {
+        // The Arch-described leak vector at the outer ring: caller binds
+        // a channel to a teamId the membership check rejects. Must throw
+        // forbidden_team before the row is persisted.
+        const validator = jest.fn(() => false);
+        const { localDb, localService } = makeServiceWithValidator(validator);
+        try {
+          let caught: ChatError | null = null;
+          try {
+            localService.createChannel({
+              name: '#leak-attempt',
+              type: 'channel',
+              teamId: 'team-other-tenant',
+              principal: owner,
+            });
+          } catch (err) {
+            caught = err as ChatError;
+          }
+          expect(caught).toBeInstanceOf(ChatError);
+          expect(caught?.code).toBe('forbidden_team');
+          expect(caught?.httpStatus).toBe(403);
+          expect(caught?.details).toMatchObject({
+            teamId: 'team-other-tenant',
+            userId: 'user-a',
+          });
+          // No rows persisted — listChannels for the owner returns 0.
+          expect(
+            localService.listChannels({ principal: owner }).length,
+          ).toBe(0);
+          expect(validator).toHaveBeenCalledTimes(1);
+        } finally {
+          localService.close();
+          localDb.close();
+        }
+      });
+
+      it('does NOT call the validator for type=dm (membership only gates type=channel)', () => {
+        const validator = jest.fn(() => false);
+        const { localDb, localService } = makeServiceWithValidator(validator);
+        try {
+          // type='dm' (the default) must remain unaffected by the
+          // membership check — DMs have no teamId.
+          const dto = localService.createChannel({
+            agentSession: 'sess-x',
+            name: 'Sam DM',
+            principal: owner,
+          });
+          expect(dto.id).toBeTruthy();
+          expect(validator).not.toHaveBeenCalled();
+        } finally {
+          localService.close();
+          localDb.close();
+        }
+      });
+
+      it('preserves pre-F2b behavior when no validator is wired (back-compat)', () => {
+        // The outer beforeEach service does NOT inject a validator, so
+        // any previously-passing channel creation must still succeed.
+        // Pinning this so a future change doesn't accidentally make the
+        // validator mandatory.
+        expect(() =>
+          service.createChannel({
+            name: '#general',
+            type: 'channel',
+            teamId: 'team-without-validator',
+            principal: owner,
+          }),
+        ).not.toThrow();
+      });
+
+      it('regression: blocks the cross-tenant leak vector at channel creation (Arch attack)', () => {
+        // Tenant separation: owner is only authorized for their own
+        // tenant; any attempt to bind a channel to another tenant's
+        // team must reject with forbidden_team.
+        const ownTenant = 'tenant-a';
+        const validator = jest.fn(
+          (_p: ChatPrincipal, teamId: string) => teamId === ownTenant,
+        );
+        const { localDb, localService } = makeServiceWithValidator(validator);
+        try {
+          // Allowed.
+          expect(() =>
+            localService.createChannel({
+              name: '#own',
+              type: 'channel',
+              teamId: ownTenant,
+              principal: owner,
+            }),
+          ).not.toThrow();
+          // Blocked at the outer ring (F2a is the inner ring on dispatch).
+          expect(() =>
+            localService.createChannel({
+              name: '#leak',
+              type: 'channel',
+              teamId: 'tenant-b-stolen',
+              principal: owner,
+            }),
+          ).toThrow(ChatError);
+        } finally {
+          localService.close();
+          localDb.close();
+        }
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // listChannels / getChannel / archiveChannel
+  // -------------------------------------------------------------------------
+
+  describe('listChannels', () => {
+    it('returns only channels owned by the caller', () => {
+      createSam();
+      service.createChannel({
+        agentSession: 'sess-b',
+        name: 'Other owner',
+        principal: otherUser,
+      });
+      expect(service.listChannels({ principal: owner })).toHaveLength(1);
+      expect(service.listChannels({ principal: otherUser })).toHaveLength(1);
+    });
+
+    it('setPresenceProvider swaps the presence used by channel DTOs (DM dots)', () => {
+      const ch = createSam();
+      // Default beforeEach presence is 'online'; the setter replaces it,
+      // proving the composition root can wire live presence post-construction.
+      service.setPresenceProvider(() => ({ status: 'busy', lastSeenAt: 777 }));
+      const dto = service.getChannel(ch.id, owner);
+      expect(dto.agentPresence.status).toBe('busy');
+      expect(dto.agentPresence.lastSeenAt).toBe(777);
+    });
+
+    it('surfaces bridged Slack channels the caller does not own', () => {
+      // Slack bridge persists under the synthetic 'system' owner.
+      service.ensureChannelForLegacyConversation({
+        conversationId: 'slack-D0-1',
+        agentSession: 'crewly-orc',
+      });
+      const list = service.listChannels({ principal: owner });
+      expect(list.some((c) => c.id === 'slack-D0-1')).toBe(true);
+    });
+
+    it('excludes bridged channels when a type filter is applied', () => {
+      service.ensureChannelForLegacyConversation({
+        conversationId: 'slack-D0-2',
+        agentSession: 'crewly-orc',
+      });
+      const list = service.listChannels({ principal: owner, type: 'channel' });
+      expect(list.some((c) => c.id === 'slack-D0-2')).toBe(false);
+    });
+
+    // Phase C — channel-rail listing refinements: type + teamId filters.
+    describe('Phase C filters', () => {
+      function seedMixedFixture() {
+        // Owner has: 1 DM + 2 team channels across 2 teams.
+        service.createChannel({
+          agentSession: 'sess-dm',
+          name: 'DM with Sam',
+          principal: owner,
+          type: 'dm',
+          targetMemberId: 'sam-id',
+        });
+        service.createChannel({
+          agentSession: '',
+          name: '#general-product',
+          principal: owner,
+          type: 'channel',
+          teamId: 'team-product',
+        });
+        service.createChannel({
+          agentSession: '',
+          name: '#general-marketing',
+          principal: owner,
+          type: 'channel',
+          teamId: 'team-marketing',
+        });
+      }
+
+      it('filters to DMs when type=dm', () => {
+        seedMixedFixture();
+        const list = service.listChannels({ principal: owner, type: 'dm' });
+        expect(list).toHaveLength(1);
+        expect(list[0].type).toBe('dm');
+        expect(list[0].name).toBe('DM with Sam');
+      });
+
+      it('filters to team channels when type=channel', () => {
+        seedMixedFixture();
+        const list = service.listChannels({ principal: owner, type: 'channel' });
+        expect(list).toHaveLength(2);
+        expect(list.every((c) => c.type === 'channel')).toBe(true);
+      });
+
+      it('rejects unknown type with validation_error', () => {
+        seedMixedFixture();
+        try {
+          service.listChannels({
+            principal: owner,
+            type: 'group' as unknown as 'dm', // intentionally invalid
+          });
+          fail('expected ChatError');
+        } catch (err) {
+          expect(err).toBeInstanceOf(ChatError);
+          expect((err as ChatError).code).toBe('validation_error');
+          expect((err as ChatError).httpStatus).toBe(400);
+          expect((err as ChatError).message).toContain('unknown channel type');
+        }
+      });
+
+      it('treats blank teamId as omitted (no filter)', () => {
+        seedMixedFixture();
+        // Empty string teamId should NOT filter to "rows with empty team_id"
+        // — that would silently nuke the rail. Instead it's normalized to
+        // "no team filter".
+        const list = service.listChannels({ principal: owner, teamId: '' });
+        expect(list).toHaveLength(3);
+      });
+
+      it('treats whitespace-only teamId as omitted (no filter)', () => {
+        seedMixedFixture();
+        const list = service.listChannels({ principal: owner, teamId: '   ' });
+        expect(list).toHaveLength(3);
+      });
+
+      it('filters to a single team when teamId is set', () => {
+        seedMixedFixture();
+        const list = service.listChannels({ principal: owner, teamId: 'team-product' });
+        expect(list).toHaveLength(1);
+        expect(list[0].name).toBe('#general-product');
+        expect(list[0].teamId).toBe('team-product');
+      });
+
+      it('teamId filter excludes DMs (which have null team_id at the row level)', () => {
+        seedMixedFixture();
+        const list = service.listChannels({ principal: owner, teamId: 'team-product' });
+        expect(list.every((c) => c.type === 'channel')).toBe(true);
+      });
+
+      it('composes type + teamId filters', () => {
+        seedMixedFixture();
+        const list = service.listChannels({
+          principal: owner,
+          type: 'channel',
+          teamId: 'team-marketing',
+        });
+        expect(list).toHaveLength(1);
+        expect(list[0].name).toBe('#general-marketing');
+      });
+
+      it('still scopes to caller-owned rows when filtered (cross-owner isolation)', () => {
+        seedMixedFixture();
+        // Other user creates an isolated marketing channel. The filtered
+        // list for owner must not see it.
+        service.createChannel({
+          agentSession: '',
+          name: '#general-marketing',
+          principal: otherUser,
+          type: 'channel',
+          teamId: 'team-marketing',
+        });
+        const list = service.listChannels({
+          principal: owner,
+          type: 'channel',
+          teamId: 'team-marketing',
+        });
+        expect(list).toHaveLength(1); // only owner's row
+      });
+    });
+  });
+
+  describe('getChannel', () => {
+    it('returns 404-style error when the caller does not own it', () => {
+      const ch = createSam();
+      try {
+        service.getChannel(ch.id, otherUser);
+        fail('expected ChatError');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ChatError);
+        expect((err as ChatError).code).toBe('channel_not_found');
+        expect((err as ChatError).httpStatus).toBe(404);
+      }
+    });
+
+    it('returns the DTO to the owner', () => {
+      const ch = createSam();
+      const dto = service.getChannel(ch.id, owner);
+      expect(dto.id).toBe(ch.id);
+    });
+  });
+
+  describe('archiveChannel', () => {
+    it('archives a channel the caller owns', () => {
+      const ch = createSam();
+      expect(service.archiveChannel(ch.id, owner)).toBe(true);
+      expect(service.archiveChannel(ch.id, owner)).toBe(false);
+    });
+
+    it('refuses non-owners', () => {
+      const ch = createSam();
+      expect(() => service.archiveChannel(ch.id, otherUser)).toThrow(ChatError);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // sendMessage
+  // -------------------------------------------------------------------------
+
+  describe('sendMessage', () => {
+    it('persists a user message with server-assigned sender fields', () => {
+      const ch = createSam();
+      const msg = service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'hello',
+      });
+      expect(msg.senderType).toBe('user');
+      expect(msg.senderId).toBe(owner.userId);
+      expect(msg.seq).toBe(1);
+      expect(msg.contentType).toBe('markdown');
+    });
+
+    it('persists an agent message when the bound agent calls', () => {
+      const ch = createSam();
+      const msg = service.sendMessage({
+        channelId: ch.id,
+        principal: agentPrincipal,
+        content: 'agent here',
+      });
+      expect(msg.senderType).toBe('agent');
+      expect(msg.senderId).toBe('sess-a');
+    });
+
+    it('flags an agent interim note in metadata; a user cannot flag one', () => {
+      const ch = createSam();
+      const note = service.sendMessage({ channelId: ch.id, principal: agentPrincipal, content: 'got it, plan: …', interim: true });
+      expect(note.metadata?.interim).toBe(true);
+      const answer = service.sendMessage({ channelId: ch.id, principal: agentPrincipal, content: 'done' });
+      expect(answer.metadata?.interim).toBeUndefined();
+      const user = service.sendMessage({ channelId: ch.id, principal: owner, content: 'hi', interim: true });
+      expect(user.metadata?.interim).toBeUndefined();
+    });
+
+    it('an agent passing a Slack thread key as threadId records it for the Slack bridge (reply-channel --thread <key>)', () => {
+      const ch = createSam();
+      const msg = service.sendMessage({ channelId: ch.id, principal: agentPrincipal, content: 'EFT done', threadId: 'D0C31U6JWBF:1790000000.000100' });
+      expect(msg.metadata?.slackThreadKey).toBe('D0C31U6JWBF:1790000000.000100');
+      // Not a chat-v2 message id: not validated as one, not stored as the thread root.
+      expect(msg.threadId).toBeUndefined();
+      const both = service.sendMessage({ channelId: ch.id, principal: agentPrincipal, content: 'plan', interim: true, threadId: '[SLACK-THREAD:D0C31U6JWBF:1790000000.000100]' });
+      expect(both.metadata).toMatchObject({ interim: true, slackThreadKey: 'D0C31U6JWBF:1790000000.000100' });
+      // A user cannot smuggle one in: it is validated as an ordinary thread id.
+      expect(() => service.sendMessage({ channelId: ch.id, principal: owner, content: 'x', threadId: 'D0C31U6JWBF:1790000000.000100' })).toThrow();
+    });
+
+    it('rejects messages exceeding the byte cap with payload_too_large', () => {
+      const ch = createSam();
+      const oversize = 'a'.repeat(40000);
+      try {
+        service.sendMessage({ channelId: ch.id, principal: owner, content: oversize });
+        fail('expected ChatError');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ChatError);
+        expect((err as ChatError).code).toBe('payload_too_large');
+        expect((err as ChatError).httpStatus).toBe(413);
+      }
+    });
+
+    it('rejects empty content', () => {
+      const ch = createSam();
+      expect(() =>
+        service.sendMessage({ channelId: ch.id, principal: owner, content: '' }),
+      ).toThrow(/content is required/);
+    });
+
+    it('rejects unknown contentType', () => {
+      const ch = createSam();
+      expect(() =>
+        service.sendMessage({
+          channelId: ch.id,
+          principal: owner,
+          content: 'x',
+          contentType: 'binary' as never,
+        }),
+      ).toThrow(/unknown contentType/);
+    });
+
+    it('forbids a user from posting system_note', () => {
+      const ch = createSam();
+      expect(() =>
+        service.sendMessage({
+          channelId: ch.id,
+          principal: owner,
+          content: 'admin-ish',
+          contentType: 'system_note',
+        }),
+      ).toThrow(/system_note/);
+    });
+
+    it('404s for unknown channel id', () => {
+      try {
+        service.sendMessage({ channelId: 'missing', principal: owner, content: 'x' });
+        fail('expected ChatError');
+      } catch (err) {
+        expect((err as ChatError).code).toBe('channel_not_found');
+      }
+    });
+
+    it('forbids non-owner non-agent from posting', () => {
+      const ch = createSam();
+      try {
+        service.sendMessage({ channelId: ch.id, principal: otherUser, content: 'hi' });
+        fail('expected ChatError');
+      } catch (err) {
+        // Not found (rather than 403) to avoid leaking channel existence.
+        expect((err as ChatError).code).toBe('channel_not_found');
+      }
+    });
+
+    it('refuses sends into an archived channel', () => {
+      const ch = createSam();
+      service.archiveChannel(ch.id, owner);
+      try {
+        service.sendMessage({ channelId: ch.id, principal: owner, content: 'x' });
+        fail('expected ChatError');
+      } catch (err) {
+        expect((err as ChatError).code).toBe('channel_archived');
+      }
+    });
+
+    it('dedupes on clientMessageId', () => {
+      const ch = createSam();
+      const a = service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'x',
+        clientMessageId: 'cmid-1',
+      });
+      const b = service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'x-DIFFERENT',
+        clientMessageId: 'cmid-1',
+      });
+      expect(a.id).toBe(b.id);
+      expect(a.seq).toBe(b.seq);
+    });
+
+    // -----------------------------------------------------------------------
+    // Phase A — mentions + threadId (SEALED §3.2)
+    // -----------------------------------------------------------------------
+
+    it('Phase A: persists mentions and emits them on the wire DTO', () => {
+      const ch = createSam();
+      const dto = service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'pinging @Sam and @team',
+        mentions: ['member-sam-uuid', 'team-1'],
+      });
+      expect(dto.mentions).toEqual(['member-sam-uuid', 'team-1']);
+    });
+
+    it('Phase A: empty/omitted mentions yield empty array on the wire (never null)', () => {
+      const ch = createSam();
+      const omitted = service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'no mentions',
+      });
+      expect(omitted.mentions).toEqual([]);
+
+      const empty = service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'still no mentions',
+        mentions: [],
+      });
+      expect(empty.mentions).toEqual([]);
+    });
+
+    it('Phase A: mentions exceeding the count cap fail validation', () => {
+      const ch = createSam();
+      const tooMany = Array.from({ length: 51 }, (_, i) => `m-${i}`);
+      expect(() =>
+        service.sendMessage({
+          channelId: ch.id,
+          principal: owner,
+          content: 'x',
+          mentions: tooMany,
+        }),
+      ).toThrow(/mentions exceeds max count/);
+    });
+
+    it('Phase A: rejects non-string mention entries', () => {
+      const ch = createSam();
+      expect(() =>
+        service.sendMessage({
+          channelId: ch.id,
+          principal: owner,
+          content: 'x',
+          // Cast through unknown to bypass the typed contract.
+          mentions: ['ok', 42 as unknown as string],
+        }),
+      ).toThrow(/mentions entries must be strings/);
+    });
+
+    it('Phase A: rejects mentions that aren’t an array', () => {
+      const ch = createSam();
+      expect(() =>
+        service.sendMessage({
+          channelId: ch.id,
+          principal: owner,
+          content: 'x',
+          mentions: 'not-an-array' as unknown as string[],
+        }),
+      ).toThrow(/mentions must be an array/);
+    });
+
+    it('Phase A: persists threadId for replies and emits it on the wire DTO', () => {
+      const ch = createSam();
+      const root = service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'thread root',
+      });
+      const reply = service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'reply',
+        threadId: root.id,
+      });
+      expect(reply.threadId).toBe(root.id);
+      // Top-level messages omit threadId on the wire.
+      expect(root.threadId).toBeUndefined();
+    });
+
+    it('Phase A: rejects threadId that does not reference an existing message', () => {
+      const ch = createSam();
+      expect(() =>
+        service.sendMessage({
+          channelId: ch.id,
+          principal: owner,
+          content: 'orphan reply',
+          threadId: 'non-existent-id',
+        }),
+      ).toThrow(/non-existent message/);
+    });
+
+    it('CREW-957: a Slack ts as threadId resolves to the Crewly thread root of that channel', () => {
+      const ch = createSam();
+      const root = service.recordTurn({ channelId: ch.id, senderType: 'user', senderId: 'Steve', content: 'question', metadata: { source: 'slack', slackChannelId: 'C1', slackTs: '1793621773.519539', slackThreadTs: '1793621773.519539' } }).message;
+      const reply = service.sendMessage({ channelId: ch.id, principal: owner, content: 'answer', threadId: '1793621773.519539' });
+      expect(reply.threadId).toBe(root.id);
+    });
+
+    it('CREW-957: an unknown Slack ts is refused with a hint naming the right id', () => {
+      const ch = createSam();
+      expect(() =>
+        service.sendMessage({ channelId: ch.id, principal: owner, content: 'x', threadId: '1793621773.519539' }),
+      ).toThrow(/Slack ts.*Crewly thread id from your brief.*reply --work-item/s);
+    });
+
+    it('Phase A: rejects threadId that references a message in a different channel', () => {
+      // Set up two channels owned by the same user. A reply in channel B
+      // pointing at a thread root in channel A must be rejected.
+      const chA = createSam();
+      const chB = service.createChannel({
+        agentSession: 'sess-b',
+        name: 'Other DM',
+        principal: owner,
+      });
+      const rootInA = service.sendMessage({
+        channelId: chA.id,
+        principal: owner,
+        content: 'root in A',
+      });
+      expect(() =>
+        service.sendMessage({
+          channelId: chB.id,
+          principal: owner,
+          content: 'cross-channel reply',
+          threadId: rootInA.id,
+        }),
+      ).toThrow(/different channel/);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // listMessages — Slack-style thread reply counts
+  // -------------------------------------------------------------------------
+
+  describe('listMessages thread reply counts', () => {
+    it('attaches replyCount + lastReplyAt to a root once a reply is posted', () => {
+      const ch = createSam();
+      const root = service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'thread root',
+      });
+
+      // Before any reply: the root carries no reply summary.
+      const before = service.listMessages({ channelId: ch.id, principal: owner });
+      const rootBefore = before.messages.find((m) => m.id === root.id);
+      expect(rootBefore?.replyCount).toBeUndefined();
+      expect(rootBefore?.lastReplyAt).toBeUndefined();
+
+      // Post one reply into the thread.
+      service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'a reply',
+        threadId: root.id,
+      });
+
+      // After: the root has replyCount=1 and a populated lastReplyAt; the
+      // reply row itself never carries a count.
+      const after = service.listMessages({ channelId: ch.id, principal: owner });
+      const rootAfter = after.messages.find((m) => m.id === root.id);
+      expect(rootAfter?.replyCount).toBe(1);
+      expect(typeof rootAfter?.lastReplyAt).toBe('string');
+      expect(Number.isNaN(Date.parse(rootAfter!.lastReplyAt!))).toBe(false);
+
+      const replyRow = after.messages.find((m) => m.threadId === root.id);
+      expect(replyRow).toBeDefined();
+      expect(replyRow?.replyCount).toBeUndefined();
+    });
+
+    it('counts multiple replies and tracks the latest reply time', () => {
+      const ch = createSam();
+      const root = service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'root',
+      });
+      service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'r1',
+        threadId: root.id,
+      });
+      service.sendMessage({
+        channelId: ch.id,
+        principal: owner,
+        content: 'r2',
+        threadId: root.id,
+      });
+      const page = service.listMessages({ channelId: ch.id, principal: owner });
+      const rootDto = page.messages.find((m) => m.id === root.id);
+      expect(rootDto?.replyCount).toBe(2);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // listMessages
+  // -------------------------------------------------------------------------
+
+  describe('listMessages', () => {
+    it('pages newest-first with cursor continuation', () => {
+      const ch = createSam();
+      for (let i = 0; i < 7; i++) {
+        service.sendMessage({ channelId: ch.id, principal: owner, content: `m${i}` });
+      }
+      const first = service.listMessages({
+        channelId: ch.id,
+        principal: owner,
+        limit: 3,
+      });
+      expect(first.messages.map((m) => m.content)).toEqual(['m6', 'm5', 'm4']);
+      const second = service.listMessages({
+        channelId: ch.id,
+        principal: owner,
+        limit: 3,
+        cursor: first.nextCursor,
+      });
+      expect(second.messages.map((m) => m.content)).toEqual(['m3', 'm2', 'm1']);
+    });
+
+    it('refuses listing a channel the caller doesn\'t own', () => {
+      const ch = createSam();
+      service.sendMessage({ channelId: ch.id, principal: owner, content: 'x' });
+      expect(() =>
+        service.listMessages({ channelId: ch.id, principal: otherUser }),
+      ).toThrow(ChatError);
+    });
+
+    it('lets any caller READ a shared bridged Slack channel they do not own', () => {
+      // Slack bridge persists under the synthetic 'system' owner; the bound
+      // agent records the turn. The team-chat surface merges these into the
+      // Orchestrator timeline, so a non-owner web user must be able to read them.
+      const ch = service.ensureChannelForLegacyConversation({
+        conversationId: 'slack-D0-read',
+        agentSession: 'crewly-orc',
+      });
+      const orcAgent: ChatPrincipal = {
+        userId: 'orc-agent',
+        agentSession: 'crewly-orc',
+        source: 'oss',
+      };
+      service.sendMessage({ channelId: ch.id, principal: orcAgent, content: 'from slack' });
+      // `owner` does NOT own this channel ('system' does) yet can read it.
+      const page = service.listMessages({ channelId: ch.id, principal: owner });
+      expect(page.messages.map((m) => m.content)).toEqual(['from slack']);
+    });
+
+    it('still forbids a non-owner from POSTING into a shared Slack channel', () => {
+      const ch = service.ensureChannelForLegacyConversation({
+        conversationId: 'slack-D0-write',
+        agentSession: 'crewly-orc',
+      });
+      // The read gate now allows shared Slack channels, but resolveSender keeps
+      // writes locked to the owner / bound agent → forbidden for a plain user.
+      try {
+        service.sendMessage({ channelId: ch.id, principal: owner, content: 'nope' });
+        fail('expected ChatError');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ChatError);
+        expect((err as ChatError).code).toBe('forbidden');
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // countAllMessages — Onboarding v3 (B1) cold-start probe
+  // -------------------------------------------------------------------------
+
+  describe('countAllMessages (Onboarding v3 — B1)', () => {
+    it('returns 0 on a fresh service before any channel exists', () => {
+      expect(service.countAllMessages()).toBe(0);
+    });
+
+    it('counts messages across the channels owned by every principal', () => {
+      // Two channels, two owners, three messages — sum is 3.
+      const ch1 = createSam();
+      const ch2 = service.createChannel({
+        agentSession: 'sess-b',
+        name: 'Other Agent',
+        principal: otherUser,
+      });
+      service.sendMessage({ channelId: ch1.id, principal: owner, content: 'a' });
+      service.sendMessage({ channelId: ch1.id, principal: owner, content: 'b' });
+      service.sendMessage({ channelId: ch2.id, principal: otherUser, content: 'c' });
+
+      expect(service.countAllMessages()).toBe(3);
+    });
+
+    it('is callable without an HTTP-request principal (orc bootstrap path)', () => {
+      // The orc bootstrap calls this from a closure with no principal —
+      // verify there's no implicit auth guard that would throw.
+      expect(() => service.countAllMessages()).not.toThrow();
+    });
+  });
+
+  describe('hasConversationSince (wiki reflect gate, 2026-09-17)', () => {
+    it('is false on a fresh service and true once a person has written', () => {
+      expect(service.hasConversationSince(0)).toBe(false);
+      const ch = createSam();
+      service.sendMessage({ channelId: ch.id, principal: owner, content: 'hello' });
+      expect(service.hasConversationSince(0)).toBe(true);
+      // Nothing is newer than "now".
+      expect(service.hasConversationSince(Date.now() + 60_000)).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // recordTurn — canonical server-internal write entry
+  // Spec: 2026-05-14-unified-chat-message-store.md (Phase 1)
+  // -------------------------------------------------------------------------
+
+  describe('recordTurn', () => {
+    it('reads a legacy owner row without the harness ticket line; agent rows are untouched', () => {
+      const ch = createSam();
+      const line = '\n\n[TICKET:TKT-238 26a0accf] (Crewly 内部记录 TKT-238) ticket-check --ticket TKT-238';
+      service.recordTurn({ channelId: ch.id, senderType: 'user', senderId: 'Steve', content: `Rex用ipad吗${line}`, metadata: { source: 'slack' } });
+      service.recordTurn({ channelId: ch.id, senderType: 'agent', senderId: 'sess-a', content: `quoting${line}`, metadata: { source: 'slack' } });
+      const { messages } = service.listMessages({ channelId: ch.id, principal: owner });
+      expect(messages.map((m) => m.content).sort()).toEqual(['Rex用ipad吗', `quoting${line}`].sort());
+    });
+
+    it('persists an agent turn and stamps metadata.source', () => {
+      const ch = createSam();
+
+      const { message, deduped } = service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'Hello!',
+        metadata: { source: 'in-process-runtime', runtime: 'crewly-agent' },
+      });
+
+      expect(deduped).toBe(false);
+      expect(message.content).toBe('Hello!');
+      expect(message.senderType).toBe('agent');
+      expect(message.senderId).toBe('crewly-orc');
+      // metadata.source must be carried through to storage — audit trail
+      expect(message.metadata).toMatchObject({
+        source: 'in-process-runtime',
+        runtime: 'crewly-agent',
+      });
+    });
+
+    it('persists a user turn for Slack inbound', () => {
+      const ch = createSam();
+
+      const { message } = service.recordTurn({
+        channelId: ch.id,
+        senderType: 'user',
+        senderId: 'slack-U0XYZ',
+        content: 'hi orc',
+        metadata: {
+          source: 'slack',
+          slackChannelId: 'D0AC7',
+          slackThreadTs: '1700000000.000111',
+        },
+      });
+
+      expect(message.senderType).toBe('user');
+      expect(message.metadata).toMatchObject({
+        source: 'slack',
+        slackChannelId: 'D0AC7',
+      });
+    });
+
+    it('is idempotent via clientMessageId — second call returns deduped=true', () => {
+      const ch = createSam();
+      const clientId = 'agent-finish-2026-05-14T22:30:00Z';
+
+      const first = service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'one',
+        clientMessageId: clientId,
+        metadata: { source: 'in-process-runtime' },
+      });
+      const second = service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'one',  // same content
+        clientMessageId: clientId,
+        metadata: { source: 'in-process-runtime' },
+      });
+
+      expect(first.deduped).toBe(false);
+      expect(second.deduped).toBe(true);
+      expect(second.message.id).toBe(first.message.id);
+      expect(service.countAllMessages()).toBe(1);
+    });
+
+    it('rejects empty content (400)', () => {
+      const ch = createSam();
+      expect(() =>
+        service.recordTurn({
+          channelId: ch.id,
+          senderType: 'agent',
+          senderId: 'crewly-orc',
+          content: '',
+          metadata: { source: 'in-process-runtime' },
+        }),
+      ).toThrow(ChatError);
+    });
+
+    it('rejects missing metadata.source (audit trail required)', () => {
+      const ch = createSam();
+      expect(() =>
+        service.recordTurn({
+          channelId: ch.id,
+          senderType: 'agent',
+          senderId: 'crewly-orc',
+          content: 'hi',
+          // @ts-expect-error — deliberately omitting source to test runtime guard
+          metadata: { runtime: 'crewly-agent' },
+        }),
+      ).toThrow(/metadata\.source is required/);
+    });
+
+    it('rejects unknown metadata.source values (closed enum)', () => {
+      const ch = createSam();
+      expect(() =>
+        service.recordTurn({
+          channelId: ch.id,
+          senderType: 'agent',
+          senderId: 'crewly-orc',
+          content: 'hi',
+          // @ts-expect-error — invalid source string at compile + runtime
+          metadata: { source: 'made-up-source' },
+        }),
+      ).toThrow(/unknown metadata\.source/);
+    });
+
+    it('rejects unknown senderType', () => {
+      const ch = createSam();
+      expect(() =>
+        service.recordTurn({
+          channelId: ch.id,
+          // @ts-expect-error
+          senderType: 'robot',
+          senderId: 'crewly-orc',
+          content: 'hi',
+          metadata: { source: 'in-process-runtime' },
+        }),
+      ).toThrow(/unknown senderType/);
+    });
+
+    it('rejects empty senderId', () => {
+      const ch = createSam();
+      expect(() =>
+        service.recordTurn({
+          channelId: ch.id,
+          senderType: 'agent',
+          senderId: '',
+          content: 'hi',
+          metadata: { source: 'in-process-runtime' },
+        }),
+      ).toThrow(/senderId is required/);
+    });
+
+    it('rejects unknown channelId (channel_not_found)', () => {
+      expect(() =>
+        service.recordTurn({
+          channelId: 'no-such-channel',
+          senderType: 'agent',
+          senderId: 'crewly-orc',
+          content: 'hi',
+          metadata: { source: 'in-process-runtime' },
+        }),
+      ).toThrow(ChatError);
+    });
+
+    it('accepts all RECORD_TURN_SOURCES values', () => {
+      const ch = createSam();
+      const sources = [
+        'web',
+        'slack',
+        'pty-runtime',
+        'in-process-runtime',
+        'reply-tool',
+        'system',
+      ] as const;
+
+      for (const source of sources) {
+        const { message } = service.recordTurn({
+          channelId: ch.id,
+          senderType: 'system',
+          senderId: 'system',
+          content: `msg from ${source}`,
+          metadata: { source },
+        });
+        expect(message.metadata).toMatchObject({ source });
+      }
+
+      expect(service.countAllMessages()).toBe(sources.length);
+    });
+
+    it('rejects oversized content with payload_too_large', () => {
+      const ch = createSam();
+      const huge = 'x'.repeat(service.config.maxMessageBytes + 1);
+
+      expect(() =>
+        service.recordTurn({
+          channelId: ch.id,
+          senderType: 'agent',
+          senderId: 'crewly-orc',
+          content: huge,
+          metadata: { source: 'in-process-runtime' },
+        }),
+      ).toThrow(ChatError);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // ensureChannelForLegacyConversation
+  // Spec: 2026-05-14-unified-chat-message-store.md Phase 2 (Option B)
+  // -------------------------------------------------------------------------
+
+  describe('ensureChannelForLegacyConversation', () => {
+    it('creates a fresh channel using the conversationId as the id', () => {
+      const ch = service.ensureChannelForLegacyConversation({
+        conversationId: 'slack-D0AC7-1700000000.000111',
+        agentSession: 'crewly-orc',
+      });
+
+      expect(ch.id).toBe('slack-D0AC7-1700000000.000111');
+      expect(ch.agentSession).toBe('crewly-orc');
+      expect(ch.type).toBe('dm');
+    });
+
+    it('is idempotent — second call returns the existing channel', () => {
+      const first = service.ensureChannelForLegacyConversation({
+        conversationId: 'web-conv-abc',
+        agentSession: 'crewly-orc',
+      });
+      const second = service.ensureChannelForLegacyConversation({
+        conversationId: 'web-conv-abc',
+        agentSession: 'crewly-orc',
+      });
+
+      expect(second.id).toBe(first.id);
+      expect(second.createdAt).toBe(first.createdAt);
+    });
+
+    it('allows the same agent to participate in MANY concurrent channels (the whole point)', () => {
+      // This is the post-Option-B contract: no `agent_already_bound`
+      // failure on the second / third / Nth channel for the same agent.
+      const a = service.ensureChannelForLegacyConversation({
+        conversationId: 'slack-thread-1',
+        agentSession: 'crewly-orc',
+      });
+      const b = service.ensureChannelForLegacyConversation({
+        conversationId: 'slack-thread-2',
+        agentSession: 'crewly-orc',
+      });
+      const c = service.ensureChannelForLegacyConversation({
+        conversationId: 'web-conv-xyz',
+        agentSession: 'crewly-orc',
+      });
+
+      expect([a.id, b.id, c.id]).toEqual([
+        'slack-thread-1',
+        'slack-thread-2',
+        'web-conv-xyz',
+      ]);
+    });
+
+    it('feeds directly into recordTurn — combined bridge flow', () => {
+      const ch = service.ensureChannelForLegacyConversation({
+        conversationId: 'slack-X-1234',
+        agentSession: 'crewly-orc',
+      });
+
+      const { message, deduped } = service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'Hello from auto-route',
+        metadata: { source: 'in-process-runtime', runtime: 'crewly-agent' },
+      });
+
+      expect(deduped).toBe(false);
+      expect(message.content).toBe('Hello from auto-route');
+      expect(message.senderType).toBe('agent');
+    });
+
+    it('defaults ownerUserId to "system" for server-internal callers', () => {
+      const ch = service.ensureChannelForLegacyConversation({
+        conversationId: 'server-internal-conv',
+        agentSession: 'crewly-orc',
+      });
+      // The DTO doesn't expose ownerUserId directly; we verify via list
+      // filter which is scoped by owner.
+      const channels = service.listChannels({
+        principal: { userId: 'system', source: 'oss' },
+      });
+      expect(channels.some((c) => c.id === ch.id)).toBe(true);
+    });
+
+    it('rejects empty conversationId', () => {
+      expect(() =>
+        service.ensureChannelForLegacyConversation({
+          conversationId: '',
+          agentSession: 'crewly-orc',
+        }),
+      ).toThrow(/conversationId is required/);
+    });
+
+    it('rejects empty agentSession', () => {
+      expect(() =>
+        service.ensureChannelForLegacyConversation({
+          conversationId: 'slack-X-1',
+          agentSession: '',
+        }),
+      ).toThrow(/agentSession is required/);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // ensureDmChannel — find-or-create for the /agents page
+  // -------------------------------------------------------------------------
+
+  describe('ensureDmChannel', () => {
+    it('creates a fresh DM channel when none exists', () => {
+      const { channel, created } = service.ensureDmChannel({
+        agentSession: 'sess-x',
+        name: 'Leo',
+        principal: owner,
+      });
+      expect(created).toBe(true);
+      expect(channel.agentSession).toBe('sess-x');
+      expect(channel.name).toBe('Leo');
+      expect(channel.type).toBe('dm');
+    });
+
+    it('returns the existing channel on a second call (idempotent)', () => {
+      const first = service.ensureDmChannel({
+        agentSession: 'sess-x',
+        name: 'Leo',
+        principal: owner,
+      });
+      const second = service.ensureDmChannel({
+        agentSession: 'sess-x',
+        name: 'Leo (renamed)',
+        principal: owner,
+      });
+      expect(second.created).toBe(false);
+      expect(second.channel.id).toBe(first.channel.id);
+      // We don't auto-rename — the existing row's name wins.
+      expect(second.channel.name).toBe('Leo');
+    });
+
+    it('scopes find-or-create by ownerUserId — other users get a separate channel', () => {
+      // F2b: this matters for Cloud Portal where multiple users share the
+      // singleton ChatV2Service. In OSS we always have one user, but the
+      // scoping invariant must hold so the same code path works in both.
+      const first = service.ensureDmChannel({
+        agentSession: 'sess-x',
+        name: 'Leo',
+        principal: owner,
+      });
+      const otherOwnerChan = service.ensureDmChannel({
+        agentSession: 'sess-x',
+        name: 'Leo',
+        principal: otherUser,
+      });
+      expect(otherOwnerChan.created).toBe(true);
+      expect(otherOwnerChan.channel.id).not.toBe(first.channel.id);
+    });
+
+    it('rejects empty agentSession', () => {
+      expect(() =>
+        service.ensureDmChannel({ agentSession: '   ', principal: owner }),
+      ).toThrow(/agentSession is required/);
+    });
+
+    it('falls back to the agentSession as the channel name when no name is provided', () => {
+      const { channel, created } = service.ensureDmChannel({
+        agentSession: 'sess-y',
+        principal: owner,
+      });
+      expect(created).toBe(true);
+      expect(channel.name).toBe('sess-y');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // ensureTeamChannel — find-or-create for the consolidated team-chat surface
+  // -------------------------------------------------------------------------
+
+  describe('ensureTeamChannel', () => {
+    it('creates a default #general channel when the team has none', () => {
+      const { channel, created } = service.ensureTeamChannel({
+        teamId: 'team-1',
+        principal: owner,
+      });
+      expect(created).toBe(true);
+      expect(channel.type).toBe('channel');
+      expect(channel.teamId).toBe('team-1');
+      expect(channel.name).toBe('#general');
+    });
+
+    it('uses a provided name for a freshly created channel', () => {
+      const { channel, created } = service.ensureTeamChannel({
+        teamId: 'team-2',
+        name: '#standup',
+        principal: owner,
+      });
+      expect(created).toBe(true);
+      expect(channel.name).toBe('#standup');
+    });
+
+    it('is idempotent — returns the existing channel on a second call', () => {
+      const first = service.ensureTeamChannel({ teamId: 'team-1', principal: owner });
+      const second = service.ensureTeamChannel({
+        teamId: 'team-1',
+        name: '#ignored',
+        principal: owner,
+      });
+      expect(second.created).toBe(false);
+      expect(second.channel.id).toBe(first.channel.id);
+      expect(second.channel.name).toBe('#general');
+    });
+
+    it('reuses a channel created via the public createChannel path', () => {
+      const made = service.createChannel({
+        name: '#existing',
+        type: 'channel',
+        teamId: 'team-3',
+        principal: owner,
+      });
+      const ensured = service.ensureTeamChannel({ teamId: 'team-3', principal: owner });
+      expect(ensured.created).toBe(false);
+      expect(ensured.channel.id).toBe(made.id);
+    });
+
+    it('rejects an empty teamId', () => {
+      expect(() => service.ensureTeamChannel({ teamId: '   ', principal: owner })).toThrow(
+        /teamId is required/,
+      );
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // importLegacyConversation
+  // Spec: 2026-05-14-unified-chat-message-store.md Phase 5
+  // -------------------------------------------------------------------------
+
+  describe('importLegacyConversation', () => {
+    const sampleLegacy = {
+      conversation: { id: 'slack-D0AC7-1777130816-772509' },
+      messages: [
+        {
+          id: 'msg-a',
+          from: { type: 'user', name: 'You' },
+          content: 'hello',
+          timestamp: '2026-05-04T11:26:58.361Z',
+          metadata: { source: 'slack', userId: 'UG94JLNGK', channelId: 'D0AC7' },
+        },
+        {
+          id: 'msg-b',
+          from: { type: 'orchestrator', name: 'Orchestrator' },
+          content: 'hi back',
+          timestamp: '2026-05-04T11:27:01.000Z',
+          metadata: { source: 'slack' },
+        },
+        {
+          id: 'msg-c',
+          from: { type: 'system' },
+          content: 'system note',
+          timestamp: '2026-05-04T11:28:00.000Z',
+        },
+      ],
+    };
+
+    it('imports all rows on first run, dedups on second run', () => {
+      const first = service.importLegacyConversation(sampleLegacy);
+      expect(first.imported).toBe(3);
+      expect(first.deduped).toBe(0);
+      expect(first.channelId).toBe('slack-D0AC7-1777130816-772509');
+
+      // Re-run — every row must dedupe via clientMessageId
+      const second = service.importLegacyConversation(sampleLegacy);
+      expect(second.imported).toBe(0);
+      expect(second.deduped).toBe(3);
+      expect(second.channelId).toBe(first.channelId);
+
+      // No phantom rows
+      expect(service.countAllMessages()).toBe(3);
+    });
+
+    it('maps from.type correctly (user, orchestrator → agent, anything → system)', () => {
+      service.importLegacyConversation(sampleLegacy);
+      // Fetch via listMessages to inspect sender types
+      const messages = service.listMessages({
+        channelId: 'slack-D0AC7-1777130816-772509',
+        principal: { userId: 'system', source: 'oss' },
+        direction: 'forward',
+      }).messages;
+      expect(messages).toHaveLength(3);
+      expect(messages.map((m) => m.senderType)).toEqual(['user', 'agent', 'system']);
+      expect(messages[1].senderId).toBe('crewly-orc');
+      expect(messages[2].senderId).toBe('system');
+    });
+
+    it('preserves legacy metadata under explicit legacy* keys', () => {
+      service.importLegacyConversation(sampleLegacy);
+      const messages = service.listMessages({
+        channelId: 'slack-D0AC7-1777130816-772509',
+        principal: { userId: 'system', source: 'oss' },
+        direction: 'forward',
+      }).messages;
+      expect(messages[0].metadata).toMatchObject({
+        source: 'system',
+        legacySource: 'slack',
+        legacyMessageId: 'msg-a',
+        legacyTimestamp: '2026-05-04T11:26:58.361Z',
+      });
+    });
+
+    it('skips malformed rows without aborting the import', () => {
+      const conv = {
+        conversation: { id: 'slack-X-1' },
+        messages: [
+          { id: 'good', from: { type: 'user' }, content: 'kept' },
+          { id: '', from: { type: 'user' }, content: 'dropped — no id' } as any,
+          { id: 'bad-empty', from: { type: 'user' }, content: '' },
+          { id: 'no-content', from: { type: 'user' } } as any,
+          { id: 'good2', from: { type: 'user' }, content: 'kept2' },
+        ],
+      };
+      const result = service.importLegacyConversation(conv as any);
+      expect(result.imported).toBe(2);
+      expect(result.deduped).toBe(0);
+      expect(result.skipped).toBe(3);
+    });
+
+    it('logs a warning surfacing skipped row count + reasons when malformed rows are present', () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        service.importLegacyConversation({
+          conversation: { id: 'slack-Y-1' },
+          messages: [
+            { id: 'ok', from: { type: 'user' }, content: 'ok' },
+            { id: 'bad-empty', from: { type: 'user' }, content: '' },
+            { id: '', from: { type: 'user' }, content: 'no id' } as any,
+          ],
+        } as any);
+        expect(warn).toHaveBeenCalledTimes(1);
+        const [msg, ctx] = warn.mock.calls[0];
+        expect(String(msg)).toMatch(/skipped 2\/3 malformed row/);
+        expect(ctx).toMatchObject({
+          skipped: 2,
+          totalRows: 3,
+          truncated: false,
+        });
+        expect((ctx as any).reasons).toEqual([
+          { index: 1, reason: 'empty-content', id: 'bad-empty' },
+          { index: 2, reason: 'missing-id', id: '' },
+        ]);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('does NOT log a warning when no rows are skipped (silent on the happy path)', () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        service.importLegacyConversation(sampleLegacy);
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('caps the reasons list at 10 entries and sets truncated=true beyond that', () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const messages: Array<{ id: string; from: { type: string }; content: string }> = [];
+        for (let i = 0; i < 12; i++) {
+          messages.push({ id: `bad-${i}`, from: { type: 'user' }, content: '' });
+        }
+        service.importLegacyConversation({
+          conversation: { id: 'slack-Z-1' },
+          messages,
+        } as any);
+        const [, ctx] = warn.mock.calls[0];
+        expect((ctx as any).reasons).toHaveLength(10);
+        expect((ctx as any).truncated).toBe(true);
+        expect((ctx as any).skipped).toBe(12);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('rejects missing conversation.id', () => {
+      expect(() =>
+        service.importLegacyConversation({
+          conversation: { id: '' },
+          messages: [],
+        } as any),
+      ).toThrow(/conversation\.id is required/);
+    });
+
+    it('rejects non-array messages', () => {
+      expect(() =>
+        service.importLegacyConversation({
+          conversation: { id: 'x' },
+          messages: null,
+        } as any),
+      ).toThrow(/messages must be an array/);
+    });
+
+    it('extracts user id from legacy metadata when present', () => {
+      service.importLegacyConversation(sampleLegacy);
+      const messages = service.listMessages({
+        channelId: 'slack-D0AC7-1777130816-772509',
+        principal: { userId: 'system', source: 'oss' },
+        direction: 'forward',
+      }).messages;
+      // First message has metadata.userId = 'UG94JLNGK'
+      expect(messages[0].senderId).toBe('UG94JLNGK');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 6.0 — API gap fill for legacy ChatService retirement
+  // Spec: 2026-05-14-unified-chat-message-store.md
+  // -------------------------------------------------------------------------
+
+  describe('updateMessageMetadata (Phase 6.0)', () => {
+    it('merges patch into existing metadata and returns the updated DTO', () => {
+      const ch = createSam();
+      const { message } = service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'hello',
+        metadata: {
+          source: 'reply-tool',
+          slackChannelId: 'D0AC7',
+          slackDeliveryStatus: 'pending',
+        },
+      });
+
+      const updated = service.updateMessageMetadata(message.id, {
+        slackDeliveryStatus: 'delivered',
+        slackMessageTs: '1234567890.000100',
+      });
+
+      expect(updated).not.toBeNull();
+      expect(updated!.metadata).toMatchObject({
+        source: 'reply-tool',                  // preserved
+        slackChannelId: 'D0AC7',                // preserved
+        slackDeliveryStatus: 'delivered',       // overwritten
+        slackMessageTs: '1234567890.000100',    // added
+      });
+    });
+
+    it('returns null when the message does not exist', () => {
+      expect(service.updateMessageMetadata('no-such-msg', { x: 1 })).toBeNull();
+    });
+  });
+
+  describe('updateSystemMessage (ticket receipts)', () => {
+    it('edits a system row, merges metadata and emits chat_message_updated', () => {
+      const ch = createSam();
+      const { message } = service.recordTurn({
+        channelId: ch.id,
+        senderType: 'system',
+        senderId: 'system',
+        content: '已记成 TKT-001',
+        contentType: 'system_note',
+        metadata: { source: 'system', ticketReceipt: { ticketId: 't1', status: 'recorded' } },
+      });
+      const seen: unknown[] = [];
+      service.on('chat_message_updated', (dto) => seen.push(dto));
+      const updated = service.updateSystemMessage(message.id, 'TKT-001 已取消记录', { ticketReceipt: { status: 'dismissed' } });
+      expect(updated?.content).toBe('TKT-001 已取消记录');
+      expect(updated?.metadata).toMatchObject({ source: 'system', ticketReceipt: { ticketId: 't1', status: 'dismissed' } });
+      expect(seen).toHaveLength(1);
+    });
+
+    it('never edits the owner’s or an agent’s words', () => {
+      const ch = createSam();
+      const { message } = service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'hello',
+        metadata: { source: 'reply-tool' },
+      });
+      expect(service.updateSystemMessage(message.id, 'rewritten')).toBeNull();
+      expect(service.updateSystemMessage('no-such-msg', 'x')).toBeNull();
+    });
+  });
+
+  describe('findMessagesWithPendingSlackDelivery (Phase 6.0)', () => {
+    it('returns only messages tagged pending with a slackChannelId, within window', () => {
+      const ch = createSam();
+
+      const pending = service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'pending msg',
+        metadata: {
+          source: 'reply-tool',
+          slackChannelId: 'D0AC7',
+          slackDeliveryStatus: 'pending',
+        },
+      });
+      service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'delivered msg',
+        metadata: {
+          source: 'reply-tool',
+          slackChannelId: 'D0AC7',
+          slackDeliveryStatus: 'delivered',
+        },
+      });
+      service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'pending but no channel id',
+        metadata: { source: 'reply-tool', slackDeliveryStatus: 'pending' },
+      });
+
+      // Window large enough to include all
+      const found = service.findMessagesWithPendingSlackDelivery(60 * 60 * 1000);
+      expect(found).toHaveLength(1);
+      expect(found[0].id).toBe(pending.message.id);
+    });
+
+    it('respects the maxAgeMs window — older rows are excluded', () => {
+      // Drive the service clock explicitly: the lookback window must be
+      // measured on the same clock that stamps `created_at` (regression —
+      // it used to mix the injected clock with Date.now()).
+      service.close();
+      db = openChatDatabase({ dbPath: ':memory:', inMemory: true, skipIntegrityCheck: true });
+      let clock = 1_000_000;
+      service = new ChatV2Service({ config: loadChatV2Config({}), db, now: () => clock });
+
+      const ch = createSam();
+      service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'pending, 5s old',
+        metadata: {
+          source: 'reply-tool',
+          slackChannelId: 'D0AC7',
+          slackDeliveryStatus: 'pending',
+        },
+      });
+      clock += 5_000;
+
+      // Row is 5s old: outside a 1s window, inside a 10s window.
+      expect(service.findMessagesWithPendingSlackDelivery(1_000)).toHaveLength(0);
+      expect(service.findMessagesWithPendingSlackDelivery(10_000)).toHaveLength(1);
+    });
+  });
+
+  describe('getStatistics (Phase 6.0)', () => {
+    it('counts active and archived channels separately and totals messages across both', () => {
+      const a = createSam();
+      service.archiveChannel(a.id, owner);
+
+      const b = service.createChannel({
+        agentSession: 'sess-b',
+        name: 'Active B',
+        principal: owner,
+      });
+
+      service.recordTurn({
+        channelId: b.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'one',
+        metadata: { source: 'in-process-runtime' },
+      });
+      service.recordTurn({
+        channelId: b.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'two',
+        metadata: { source: 'in-process-runtime' },
+      });
+
+      const stats = service.getStatistics();
+      expect(stats).toEqual({
+        totalChannels: 2,
+        activeChannels: 1,
+        archivedChannels: 1,
+        totalMessages: 2,
+      });
+    });
+
+    it('returns zeros on a fresh store', () => {
+      expect(service.getStatistics()).toEqual({
+        totalChannels: 0,
+        activeChannels: 0,
+        archivedChannels: 0,
+        totalMessages: 0,
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 6.0b — conversation-lifecycle methods (rename, unarchive, delete,
+  // clear, count). Each replaces a legacy ChatService method.
+  // -------------------------------------------------------------------------
+
+  describe('unarchiveChannel (Phase 6.0b)', () => {
+    it('flips an archived channel back to active', () => {
+      const ch = createSam();
+      service.archiveChannel(ch.id, owner);
+      expect(service.unarchiveChannel(ch.id, owner)).toBe(true);
+      // Channel is listable again
+      const list = service.listChannels({ principal: owner });
+      expect(list.some((c) => c.id === ch.id)).toBe(true);
+    });
+
+    it('returns false when the channel was already active', () => {
+      const ch = createSam();
+      expect(service.unarchiveChannel(ch.id, owner)).toBe(false);
+    });
+
+    it('rejects on non-owned channel', () => {
+      const ch = createSam();
+      service.archiveChannel(ch.id, owner);
+      expect(() => service.unarchiveChannel(ch.id, otherUser)).toThrow(ChatError);
+    });
+  });
+
+  describe('renameChannel (Phase 6.0b)', () => {
+    it('renames an existing channel and returns the updated DTO', () => {
+      const ch = createSam();
+      const renamed = service.renameChannel(ch.id, 'Sam (renamed)', owner);
+      expect(renamed.id).toBe(ch.id);
+      expect(renamed.name).toBe('Sam (renamed)');
+      // Round-trip through the store confirms it stuck
+      const fetched = service.getChannel(ch.id, owner);
+      expect(fetched.name).toBe('Sam (renamed)');
+    });
+
+    it('trims whitespace from the new name', () => {
+      const ch = createSam();
+      const renamed = service.renameChannel(ch.id, '  Trim Me  ', owner);
+      expect(renamed.name).toBe('Trim Me');
+    });
+
+    it('rejects empty / whitespace-only names', () => {
+      const ch = createSam();
+      expect(() => service.renameChannel(ch.id, '', owner)).toThrow(/name is required/);
+      expect(() => service.renameChannel(ch.id, '   ', owner)).toThrow(/name is required/);
+    });
+
+    it('rejects oversize names', () => {
+      const ch = createSam();
+      const tooLong = 'x'.repeat(service.config.maxChannelNameChars + 1);
+      expect(() => service.renameChannel(ch.id, tooLong, owner)).toThrow(/exceeds/);
+    });
+  });
+
+  describe('deleteChannel (Phase 6.0b)', () => {
+    it('hard-deletes channel + all messages via FK cascade', () => {
+      const ch = createSam();
+      service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'msg',
+        metadata: { source: 'in-process-runtime' },
+      });
+      expect(service.countAllMessages()).toBe(1);
+
+      expect(service.deleteChannel(ch.id, owner)).toBe(true);
+
+      // Channel + messages both gone
+      expect(service.countAllMessages()).toBe(0);
+      const list = service.listChannels({ principal: owner });
+      expect(list.find((c) => c.id === ch.id)).toBeUndefined();
+    });
+
+    it('throws on unknown channel id (auth probe fails first)', () => {
+      expect(() => service.deleteChannel('no-such-id', owner)).toThrow(ChatError);
+    });
+  });
+
+  describe('clearChannel (Phase 6.0b)', () => {
+    it('deletes messages but keeps the channel row', () => {
+      const ch = createSam();
+      service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'a',
+        metadata: { source: 'in-process-runtime' },
+      });
+      service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'b',
+        metadata: { source: 'in-process-runtime' },
+      });
+      expect(service.countAllMessages()).toBe(2);
+
+      const cleared = service.clearChannel(ch.id, owner);
+      expect(cleared).toBe(2);
+
+      // Channel survives, messages don't
+      expect(service.countAllMessages()).toBe(0);
+      expect(service.getChannel(ch.id, owner).id).toBe(ch.id);
+    });
+  });
+
+  describe('countChannelMessages (Phase 6.0b)', () => {
+    it('returns 0 for a fresh channel and counts after writes', () => {
+      const ch = createSam();
+      expect(service.countChannelMessages(ch.id, owner)).toBe(0);
+      service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'one',
+        metadata: { source: 'in-process-runtime' },
+      });
+      service.recordTurn({
+        channelId: ch.id,
+        senderType: 'agent',
+        senderId: 'crewly-orc',
+        content: 'two',
+        metadata: { source: 'in-process-runtime' },
+      });
+      expect(service.countChannelMessages(ch.id, owner)).toBe(2);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase B-2 (2026-05-17): createHuddle + listHuddleMembers + queryHuddleMembersForDispatch
+  // ---------------------------------------------------------------------------
+
+  describe('createHuddle', () => {
+    it('creates a type=huddle channel with the given roster', () => {
+      const dto = service.createHuddle({
+        name: 'Q4 planning',
+        memberSessions: ['sess-a', 'sess-b', 'sess-c'],
+        principal: owner,
+      });
+
+      expect(dto.type).toBe('huddle');
+      expect(dto.name).toBe('Q4 planning');
+      expect(dto.agentSession).toBe(''); // huddle is not 1:1-bound
+      expect(dto.teamId).toBeUndefined();
+      expect(dto.members?.map((m) => m.sessionName).sort()).toEqual(['sess-a', 'sess-b', 'sess-c']);
+      for (const m of dto.members!) {
+        expect(m.joinedAt).toBe(1000); // matches the test clock
+      }
+    });
+
+    it('dedupes and trims member sessions', () => {
+      const dto = service.createHuddle({
+        name: 'Dupes',
+        memberSessions: [' sess-a ', 'sess-a', 'sess-b', '', '   '],
+        principal: owner,
+      });
+      expect(dto.members?.map((m) => m.sessionName).sort()).toEqual(['sess-a', 'sess-b']);
+    });
+
+    it('rejects empty membership', () => {
+      expect(() =>
+        service.createHuddle({ name: 'Empty', memberSessions: [], principal: owner }),
+      ).toThrow(/at least one agent session/);
+      expect(() =>
+        service.createHuddle({ name: 'Whitespace', memberSessions: ['  ', ''], principal: owner }),
+      ).toThrow(/at least one agent session/);
+    });
+
+    it('rejects blank name', () => {
+      expect(() =>
+        service.createHuddle({ name: '   ', memberSessions: ['sess-a'], principal: owner }),
+      ).toThrow(/name is required/);
+    });
+
+    it('caps the roster size to 50', () => {
+      const fifty = Array.from({ length: 50 }, (_, i) => `sess-${i}`);
+      // 50 is fine
+      expect(() =>
+        service.createHuddle({ name: 'Big', memberSessions: fifty, principal: owner }),
+      ).not.toThrow();
+      // 51 throws
+      expect(() =>
+        service.createHuddle({
+          name: 'Bigger',
+          memberSessions: [...fifty, 'sess-51'],
+          principal: owner,
+        }),
+      ).toThrow(/50-member cap/);
+    });
+  });
+
+  describe('listHuddleMembers', () => {
+    it('returns the roster ordered by joined_at ASC', () => {
+      const huddle = service.createHuddle({
+        name: 'h',
+        memberSessions: ['sess-a', 'sess-b', 'sess-c'],
+        principal: owner,
+      });
+      const members = service.listHuddleMembers(huddle.id, owner);
+      expect(members.map((m) => m.sessionName).sort()).toEqual(['sess-a', 'sess-b', 'sess-c']);
+    });
+
+    it('returns an empty array for a non-huddle channel (instead of throwing)', () => {
+      const dm = createSam();
+      expect(service.listHuddleMembers(dm.id, owner)).toEqual([]);
+    });
+
+    it('refuses to expose a huddle owned by a different user', () => {
+      const huddle = service.createHuddle({
+        name: 'h',
+        memberSessions: ['sess-a'],
+        principal: owner,
+      });
+      expect(() => service.listHuddleMembers(huddle.id, otherUser)).toThrow();
+    });
+  });
+
+  describe('queryHuddleMembersForDispatch', () => {
+    it('returns just the session names (dispatcher-shaped)', () => {
+      const huddle = service.createHuddle({
+        name: 'h',
+        memberSessions: ['sess-a', 'sess-b'],
+        principal: owner,
+      });
+      const sessions = service.queryHuddleMembersForDispatch(huddle.id);
+      expect(sessions.sort()).toEqual(['sess-a', 'sess-b']);
+    });
+
+    it('returns empty for non-huddle channels', () => {
+      const dm = createSam();
+      expect(service.queryHuddleMembersForDispatch(dm.id)).toEqual([]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // getRecentOwnerMessageContents (commitment-approval-guard read)
+  // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Slack team channels — bridge-facing huddle helpers (2026-09-12)
+  // -------------------------------------------------------------------------
+
+  describe('huddle bridge helpers (Slack team channels)', () => {
+    function makeTeamHuddle() {
+      return service.createHuddle({
+        name: '#team-alpha',
+        memberSessions: ['sess-a', 'sess-b'],
+        principal: owner,
+      });
+    }
+
+    it('setHuddleMembers reconciles the roster and reports the diff', () => {
+      const huddle = makeTeamHuddle();
+      const diff = service.setHuddleMembers(huddle.id, ['sess-b', 'sess-c', ' sess-c ']);
+      expect(diff.added).toEqual(['sess-c']);
+      expect(diff.removed).toEqual(['sess-a']);
+      expect(service.queryHuddleMembersForDispatch(huddle.id).sort()).toEqual(['sess-b', 'sess-c']);
+    });
+
+    it('a system-owned huddle marked shared (a Crewly channel) is open to the owner, not to non-member agents', () => {
+      const system: ChatPrincipal = { userId: 'system', source: 'oss' };
+      const room = service.createHuddle({ name: '#tech-brief', memberSessions: ['sess-a'], principal: system });
+      // Not shared yet: the owner cannot see it.
+      expect(() => service.getChannel(room.id, owner)).toThrow(ChatError);
+      service.setSharedChannelResolver((id) => id === room.id);
+      expect(service.getChannel(room.id, owner).id).toBe(room.id);
+      const msg = service.sendMessage({ channelId: room.id, principal: owner, content: 'morning', attachments: [] });
+      expect(msg.senderType).toBe('user');
+      expect(service.listMessages({ channelId: room.id, principal: owner }).messages).toHaveLength(1);
+      // An agent outside the roster is still refused.
+      const outsider: ChatPrincipal = { userId: 'user-a', agentSession: 'sess-zzz', source: 'oss' };
+      expect(() => service.sendMessage({ channelId: room.id, principal: outsider, content: 'x', attachments: [] })).toThrow(ChatError);
+      service.setSharedChannelResolver(null);
+      expect(() => service.getChannel(room.id, owner)).toThrow(ChatError);
+    });
+
+    it('renameChannelForBridge renames without a principal; blank names and unknown ids are no-ops', () => {
+      const huddle = makeTeamHuddle();
+      expect(service.renameChannelForBridge(huddle.id, '#daily-brief')).toBe(true);
+      expect(service.getChannelForBridge(huddle.id)?.name).toBe('#daily-brief');
+      expect(service.renameChannelForBridge(huddle.id, '  ')).toBe(false);
+      expect(service.renameChannelForBridge('ghost', '#x')).toBe(false);
+    });
+
+    it('setHuddleMembers is a no-op on DMs and unknown ids', () => {
+      const dm = createSam();
+      expect(service.setHuddleMembers(dm.id, ['x'])).toEqual({ added: [], removed: [] });
+      expect(service.setHuddleMembers('ghost', ['x'])).toEqual({ added: [], removed: [] });
+    });
+
+    describe('owner-facing roster + rename (#1400 private channels)', () => {
+      it('setHuddleRoster replaces the roster and returns the channel with its members', () => {
+        const huddle = service.createHuddle({ name: 'Launch crew', memberSessions: ['sess-a', 'sess-b'], principal: owner });
+        const dto = service.setHuddleRoster(huddle.id, ['sess-b', 'sess-c', ' sess-c '], owner);
+        expect(dto.id).toBe(huddle.id);
+        expect(dto.members?.map((m) => m.sessionName).sort()).toEqual(['sess-b', 'sess-c']);
+        expect(service.queryHuddleMembersForDispatch(huddle.id).sort()).toEqual(['sess-b', 'sess-c']);
+      });
+
+      it('setHuddleRoster refuses an empty roster, a DM, another owner\'s huddle and a Crewly channel', () => {
+        const huddle = service.createHuddle({ name: 'h', memberSessions: ['sess-a'], principal: owner });
+        expect(() => service.setHuddleRoster(huddle.id, [], owner)).toThrow(/at least one agent/);
+        expect(() => service.setHuddleRoster(createSam().id, ['x'], owner)).toThrow(/only a group chat/);
+        const other: ChatPrincipal = { userId: 'someone-else', source: 'oss' };
+        expect(() => service.setHuddleRoster(huddle.id, ['x'], other)).toThrow(ChatError);
+        expect(service.queryHuddleMembersForDispatch(huddle.id)).toEqual(['sess-a']);
+        service.setSharedChannelResolver((id) => id === huddle.id);
+        try {
+          expect(() => service.setHuddleRoster(huddle.id, ['x'], owner)).toThrow(/Crewly channel/);
+          expect(() => service.renameChannel(huddle.id, 'new', owner)).toThrow(/Crewly channel/);
+        } finally {
+          service.setSharedChannelResolver(null);
+        }
+      });
+
+      it('renameChannel renames a huddle the owner holds', () => {
+        const huddle = service.createHuddle({ name: 'h', memberSessions: ['sess-a'], principal: owner });
+        expect(service.renameChannel(huddle.id, '  Launch crew ', owner).name).toBe('Launch crew');
+        expect(service.getChannel(huddle.id, owner).name).toBe('Launch crew');
+      });
+    });
+
+    // The whole point of a team channel is that every member can answer.
+    // Before this, `resolveSender` only accepted the DM-bound agent, so a
+    // fanned-out huddle member's reply-channel call was refused with 403.
+    it('a huddle member may send as an agent; a non-member may not', () => {
+      const huddle = makeTeamHuddle();
+      const memberPrincipal: ChatPrincipal = { userId: 'someone-else', agentSession: 'sess-a', source: 'oss' };
+      const msg = service.sendMessage({
+        channelId: huddle.id,
+        principal: memberPrincipal,
+        content: 'on it',
+        attachments: [],
+      });
+      expect(msg.senderType).toBe('agent');
+      expect(msg.senderId).toBe('sess-a');
+
+      const stranger: ChatPrincipal = { userId: 'someone-else', agentSession: 'sess-zzz', source: 'oss' };
+      expect(() =>
+        service.sendMessage({ channelId: huddle.id, principal: stranger, content: 'hi', attachments: [] }),
+      ).toThrow(ChatError);
+    });
+
+    it('getChannelForBridge returns the DTO without a principal and null for unknown ids', () => {
+      const huddle = makeTeamHuddle();
+      const dto = service.getChannelForBridge(huddle.id);
+      expect(dto?.id).toBe(huddle.id);
+      expect(dto?.type).toBe('huddle');
+      expect(dto?.members?.map((m) => m.sessionName).sort()).toEqual(['sess-a', 'sess-b']);
+      expect(service.getChannelForBridge('ghost')).toBeNull();
+    });
+
+    it('archiveChannelForBridge archives once and is idempotent', () => {
+      const huddle = makeTeamHuddle();
+      expect(service.archiveChannelForBridge(huddle.id)).toBe(true);
+      expect(service.archiveChannelForBridge(huddle.id)).toBe(false);
+      expect(service.getChannelForBridge(huddle.id)?.archivedAt).not.toBeNull();
+      expect(service.archiveChannelForBridge('ghost')).toBe(false);
+    });
+
+    it('findSlackThreadRoot / findLatestSlackRoot recover roots by slackThreadTs', () => {
+      const huddle = makeTeamHuddle();
+      const root1 = service.recordTurn({
+        channelId: huddle.id,
+        senderType: 'user',
+        senderId: 'U1',
+        content: 'first',
+        metadata: { source: 'slack', slackChannelId: 'C1', slackThreadTs: '100.1' },
+      }).message;
+      const root2 = service.recordTurn({
+        channelId: huddle.id,
+        senderType: 'user',
+        senderId: 'U1',
+        content: 'second',
+        metadata: { source: 'slack', slackChannelId: 'C1', slackThreadTs: '200.2' },
+      }).message;
+      // A reply under root1 must not be mistaken for a root.
+      service.recordTurn({
+        channelId: huddle.id,
+        senderType: 'user',
+        senderId: 'U1',
+        content: 'reply',
+        threadId: root1.id,
+        metadata: { source: 'slack', slackChannelId: 'C1', slackThreadTs: '100.1' },
+      });
+      // A non-Slack root must not win "latest Slack root".
+      service.recordTurn({
+        channelId: huddle.id,
+        senderType: 'user',
+        senderId: 'U1',
+        content: 'web',
+        metadata: { source: 'web' },
+      });
+
+      expect(service.findSlackThreadRoot(huddle.id, '100.1')?.id).toBe(root1.id);
+      expect(service.findSlackThreadRoot(huddle.id, '999.9')).toBeNull();
+      expect(service.findLatestSlackRoot(huddle.id)?.id).toBe(root2.id);
+      expect(service.getMessageForBridge(root1.id)?.content).toBe('first');
+      expect(service.getMessageForBridge('ghost')).toBeNull();
+    });
+
+    it('hasSlackMessageForBridge says whether this machine recorded a Slack message (delivery audit)', () => {
+      const huddle = makeTeamHuddle();
+      service.recordTurn({
+        channelId: huddle.id,
+        senderType: 'user',
+        senderId: 'U1',
+        content: 'owner',
+        metadata: { source: 'slack', slackChannelId: 'C1', slackThreadTs: '300.3', slackTs: '300.3' },
+      });
+      expect(service.hasSlackMessageForBridge('C1', '300.3')).toBe(true);
+      expect(service.hasSlackMessageForBridge('C1', '300.4')).toBe(false);
+    });
+  });
+
+  describe('getRecentOwnerMessageContents', () => {
+    function seed(channelId: string, senderType: string, content: string, createdAt: number, seq: number): void {
+      db.prepare(
+        `INSERT INTO chat_messages (id, channel_id, seq, sender_type, sender_id, content, content_type, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'markdown', ?)`,
+      ).run(`m-${seq}`, channelId, seq, senderType, `${senderType}-1`, content, createdAt);
+    }
+
+    it('returns only OWNER (user) messages at/after sinceMs, newest first, excluding agent/system', () => {
+      const ch = createSam();
+      seed(ch.id, 'user', 'old owner msg', 500, 1); // before window
+      seed(ch.id, 'agent', '好，启动 Phase 1 (agent — must be ignored)', 2000, 2);
+      seed(ch.id, 'system', 'system note', 2000, 3);
+      seed(ch.id, 'user', '好，启动 Phase 1', 2000, 4);
+      seed(ch.id, 'user', '再来一条', 3000, 5);
+
+      const got = service.getRecentOwnerMessageContents(1000);
+
+      // Newest-first, only user rows within the window.
+      expect(got).toEqual(['再来一条', '好，启动 Phase 1']);
+    });
+
+    it('getOwnerMessageTimes returns only the times of owner messages in the window, newest first', () => {
+      const ch = createSam();
+      seed(ch.id, 'user', 'old', 500, 1);
+      seed(ch.id, 'agent', 'agent', 2000, 2);
+      seed(ch.id, 'user', 'a', 2000, 3);
+      seed(ch.id, 'user', 'b', 3000, 4);
+      expect(service.getOwnerMessageTimes(1000)).toEqual([3000, 2000]);
+      expect(service.getOwnerMessageTimes(1000, 1)).toEqual([3000]);
+    });
+
+    it('getOwnerMessageTimes with a bucket returns one start per bucket the owner wrote in', () => {
+      const ch = createSam();
+      seed(ch.id, 'user', 'a', 2100, 1);
+      seed(ch.id, 'user', 'b', 2900, 2);
+      seed(ch.id, 'user', 'c', 5500, 3);
+      expect(service.getOwnerMessageTimes(1000, 100, 1000)).toEqual([5000, 2000]);
+    });
+
+    it('returns empty when there are no owner messages in the window', () => {
+      const ch = createSam();
+      seed(ch.id, 'user', 'way old', 100, 1);
+      seed(ch.id, 'agent', 'recent agent', 5000, 2);
+      expect(service.getRecentOwnerMessageContents(1000)).toEqual([]);
+    });
+
+    /**
+     * Issue #730 — the commitment gate must see the owner's approval no matter
+     * which surface/conversation it arrived on. The read is deliberately NOT
+     * scoped to a conversationId: a legacy `[CHAT:…]` conversation channel, a
+     * Slack-bridged channel and a fresh DM all contribute. A regression to a
+     * per-conversation query would silently re-open the "go ahead is never
+     * found" loop the issue reported.
+     */
+    it('is conversation-agnostic: owner rows from every channel in the window are returned (#730)', () => {
+      const dm = createSam();
+      const legacy = service.ensureChannelForLegacyConversation({
+        conversationId: 'conv-legacy-1',
+        agentSession: 'crewly-orc',
+      });
+      const slackish = service.createChannel({
+        agentSession: 'crewly-orc',
+        name: 'slack-thread-42',
+        principal: owner,
+      });
+
+      seed(dm.id, 'user', 'first on the DM', 2000, 1);
+      seed(legacy.id, 'user', 'go ahead', 3000, 2);
+      seed(slackish.id, 'user', '启动 Phase 1', 4000, 3);
+      seed(slackish.id, 'agent', 'agent echo — ignored', 4500, 4);
+
+      const got = service.getRecentOwnerMessageContents(1000);
+      expect(got).toEqual(['启动 Phase 1', 'go ahead', 'first on the DM']);
+    });
+
+    /**
+     * #730: widening which owner CHANNELS count must not widen which AUTHORS
+     * count. Each case below is a `sender_type='user'` row whose text an
+     * agent wrote — every one of them must stay invisible to the gate, so a
+     * fabricated "approval" still cannot cold-launch a dormant team.
+     */
+    describe('agent-authored user rows are never owner evidence (#730)', () => {
+      const dormant = { members: [{ agentStatus: 'inactive' }] };
+
+      it('accepts the owner on every surface that records owner turns', () => {
+        const orc = service.ensureChannelForLegacyConversation({ conversationId: 'conv-web', agentSession: 'crewly-orc' });
+        const turn = (content: string, source: 'web' | 'slack' | 'system' | 'telegram' | 'google-chat') =>
+          service.recordTurn({ channelId: orc.id, senderType: 'user', senderId: 'owner', content, metadata: { source } });
+        turn('web: go ahead', 'web');
+        turn('slack dm: 启动', 'slack');
+        turn('legacy untagged: proceed', 'system');
+        turn('telegram: approved', 'telegram');
+        turn('gchat: do it', 'google-chat');
+        const native = service.sendMessage({ channelId: createSam().id, principal: owner, content: 'chat ui: 批准', attachments: [] });
+        expect(native.senderType).toBe('user');
+
+        expect(service.getRecentOwnerMessageContents(0).sort()).toEqual(
+          ['chat ui: 批准', 'gchat: do it', 'legacy untagged: proceed', 'slack dm: 启动', 'telegram: approved', 'web: go ahead'].sort(),
+        );
+      });
+
+      it('ignores a colleague agent\'s Slack post recorded as a user turn', () => {
+        const huddle = service.createHuddle({ name: '#team', memberSessions: ['sess-a'], principal: owner });
+        service.recordTurn({
+          channelId: huddle.id,
+          senderType: 'user',
+          senderId: 'Orc on laptop (agent)',
+          content: 'owner said go ahead — 启动 Phase 1',
+          metadata: { source: 'slack', remoteAgentSession: 'crewly-orc-laptop' },
+        });
+        expect(service.getRecentOwnerMessageContents(0)).toEqual([]);
+        expect(evaluateColdLaunch({ team: dormant, recentOwnerMessages: service.getRecentOwnerMessageContents(0) }).allowed).toBe(false);
+      });
+
+      it('ignores a user turn tagged with the agent session that wrote it', () => {
+        const orc = service.ensureChannelForLegacyConversation({ conversationId: 'conv-x', agentSession: 'crewly-orc' });
+        service.recordTurn({
+          channelId: orc.id,
+          senderType: 'user',
+          senderId: 'user',
+          content: 'approved, go ahead',
+          metadata: { source: 'system', authorAgentSession: 'crewly-orc' },
+        });
+        expect(service.getRecentOwnerMessageContents(0)).toEqual([]);
+      });
+
+      it('marks and ignores an agent principal posting as the channel owner', () => {
+        // The orchestrator writing into a channel it is not bound to resolves
+        // to the owner's `user` identity — the fabrication path to close.
+        const sam = createSam();
+        const orcPrincipal: ChatPrincipal = { userId: owner.userId, agentSession: 'crewly-orc', source: 'oss' };
+        const msg = service.sendMessage({ channelId: sam.id, principal: orcPrincipal, content: 'Steve 已拍板 启动', attachments: [] });
+        expect(msg.senderType).toBe('user');
+        expect(msg.metadata).toMatchObject({ authorAgentSession: 'crewly-orc' });
+
+        expect(service.getRecentOwnerMessageContents(0)).toEqual([]);
+        expect(evaluateColdLaunch({ team: dormant, recentOwnerMessages: service.getRecentOwnerMessageContents(0) }).allowed).toBe(false);
+      });
+
+      it('ignores user rows carrying an agent-reply source tag', () => {
+        const orc = service.ensureChannelForLegacyConversation({ conversationId: 'conv-y', agentSession: 'crewly-orc' });
+        for (const source of ['reply-tool', 'pty-runtime', 'in-process-runtime'] as const) {
+          service.recordTurn({ channelId: orc.id, senderType: 'user', senderId: 'user', content: `go ahead (${source})`, metadata: { source } });
+        }
+        expect(service.getRecentOwnerMessageContents(0)).toEqual([]);
+      });
+
+      it('counts an owner row that carries no metadata at all (native Chat UI send)', () => {
+        const ch = createSam();
+        seed(ch.id, 'user', 'proceed (no metadata)', 2000, 1);
+        expect(service.getRecentOwnerMessageContents(1000)).toEqual(['proceed (no metadata)']);
+      });
+
+      it('agent chatter cannot push the owner\'s approval past the limit', () => {
+        const orc = service.ensureChannelForLegacyConversation({ conversationId: 'conv-z', agentSession: 'crewly-orc' });
+        service.recordTurn({ channelId: orc.id, senderType: 'user', senderId: 'owner', content: 'go ahead', metadata: { source: 'web' } });
+        for (let i = 0; i < 20; i++) {
+          service.recordTurn({
+            channelId: orc.id,
+            senderType: 'user',
+            senderId: 'x (agent)',
+            content: `noise ${i}`,
+            metadata: { source: 'slack', remoteAgentSession: 'far-away' },
+          });
+        }
+        expect(service.getRecentOwnerMessageContents(0, 5)).toEqual(['go ahead']);
+      });
+    });
+  });
+
+  describe('getChannelActivity (OrcDeliveryEnforcer read, #731)', () => {
+    function seed(channelId: string, senderType: string, createdAt: number, seq: number): void {
+      db.prepare(
+        `INSERT INTO chat_messages (id, channel_id, seq, sender_type, sender_id, content, content_type, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'markdown', ?)`,
+      ).run(`a-${channelId}-${seq}`, channelId, seq, senderType, `${senderType}-1`, `msg ${seq}`, createdAt);
+    }
+
+    it('returns null for an unknown channel', () => {
+      expect(service.getChannelActivity('slack-NOPE-1-2')).toBeNull();
+    });
+
+    it('returns both nulls for a channel with no messages', () => {
+      const ch = service.ensureChannelForLegacyConversation({
+        conversationId: 'slack-D0AG8QM4J21-1785672178-254459',
+        agentSession: 'crewly-orc',
+      });
+      expect(service.getChannelActivity(ch.id)).toEqual({ lastOwnerMessageAt: null, lastReplyAt: null });
+    });
+
+    it('reports the latest owner row and the latest non-owner row separately', () => {
+      const ch = service.ensureChannelForLegacyConversation({
+        conversationId: 'slack-D0AG8QM4J21-1785672178-254459',
+        agentSession: 'crewly-orc',
+      });
+      seed(ch.id, 'user', 1000, 1);
+      seed(ch.id, 'agent', 2000, 2);
+      seed(ch.id, 'user', 3000, 3);
+      seed(ch.id, 'system', 4000, 4);
+      seed(ch.id, 'agent', 5000, 5);
+      expect(service.getChannelActivity(ch.id)).toEqual({ lastOwnerMessageAt: 3000, lastReplyAt: 5000 });
+    });
+
+    it('does not mix channels', () => {
+      const a = service.ensureChannelForLegacyConversation({ conversationId: 'slack-A-1-1', agentSession: 'crewly-orc' });
+      const b = service.ensureChannelForLegacyConversation({ conversationId: 'slack-B-1-1', agentSession: 'crewly-orc' });
+      seed(a.id, 'user', 1000, 1);
+      seed(b.id, 'agent', 9000, 1);
+      expect(service.getChannelActivity(a.id)).toEqual({ lastOwnerMessageAt: 1000, lastReplyAt: null });
+      expect(service.getChannelActivity(b.id)).toEqual({ lastOwnerMessageAt: null, lastReplyAt: 9000 });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Unified conversation log (specs/unified-conversations-cloud-store.md §A)
+  // -------------------------------------------------------------------------
+
+  describe('unified conversation log', () => {
+    it('accepts the whatsapp and cloud-talk sources', () => {
+      const ch = createSam();
+      expect(() =>
+        service.recordTurn({ channelId: ch.id, senderType: 'user', senderId: 'x', content: 'hi', metadata: { source: 'whatsapp' } }),
+      ).not.toThrow();
+      expect(() =>
+        service.recordTurn({ channelId: ch.id, senderType: 'user', senderId: 'x', content: 'hi', metadata: { source: 'cloud-talk' } }),
+      ).not.toThrow();
+    });
+
+    it('tags a relayed Cloud Talk send so it is not mistaken for Crewly Chat (G3)', () => {
+      const ch = createSam();
+      const talk = service.sendMessage({ channelId: ch.id, principal: owner, content: 'from the phone', origin: 'cloud-talk' });
+      const web = service.sendMessage({ channelId: ch.id, principal: owner, content: 'from the dashboard' });
+      expect(talk.metadata?.source).toBe('cloud-talk');
+      expect(web.metadata?.source).toBeUndefined();
+      expect(service.getLatestOwnerTurnSource(ch.id)).toBe('crewly-chat');
+    });
+
+    it('never lets an agent write pass as a Cloud Talk turn', () => {
+      const ch = createSam();
+      const reply = service.sendMessage({ channelId: ch.id, principal: agentPrincipal, content: 'on it', origin: 'cloud-talk' });
+      expect(reply.senderType).toBe('agent');
+      expect(reply.metadata?.source).toBeUndefined();
+    });
+
+    it('reports the surface of the owner\'s latest turn, skipping other people and agents', () => {
+      const ch = createSam();
+      expect(service.getLatestOwnerTurnSource(ch.id)).toBeNull();
+      service.recordTurn({ channelId: ch.id, senderType: 'user', senderId: 'Steve', content: 'q', metadata: { source: 'slack', slackChannelId: 'D1' } });
+      service.recordTurn({ channelId: ch.id, senderType: 'agent', senderId: 'sess-a', content: 'a', metadata: { source: 'reply-tool' } });
+      service.recordTurn({ channelId: ch.id, senderType: 'user', senderId: 'x', content: 'agent as user', metadata: { source: 'slack', authorAgentSession: 'sam' } });
+      expect(service.getLatestOwnerTurnSource(ch.id)).toBe('slack');
+      service.recordTurn({ channelId: ch.id, senderType: 'user', senderId: 'Steve', content: 'q2', metadata: { source: 'cloud-talk' } });
+      expect(service.getLatestOwnerTurnSource(ch.id)).toBe('cloud-talk');
+    });
+
+    it('upgrades the owner\'s earlier shared-channel rows when the owner becomes known', () => {
+      const huddle = service.createHuddle({ name: 'daily', memberSessions: ['sess-a'], principal: owner });
+      service.recordTurn({
+        channelId: huddle.id,
+        senderType: 'user',
+        senderId: 'Steve',
+        content: 'morning',
+        metadata: { source: 'slack', slackUserId: 'U-owner', slackChannelId: 'C1' },
+      });
+      expect(service.getCloudOutbox().count()).toBe(0);
+      service.setOwnerIdentityProvider(() => ({ slackUserId: 'U-owner' }));
+      expect(service.getCloudOutbox().count()).toBe(1);
+    });
+
+    describe('recordSlackOnlyAgentPost (work-item posts made searchable, CREW-877)', () => {
+      beforeEach(() => {
+        service.close();
+        db = openChatDatabase({ dbPath: ':memory:', inMemory: true, skipIntegrityCheck: true });
+        service = new ChatV2Service({ config: loadChatV2Config({}), db });
+      });
+
+      function room() {
+        return service.createHuddle({ name: 'crewly-product', memberSessions: ['sam', 'leo'], principal: owner });
+      }
+      const post = (channelId: string, extra: Partial<Parameters<ChatV2Service['recordSlackOnlyAgentPost']>[0]> = {}) =>
+        service.recordSlackOnlyAgentPost({ channelId, agentSession: 'leo', content: 'smart-home: use the Hue bridge', slackChannelId: 'C1', slackTs: '1760000300.000100', ...extra });
+
+      it('is attributed to the posting agent, never the orchestrator', () => {
+        const r = room();
+        const id = post(r.id);
+        const row = db.prepare('SELECT sender_type, sender_id, agent_session, direction, sender_kind FROM chat_messages WHERE id = ?').get(id) as Record<string, string>;
+        expect(row).toMatchObject({ sender_type: 'agent', sender_id: 'leo', agent_session: 'leo', direction: 'out' });
+        expect(row.sender_kind).not.toBe('owner');
+        expect(row.sender_id).not.toBe('crewly-orc');
+      });
+
+      it('is found by search-chat for the team lead and for the poster, not for an outsider', () => {
+        const r = room();
+        post(r.id);
+        const q = (who: string) => service.searchMessagesForAgent({ agentSession: who, principal: { ...owner, agentSession: who }, query: 'smart-home hue' });
+        expect(q('sam')).toHaveLength(1);
+        expect(q('sam')[0]).toMatchObject({ channelId: r.id, channel: 'crewly-product', sender: 'leo' });
+        expect(q('leo')).toHaveLength(1);
+        expect(q('stranger')).toHaveLength(0);
+      });
+
+      it('emits nothing: no agent is woken, no mirror posts it to Slack again, no live view or owner tracker sees it', () => {
+        const r = room();
+        const emitted = jest.fn();
+        service.on('chat_message', emitted);
+        post(r.id);
+        expect(emitted).not.toHaveBeenCalled();
+        // Control: the normal write path DOES emit, so the spy is watching the right event.
+        service.recordTurn({ channelId: r.id, senderType: 'agent', senderId: 'leo', content: 'normal', metadata: { source: 'reply-tool' } });
+        expect(emitted).toHaveBeenCalledTimes(1);
+      });
+
+      it('does not count as an owner message', () => {
+        const r = room();
+        post(r.id);
+        expect(service.getOwnerTurnMarks()).toEqual([]);
+        expect(service.hasConversationSince(0)).toBe(false); // agent rows are not a person speaking
+        const row = db.prepare("SELECT COUNT(*) AS n FROM chat_messages WHERE sender_type = 'user'").get() as { n: number };
+        expect(row.n).toBe(0);
+      });
+
+      it('syncs to Cloud like any other agent row', () => {
+        const r = room();
+        const id = post(r.id);
+        const sync = db.prepare('SELECT cloud_sync FROM chat_messages WHERE id = ?').get(id) as { cloud_sync: number };
+        expect(sync.cloud_sync).toBe(1);
+        expect((db.prepare('SELECT COUNT(*) AS n FROM cloud_outbox WHERE message_id = ?').get(id) as { n: number }).n).toBe(1);
+      });
+
+      it('makes no second row for the same Slack message', () => {
+        const r = room();
+        expect(post(r.id)).not.toBeNull();
+        expect(post(r.id)).toBeNull();
+        // A row another path already filed for that Slack message counts too.
+        service.recordTurn({ channelId: r.id, senderType: 'agent', senderId: 'leo', content: 'mirrored', metadata: { source: 'slack', slackChannelId: 'C1', slackTs: '1760000999.000900' } });
+        expect(post(r.id, { slackTs: '1760000999.000900' })).toBeNull();
+        expect((db.prepare('SELECT COUNT(*) AS n FROM chat_messages').get() as { n: number }).n).toBe(2);
+      });
+
+      it('files a threaded post under the thread root that has a chat row', () => {
+        const r = room();
+        const root = service.recordTurn({ channelId: r.id, senderType: 'user', senderId: 'Steve', content: 'question', metadata: { source: 'slack', slackChannelId: 'C1', slackTs: '1760000100.000100', slackThreadTs: '1760000100.000100' } }).message;
+        const id = post(r.id, { slackThreadTs: '1760000100.000100' });
+        const hit = service.searchMessagesForAgent({ agentSession: 'sam', principal: { ...owner, agentSession: 'sam' }, query: 'hue' })[0];
+        expect(hit.id).toBe(id);
+        expect(hit.threadId).toBe(root.id);
+      });
+
+      it('a threaded post whose root has no row carries the thread key and does not pose as the thread root', () => {
+        const r = room();
+        const id = post(r.id, { slackThreadTs: '1760000100.000100' });
+        const meta = JSON.parse((db.prepare('SELECT metadata FROM chat_messages WHERE id = ?').get(id) as { metadata: string }).metadata) as Record<string, unknown>;
+        expect(meta.slackThreadKey).toBe('C1:1760000100.000100');
+        expect(meta.slackThreadTs).toBeUndefined();
+        expect(service.findSlackThreadRoot(r.id, '1760000100.000100')).toBeNull();
+      });
+
+      it('a top-level post becomes the root of the replies that follow', () => {
+        const r = room();
+        const rootId = post(r.id, { slackTs: '1760000500.000100' });
+        const replyId = post(r.id, { slackTs: '1760000500.000200', slackThreadTs: '1760000500.000100', content: 'reply under it' });
+        expect(service.findSlackThreadRoot(r.id, '1760000500.000100')?.id).toBe(rootId);
+        const hit = service.searchMessagesForAgent({ agentSession: 'sam', principal: { ...owner, agentSession: 'sam' }, query: 'reply under it' })[0];
+        expect(hit.id).toBe(replyId);
+        expect(hit.threadId).toBe(rootId);
+      });
+
+      it('refuses a missing channel and empty input', () => {
+        expect(() => post('nope')).toThrow(/not found/i);
+        expect(() => post(room().id, { content: '' })).toThrow(/content is required/);
+        expect(() => post(room().id, { slackTs: '' })).toThrow(/slackChannelId and slackTs/);
+      });
+    });
+
+    describe('searchMessagesForAgent (search-chat skill)', () => {
+      beforeEach(() => {
+        service.close();
+        db = openChatDatabase({ dbPath: ':memory:', inMemory: true, skipIntegrityCheck: true });
+        service = new ChatV2Service({ config: loadChatV2Config({}), db });
+      });
+
+      function seedRoom() {
+        const room = service.createHuddle({ name: 'awesome-videos', memberSessions: ['pia', 'sam'], principal: owner });
+        const other = service.createHuddle({ name: 'secret', memberSessions: ['bob'], principal: owner });
+        service.recordTurn({ channelId: room.id, senderType: 'user', senderId: 'Steve', content: 'Three-video plan: intro, demo, wrap-up. ' + 'x'.repeat(400), metadata: { source: 'slack' } });
+        service.recordTurn({ channelId: other.id, senderType: 'user', senderId: 'Steve', content: 'Three-video budget', metadata: { source: 'slack' } });
+        return room;
+      }
+
+      it('returns compact hits only from what the agent can see', () => {
+        const room = seedRoom();
+        const hits = service.searchMessagesForAgent({ agentSession: 'pia', principal: { ...owner, agentSession: 'pia' }, query: 'three-video' });
+        expect(hits).toHaveLength(1);
+        expect(hits[0]).toMatchObject({ channelId: room.id, channel: 'awesome-videos', sender: 'Steve', threadId: null });
+        expect(hits[0].text.length).toBeLessThanOrEqual(301);
+        expect(hits[0].text.endsWith('…')).toBe(true);
+        expect(new Date(hits[0].time).toString()).not.toBe('Invalid Date');
+      });
+
+      it('refuses to search as another agent, and needs a keyword', () => {
+        seedRoom();
+        expect(() => service.searchMessagesForAgent({ agentSession: 'bob', principal: { ...owner, agentSession: 'pia' }, query: 'budget' })).toThrow(/own chat history/);
+        expect(() => service.searchMessagesForAgent({ agentSession: 'pia', principal: owner, query: '   ' })).toThrow(/query is required/);
+        // An agent caller must name itself; an empty session is not "everything".
+        expect(() => service.searchMessagesForAgent({ agentSession: '', principal: { ...owner, agentSession: 'pia' }, query: 'x' })).toThrow(/agent session is required/);
+      });
+
+      it('the owner without a session searches every conversation (#1400 cross-conversation search)', () => {
+        const room = seedRoom();
+        const hits = service.searchMessagesForAgent({ principal: owner, query: 'three-video' });
+        expect(hits.map((h) => h.channel).sort()).toEqual(['awesome-videos', 'secret']);
+        const inRoom = hits.find((h) => h.channelId === room.id);
+        expect(inRoom).toMatchObject({ channelType: 'huddle', sender: 'Steve', senderType: 'user' });
+        expect(service.searchMessagesForAgent({ principal: owner, query: 'three-video budget' })).toHaveLength(1);
+      });
+    });
+
+    describe('getAgentTimeline (§A.5)', () => {
+      let clock = 0;
+      beforeEach(() => {
+        service.close();
+        db = openChatDatabase({ dbPath: ':memory:', inMemory: true, skipIntegrityCheck: true });
+        clock = 0;
+        service = new ChatV2Service({ config: loadChatV2Config({}), db, now: () => (clock += 10) });
+      });
+
+      /** Seed a DM, a Slack orchestrator thread (other agent), and a huddle the agent is in. */
+      function seed() {
+        const dm = service.ensureDmChannel({ agentSession: 'ella', principal: owner }).channel;
+        const orc = service.ensureChannelForLegacyConversation({ conversationId: 'slack-C1-1.0', agentSession: 'crewly-orc' });
+        const huddle = service.createHuddle({ name: 'daily', memberSessions: ['ella', 'sam'], principal: owner });
+        service.recordTurn({ channelId: dm.id, senderType: 'user', senderId: 'Steve', content: 'dm q', metadata: { source: 'web' } });
+        service.recordTurn({ channelId: orc.id, senderType: 'user', senderId: 'U1', content: 'orc q', metadata: { source: 'slack' } });
+        service.recordTurn({ channelId: huddle.id, senderType: 'user', senderId: 'Maya', content: 'room chatter', metadata: { source: 'slack', slackUserId: 'U-maya' } });
+        service.recordTurn({ channelId: dm.id, senderType: 'agent', senderId: 'ella', content: 'dm a', metadata: { source: 'reply-tool' } });
+        service.recordTurn({ channelId: dm.id, senderType: 'user', senderId: 'Steve', content: 'talk q', metadata: { source: 'cloud-talk' } });
+        return { dm, huddle };
+      }
+
+      it('merges the agent\'s DM and its huddles, newest first, with surface fields', () => {
+        const { dm, huddle } = seed();
+        const res = service.getAgentTimeline({ agentSession: 'ella', principal: owner });
+        expect(res.items.map((i) => i.content)).toEqual(['talk q', 'dm a', 'room chatter', 'dm q']);
+        expect(res.items[0]).toMatchObject({ source: 'cloud-talk', direction: 'in', senderKind: 'owner', channelId: dm.id, channelType: 'dm' });
+        expect(res.items[1]).toMatchObject({ source: 'crewly-chat', direction: 'out', senderKind: 'agent', agentSession: 'ella' });
+        expect(res.items[2]).toMatchObject({ channelId: huddle.id, channelName: 'daily', channelType: 'huddle', senderKind: 'human' });
+        expect(res.nextCursor).toBeNull();
+      });
+
+      it('pages with a cursor, and with before=<ms>', () => {
+        seed();
+        const first = service.getAgentTimeline({ agentSession: 'ella', principal: owner, limit: 2 });
+        expect(first.items.map((i) => i.content)).toEqual(['talk q', 'dm a']);
+        const second = service.getAgentTimeline({ agentSession: 'ella', principal: owner, limit: 2, cursor: first.nextCursor });
+        expect(second.items.map((i) => i.content)).toEqual(['room chatter', 'dm q']);
+        const before = service.getAgentTimeline({ agentSession: 'ella', principal: owner, before: first.items[1].createdAt });
+        expect(before.items.map((i) => i.content)).toEqual(['room chatter', 'dm q']);
+      });
+
+      it('filters by source', () => {
+        seed();
+        const res = service.getAgentTimeline({ agentSession: 'ella', principal: owner, sources: ['cloud-talk', 'slack'] });
+        expect(res.items.map((i) => i.content)).toEqual(['talk q', 'room chatter']);
+        expect(() => service.getAgentTimeline({ agentSession: 'ella', principal: owner, sources: ['fax'] })).toThrow(/unknown source/);
+      });
+
+      it('lets an agent read only its own timeline', () => {
+        seed();
+        expect(() =>
+          service.getAgentTimeline({ agentSession: 'ella', principal: { userId: 'x', agentSession: 'sam', source: 'oss' } }),
+        ).toThrow(ChatError);
+        expect(
+          service.getAgentTimeline({ agentSession: 'ella', principal: { userId: 'x', agentSession: 'ella', source: 'oss' } }).items,
+        ).toHaveLength(4);
+      });
+
+      it('rejects a malformed cursor', () => {
+        expect(() => service.getAgentTimeline({ agentSession: 'ella', principal: owner, cursor: 'nope' })).toThrow(/Cursor/);
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Read state (#1400)
+  // -------------------------------------------------------------------------
+
+  describe('read state', () => {
+    const asAgent = (channelId: string, content = 'hi') =>
+      service.sendMessage({ channelId, principal: agentPrincipal, content, attachments: [] });
+    const asOwner = (channelId: string, content = 'q') =>
+      service.sendMessage({ channelId, principal: owner, content, attachments: [] });
+
+    it('a new channel starts at marker 0 and DTOs carry lastReadSeq/unreadCount', () => {
+      const ch = createSam();
+      expect(ch.lastReadSeq).toBe(0);
+      expect(ch.unreadCount).toBe(0);
+      asAgent(ch.id);
+      asAgent(ch.id);
+      expect(service.getChannel(ch.id, owner)).toMatchObject({ lastReadSeq: 0, unreadCount: 2 });
+      expect(service.listChannels({ principal: owner })[0]).toMatchObject({ unreadCount: 2 });
+    });
+
+    it('markChannelRead is forward-only and emits read_state', () => {
+      const ch = createSam();
+      asAgent(ch.id);
+      const m2 = asAgent(ch.id);
+      const frames: unknown[] = [];
+      service.on('read_state', (f) => frames.push(f));
+      expect(service.markChannelRead(ch.id, owner)).toEqual({
+        channelId: ch.id,
+        lastReadSeq: m2.seq,
+        unreadCount: 0,
+      });
+      expect(service.markChannelRead(ch.id, owner, 1).lastReadSeq).toBe(m2.seq);
+      expect(frames).toHaveLength(2);
+    });
+
+    it('markChannelUnread moves the marker back to seq - 1', () => {
+      const ch = createSam();
+      asAgent(ch.id);
+      const m2 = asAgent(ch.id);
+      service.markChannelRead(ch.id, owner);
+      expect(service.markChannelUnread(ch.id, owner, m2.seq)).toEqual({
+        channelId: ch.id,
+        lastReadSeq: 1,
+        unreadCount: 1,
+      });
+    });
+
+    it('rejects an invalid seq', () => {
+      const ch = createSam();
+      expect(() => service.markChannelUnread(ch.id, owner, 0)).toThrow(ChatError);
+      expect(() => service.markChannelUnread(ch.id, owner, undefined as unknown as number)).toThrow(ChatError);
+      expect(() => service.markChannelRead(ch.id, owner, -1)).toThrow(ChatError);
+      expect(() => service.markChannelRead(ch.id, owner, 1.5)).toThrow(ChatError);
+    });
+
+    it('does not let another user touch the marker', () => {
+      const ch = createSam();
+      expect(() => service.markChannelRead(ch.id, otherUser)).toThrow(ChatError);
+    });
+
+    it('excludes the owner own messages and system notes from the count', () => {
+      const ch = createSam();
+      asOwner(ch.id);
+      service.recordTurn({
+        channelId: ch.id,
+        senderType: 'system',
+        senderId: 'system',
+        content: 'note',
+        contentType: 'system_note',
+        metadata: { source: 'slack' },
+      });
+      expect(service.getChannel(ch.id, owner).unreadCount).toBe(0);
+    });
+
+    it('the owner sending advances the marker (forward-only) and emits', () => {
+      const ch = createSam();
+      asAgent(ch.id);
+      asAgent(ch.id);
+      const frames: Array<{ lastReadSeq: number; unreadCount: number }> = [];
+      service.on('read_state', (f) => frames.push(f));
+      const sent = asOwner(ch.id);
+      expect(service.getChannel(ch.id, owner)).toMatchObject({ lastReadSeq: sent.seq, unreadCount: 0 });
+      expect(frames.at(-1)).toMatchObject({ lastReadSeq: sent.seq, unreadCount: 0 });
+      // The owner can still keep an older agent message unread after replying.
+      service.markChannelUnread(ch.id, owner, 2);
+      expect(service.getChannel(ch.id, owner)).toMatchObject({ lastReadSeq: 1, unreadCount: 1 });
+    });
+
+    it('an agent message raises the count and emits read_state', () => {
+      const ch = createSam();
+      const frames: Array<{ unreadCount: number }> = [];
+      service.on('read_state', (f) => frames.push(f));
+      asAgent(ch.id);
+      expect(frames.at(-1)).toMatchObject({ channelId: ch.id, unreadCount: 1 });
+    });
+
+    it('getUnreadSummary lists only channels with unread and totals them', () => {
+      const a = createSam();
+      const b = service.createChannel({ agentSession: 'sess-a', name: 'B', principal: owner });
+      asAgent(a.id);
+      asAgent(a.id);
+      asAgent(b.id);
+      service.markChannelRead(b.id, owner);
+      expect(service.getUnreadSummary(owner)).toEqual({
+        total: 2,
+        channels: [{ channelId: a.id, lastReadSeq: 0, unreadCount: 2 }],
+      });
+    });
+  });
+});

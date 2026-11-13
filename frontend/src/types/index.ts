@@ -1,0 +1,463 @@
+// Frontend types (mirrors backend types exactly)
+
+/**
+ * A runtime sign-in the owner must complete before an agent session can
+ * continue. Captured from the agent's terminal by the OAuth re-login monitor.
+ */
+export interface LoginRequiredInfo {
+  /** Login URL, or null when the screen names no URL */
+  url: string | null;
+  /** Device / authorization code (e.g. `FBVZ-MJHKK`), or null for browser-callback flows */
+  code: string | null;
+  /** ISO timestamp of first detection */
+  detectedAt: string;
+}
+
+/**
+ * One entry from `GET /api/oauth/pending` — a session waiting on a human sign-in.
+ */
+export interface PendingLogin extends LoginRequiredInfo {
+  /** PTY session name */
+  sessionName: string;
+  /** Runtime type when known */
+  runtimeType: string | null;
+  /** ISO timestamp the owner was last notified, or null */
+  notifiedAt: string | null;
+}
+
+/** An agent running on a fallback runtime (specs/2026-10-01-runtime-fallback.md). */
+export interface RuntimeOverrideInfo {
+  /** Runtime it runs on now */
+  runtime: string;
+  /** Its configured runtime */
+  primary: string;
+  reason: 'usage_limit';
+  since: string;
+  until?: string;
+  /** e.g. "on DeepSeek (Claude limit)" */
+  badge: string;
+}
+
+export interface TeamMember {
+  id: string;
+  name: string;
+  sessionName: string; // terminal session name
+  role: string; // Now accepts any role key from configuration
+  avatar?: string; // URL or emoji
+  systemPrompt: string;
+  agentStatus: 'inactive' | 'starting' | 'started' | 'active' | 'suspended' | 'activating'; // Connection/registration status (activating is deprecated)
+  workingStatus: 'idle' | 'in_progress'; // Activity level status
+  runtimeType: 'claude-code' | 'gemini-cli' | 'codex-cli' | 'opencode-cli' | 'antigravity-cli' | 'crewly-agent'; // AI runtime to use
+  /**
+   * Per-agent model. PTY runtimes take the harness's own model name and get
+   * it at launch (`claude --model`, `codex -m`, `gemini -m`, `opencode --model`);
+   * crewly-agent takes `provider/modelId`. Unset = the runtime's default.
+   */
+  modelId?: string;
+  /** Per-agent reasoning effort (Claude Code `--effort`, Codex `model_reasoning_effort`). */
+  reasoningEffort?: string;
+  /** Model tier (crewly#1173); an explicit `modelId` wins */
+  tier?: ModelTier;
+  /** Slack user id of the one person this agent works for; others get a polite decline (issue #968). '' clears. */
+  dedicatedTo?: string;
+  skillOverrides?: string[]; // Additional skill IDs beyond what the role provides
+  excludedRoleSkills?: string[]; // Role skills to exclude for this specific member
+  currentTickets?: string[];
+  readyAt?: string; // ISO timestamp when agent reported ready
+  capabilities?: string[]; // Agent-reported capabilities
+  lastActivityCheck?: string; // ISO timestamp of last activity monitoring
+  /** Set while the session is parked on a runtime sign-in screen (url + device code) */
+  loginRequired?: LoginRequiredInfo;
+  /** Set while the agent runs on a fallback runtime (its own ran out of usage) */
+  runtimeOverride?: RuntimeOverrideInfo;
+  createdAt: string;
+  updatedAt: string;
+
+  // === Hierarchy fields (for hierarchical team management) ===
+
+  /** Parent member ID in the hierarchy. undefined = root (orchestrator). */
+  parentMemberId?: string;
+
+  /**
+   * Position in hierarchy: 0=orchestrator, 1=team leader, 2=worker.
+   * Supports N-level depth for future expansion.
+   */
+  hierarchyLevel?: number;
+
+  /** IDs of direct subordinate members. Maintained by backend. */
+  subordinateIds?: string[];
+
+  /** Whether this member can delegate tasks to subordinates. */
+  canDelegate?: boolean;
+
+  /** Maximum number of concurrent tasks this member can handle. */
+  maxConcurrentTasks?: number;
+
+  /** Expert profile ID — loads thinking patterns from config/experts/{expertId}.md */
+  expertId?: string;
+}
+
+/**
+ * Model suggestions per PTY runtime. Free text is always allowed — these
+ * only seed the picker with names each harness is known to accept.
+ */
+export const RUNTIME_MODEL_PRESETS: Record<string, readonly { id: string; label: string }[]> = {
+  'claude-code': [
+    { id: 'fable', label: 'fable (latest Fable)' },
+    { id: 'opus', label: 'opus (latest Opus)' },
+    { id: 'sonnet', label: 'sonnet (latest Sonnet)' },
+    { id: 'haiku', label: 'haiku (latest Haiku)' },
+  ],
+  'codex-cli': [
+    { id: 'gpt-6-luna', label: 'GPT-6 Luna (gpt-6-luna)' },
+    { id: 'gpt-6.1-sol', label: 'gpt-6.1-sol' },
+    { id: 'gpt-5.6-sol', label: 'gpt-5.6-sol' },
+    { id: 'gpt-5.4', label: 'gpt-5.4' },
+  ],
+  'gemini-cli': [
+    { id: 'gemini-2.5-pro', label: 'gemini-2.5-pro' },
+    { id: 'gemini-2.5-flash', label: 'gemini-2.5-flash' },
+  ],
+  'opencode-cli': [
+    { id: 'anthropic/claude-sonnet-4-20250514', label: 'anthropic/claude-sonnet-4-20250514' },
+    { id: 'openai/gpt-4o', label: 'openai/gpt-4o' },
+  ],
+  // Slugs from `agy models` (agy 1.2.11)
+  'antigravity-cli': [
+    { id: 'gemini-3.8-flash-high', label: 'gemini-3.8-flash-high' },
+    { id: 'gemini-3.8-flash-medium', label: 'gemini-3.8-flash-medium' },
+    { id: 'gemini-3.1-pro-high', label: 'gemini-3.1-pro-high' },
+    { id: 'gemini-3.1-pro-low', label: 'gemini-3.1-pro-low' },
+  ],
+};
+
+/** Reasoning-effort levels per runtime (empty = the runtime has no such flag). */
+export const RUNTIME_EFFORT_LEVELS: Record<string, readonly string[]> = {
+  'claude-code': ['low', 'medium', 'high', 'xhigh', 'max'],
+  'codex-cli': ['minimal', 'low', 'medium', 'high', 'xhigh'],
+  'gemini-cli': [],
+  'opencode-cli': [],
+  'antigravity-cli': ['low', 'medium', 'high', 'max'],
+  'crewly-agent': [],
+};
+
+/** How each runtime expects the model name — shown as the field hint. */
+export const RUNTIME_MODEL_HINTS: Record<string, string> = {
+  'claude-code': 'Passed as `claude --model` — an alias (opus, sonnet) or a full model name.',
+  'codex-cli': 'Passed as `codex -m` — a model name your Codex account can use.',
+  'gemini-cli': 'Passed as `gemini -m`.',
+  'opencode-cli': 'Passed as `opencode --model` — must be provider/model.',
+  'antigravity-cli': 'Passed as `agy --model` — a slug from `agy models`. Runs on your Gemini API key.',
+  'crewly-agent': 'provider/model for the in-process runtime.',
+};
+
+/** Supported AI models for crewly-agent runtime dropdown */
+export const SUPPORTED_MODELS = [
+  { id: 'google/gemini-3-flash-preview', label: 'Gemini 3 Flash (Preview)' },
+  { id: 'google/gemini-2.5-flash-preview-05-20', label: 'Gemini 2.5 Flash' },
+  { id: 'anthropic/claude-sonnet-4-20250514', label: 'Claude Sonnet 4' },
+  { id: 'anthropic/claude-haiku-4-20250514', label: 'Claude Haiku 4' },
+  { id: 'openai/gpt-4o', label: 'GPT-4o' },
+  { id: 'openai/gpt-4o-mini', label: 'GPT-4o Mini' },
+  { id: 'ollama/llama3', label: 'Llama 3 (Ollama)' },
+] as const;
+
+export interface Team {
+  id: string;
+  name: string;
+  description?: string;
+  members: TeamMember[];
+  projectIds: string[];
+  createdAt: string;
+  updatedAt: string;
+
+  // === Hierarchy fields ===
+
+  /** Whether this team uses hierarchical management (TL → Workers). Default: false. */
+  hierarchical?: boolean;
+
+  /**
+   * @deprecated Use `leaderIds` instead. Retained for backward compatibility.
+   * When both exist, `leaderId` equals `leaderIds[0]`.
+   */
+  leaderId?: string;
+
+  /** Member IDs of the team leaders. Supports multiple TLs per team. */
+  leaderIds?: string[];
+
+  /** Template ID this team was created from. */
+  templateId?: string;
+
+  /** Parent team ID for team organization/grouping. null/undefined = top-level team. */
+  parentTeamId?: string;
+
+  // === Temporary pause (specs/2026-10-04-team-pause.md) ===
+
+  /** Set while the owner has paused the team (kept until resumed or swept after `until`) */
+  paused?: TeamPauseState;
+  /** GitHub repo (`owner/name`) other agents file issues in while the team is paused */
+  issueRepo?: string;
+  /** From GET /api/teams: the pause is in force right now */
+  pausedNow?: boolean;
+  /** From GET /api/teams: `paused (owner)` while paused */
+  pauseLabel?: string;
+  /** "Optimize usage": the lead reviews usage weekly and proposes tier changes the owner approves (crewly#1173) */
+  optimizeUsage?: boolean;
+}
+
+/** Model tiers, strongest first (crewly#1173). */
+export type ModelTier = 'strong' | 'mid' | 'weak';
+
+/** Who changes a team's tiers: `approve` — the owner approves each change; `auto` — the lead decides and tells the owner (crewly#1173). */
+export type TierChangeMode = 'approve' | 'auto';
+
+/** GET /api/teams/:id/model-tiers. */
+export interface TeamModelTierSettings {
+  teamId: string;
+  optimizeUsage: boolean;
+  /** Absent on older backends (= approve) */
+  tierChangeMode?: TierChangeMode;
+  tierModels: Record<string, Partial<Record<ModelTier, string>>>;
+  routingRules: string[];
+  tierMaps: Record<string, Partial<Record<ModelTier, string>>>;
+  members: Array<{ id: string; name: string; isLead: boolean; runtime: string; tier: ModelTier | null; modelId: string | null; model: string }>;
+  review: {
+    lastReviewAt: string | null;
+    nextReviewAt: string | null;
+    drafting: boolean;
+    openDecisionId: string | null;
+    recent: Array<{ memberName: string; from: ModelTier | null; to: ModelTier; appliedAt: string; guard: string; decisionId: string }>;
+  };
+}
+
+/** The owner's pause of a team. */
+export interface TeamPauseState {
+  pausedAt: string;
+  by: 'owner';
+  reason?: string;
+  /** ISO time the team resumes by itself */
+  until?: string;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  description?: string;
+  path: string; // absolute filesystem path
+  teams: Record<string, string[]>; // team assignments
+  status: 'active' | 'paused' | 'completed';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Ticket {
+  id: string;
+  title: string;
+  description: string;
+  status: 'open' | 'in_progress' | 'review' | 'done' | 'blocked';
+  assignedTo?: string;
+  priority: 'low' | 'medium' | 'high' | 'critical';
+  labels?: string[];
+  projectId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ScheduledCheck {
+  id: string;
+  targetSession: string;
+  message: string;
+  scheduledFor: string;
+  intervalMinutes?: number;
+  isRecurring: boolean;
+  createdAt: string;
+}
+
+export interface TerminalOutput {
+  sessionName: string;
+  content: string;
+  timestamp: string;
+  type: 'stdout' | 'stderr';
+}
+
+export interface WebSocketMessage {
+  type: 'terminal_output' | 'file_change' | 'team_status' | 'schedule_update';
+  payload: unknown;
+  timestamp: string;
+}
+
+/**
+ * WebSocket event data for team member status changes
+ * Used by Teams and TeamDetail pages for real-time status updates
+ */
+export interface TeamMemberStatusChangeEvent {
+  teamId: string;
+  memberId: string;
+  sessionName: string;
+  agentStatus: TeamMember['agentStatus'];
+}
+
+export interface ApiResponse<T = any> {
+  success: boolean;
+  data?: T;
+  error?: string;
+  message?: string;
+}
+
+/**
+ * A previously running session that can be resumed after app restart
+ */
+export interface PreviousSession {
+  name: string;
+  role?: string;
+  teamId?: string;
+  runtimeType: string;
+  hasResumeId: boolean;
+}
+
+/**
+ * Status of the teams backup compared to current state
+ */
+export interface TeamsBackupStatus {
+  /** Whether current teams are empty but backup has data */
+  hasMismatch: boolean;
+  /** Number of teams in the backup file */
+  backupTeamCount: number;
+  /** Number of teams currently in storage */
+  currentTeamCount: number;
+  /** ISO timestamp of the most recent backup */
+  backupTimestamp: string | null;
+}
+
+/**
+ * Result of a teams restore operation
+ */
+export interface TeamsRestoreResult {
+  /** Number of teams successfully restored */
+  restoredCount: number;
+  /** Total number of teams that were in the backup */
+  totalInBackup: number;
+  /** Error messages for individual team restore failures */
+  errors?: string[];
+}
+
+// =============================================================================
+// Message Queue Types
+// =============================================================================
+
+/**
+ * Status of a message in the queue
+ */
+export type QueueMessageStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
+
+/**
+ * A message in the processing queue
+ */
+export interface QueuedMessage {
+  /** Unique queue entry ID */
+  id: string;
+  /** Message content */
+  content: string;
+  /** Conversation ID for routing */
+  conversationId: string;
+  /** Source of the message */
+  source: 'web_chat' | 'slack';
+  /** Current status in the queue */
+  status: QueueMessageStatus;
+  /** ISO timestamp when enqueued */
+  enqueuedAt: string;
+  /** ISO timestamp when processing started */
+  processingStartedAt?: string;
+  /** ISO timestamp when completed or failed */
+  completedAt?: string;
+  /** Error message if failed */
+  error?: string;
+  /** Response content from the orchestrator */
+  response?: string;
+}
+
+/**
+ * Queue status summary for monitoring
+ */
+export interface QueueStatus {
+  /** Number of messages waiting */
+  pendingCount: number;
+  /** Whether a message is currently being processed */
+  isProcessing: boolean;
+  /** The message currently being processed, if any */
+  currentMessage?: QueuedMessage;
+  /** Total messages processed since startup */
+  totalProcessed: number;
+  /** Total messages that failed since startup */
+  totalFailed: number;
+  /** Number of completed messages in history */
+  historyCount: number;
+}
+
+// =============================================================================
+// Cloud Connection Types
+// =============================================================================
+
+/**
+ * Cloud subscription tier levels
+ */
+export type CloudTier = 'free' | 'starter' | 'pro' | 'max';
+
+/**
+ * Cloud connection status
+ */
+export type CloudConnectionStatus = 'disconnected' | 'connected' | 'error';
+
+/**
+ * Status of the CrewlyAI Cloud connection
+ */
+export interface CloudStatus {
+  /** Whether the client is currently connected to cloud */
+  connected: boolean;
+  /** Current subscription tier when connected */
+  tier: CloudTier | null;
+  /** Cloud API URL when connected */
+  cloudUrl: string | null;
+  /** Connection status label */
+  status: CloudConnectionStatus;
+}
+
+/**
+ * Result of a cloud connect operation
+ */
+export interface CloudConnectResult {
+  /** Whether the connection succeeded */
+  connected: boolean;
+  /** Subscription tier of the connected account */
+  tier: CloudTier;
+  /** Cloud API URL */
+  cloudUrl: string;
+}
+
+// Re-export cron task types
+export * from './cron-task.types';
+
+// Re-export auth types
+export * from './auth.types';
+
+// Re-export factory types
+export * from './factory.types';
+
+// Re-export role types
+export * from './role.types';
+
+// Re-export settings types
+export * from './settings.types';
+
+// Re-export chat types
+export * from './chat.types';
+
+// Re-export skill types
+export * from './skill.types';
+
+
+// Re-export monitoring types
+export * from './monitoring.types';
+
+// Re-export expert types
+export * from './expert.types';

@@ -1,0 +1,7432 @@
+import { createHash } from 'crypto';
+import { getHarnessCredentialsStore, harnessEnvForAgents } from '../harness/harness-credentials.store.js';
+import * as path from 'path';
+import * as os from 'os';
+import { readFile, readdir, stat, mkdir, writeFile, access } from 'fs/promises';
+import * as fsSync from 'fs';
+import { existsSync } from 'fs';
+import { LoggerService, ComponentLogger } from '../core/logger.service.js';
+import { getRestoreQueue } from './restore-queue.js';
+import { ResourceModeService, RESOURCE_MODE_CONSTANTS } from './resource-mode.service.js';
+import {
+	SessionCommandHelper,
+	createSessionCommandHelper,
+	getSessionBackendSync,
+	createSessionBackend,
+	getSessionStatePersistence,
+} from '../session/index.js';
+import { DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS } from '../session/session-backend.interface.js';
+import { RuntimeAgentService } from './runtime-agent.service.abstract.js';
+import { RuntimeServiceFactory } from './runtime-service.factory.js';
+import { CrewlyAgentExternalRuntimeService } from './crewly-agent/crewly-agent-external-runtime.service.js';
+import { OrcReplyRouteService } from '../orc/orc-reply-route.service.js';
+import {
+	registerInProcessRuntime,
+	unregisterInProcessRuntime,
+} from './crewly-agent/in-process-runtime-registry.js';
+import { StorageService } from '../core/storage.service.js';
+import { getCrewlyHomePath } from '../core/crewly-home.utils.js';
+import {
+	CREWLY_CONSTANTS,
+	ENV_CONSTANTS,
+	OWNER_AUTH_CONSTANTS,
+	AGENT_TIMEOUTS,
+	ORCHESTRATOR_SESSION_NAME,
+	ORCHESTRATOR_ROLE,
+	RUNTIME_TYPES,
+	RuntimeType,
+	SESSION_COMMAND_DELAYS,
+	SUB_AGENT_QUEUE_CONSTANTS,
+	SESSION_RECREATION_CONSTANTS,
+	EVENT_DELIVERY_CONSTANTS,
+	TERMINAL_PATTERNS,
+	GEMINI_SHELL_MODE_CONSTANTS,
+	GEMINI_STUCK_CONNECTIVITY_PATTERN,
+	GEMINI_ERROR_STATE_CONSTANTS,
+	REGISTRATION_DELIVERY_CONSTANTS,
+	ORC_CONVERSATION_CONSTANTS,
+	SLACK_THREAD_KEY_CONSTANTS,
+	OPEN_ITEMS_CONSTANTS,
+	BROWSER_PRIORITY_CONSTANTS,
+	WORKTREE_JANITOR_CONSTANTS,
+	SPEND_CAP_CONSTANTS,
+	RUNTIME_INPUT_SAFETY,
+	TUI_INPUT_GUARD,
+	INPUT_BLOCKED_RETRY_CONSTANTS,
+	USAGE_LIMIT_STATE_CONSTANTS,
+} from '../../constants.js';
+import { clearMemoryStop } from './memory-stop-hold.js';
+import { TuiInputGuardError, TuiPasteHoldError, screenShowsTurnInProgress, type TuiInputReading } from '../session/tui-input-guard.js';
+import { InputBlockedRetryService } from '../messaging/input-blocked-retry.service.js';
+import { extractSlackThreadKeys, formatSlackThreadKey } from '../slack/slack-thread-key.js';
+import { delay } from '../../utils/async.utils.js';
+import { buildRuntimeModelFlags, isSafeSkillRuntimeFlag } from '../../utils/runtime-model-flags.utils.js';
+import { buildRemoteMcpLaunchFlags } from '../connector/remote-mcp-launch.service.js';
+import { effectiveMemberModelId, fallbackRuntimeModelId } from '../../utils/member-default-model.utils.js';
+import { canMemberDelegate, getLeadSubordinates } from '../../utils/team.utils.js';
+import { stripToolCallMarkup } from '../../utils/tool-call-markup.utils.js';
+import { appendIncompleteNotice } from '../../utils/incomplete-turn.utils.js';
+import { filterAgentTurnReply } from '../../utils/agent-reply-filter.utils.js';
+import { getSettingsService } from '../settings/settings.service.js';
+import { SessionMemoryService } from '../memory/session-memory.service.js';
+import { StartupBriefingService } from '../memory/startup-briefing.service.js';
+import { ActiveWorkBriefingService } from './active-work-briefing.service.js';
+import { RuntimeExitMonitorService } from './runtime-exit-monitor.service.js';
+import { clearPlannedStop, markPlannedStop } from './planned-relaunch.registry.js';
+import { ContextWindowMonitorService } from './context-window-monitor.service.js';
+import { OAuthReloginMonitorService } from './oauth-relogin-monitor.service.js';
+import { SubAgentMessageQueue } from '../messaging/sub-agent-message-queue.service.js';
+import { InFlightTurnTracker } from '../restart/in-flight-turn-tracker.service.js';
+import { getInProcessTurnFailureService } from './in-process-turn-failure.service.js';
+import { AgentTurnStateService } from '../monitoring/agent-turn-state.js';
+import { FreshTaskConversationService } from './fresh-task-conversation.service.js';
+import { RestartDrainService } from '../restart/restart-drain.service.js';
+import {
+	PromptBuilderService,
+	buildModuleConfigFromTeamMember,
+	memberSkillsJson,
+	type SessionRuntimeContext,
+} from '../ai/prompt-builder.service.js';
+import { PromptAssemblyService } from '../ai/prompt-modules/prompt-assembly.service.js';
+import { renderActiveWorkSection } from '../ai/prompt-modules/active-work.module.js';
+import {
+	resolveOrcPromptProfile,
+	ORC_PROMPT_PROFILE_ENV,
+	type ModuleConfig,
+	type PromptProfile,
+} from '../ai/prompt-modules/prompt-module.interface.js';
+import type { SubordinateInfo, TeamMemberSessionConfig, Team, TeamMember } from '../../types/index.js';
+import { stripAnsiCodes } from '../../utils/terminal-output.utils.js';
+import {
+	isPromptLine,
+	isAgentAtPrompt,
+	containsSpinnerOrWorkingIndicator,
+	containsProcessingIndicator,
+	containsBusyStatusBar,
+	containsRewindMode,
+	containsGeminiProcessingKeywords,
+	extractChatPrefix,
+	stripTuiLineBorders,
+	matchTuiPromptLine,
+	stripBoxDrawing,
+} from '../../utils/terminal-string-ops.js';
+import { PtyActivityTrackerService } from './pty-activity-tracker.service.js';
+import { synthesizeSlackConversationId } from '../chat-v2/legacy-dto.utils.js';
+import { isRuntimeStartupBlockedError } from './runtime-startup-blocked.error.js';
+import {
+	buildHandoverSummary,
+	claudeTranscriptPath,
+	conversationExists,
+	defaultClaudeHome,
+	writeRestartHandover,
+	lastTurnContextTokens,
+	orcFreshContextTokens,
+	memberFreshContextTokens,
+	planRuntimeSessionFlags,
+	readLastConversation,
+	rememberedConversationToResume,
+	waitForAntigravityConversationId,
+	waitForCodexSessionId,
+	type RuntimeSessionPlan,
+} from './runtime-session-recovery.js';
+import { isTextInAntigravityInputBox } from './antigravity-runtime.service.js';
+import { getLocalApiBaseUrl } from '../../utils/local-api-url.utils.js';
+import { RegistrationFlowRegistry, type RegistrationFlowCancelReason } from './registration-flow-registry.js';
+import { buildResumedKickoff } from './resumed-kickoff.js';
+import { claudeAccountConfigDir, claudeAccountEnv } from '../harness/claude-accounts.js';
+import {
+	effectiveClaudeAccount,
+	effectiveRuntimeType,
+	resolveLaunchRuntime,
+	runtimeFallbackBeforeDelivery,
+	takeRuntimeSwitchKickoffNote,
+} from '../runtime-fallback/effective-runtime.js';
+import { spendCapReason, spendCapStopOf } from '../spend/spend-cap.gate.js';
+import { inspectUsageLimitScreen } from '../runtime-fallback/usage-limit-screen.js';
+import { usageLimitOf, usageLimitReason, usageLimitRemainingMs } from '../runtime-fallback/usage-limit-state.js';
+import { noteTurnDelivery, traceTurnActivity, traceTurnError } from '../trace/trace-recorder.js';
+import { stripTraceMarkers } from '../trace/trace-markers.js';
+import { mintAgentBadge } from '../core/owner-auth.service.js';
+import { credentialGuardEnvFor } from './credential-guard.service.js';
+import { isDriveWarm } from '../drive/drive-keep-warm.js';
+
+/**
+ * Whether a file exists (readable).
+ *
+ * @param filePath - Absolute path
+ * @returns True when `fs.access` succeeds
+ */
+async function fileExists(filePath: string): Promise<boolean> {
+	try {
+		await access(filePath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export interface OrchestratorConfig {
+	sessionName: string;
+	projectPath: string;
+	windowName?: string;
+	/** Runtime the orchestrator will run (adds runtime-scoped env such as Antigravity's key, and selects the settings API keys passed in its spawn env) */
+	runtimeType?: RuntimeType;
+}
+
+/**
+ * Error thrown when an agent role cannot be resolved to a valid value.
+ *
+ * Indicates a member with no `role` field in storage, or a caller passing
+ * `undefined`/empty/literal-"undefined". Surfaces the failure loudly so it
+ * cannot manifest as the silent "empty Claude prompt" symptom (Bug #1).
+ */
+export class InvalidAgentRoleError extends Error {
+	constructor(public readonly received: unknown, context?: string) {
+		const ctx = context ? ` (${context})` : '';
+		const display =
+			received === undefined ? 'undefined'
+			: received === null ? 'null'
+			: typeof received === 'string' ? `"${received}"`
+			: String(received);
+		super(
+			`Invalid agent role${ctx}: received ${display}. Role must be a non-empty string ` +
+			`matching a directory under config/roles/. ` +
+			`Common cause: team member.role field missing or unset in storage.`
+		);
+		this.name = 'InvalidAgentRoleError';
+	}
+}
+
+/**
+ * Validate that an agent role is a usable string before it flows into session
+ * creation, env-var injection, or prompt-template path resolution.
+ *
+ * Rejects: undefined, null, non-strings, empty/whitespace strings, and the
+ * literal string "undefined" (which results from JS coercion when an undefined
+ * is interpolated into a template literal — the exact failure mode behind
+ * `CREWLY_ROLE="undefined"` in tmux env).
+ *
+ * @param role - The candidate role value
+ * @param context - Optional caller context for the error message (e.g. "startTeamMember")
+ * @throws {InvalidAgentRoleError} when role is unusable
+ */
+export function validateAgentRole(role: unknown, context?: string): asserts role is string {
+	if (typeof role !== 'string') {
+		throw new InvalidAgentRoleError(role, context);
+	}
+	const trimmed = role.trim();
+	if (trimmed.length === 0 || trimmed.toLowerCase() === 'undefined' || trimmed.toLowerCase() === 'null') {
+		throw new InvalidAgentRoleError(role, context);
+	}
+}
+
+/**
+ * Service responsible for the complex, multi-step process of agent initialization and registration.
+ * Isolates the complex state management of agent startup with progressive escalation.
+ *
+ * Key capabilities:
+ * - Agent session creation and management
+ * - Runtime initialization and registration
+ * - Reliable message delivery to Claude Code with retry logic
+ * - Health checking and status management
+ */
+/**
+ * Key for the duplicate-write guard (#128): a hash of the whole message.
+ *
+ * @param message - Text written to the agent
+ * @returns sha1 hex of the full text
+ */
+export function messageDedupKey(message: string): string {
+	return createHash('sha1').update(message).digest('hex');
+}
+
+export class AgentRegistrationService {
+	private logger: ComponentLogger;
+	private _sessionHelper: SessionCommandHelper | null = null;
+	private storageService: StorageService;
+	private projectRoot: string;
+
+	// Prompt file caching to eliminate file I/O contention during concurrent session creation
+	private promptCache = new Map<string, string>();
+
+	// Session creation locks to prevent concurrent createAgentSession calls for the same session
+	private sessionCreationLocks = new Map<string, Promise<{ success: boolean; sessionName?: string; message?: string; error?: string; errorCode?: string }>>();
+
+	// The one live registration/kickoff flow per session, bound to the PTY it
+	// was started for. An orphaned flow (its PTY killed and replaced under the
+	// same name) must never type into the replacement (2026-09-25).
+	private registrationFlows = new RegistrationFlowRegistry<object>();
+
+	// Background stuck-message detector timer
+	private stuckMessageDetectorTimer: ReturnType<typeof setInterval> | null = null;
+
+	// Track TUI sessions for the stuck-message detector (sessionName → runtimeType)
+	private tuiSessionRegistry = new Map<string, RuntimeType>();
+
+	// Track recently-sent messages for background stuck-detection (all runtimes).
+	// Key: sessionName, Value: array of tracked message entries
+	private sentMessageTracker = new Map<string, Array<{
+		snippet: string;
+		/** Full text sent — Enter is pressed only when the input box holds exactly this */
+		message: string;
+		sentAt: number;
+		recovered: boolean;
+		recoveryAttempts: number;
+		/** Last recovery reading was an unreadable box */
+		unreadable?: boolean;
+		/** Delivery of this message was confirmed (it must never be re-sent) */
+		confirmed?: boolean;
+	}>>();
+
+	// Per-session delivery mutex to serialize message delivery.
+	// Prevents concurrent sendMessageWithRetry calls to the same session,
+	// which causes multiple Ctrl+C presses that can crash the runtime.
+	private sessionDeliveryMutex = new Map<string, Promise<void>>();
+
+	// Per-session hash of last sent message to prevent duplicate writes (#128).
+	// Key: sessionName, Value: { hash, sentAt }
+	private lastSentMessageHash = new Map<string, { hash: string; sentAt: number }>();
+
+	// Last input-guard refusal per session during the current delivery: the
+	// box was unreadable or held text we did not write. Such a message is
+	// kept queued and retried, never dropped (2026-10-03 review).
+	private lastGuardRefusal = new Map<string, TuiInputGuardError>();
+	/**
+	 * Sessions whose last delivery attempt found a busy Claude Code (its
+	 * "esc to interrupt" bar on screen) and did not paste: the message is
+	 * queued and delivered when the agent goes idle (2026-10-03 Ella: a paste
+	 * into a busy box rendered late, got no Enter and blocked the box).
+	 */
+	private busyHold = new Set<string>();
+	/** When messages to a session started being held for a busy agent (first hold of the episode) */
+	private busyHoldSince = new Map<string, { at: number; message: string }>();
+	/** Re-check timers for messages held for a busy agent */
+	private busyHoldTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	/** Timers that write out messages held for a usage-limited agent */
+	private usageLimitFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	// Consecutive guard refusals per session, for escalation.
+	private guardRefusalCount = new Map<string, number>();
+
+	// In-process Crewly Agent runtimes (sessionName → runtime instance).
+	// Used for crewly-agent runtimeType agents that run without PTY sessions.
+	private inProcessRuntimes = new Map<string, CrewlyAgentExternalRuntimeService>();
+
+	/** #167: Optional scheduler service for DLQ drain on agent activation. */
+	private schedulerService: { drainDeadLetterQueue(sessionName: string): Promise<number> } | null = null;
+
+	/** Architecture Upgrade Phase 6: EventBusService for standing task subscriptions. */
+	private eventBusService: { subscribe(input: import('../../types/event-bus.types.js').CreateSubscriptionInput): import('../../types/event-bus.types.js').EventSubscription } | null = null;
+
+
+	// Terminal patterns are now centralized in TERMINAL_PATTERNS constant
+	// Keeping prompt chars as static getter for backwards compatibility within the class
+	private static get CLAUDE_PROMPT_INDICATORS() {
+		return TERMINAL_PATTERNS.PROMPT_CHARS;
+	}
+
+	constructor(
+		_legacyTmuxService: unknown, // Legacy parameter for backwards compatibility
+		projectRoot: string | null,
+		storageService: StorageService
+	) {
+		this.logger = LoggerService.getInstance().createComponentLogger('AgentRegistrationService');
+		this.storageService = storageService;
+		this.projectRoot = projectRoot || this.findProjectRoot();
+
+		// Wire up the exit monitor to cancel pending registrations on runtime exit
+		RuntimeExitMonitorService.getInstance().setOnExitDetectedCallback(
+			(sessionName: string) => {
+				this.cancelPendingRegistration(sessionName);
+				this.unregisterTuiSession(sessionName);
+				// Queued messages are kept when the runtime exits (crewly#1014
+				// review #4): they are someone's undelivered words. They go out
+				// when the agent is started again (registration flushes the
+				// queue; an agent that went down with messages queued is woken
+				// for them), and the queue reports anything it drops.
+				const pending = SubAgentMessageQueue.getInstance().getQueueSize(sessionName);
+				if (pending > 0) {
+					this.logger.warn('Runtime exited with messages still queued — keeping them for its next start', { sessionName, pending });
+				}
+				InFlightTurnTracker.getInstance().markTurnComplete(sessionName, 'runtime exited');
+				// Its hook state belonged to the process that just exited.
+				AgentTurnStateService.getInstance().forget(sessionName);
+			}
+		);
+	}
+
+	/**
+	 * #167: Inject scheduler service for dead-letter queue drain on agent activation.
+	 *
+	 * @param scheduler - Scheduler service with drainDeadLetterQueue method
+	 */
+	setSchedulerService(scheduler: { drainDeadLetterQueue(sessionName: string): Promise<number> }): void {
+		this.schedulerService = scheduler;
+	}
+
+	/**
+	 * Inject EventBusService for standing task workflow subscriptions at agent registration.
+	 *
+	 * @param eventBus - EventBusService instance with subscribe method
+	 */
+	setEventBusService(eventBus: { subscribe(input: import('../../types/event-bus.types.js').CreateSubscriptionInput): import('../../types/event-bus.types.js').EventSubscription }): void {
+		this.eventBusService = eventBus;
+	}
+
+	/**
+	 * Cancel a pending registration prompt for a session.
+	 * Called by RuntimeExitMonitorService when a runtime exit is detected, and
+	 * before every kill of the session's PTY.
+	 *
+	 * @param sessionName - The session whose registration to cancel
+	 * @param reason - Why the flow is cancelled (defaults to a runtime exit)
+	 */
+	cancelPendingRegistration(
+		sessionName: string,
+		reason: RegistrationFlowCancelReason = 'runtime-exited'
+	): void {
+		if (this.registrationFlows.cancel(sessionName, reason)) {
+			this.logger.info('Cancelled pending registration', { sessionName, reason });
+		}
+	}
+
+	/**
+	 * The PTY currently registered under a session name, used as the identity
+	 * a registration flow is bound to. Undefined when there is none (or the
+	 * session helper is not initialised yet).
+	 *
+	 * @param sessionName - Session name
+	 * @returns The live session object, compared by reference
+	 */
+	private currentPtySession(sessionName: string): object | undefined {
+		try {
+			const helper = this._sessionHelper as (SessionCommandHelper & { getSession?: (n: string) => object | undefined }) | null;
+			return typeof helper?.getSession === 'function' ? helper.getSession(sessionName) ?? undefined : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Whether a registration flow must stop writing to its session: its
+	 * signal was aborted, a newer flow took over, or the session's PTY was
+	 * killed/replaced since the flow started. Checked before every send.
+	 *
+	 * @param sessionName - Session the flow writes to
+	 * @param abortSignal - The flow's signal (undefined = unguarded caller)
+	 * @returns True when the caller must not send anything
+	 */
+	private isFlowCancelled(sessionName: string, abortSignal?: AbortSignal): boolean {
+		const cancelled = this.registrationFlows.isCancelled(abortSignal, this.currentPtySession(sessionName));
+		if (cancelled && abortSignal && abortSignal.reason === 'session-replaced') {
+			this.logger.info('Registration flow orphaned — its PTY was replaced; sending nothing', { sessionName });
+		}
+		return cancelled;
+	}
+
+	/**
+	 * Whether a session is already up or being brought up: a creation is in
+	 * flight, a PTY exists under the name, or an in-process runtime runs it.
+	 * The boot restore uses this to leave alone an agent another launcher
+	 * (reconciler wake, team start) already started this boot, instead of
+	 * killing it and resuming the same conversation a second time.
+	 *
+	 * @param sessionName - Session name
+	 * @returns True when the session is live or launching
+	 */
+	async isSessionLiveOrLaunching(sessionName: string): Promise<boolean> {
+		if (this.sessionCreationLocks.has(sessionName)) return true;
+		if (this.inProcessRuntimes.has(sessionName)) return true;
+		try {
+			return (await this.getSessionHelper()).sessionExists(sessionName);
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Get or create the session helper with lazy initialization
+	 */
+	private async getSessionHelper(): Promise<SessionCommandHelper> {
+		this.logger.debug('Getting session helper', {
+			hasExistingHelper: !!this._sessionHelper,
+		});
+
+		if (this._sessionHelper) {
+			return this._sessionHelper;
+		}
+
+		let backend = getSessionBackendSync();
+		this.logger.debug('Backend sync check', {
+			hasBackend: !!backend,
+		});
+
+		if (!backend) {
+			this.logger.info('Creating new PTY session backend');
+			backend = await createSessionBackend('pty');
+			this.logger.info('PTY session backend created', {
+				hasBackend: !!backend,
+			});
+		}
+
+		this._sessionHelper = createSessionCommandHelper(backend);
+		this.logger.debug('Session helper created');
+		return this._sessionHelper;
+	}
+
+	/**
+	 * Get session helper synchronously (may throw if not initialized)
+	 */
+	private getSessionHelperSync(): SessionCommandHelper {
+		if (!this._sessionHelper) {
+			const backend = getSessionBackendSync();
+			if (!backend) {
+				throw new Error('Session backend not initialized');
+			}
+			this._sessionHelper = createSessionCommandHelper(backend);
+		}
+		return this._sessionHelper;
+	}
+
+	/**
+	 * Resolve the runtime type for a session from storage.
+	 * Checks orchestrator status first, then team member data.
+	 * Falls back to CLAUDE_CODE if nothing is found.
+	 *
+	 * IMPORTANT: Callers should prefer passing runtimeType explicitly.
+	 * This method exists as a safety net so that Ctrl+C (Claude Code
+	 * cleanup) is never sent to a Gemini CLI session, which would
+	 * trigger /quit and kill the agent.
+	 */
+	private async resolveSessionRuntimeType(sessionName: string): Promise<RuntimeType> {
+		try {
+			// Check if this is the orchestrator session
+			if (sessionName === ORCHESTRATOR_SESSION_NAME) {
+				const orchestratorStatus = await this.storageService.getOrchestratorStatus();
+				if (orchestratorStatus?.runtimeType) {
+					return effectiveRuntimeType(sessionName, orchestratorStatus.runtimeType as RuntimeType);
+				}
+			}
+
+			// Check team member data
+			const memberInfo = await this.storageService.findMemberBySessionName(sessionName);
+			if (memberInfo?.member?.runtimeType) {
+				// A member on a fallback runtime (its own ran out of usage) runs
+				// something else than its record says.
+				return effectiveRuntimeType(sessionName, memberInfo.member.runtimeType as RuntimeType);
+			}
+		} catch (error) {
+			this.logger.debug('Could not resolve runtime type from storage, using default', {
+				sessionName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+
+		// Check in-process runtimes before defaulting to CLAUDE_CODE.
+		// crewly-agent runtimes may not have a team config entry yet.
+		if (this.inProcessRuntimes.has(sessionName)) {
+			return RUNTIME_TYPES.CREWLY_AGENT;
+		}
+
+		return RUNTIME_TYPES.CLAUDE_CODE;
+	}
+
+	/**
+	 * Route a crewly-agent in-process response to the originating chat conversation.
+	 *
+	 * PTY-based runtimes emit [NOTIFY] markers that the terminal gateway parses.
+	 * In-process crewly-agents have no terminal output, so this method provides
+	 * the equivalent routing for their text responses.
+	 *
+	 * @param sessionName - Agent session that produced the response
+	 * @param text - Response text from the agent
+	 * @param conversationId - Chat conversation to route the response to
+	 * @param slackThreadKey - Slack thread the delivered message came from, when it named exactly one
+	 */
+	private routeInProcessResponseToChat(
+		sessionName: string,
+		text: string,
+		conversationId: string,
+		slackThreadKey?: string,
+	): void {
+		// LEGACY PATH — chatGateway.processNotifyMessage → ChatService
+		// (JSON files in ~/.crewly/chat/). Kept until Phase 5 data
+		// migration retires the JSON store; until then the legacy file
+		// is what the frontend chat-v1 readers consume.
+		import('../../websocket/chat.gateway.js')
+			.then(({ getChatGateway }) => {
+				const chatGateway = getChatGateway();
+				if (!chatGateway) {
+					this.logger.debug('ChatGateway not available, skipping response routing', {
+						sessionName, conversationId,
+					});
+					return;
+				}
+				// No metadata override here: processNotifyMessage already tags the
+				// turn `source: 'in-process-runtime'` — the canonical member of the
+				// closed RECORD_TURN_SOURCES enum for exactly this path. The old
+				// `'crewly-agent'` value was spread OVER that correct default and
+				// then failed enum validation, so every in-process reply to a web
+				// conversation was rejected with "unknown metadata.source" and
+				// silently dropped after the agent had already done the work.
+				return chatGateway.processNotifyMessage(
+					sessionName,
+					text,
+					conversationId,
+					slackThreadKey ? { [SLACK_THREAD_KEY_CONSTANTS.METADATA_KEY]: slackThreadKey } : undefined,
+				);
+			})
+			.then((chatMessage) => {
+				if (chatMessage) {
+					this.logger.debug('Routed in-process agent response to chat (legacy)', {
+						sessionName, conversationId,
+						messageId: typeof chatMessage === 'object' ? (chatMessage as unknown as Record<string, unknown>).id : undefined,
+					});
+				}
+			})
+			.catch((err) => {
+				this.logger.warn('Failed to route in-process agent response to chat', {
+					sessionName, conversationId,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
+
+		// Phase 6β of unified-chat-message-store spec: the explicit
+		// chat-v2 recordTurn call that lived here during Phases 2-3
+		// was removed because `ChatService` is now a thin façade over
+		// `ChatV2Service` — the `processNotifyMessage` call above
+		// already writes through to chat-v2 internally. Keeping both
+		// paths would produce duplicate rows.
+	}
+
+	/**
+	 * Auto-route an in-process agent's text response back to Slack.
+	 *
+	 * Mirrors the post-send side effects of POST /slack/send so that the
+	 * Slack reply, thread-status bookkeeping, and V3 SLA cascade all stay in
+	 * sync. Used as a finish-event hook for the in-process Crewly Agent
+	 * runtime when:
+	 *   1. The inbound message carried a `[SLACK:channelId:threadTs]` marker
+	 *   2. The agent produced text output (`result.text` non-empty)
+	 *   3. The agent did NOT explicitly call the `reply_slack` tool
+	 *
+	 * Without this hook, AI SDK agents that finish with `toolCalls=0,
+	 * finishReason=stop` would drop their reply on the floor — unlike the
+	 * claude-code PTY path, the in-process runtime has no stdout stream the
+	 * SlackBridge can tail.
+	 *
+	 * Best-effort: a Slack-not-connected condition or a downstream
+	 * bookkeeping failure is logged and swallowed; never throws. The chat
+	 * route (`routeInProcessResponseToChat`) handles persistence to the chat
+	 * service separately.
+	 *
+	 * @param sessionName - Agent session that produced the response
+	 * @param text - Response text from the agent
+	 * @param slackContext - Slack channel + thread metadata captured from the
+	 *                       inbound `[SLACK:channelId:threadTs]` marker
+	 */
+	private routeInProcessResponseToSlack(
+		sessionName: string,
+		text: string,
+		slackContext: { channelId: string; threadTs?: string },
+	): void {
+		// Lazy import to avoid module-load circular dependency between
+		// agent-registration ↔ slack ↔ messaging ↔ v3.
+		import('../slack/slack.service.js')
+			.then(async ({ getSlackService }) => {
+				const slack = getSlackService();
+				if (!slack.isConnected()) {
+					this.logger.warn('Slack not connected — cannot auto-route in-process agent response', {
+						sessionName,
+						channelId: slackContext.channelId,
+						threadTs: slackContext.threadTs,
+						textLength: text.length,
+					});
+					return;
+				}
+
+				// Auto-prefix with the agent display name (mirrors reply_slack tool
+				// behavior) so the message is attributable in the Slack thread.
+				// Skip if the text already starts with `[` — the agent supplied its
+				// own prefix.
+				let cleanText = text;
+				if (sessionName && !cleanText.startsWith('[')) {
+					const parts = sessionName.split('-');
+					const namePart = parts.length >= 3 ? parts[2] : parts[parts.length - 1];
+					if (namePart) {
+						const capitalized = namePart.charAt(0).toUpperCase() + namePart.slice(1);
+						cleanText = `[${capitalized}] ${cleanText}`;
+					}
+				}
+
+				await slack.sendMessage({
+					channelId: slackContext.channelId,
+					text: cleanText,
+					threadTs: slackContext.threadTs,
+				});
+
+				this.logger.info('Auto-routed in-process agent response to Slack', {
+					sessionName,
+					channelId: slackContext.channelId,
+					threadTs: slackContext.threadTs,
+					textLength: cleanText.length,
+				});
+
+				// Mirror /slack/send bookkeeping #4 — clear the pending-delivery
+				// reminder OrcDeliveryEnforcer holds for this thread. This is the one
+				// side-effect the auto-route never mirrored, and the gap is
+				// user-visible: when the agent answers with plain text instead of
+				// calling the reply_slack tool, the reply reaches Slack but the
+				// ledger entry survives, so the enforcer nudges again at 10 min and
+				// again at 30 min — and the agent posts the same answer each time.
+				// SlackService's dedup window is 30s, far too short to absorb
+				// reminders spaced minutes apart, so every nudge lands in the thread
+				// as a visible duplicate.
+				if (slackContext.threadTs) {
+					try {
+						const { OrcDeliveryEnforcerService } = await import(
+							'../orc/orc-delivery-enforcer.service.js'
+						);
+						OrcDeliveryEnforcerService.getInstance()?.markDelivered({
+							channelId: slackContext.channelId,
+							threadTs: slackContext.threadTs,
+						});
+					} catch (err) {
+						this.logger.debug('Failed to clear pending delivery after auto-route (non-fatal)', {
+							sessionName,
+							error: err instanceof Error ? err.message : String(err),
+						});
+					}
+				}
+
+				// Mirror /slack/send bookkeeping #3 — record `agent.action`
+				// with actionType='send_slack' so the auditor view and any
+				// V3 downstream analysis see the auto-routed reply. Without
+				// this entry the in-process auto-route is invisible in the
+				// behavior log (only `/slack/send`-originated replies show
+				// up). Follow-up #9 from PR #543 review.
+				try {
+					const { getAgentBehaviorLogService } = await import(
+						'../observability/agent-behavior-log.singleton.js'
+					);
+					getAgentBehaviorLogService()?.record({
+						type: 'agent.action',
+						agent: sessionName,
+						actionType: 'send_slack',
+						details: {
+							channelId: slackContext.channelId,
+							threadTs: slackContext.threadTs ?? null,
+							textLength: cleanText.length,
+							source: 'in_process_auto_route',
+						},
+					});
+				} catch (err) {
+					this.logger.debug('Failed to record send_slack agent.action (non-fatal)', {
+						sessionName,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+
+				// Mirror /slack/send bookkeeping #1 — mark thread as
+				// replied_completed so the recovery loop on the next restart
+				// does not re-enqueue this inbound message. Without this, every
+				// backend restart would cause orc to re-reply.
+				//
+				// Race-protection: build the thread-status entry on the fly if
+				// it isn't tracked yet. The Slack listener's `trackInbound` is
+				// what normally populates the entry, but in a startup-race
+				// scenario the agent finish event can land before the listener
+				// has persisted the inbound. Without this fallback,
+				// `markReplied` short-circuits and the recovery loop on the
+				// next boot still re-fires the inbound (the exact bug
+				// /slack/send already guards against — keep parity).
+				if (slackContext.threadTs) {
+					try {
+						const { ThreadStatusQueueService } = await import(
+							'../messaging/thread-status-queue.service.js'
+						);
+						const tsq = ThreadStatusQueueService.getInstance();
+						const threadKey = `${slackContext.channelId}:${slackContext.threadTs}`;
+						if (!tsq.get(threadKey)) {
+							tsq.trackInbound({
+								threadKey,
+								conversationId: synthesizeSlackConversationId(slackContext.channelId, slackContext.threadTs),
+								source: 'slack',
+								messagePreview: '[in-process auto-route — no inbound recorded]',
+							});
+						}
+						tsq.markReplied(threadKey, 'replied_completed');
+					} catch (err) {
+						this.logger.debug('Failed to update thread-status after auto-route (non-fatal)', {
+							sessionName,
+							error: err instanceof Error ? err.message : String(err),
+						});
+					}
+				}
+
+				// Mirror /slack/send bookkeeping #2 — fire the V3 SLA cascade so
+				// the matching Request transitions out of `queued`. Without
+				// this, requests whose acknowledgement came via this auto-route
+				// would never reach a terminal state.
+				if (slackContext.threadTs) {
+					try {
+						const { getRequestSlaSubscriber } = await import(
+							'../v3/request-sla.subscriber.js'
+						);
+						const sub = getRequestSlaSubscriber();
+						if (sub) {
+							await sub.markResolvedByThread(slackContext.threadTs);
+						}
+					} catch (err) {
+						this.logger.debug('Failed to fire SLA cascade after auto-route (non-fatal)', {
+							sessionName,
+							error: err instanceof Error ? err.message : String(err),
+						});
+					}
+				}
+			})
+			.catch((err) => {
+				this.logger.warn('Failed to auto-route in-process agent response to Slack', {
+					sessionName,
+					channelId: slackContext.channelId,
+					threadTs: slackContext.threadTs,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
+	}
+
+	/**
+	 * Find the project root by looking for package.json
+	 */
+	private findProjectRoot(): string {
+		// Resolve from the compiled dist/ location to the package root (#209)
+		// dist/backend/src/services/agent/ → root (5 levels up)
+		// This works for both local dev and npm global installs
+		try {
+			// Use __dirname equivalent: path.dirname(fileURLToPath(import.meta.url))
+			// But since Jest doesn't support import.meta, we use the module path directly
+			const candidates = [
+				// From source: backend/src/services/agent/ → root
+				path.resolve(__dirname, '..', '..', '..', '..'),
+				// From compiled dist: dist/backend/src/services/agent/ → root
+				path.resolve(__dirname, '..', '..', '..', '..', '..'),
+			];
+			for (const candidate of candidates) {
+				if (existsSync(path.join(candidate, 'config', 'skills'))) {
+					return candidate;
+				}
+			}
+		} catch {
+			// Path resolution failed — fall back
+		}
+		return process.cwd();
+	}
+
+	/**
+	 * Turn a member's model / reasoning-effort choice into launch flags for
+	 * its PTY runtime (`--model` for Claude Code, `-m` for Codex / Gemini,
+	 * `--model provider/model` for OpenCode). The in-process Crewly Agent
+	 * runtime reads `modelId` directly and gets no flags here.
+	 *
+	 * @param sessionName - For logging
+	 * @param runtimeType - The member's runtime
+	 * @param modelId - Model name as the harness expects it
+	 * @param reasoningEffort - Optional effort level (Claude Code / Codex)
+	 * @returns Flags to inject after the binary, or `[]`
+	 */
+	private resolveModelFlags(sessionName: string, runtimeType: RuntimeType, modelId?: string, reasoningEffort?: string): string[] {
+		const flags = buildRuntimeModelFlags(runtimeType, modelId, reasoningEffort);
+		if ((modelId || reasoningEffort) && flags.length === 0 && runtimeType !== RUNTIME_TYPES.CREWLY_AGENT) {
+			this.logger.warn('Ignoring per-agent model setting (not shell-safe or unsupported runtime)', { sessionName, runtimeType, modelId, reasoningEffort });
+		} else if (flags.length > 0) {
+			this.logger.info('Per-agent model flags resolved', { sessionName, runtimeType, modelId, reasoningEffort });
+		}
+		return flags;
+	}
+
+	/**
+	 * Resolve runtime flags from the agent's effective skills.
+	 * Reads role config and skill configs to collect flags compatible with the runtime.
+	 *
+	 * @param role - The agent's role name
+	 * @param runtimeType - The agent's runtime type (e.g. 'claude-code')
+	 * @param skillOverrides - Additional skills assigned to the member
+	 * @param excludedRoleSkills - Skills excluded from the role's default set
+	 * @returns Array of CLI flags to inject (e.g. ['--chrome'])
+	 */
+	private async resolveRuntimeFlags(
+		role: string,
+		runtimeType: RuntimeType,
+		skillOverrides?: string[],
+		excludedRoleSkills?: string[]
+	): Promise<string[]> {
+		const flags = new Set<string>();
+		try {
+			// 1. Get role's assigned skills from config/roles/{role}/role.json
+			const roleName = role.toLowerCase().replace(/\s+/g, '-');
+			const rolePath = path.join(this.projectRoot, 'config', 'roles', roleName, 'role.json');
+			const roleContent = await readFile(rolePath, 'utf8');
+			const roleConfig = JSON.parse(roleContent);
+			const roleSkills: string[] = roleConfig.assignedSkills || [];
+
+			// 2. Apply skill overrides and exclusions
+			const effectiveSkills = new Set([...roleSkills, ...(skillOverrides || [])]);
+			for (const excluded of (excludedRoleSkills || [])) {
+				effectiveSkills.delete(excluded);
+			}
+
+			// 3. For each skill, read skill.json and collect flags matching runtime.
+			//    Skills live under agent/core/ or agent/marketplace/ subdirectories,
+			//    so search both paths when looking up skill.json.
+			for (const skillId of effectiveSkills) {
+				try {
+					const skillJsonPath = await this.findSkillJsonPath(skillId);
+					if (!skillJsonPath) {
+						this.logger.debug('Skill config not found in any known directory (no runtime flags)', { skillId });
+						continue;
+					}
+					const skillContent = await readFile(skillJsonPath, 'utf8');
+					const skillConfig = JSON.parse(skillContent);
+					if (skillConfig.runtime?.runtime === runtimeType && Array.isArray(skillConfig.runtime?.flags)) {
+						for (const flag of skillConfig.runtime.flags) {
+							// skill.json is external input (marketplace skills too) and these
+							// flags are typed into the launch line: refuse anything that is not
+							// a plain flag (CREW-967).
+							if (!isSafeSkillRuntimeFlag(flag)) {
+								this.logger.warn('Refused unsafe runtime flag from skill.json', { skillId, flag: String(flag).slice(0, 80) });
+								continue;
+							}
+							flags.add(flag);
+						}
+					}
+				} catch (skillErr) {
+					this.logger.warn('Failed to read skill config', {
+						skillId,
+						error: skillErr instanceof Error ? skillErr.message : String(skillErr),
+					});
+				}
+			}
+
+			if (flags.size > 0) {
+				this.logger.info('Resolved runtime flags from skills', {
+					role, runtimeType, flags: Array.from(flags),
+				});
+			}
+		} catch (error) {
+			this.logger.debug('Could not resolve runtime flags (no role config or read error)', {
+				role, runtimeType, error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		return Array.from(flags);
+	}
+
+	/**
+	 * Search known skill directories for a skill's skill.json file.
+	 * Skills live under `config/skills/agent/core/` or `config/skills/agent/marketplace/`.
+	 *
+	 * @param skillId - The skill identifier (directory name)
+	 * @returns Absolute path to skill.json, or null if not found
+	 */
+	private async findSkillJsonPath(skillId: string): Promise<string | null> {
+		const searchDirs = [
+			path.join(this.projectRoot, 'config', 'skills', 'agent', 'core', skillId, 'skill.json'),
+			path.join(this.projectRoot, 'config', 'skills', 'agent', 'marketplace', skillId, 'skill.json'),
+		];
+		for (const candidate of searchDirs) {
+			try {
+				await access(candidate);
+				return candidate;
+			} catch {
+				// Not found in this directory, try next
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Create a runtime service instance for the given runtime type.
+	 * Centralizes RuntimeServiceFactory creation to reduce code duplication.
+	 */
+	private createRuntimeService(runtimeType: RuntimeType): RuntimeAgentService {
+		return RuntimeServiceFactory.create(runtimeType, null, this.projectRoot);
+	}
+
+	/**
+	 * Get an in-process Crewly Agent runtime by session name.
+	 * Used by the terminal controller for force-delivery to in-process agents.
+	 *
+	 * @param sessionName - Session name to look up
+	 * @returns The CrewlyAgentExternalRuntimeService if it exists, undefined otherwise
+	 */
+	getInProcessRuntime(sessionName: string): CrewlyAgentExternalRuntimeService | undefined {
+		return this.inProcessRuntimes.get(sessionName);
+	}
+
+	/**
+	 * Check if an in-process Crewly Agent runtime is active and ready for a given session.
+	 *
+	 * Used by team status resolution to correctly report active status for
+	 * crewly-agent runtimes that have no PTY session.
+	 *
+	 * @param sessionName - The session name to check
+	 * @returns True if an in-process runtime exists and is ready
+	 */
+	isInProcessRuntimeActive(sessionName: string): boolean {
+		const runtime = this.inProcessRuntimes.get(sessionName);
+		return runtime !== undefined && runtime.isReady();
+	}
+
+	/**
+	 * Decide how the runtime's conversation id is handled for this launch and
+	 * apply the Claude Code half (flags + persisting a preset id). Codex's
+	 * resume id is returned for the command rewrite; a fresh Codex id is
+	 * discovered after launch by {@link recordRuntimeSessionAfterLaunch}.
+	 *
+	 * @param sessionName - Agent session
+	 * @param runtimeType - Runtime
+	 * @param effectiveFlags - Flag list to extend in place
+	 * @returns The plan
+	 */
+	private async planSessionRecovery(
+		sessionName: string,
+		runtimeType: string,
+		effectiveFlags: string[],
+		cwd?: string,
+	): Promise<RuntimeSessionPlan> {
+		let autoResume = true;
+		try {
+			autoResume = (await getSettingsService().getSettings()).general.autoResumeOnRestart !== false;
+		} catch {
+			// settings unavailable — default to resuming
+		}
+		// Persistence is optional infrastructure: without it the agent still
+		// launches, it just cannot be resumed after a restart.
+		let persistence: ReturnType<typeof getSessionStatePersistence> | null = null;
+		try {
+			persistence = getSessionStatePersistence();
+		} catch (err) {
+			this.logger.warn('Session persistence unavailable — launching without resume support', {
+				sessionName,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		let storedSessionId = persistence?.getSessionId(sessionName) ?? null;
+		// A stop (idle eviction, manual) unregisters the session and drops its
+		// stored id; the last-conversations file still has it. Without this a
+		// stopped agent started a fresh conversation on every start.
+		let storedFromLastConversation = false;
+		if (!storedSessionId && autoResume && cwd && persistence) {
+			try {
+				const claimed = new Set<string>();
+				for (const [name, info] of persistence.getRegisteredSessionsMap()) {
+					if (name !== sessionName && info.claudeSessionId) claimed.add(info.claudeSessionId);
+				}
+				const remembered = rememberedConversationToResume({
+					file: persistence.lastConversationsFile(),
+					sessionName,
+					claimedByOthers: claimed,
+				});
+				if (remembered) {
+					storedSessionId = remembered.sessionId;
+					storedFromLastConversation = true;
+				}
+			} catch {
+				// no remembered conversation available: start fresh as before
+			}
+		}
+		// A Claude Code agent (orchestrator or member) whose conversation has
+		// grown too big starts over here, at a launch, rather than re-reading it
+		// on every turn.
+		const freshInstead =
+			autoResume && storedSessionId && cwd
+				? this.closeOversizedConversation(sessionName, runtimeType, storedSessionId, cwd)
+				: false;
+		const plan = planRuntimeSessionFlags({
+			runtimeType,
+			isRestored: persistence?.isRestoredSession(sessionName) ?? false,
+			storedSessionId,
+			autoResume: autoResume && !freshInstead,
+			conversationExists:
+				storedSessionId && cwd ? conversationExists({ runtimeType, sessionId: storedSessionId, cwd, ...this.claudeHomeOverride(sessionName, runtimeType) }) : undefined,
+		});
+		effectiveFlags.push(...plan.flags);
+		if (storedFromLastConversation && plan.resumeSessionId && persistence) {
+			try {
+				persistence.updateSessionId(sessionName, plan.resumeSessionId);
+			} catch {
+				// best effort: the launch still resumes
+			}
+		}
+		// A fresh Claude Code conversation that nobody chose (stop, or a stored
+		// conversation that is gone) still gets the previous one handed over.
+		// Deliberate fresh starts (oversized, per-task, runtime switch) wrote
+		// their own handover, which prepareRestartHandover sees and respects.
+		if (plan.presetSessionId && !freshInstead && autoResume && cwd && runtimeType === RUNTIME_TYPES.CLAUDE_CODE) {
+			this.prepareRestartHandover(sessionName, cwd, persistence);
+		}
+		if (plan.presetSessionId && persistence) {
+			try {
+				persistence.updateSessionId(sessionName, plan.presetSessionId);
+			} catch (err) {
+				this.logger.warn('Could not persist the preset session id (resume after restart may not work)', {
+					sessionName,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+		this.logger.info('Runtime conversation plan', {
+			sessionName,
+			runtimeType,
+			note: plan.note,
+			sessionId: plan.presetSessionId ?? plan.resumeSessionId ?? null,
+		});
+		return plan;
+	}
+
+	/**
+	 * For a fresh Claude Code conversation, hand over the most recent previous
+	 * one (written within the last week) the way a runtime switch does: a
+	 * handover file plus a note on the kickoff. Skipped when a handover for the
+	 * session is already newer than that conversation (the oversized, per-task
+	 * and runtime-switch paths write their own). Never throws.
+	 *
+	 * @param sessionName - Session being launched
+	 * @param cwd - Its working directory
+	 * @param persistence - Session persistence, when available
+	 */
+	private prepareRestartHandover(
+		sessionName: string,
+		cwd: string,
+		persistence: ReturnType<typeof getSessionStatePersistence> | null,
+	): void {
+		try {
+			const override = this.claudeHomeOverride(sessionName, RUNTIME_TYPES.CLAUDE_CODE);
+			const claudeHomes = [...(override.claudeHome ? [override.claudeHome] : []), defaultClaudeHome()];
+			const claimed = new Set<string>();
+			for (const [name, info] of persistence?.getRegisteredSessionsMap() ?? []) {
+				if (name !== sessionName && info.claudeSessionId) claimed.add(info.claudeSessionId);
+			}
+			const result = writeRestartHandover({
+				sessionName,
+				cwd,
+				claudeHomes,
+				handoverDir: path.join(getCrewlyHomePath(), ORC_CONVERSATION_CONSTANTS.HANDOVER_DIR),
+				...(persistence ? { lastConversationsFile: persistence.lastConversationsFile() } : {}),
+				claimedByOthers: claimed,
+			});
+			if (!result) return;
+			this.pendingRestartNotes.set(sessionName, result.note);
+			this.logger.info('Fresh conversation after a restart — handing over the previous one', {
+				sessionName,
+				previous: result.previousSessionId,
+				handover: result.file,
+			});
+		} catch (err) {
+			this.logger.warn('Could not prepare the restart handover (starting without it)', {
+				sessionName,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	/**
+	 * Decide whether a Claude Code agent's stored conversation is too big to
+	 * resume, and if so write the handover file its fresh one will read.
+	 *
+	 * The orchestrator's threshold is {@link orcFreshContextTokens} (300k);
+	 * team members use {@link memberFreshContextTokens} (400k, above Claude
+	 * Code's own 350k auto-compact so compaction runs first and this is only a
+	 * safety net — crewly#1344).
+	 *
+	 * The transcript is looked for under the Claude home the session runs on
+	 * NOW (`claudeHomeOverride`: another account's config dir after a runtime
+	 * fallback moved it there), which is also where `conversationExists` looks
+	 * before `--resume`. A switch between accounts copies the transcript there
+	 * first (runtime-fallback.wiring `carryClaudeConversation`), so the
+	 * conversation is found and resumed instead of starting fresh.
+	 * Only Claude Code, and only here — at a launch — so a conversation is
+	 * never cut in the middle of anything. Real state (tasks, teams, OKRs,
+	 * wiki) lives in Crewly and is read back at startup; the handover keeps
+	 * the tail of what was said.
+	 *
+	 * @param sessionName - Session being launched
+	 * @param runtimeType - Its runtime
+	 * @param storedSessionId - The conversation it would resume
+	 * @param cwd - Its working directory
+	 * @returns True when it should start fresh instead
+	 */
+	private closeOversizedConversation(
+		sessionName: string,
+		runtimeType: string,
+		storedSessionId: string,
+		cwd: string,
+	): boolean {
+		if (runtimeType !== RUNTIME_TYPES.CLAUDE_CODE) return false;
+		const isOrc = sessionName === ORCHESTRATOR_SESSION_NAME;
+		const transcript = claudeTranscriptPath({ sessionId: storedSessionId, cwd, ...this.claudeHomeOverride(sessionName, runtimeType) });
+		const tokens = lastTurnContextTokens(transcript);
+		const threshold = isOrc ? orcFreshContextTokens() : memberFreshContextTokens();
+		if (tokens === null || tokens < threshold) return false;
+		try {
+			const dir = path.join(getCrewlyHomePath(), ORC_CONVERSATION_CONSTANTS.HANDOVER_DIR);
+			fsSync.mkdirSync(dir, { recursive: true });
+			const file = path.join(dir, `${sessionName}-${new Date().toISOString().replace(/[:.]/g, '-')}.md`);
+			const body = buildHandoverSummary(transcript);
+			fsSync.writeFileSync(
+				file,
+				[
+					`# Handover from your previous conversation`,
+					``,
+					`Your previous conversation (${storedSessionId}) had grown to ${tokens.toLocaleString('en-US')} tokens per turn and was closed at a restart.`,
+					`Everything Crewly tracks — tasks, teams, OKRs, wiki — is still there; this file keeps only the end of what was said.`,
+					`The full transcript: ${transcript}`,
+					``,
+					body || '_Nothing readable was found at the end of the old conversation._',
+					``,
+				].join('\n'),
+				'utf-8',
+			);
+			this.pendingHandovers.set(sessionName, { path: file, tokens });
+			this.logger.info('Conversation too big to resume — starting fresh with a handover', {
+				sessionName,
+				tokens,
+				threshold,
+				handover: file,
+			});
+			return true;
+		} catch (err) {
+			this.logger.warn('Could not write the handover — resuming the old conversation', {
+				sessionName,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * For a freshly launched Codex agent, learn its conversation id from the
+	 * rollout file it writes right after start and persist it. Runs in the
+	 * background; never throws.
+	 *
+	 * @param sessionName - Agent session
+	 * @param runtimeType - Runtime
+	 * @param cwd - The agent's working directory (matched against the rollout's cwd)
+	 * @param launchedAtMs - When the launch command was sent
+	 * @param plan - The launch plan (skips when the id is already known)
+	 */
+	/**
+	 * Remember (or forget) that a session came up by resuming a conversation.
+	 *
+	 * @param sessionName - The session
+	 * @param role - Role it runs as (for the register-self kickoff)
+	 * @param plan - The launch plan
+	 */
+	private noteResumedLaunch(sessionName: string, role: string, plan: RuntimeSessionPlan): void {
+		if (plan.resumeSessionId) this.resumedSessions.set(sessionName, role);
+		else this.resumedSessions.delete(sessionName);
+	}
+
+	/**
+	 * Kickoff text for a resumed runtime conversation (any runtime): the
+	 * backend restarted, so its registration is gone even though the
+	 * conversation remembers doing it. Tell it plainly that this is the same
+	 * conversation, hand it the exact register-self command its prompt uses
+	 * (orchestrator skill for the orchestrator), and tell it to carry on.
+	 *
+	 * @param sessionName - The session
+	 * @param role - Its role
+	 * @param promptFilePath - The init prompt, for a context refresh; omitted
+	 *   for Claude Code, whose prompt is loaded as its agent definition
+	 * @returns The message to type into the runtime
+	 */
+	private resumedKickoff(sessionName: string, role: string, promptFilePath?: string): string {
+		return buildResumedKickoff({ projectRoot: this.projectRoot, sessionName, role, promptFilePath });
+	}
+
+	private recordRuntimeSessionAfterLaunch(
+		sessionName: string,
+		runtimeType: string,
+		cwd: string | undefined,
+		launchedAtMs: number,
+		plan: RuntimeSessionPlan,
+	): void {
+		if (runtimeType === RUNTIME_TYPES.ANTIGRAVITY_CLI) {
+			this.recordAntigravityConversationAfterLaunch(sessionName, cwd, launchedAtMs, plan);
+			return;
+		}
+		if (runtimeType !== RUNTIME_TYPES.CODEX_CLI || plan.resumeSessionId || !cwd) return;
+		let persistence: ReturnType<typeof getSessionStatePersistence>;
+		try {
+			persistence = getSessionStatePersistence();
+		} catch {
+			return; // no persistence, nothing to record into
+		}
+		const claimed = new Set<string>();
+		for (const name of persistence.getRegisteredSessions()) {
+			const id = persistence.getSessionId(name);
+			if (id && name !== sessionName) claimed.add(id);
+		}
+		void waitForCodexSessionId({ cwd, notBeforeMs: launchedAtMs, claimed })
+			.then((found) => {
+				if (!found) {
+					this.logger.warn('Codex conversation id not found after launch (resume after restart will not work)', { sessionName, cwd });
+					return;
+				}
+				persistence.updateSessionId(sessionName, found.sessionId);
+				this.logger.info('Codex conversation id recorded', { sessionName, sessionId: found.sessionId });
+			})
+			.catch((err) => {
+				this.logger.debug('Codex conversation id discovery failed (non-fatal)', {
+					sessionName,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
+	}
+
+	/**
+	 * For a freshly launched Antigravity agent, learn its conversation id and
+	 * persist it so a restart can resume with `agy --conversation=<id>`.
+	 * agy creates the conversation when the first prompt (the registration
+	 * kickoff) arrives; the conversation whose logs mention this agent's init
+	 * prompt file wins, else agy's latest conversation for the workspace.
+	 * Runs in the background; never throws.
+	 *
+	 * @param sessionName - Agent session
+	 * @param cwd - The agent's working directory (agy's workspace)
+	 * @param launchedAtMs - When the launch command was sent
+	 * @param plan - The launch plan (skips when resuming a known id)
+	 */
+	private recordAntigravityConversationAfterLaunch(
+		sessionName: string,
+		cwd: string | undefined,
+		launchedAtMs: number,
+		plan: RuntimeSessionPlan,
+	): void {
+		if (plan.resumeSessionId || !cwd) return;
+		let persistence: ReturnType<typeof getSessionStatePersistence>;
+		const claimed = new Set<string>();
+		try {
+			persistence = getSessionStatePersistence();
+			for (const name of persistence.getRegisteredSessions()) {
+				const id = persistence.getSessionId(name);
+				if (id && name !== sessionName) claimed.add(id);
+			}
+		} catch (err) {
+			// No (usable) persistence: nothing to record into; the launch goes on.
+			this.logger.debug('Antigravity conversation id not recorded: session persistence unavailable', {
+				sessionName,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return;
+		}
+		void waitForAntigravityConversationId({
+			cwd,
+			notBeforeMs: launchedAtMs,
+			claimed,
+			marker: path.basename(this.getInitPromptFilePath(sessionName)),
+		})
+			.then((conversationId) => {
+				if (!conversationId) {
+					this.logger.warn('Antigravity conversation id not found after launch (resume after restart will not work)', { sessionName, cwd });
+					return;
+				}
+				persistence.updateSessionId(sessionName, conversationId);
+				this.logger.info('Antigravity conversation id recorded', { sessionName, sessionId: conversationId });
+			})
+			.catch((err) => {
+				this.logger.debug('Antigravity conversation id discovery failed (non-fatal)', {
+					sessionName,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
+	}
+
+	/**
+	 * Get the check interval based on environment.
+	 * Uses shorter intervals in test environment for faster tests.
+	 */
+	private getCheckInterval(): number {
+		return process.env.NODE_ENV === 'test' ? 1000 : 2000;
+	}
+
+	/**
+	 * Use the short test-environment cadence under Jest, otherwise the given
+	 * production interval.
+	 *
+	 * @param productionMs - Interval to use outside the test environment
+	 * @returns Interval in milliseconds
+	 */
+	private testAwareInterval(productionMs: number): number {
+		return process.env.NODE_ENV === 'test' ? this.getCheckInterval() : productionMs;
+	}
+
+	/**
+	 * Update agent status with safe error handling (non-blocking).
+	 * Returns true if successful, false if failed.
+	 */
+	private async updateAgentStatusSafe(
+		sessionName: string,
+		status: (typeof CREWLY_CONSTANTS.AGENT_STATUSES)[keyof typeof CREWLY_CONSTANTS.AGENT_STATUSES],
+		context?: { role?: string }
+	): Promise<boolean> {
+		try {
+			await this.storageService.updateAgentStatus(sessionName, status);
+			this.logger.info(`Agent status updated to ${status}`, { sessionName, ...context });
+			return true;
+		} catch (error) {
+			this.logger.warn('Failed to update agent status (non-critical)', {
+				sessionName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Role aliases — common synonyms users naturally type in team configs
+	 * mapped to the canonical directory name under `config/roles/`. Without
+	 * these, a team-config role like `"tech-lead"` would fall through to a
+	 * non-existent directory and trigger the ENOENT fallback path on every
+	 * agent registration (Steve 2026-05-15 dogfood: CE team config used
+	 * `role: "tech-lead"` while the canonical directory is `team-leader`,
+	 * producing a steady drip of "Could not load prompt from config" warns
+	 * for every member-start with no actionable resolution short of editing
+	 * user data).
+	 *
+	 * Keep keys lowercased + dash-normalized (matches the post-normalization
+	 * shape used by `getPromptFileForRole`).
+	 */
+	private static readonly ROLE_DIR_ALIASES: ReadonlyMap<string, string> = new Map([
+		['tech-lead', 'team-leader'],
+		['techlead', 'team-leader'],
+		['tl', 'team-leader'],
+		['team-lead', 'team-leader'],
+		['operations', 'ops'],
+		['devops', 'ops'],
+		// The directory is `fullstack-dev`; teams name the role in full
+		// (Evership's Eve ran on the generalist prompt for weeks, 2026-10-27).
+		['fullstack-developer', 'fullstack-dev'],
+		['full-stack-developer', 'fullstack-dev'],
+		['fullstack', 'fullstack-dev'],
+		['full-stack', 'fullstack-dev'],
+		['backend-dev', 'backend-developer'],
+		['frontend-dev', 'frontend-developer'],
+		['customer-support', 'support'],
+		['pm', 'product-manager'],
+	]);
+
+	/**
+	 * Role directory used when a team's custom role string has no
+	 * `config/roles/<role>/prompt.md`. Falling back to this generic prompt
+	 * keeps the full modular assembly (identity, soul, member systemPrompt)
+	 * — the bare inline fallback left agents introducing themselves as
+	 * "Codex" instead of by their name.
+	 */
+	private static readonly FALLBACK_ROLE_DIR = 'generalist';
+
+	/** Custom roles already reported as falling back (warn once each). */
+	private readonly roleFallbackWarned = new Set<string>();
+
+	/**
+	 * Sessions launched by resuming an earlier runtime conversation (Codex
+	 * `resume`, Claude `--resume`) → the role they run as. A resumed agent has
+	 * already read its init prompt once and answers "Ready." when told to
+	 * read it again, without re-registering — the orchestrator on
+	 * steamfun-ops sat unregistered for 11 restarts that way (2026-09-19).
+	 * Such sessions get an explicit register-self kickoff instead.
+	 */
+	private readonly resumedSessions = new Map<string, string>();
+	/** Handover file for an orchestrator that was just given a fresh conversation, by session. */
+	private readonly pendingHandovers = new Map<string, { path: string; tokens: number }>();
+	/** Kickoff note for a session that restarted into a fresh conversation, with the handover to read (given the way a runtime-switch note is). */
+	private readonly pendingRestartNotes = new Map<string, string>();
+
+	/**
+	 * Assemble the orchestrator prompt at the *other* profile and log the
+	 * module count + token estimate of both tiers side by side, so the
+	 * operator can judge what `CREWLY_ORC_PROMPT_PROFILE=lite` would save (or
+	 * did save) without diffing prompts by hand. Read-only and best-effort:
+	 * a failure here never affects the prompt that was already assembled.
+	 *
+	 * @param assembler - The assembler used for the live prompt
+	 * @param moduleConfig - Config the live prompt was assembled from
+	 * @param liveReport - Report of the live (selected-profile) assembly
+	 */
+	private async logPromptProfileComparison(
+		assembler: PromptAssemblyService,
+		moduleConfig: ModuleConfig,
+		liveReport: Awaited<ReturnType<PromptAssemblyService['assemble']>>['report'],
+	): Promise<void> {
+		const otherProfile: PromptProfile = liveReport.profile === 'lite' ? 'full' : 'lite';
+		try {
+			const { report: other } = await assembler.assemble({
+				...moduleConfig,
+				promptProfile: otherProfile,
+			});
+			const byProfile = {
+				[liveReport.profile]: {
+					moduleCount: liveReport.moduleBreakdown.length,
+					estimatedTokens: liveReport.totalTokens,
+				},
+				[otherProfile]: {
+					moduleCount: other.moduleBreakdown.length,
+					estimatedTokens: other.totalTokens,
+				},
+			};
+			this.logger.info('Orchestrator prompt profile comparison', {
+				sessionName: moduleConfig.sessionName,
+				selected: liveReport.profile,
+				env: ORC_PROMPT_PROFILE_ENV,
+				...byProfile,
+				liteSavesTokens:
+					(byProfile.full?.estimatedTokens ?? 0) - (byProfile.lite?.estimatedTokens ?? 0),
+			});
+		} catch (error) {
+			this.logger.debug('Prompt profile comparison skipped', {
+				sessionName: moduleConfig.sessionName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	/**
+	 * Get prompt file path for a specific role
+	 * Uses the unified config/roles/{role}/prompt.md structure
+	 */
+	private async getPromptFileForRole(role: string): Promise<string> {
+		// Defensive: reject empty/undefined/literal-"undefined" before path concat,
+		// which would otherwise resolve to a non-existent `config/roles/undefined/prompt.md`
+		// and trigger the silent fallback path that left agents with empty prompts (Bug #1).
+		validateAgentRole(role, 'getPromptFileForRole');
+		// Normalize role name to directory name format
+		const normalized = role.toLowerCase().replace(/\s+/g, '-');
+		// Resolve aliases (e.g. tech-lead → team-leader). Falls through for
+		// any role that already matches its directory name.
+		const roleName =
+			AgentRegistrationService.ROLE_DIR_ALIASES.get(normalized) ?? normalized;
+		const promptPath = path.join(process.cwd(), 'config', 'roles', roleName, 'prompt.md');
+		if (await fileExists(promptPath)) return promptPath;
+		// A custom role (e.g. "executor") with no prompt of its own: use the
+		// generic role prompt so the agent still gets its identity and soul.
+		const fallback = path.join(process.cwd(), 'config', 'roles', AgentRegistrationService.FALLBACK_ROLE_DIR, 'prompt.md');
+		if (!this.roleFallbackWarned.has(roleName)) {
+			this.roleFallbackWarned.add(roleName);
+			this.logger.warn('No prompt for this role — using the generalist role prompt', { role, promptPath, fallback });
+		}
+		return fallback;
+	}
+
+	/**
+	 * Initialize agent with optimized 2-step escalation process
+	 * Reduced from 4-step to 2-step with shorter timeouts for better concurrency
+	 */
+	async initializeAgentWithRegistration(
+		sessionName: string,
+		role: string,
+		projectPath?: string,
+		timeout: number = AGENT_TIMEOUTS.REGULAR_AGENT_INITIALIZATION,
+		memberId?: string,
+		runtimeType: RuntimeType = RUNTIME_TYPES.CLAUDE_CODE,
+		runtimeFlags?: string[],
+		additionalAllowlistPaths?: string[]
+	): Promise<{
+		success: boolean;
+		message?: string;
+		error?: string;
+		/** Set to RUNTIME_STARTUP_BLOCKED when retrying cannot help. */
+		errorCode?: string;
+	}> {
+		const startTime = Date.now();
+
+		this.logger.info('Starting optimized agent initialization with registration', {
+			sessionName,
+			role,
+			timeout,
+			runtimeType,
+		});
+
+		// PHASE 4: agentStatus is now set immediately in API endpoints (startTeam/startTeamMember)
+		// No longer need to set it here - focus only on session creation
+		this.logger.info('Starting agent session initialization', { sessionName, role });
+
+		// Clear detection cache to ensure fresh runtime detection
+		const runtimeService = this.createRuntimeService(runtimeType);
+		runtimeService.clearDetectionCache(sessionName);
+
+		// Skip Step 1 (direct registration) as it often fails in concurrent scenarios
+		// Go directly to Step 2: Cleanup + reinit (more reliable)
+		try {
+			this.logger.info('Step 1: Attempting cleanup and reinitialization', {
+				sessionName,
+			});
+			const step1Success = await this.tryCleanupAndReinit(
+				sessionName,
+				role,
+				70000, // 70 seconds for cleanup and reinit (allows 60s for runtime ready)
+				projectPath,
+				memberId,
+				runtimeType,
+				runtimeFlags,
+				additionalAllowlistPaths
+			);
+			if (step1Success) {
+				return {
+					success: true,
+					message: 'Agent registered successfully after cleanup and reinit',
+				};
+			}
+		} catch (error) {
+			// Start-up blocked on the user (e.g. Claude Code as root, or never
+			// set up): full recreation would hit the same wall, so stop here and
+			// surface the actionable message instead of a generic timeout.
+			if (isRuntimeStartupBlockedError(error)) {
+				this.logger.error('Agent start-up blocked; not retrying', {
+					sessionName,
+					reason: error.reason,
+					error: error.message,
+				});
+				return { success: false, error: error.message, errorCode: error.code };
+			}
+			this.logger.warn('Step 1 (cleanup + reinit) failed', {
+				sessionName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+
+		// Step 2: Full session recreation (30 seconds) - only if time remaining
+		if (Date.now() - startTime < timeout - 35000) {
+			try {
+				this.logger.info('Step 2: Attempting full session recreation', { sessionName });
+				const step2Success = await this.tryFullRecreation(
+					sessionName,
+					role,
+					30000, // Reduced from 45000 to 30000
+					projectPath,
+					memberId,
+					runtimeType,
+					runtimeFlags
+				);
+				if (step2Success) {
+					return {
+						success: true,
+						message: 'Agent registered successfully after full recreation',
+					};
+				}
+			} catch (error) {
+				if (isRuntimeStartupBlockedError(error)) {
+					this.logger.error('Agent start-up blocked; not retrying', {
+						sessionName,
+						reason: error.reason,
+						error: error.message,
+					});
+					return { success: false, error: error.message, errorCode: error.code };
+				}
+				this.logger.warn('Step 2 (full recreation) failed', {
+					sessionName,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+
+		// Give up after 2 steps
+		const errorMsg = `Failed to initialize agent after optimized escalation attempts (${Math.round(
+			(Date.now() - startTime) / 1000
+		)}s)`;
+		this.logger.error(errorMsg, { sessionName, role });
+		return { success: false, error: errorMsg };
+	}
+
+	/**
+	 * Step 1: Try direct registration prompt
+	 * Assumes Claude is already running and just needs a registration prompt
+	 */
+	private async tryDirectRegistration(
+		sessionName: string,
+		role: string,
+		timeout: number,
+		memberId?: string,
+		runtimeType: RuntimeType = RUNTIME_TYPES.CLAUDE_CODE
+	): Promise<boolean> {
+		// Clear any existing input. Claude already performs Ctrl+C cleanup during
+		// runtime detection, so avoid sending additional Ctrl+C sequences.
+		// Gemini CLI: Skip cleanup — Ctrl+C at an empty prompt triggers /quit.
+		// Escape defocuses the TUI. Ctrl+U is ignored by the TUI.
+		const helper = await this.getSessionHelper();
+
+		// First check if runtime is running before sending the prompt
+		// runtimeService2: Separate instance for pre-registration runtime detection
+		// This instance is isolated from main runtimeService to avoid cache interference
+		const runtimeService2 = this.createRuntimeService(runtimeType);
+		const runtimeRunning = await runtimeService2.detectRuntimeWithCommand(sessionName);
+		if (!runtimeRunning) {
+			this.logger.debug('Runtime not detected in Step 1, skipping direct registration', {
+				sessionName,
+				runtimeType,
+			});
+			return false;
+		}
+
+		this.logger.debug('Runtime detected, sending registration prompt', {
+			sessionName,
+			runtimeType,
+		});
+
+		// Clear any pending slash command from detection. Claude detection already
+		// exits slash mode. Gemini CLI: skip — Ctrl+C at empty prompt exits CLI,
+		// Escape defocuses TUI, Ctrl+U is ignored. The prompt should be clean.
+
+		const prompt = await this.loadRegistrationPrompt(role, sessionName, memberId, runtimeType);
+		const promptDelivered = await this.sendPromptRobustly(sessionName, prompt, runtimeType);
+
+		if (!promptDelivered) {
+			this.logger.warn('Failed to deliver registration prompt', { sessionName, role });
+			return false;
+		}
+
+		return await this.waitForRegistration(sessionName, role, timeout);
+	}
+
+	/**
+	 * Step 2: Cleanup with Ctrl+C and reinitialize
+	 * Tries to reset the runtime session and start fresh
+	 */
+	private async tryCleanupAndReinit(
+		sessionName: string,
+		role: string,
+		timeout: number,
+		projectPath?: string,
+		memberId?: string,
+		runtimeType: RuntimeType = RUNTIME_TYPES.CLAUDE_CODE,
+		runtimeFlags?: string[],
+		additionalAllowlistPaths?: string[]
+	): Promise<boolean> {
+		// Clear the shell's command line before the launch command is typed —
+		// only when no runtime input box is on screen (a plain shell), and with
+		// Ctrl+U alone: never Ctrl+C into a live runtime, never wipe an agent
+		// box the harness cannot prove is its own (crewly#1014 review #3).
+		{
+			const helper = await this.getSessionHelper();
+			if (helper.readInputBox(sessionName, '', 'before-write').state === 'unknown') {
+				await helper.sendKey(sessionName, 'C-u');
+			}
+		}
+
+		// Conversation id: preset for Claude Code (--session-id), resumed on
+		// restore (--resume / `codex resume`), discovered after launch for Codex.
+		const effectiveFlags = runtimeFlags ? [...runtimeFlags] : [];
+		// Remote MCP servers (Zoho MCP …) the role may use — files under CREWLY_HOME, never the project.
+		effectiveFlags.push(...(await buildRemoteMcpLaunchFlags({ sessionName, role, runtimeType })).flags);
+		const sessionPlan = await this.planSessionRecovery(sessionName, runtimeType, effectiveFlags, projectPath);
+
+		// Write prompt file before launching runtime so --agent (Claude Code) or --append-system-prompt-file works
+		let promptFilePath: string | undefined;
+		let agentName: string | undefined;
+		if (runtimeType === RUNTIME_TYPES.CLAUDE_CODE) {
+			try {
+				const prompt = await this.loadRegistrationPrompt(role, sessionName, memberId, runtimeType);
+				promptFilePath = await this.writePromptFile(sessionName, prompt, {
+					runtimeType,
+					projectPath,
+					role,
+				});
+				agentName = sessionName;
+			} catch (promptError) {
+				this.logger.warn('Failed to pre-write prompt file (non-fatal, will fall back to direct delivery)', {
+					sessionName,
+					error: promptError instanceof Error ? promptError.message : String(promptError),
+				});
+			}
+		}
+
+		// Reinitialize runtime using the appropriate initialization script (always fresh start)
+		const runtimeService2 = this.createRuntimeService(runtimeType);
+		const launchedAtMs = Date.now();
+		await runtimeService2.executeRuntimeInitScript(sessionName, projectPath, effectiveFlags, promptFilePath, agentName, sessionPlan.resumeSessionId ?? undefined);
+		this.recordRuntimeSessionAfterLaunch(sessionName, runtimeType, projectPath, launchedAtMs, sessionPlan);
+		this.noteResumedLaunch(sessionName, role, sessionPlan);
+
+		// Wait for runtime to be ready (simplified detection)
+		// Use shorter check interval in test environment, and reasonable interval in production
+		const checkInterval = this.getCheckInterval();
+		const isReady = await runtimeService2.waitForRuntimeReady(
+			sessionName,
+			60000,
+			checkInterval
+		); // 60s timeout — Claude Code cold starts can take 30-60s
+		if (!isReady) {
+			throw new Error(`Failed to reinitialize ${runtimeType} within timeout`);
+		}
+
+		// Start runtime exit monitoring IMMEDIATELY after runtime is ready.
+		// Must be before postInitialize and sendRegistrationPromptAsync so exits
+		// during those phases are detected and the abort signal fires in time.
+		RuntimeExitMonitorService.getInstance().startMonitoring(
+			sessionName, runtimeType, role
+		);
+
+		// Start OAuth relogin monitoring for automatic re-authentication
+		OAuthReloginMonitorService.getInstance().startMonitoring(sessionName, runtimeType);
+
+		// Look up per-agent browser automation override from member config
+		let browserAutomationOverride: boolean | undefined;
+		if (memberId) {
+			try {
+				const teams = await this.storageService.getTeams();
+				for (const team of teams) {
+					const member = team.members?.find((m) => m.id === memberId || m.sessionName === sessionName);
+					if (member?.enableBrowserAutomation !== undefined) {
+						browserAutomationOverride = member.enableBrowserAutomation;
+						break;
+					}
+				}
+			} catch {
+				// Non-fatal — will use global setting
+			}
+		}
+
+		// Run post-initialization hook (e.g., Gemini CLI directory allowlist)
+		try {
+			await runtimeService2.postInitialize(sessionName, projectPath, additionalAllowlistPaths, browserAutomationOverride);
+			// Drain stale terminal escape sequences (e.g. DA1 [?1;2c) that may have
+			// arrived during postInitialize commands, so they don't leak into the prompt input
+			await delay(500);
+			// No blind Ctrl+C / Ctrl+U after post-initialization (crewly#1014):
+			// the guarded writer types only into a box it reads as empty, so
+			// stale input is refused, never wiped unseen.
+		} catch (postInitError) {
+			this.logger.warn('Post-initialization hook failed (non-fatal)', {
+				sessionName,
+				runtimeType,
+				error: postInitError instanceof Error ? postInitError.message : String(postInitError),
+			});
+		}
+
+		// For PTY sessions, once runtime is detected as ready, consider initialization successful
+		// MCP registration will happen async when the agent processes its first prompt
+		this.logger.info('Runtime detected as ready, session initialization successful', {
+			sessionName,
+			role,
+			runtimeType,
+		});
+
+		// Background: detect and store session ID for resume-on-restart
+		if (runtimeType === RUNTIME_TYPES.CLAUDE_CODE) {
+			const detectPath = projectPath || process.cwd();
+			setTimeout(() => {
+				this.detectAndStoreSessionId(sessionName, detectPath).catch(() => {});
+			}, 10000);
+		}
+
+		// Send the registration prompt in background (don't block on it)
+		this.sendRegistrationPromptAsync(sessionName, role, memberId, runtimeType).catch((err) => {
+			this.logger.warn('Background registration prompt failed (non-blocking)', {
+				sessionName,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
+
+		// Update agent status to 'started' since the runtime is running
+		// The agent will become 'active' only after it registers via the API endpoint
+		try {
+			await this.storageService.updateAgentStatus(
+				sessionName,
+				CREWLY_CONSTANTS.AGENT_STATUSES.STARTED
+			);
+			this.logger.info('Agent status updated to started (runtime running, awaiting registration)', { sessionName, role });
+		} catch (statusError) {
+			this.logger.warn('Failed to update agent status (non-critical)', {
+				sessionName,
+				error: statusError instanceof Error ? statusError.message : String(statusError),
+			});
+		}
+
+		return true;
+	}
+
+	/**
+	 * Detect and store the Claude Code session ID by scanning the filesystem.
+	 * Claude Code stores conversations as <UUID>.jsonl files in
+	 * ~/.claude/projects/<path-slug>/ where path-slug is the absolute
+	 * project path with / replaced by -.
+	 *
+	 * Runs in background after agent init to capture the session ID
+	 * for resume-on-restart support.
+	 *
+	 * @param sessionName - PTY session name
+	 * @param projectPath - Absolute path to the agent's project directory
+	 */
+	private async detectAndStoreSessionId(sessionName: string, projectPath: string): Promise<void> {
+		try {
+			// A launch with a preset or resumed id already knows the answer. The
+			// "newest transcript in the project dir" guess below is only for
+			// legacy sessions — with several agents sharing a cwd it picks the
+			// wrong agent's (or an older) conversation, and did exactly that 17 s
+			// after a preset launch on 2026-09-18.
+			if (getSessionStatePersistence().getSessionId(sessionName)) {
+				this.logger.debug('Session id already known — skipping filesystem detection', { sessionName });
+				return;
+			}
+			const slug = projectPath.replace(/\//g, '-');
+			const claudeProjectDir = path.join(os.homedir(), '.claude', 'projects', slug);
+
+			const files = await readdir(claudeProjectDir);
+			const jsonlFiles = files.filter(f => f.endsWith('.jsonl'));
+
+			if (jsonlFiles.length === 0) return;
+
+			// Find most recent .jsonl by mtime
+			let latestFile = '';
+			let latestMtime = 0;
+			for (const file of jsonlFiles) {
+				const fileStat = await stat(path.join(claudeProjectDir, file));
+				if (fileStat.mtimeMs > latestMtime) {
+					latestMtime = fileStat.mtimeMs;
+					latestFile = file;
+				}
+			}
+
+			if (!latestFile) return;
+
+			// Extract UUID from filename (remove .jsonl extension)
+			const sessionId = latestFile.replace('.jsonl', '');
+
+			const persistence = getSessionStatePersistence();
+			persistence.updateSessionId(sessionName, sessionId);
+
+			this.logger.info('Detected and stored Claude session ID from filesystem', {
+				sessionName,
+				sessionId,
+				claudeProjectDir,
+			});
+		} catch (error) {
+			this.logger.debug('Could not detect Claude session ID from filesystem (non-fatal)', {
+				sessionName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	/**
+	 * Provision the runtime-specific project config file.
+	 *
+	 * Each agent CLI reads a different file for project configuration:
+	 * - Claude Code  → .crewly/CLAUDE.md
+	 * - Gemini CLI   → GEMINI.md (project root)
+	 * - Codex        → AGENTS.md (project root)
+	 * - OpenCode     → AGENTS.md (project root, same convention as Codex — #306)
+	 * - Antigravity  → AGENTS.md (project root; agy reads GEMINI.md and AGENTS.md)
+	 *
+	 * Uses 'wx' flag to avoid overwriting existing files.
+	 *
+	 * @param projectPath - Project directory path
+	 * @param runtimeType - Agent runtime type
+	 */
+	private async provisionRuntimeConfigFile(projectPath: string, runtimeType: RuntimeType): Promise<void> {
+		// Map runtime type to template file and output path
+		const configMap: Record<string, { template: string; outputPath: string }> = {
+			[RUNTIME_TYPES.CLAUDE_CODE]: {
+				template: 'agent-claude-md.md',
+				outputPath: path.join(projectPath, '.crewly', 'CLAUDE.md'),
+			},
+			[RUNTIME_TYPES.GEMINI_CLI]: {
+				template: 'agent-gemini-md.md',
+				outputPath: path.join(projectPath, 'GEMINI.md'),
+			},
+			[RUNTIME_TYPES.CODEX_CLI]: {
+				template: 'agent-agents-md.md',
+				outputPath: path.join(projectPath, 'AGENTS.md'),
+			},
+			[RUNTIME_TYPES.OPENCODE_CLI]: {
+				template: 'agent-agents-md.md',
+				outputPath: path.join(projectPath, 'AGENTS.md'),
+			},
+			// agy reads both GEMINI.md and AGENTS.md (antigravity.google/docs/cli/gcli-migration)
+			[RUNTIME_TYPES.ANTIGRAVITY_CLI]: {
+				template: 'agent-agents-md.md',
+				outputPath: path.join(projectPath, 'AGENTS.md'),
+			},
+		};
+
+		const config = configMap[runtimeType];
+		if (!config) return; // Unknown runtime — skip
+
+		try {
+			// Ensure parent directory exists
+			const dir = path.dirname(config.outputPath);
+			await mkdir(dir, { recursive: true });
+
+			const templatePath = path.join(this.projectRoot, 'config', 'templates', config.template);
+			let content = this.promptCache.get(templatePath);
+			if (!content) {
+				content = await readFile(templatePath, 'utf8');
+				this.promptCache.set(templatePath, content);
+			}
+
+			// Substitute path placeholders before writing (#209). The cache holds
+			// the RAW template; resolve into a per-project copy so skill-script and
+			// project paths in the provisioned config file point at real locations
+			// (mirrors the placeholder substitution done for the registration prompt).
+			const agentSkillsPath = path.join(this.projectRoot, 'config', 'skills', 'agent');
+			const orchestratorSkillsPath = path.join(this.projectRoot, 'config', 'skills', 'orchestrator');
+			const marketplaceSkillsPath = path.join(os.homedir(), '.crewly', 'marketplace', 'skills');
+			const resolved = content
+				.replace(/\{\{PROJECT_PATH\}\}/g, projectPath)
+				.replace(/\{\{AGENT_SKILLS_PATH\}\}/g, agentSkillsPath)
+				.replace(/\{\{ORCHESTRATOR_SKILLS_PATH\}\}/g, orchestratorSkillsPath)
+				.replace(/\{\{MARKETPLACE_SKILLS_PATH\}\}/g, marketplaceSkillsPath);
+
+			await writeFile(config.outputPath, resolved, { flag: 'wx' }).catch(() => {
+				// File already exists — no action needed
+			});
+		} catch (err) {
+			this.logger.warn('Could not provision runtime config file (non-critical)', {
+				runtimeType,
+				outputPath: config.outputPath,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	/**
+	 * Send registration prompt asynchronously (non-blocking).
+	 * Uses an AbortController so the operation can be cancelled if the
+	 * runtime exits before registration completes.
+	 */
+	private async sendRegistrationPromptAsync(
+		sessionName: string,
+		role: string,
+		memberId?: string,
+		runtimeType: RuntimeType = RUNTIME_TYPES.CLAUDE_CODE
+	): Promise<void> {
+		// One live flow per session, bound to the PTY that exists right now
+		// (the helper is initialised: the caller just created the PTY with it).
+		// Starting it aborts any older flow for the same name.
+		const { flow, superseded } = this.registrationFlows.begin(sessionName, this.currentPtySession(sessionName));
+		if (superseded) {
+			this.logger.info('Superseded an older registration flow for this session', { sessionName, generation: flow.generation });
+		}
+		const signal = flow.signal;
+		const cancelled = (): boolean => this.isFlowCancelled(sessionName, signal);
+
+		try {
+			this.logger.info('Loading registration prompt', { sessionName, role, runtimeType });
+
+			if (cancelled()) return;
+			const prompt = await this.loadRegistrationPrompt(role, sessionName, memberId, runtimeType);
+
+			this.logger.info('Registration prompt loaded, sending to agent', {
+				sessionName, role, runtimeType, promptLength: prompt.length,
+			});
+
+			// Gate on the runtime actually accepting input. `waitForRuntimeReady`
+			// (already passed by the caller) matches banner text that is on screen
+			// while the TUI is still booting — with Codex the instruction landed
+			// ~2 s after spawn, during `model: loading`, and was swallowed while
+			// every log line still said "sent successfully" (server-install finding 3).
+			if (cancelled()) return;
+			const inputReady = await this.waitForRuntimeInputReady(sessionName, runtimeType, signal);
+
+			if (cancelled()) return;
+			if (!inputReady && (await this.isOnSignInScreen(sessionName))) return;
+			const sent = await this.sendPromptRobustly(sessionName, prompt, runtimeType, signal);
+
+			if (sent) {
+				this.logger.info('Registration prompt sent successfully', { sessionName, role });
+			} else {
+				this.logger.warn('Registration prompt delivery returned false', { sessionName, role, runtimeType });
+			}
+
+			// Make a silent non-registration loud, and re-deliver once. Previously a
+			// swallowed instruction left the agent at `started` / readyAt null forever
+			// with no log line saying so.
+			await this.redeliverIfUnregistered(sessionName, role, prompt, runtimeType, signal);
+		} catch (error) {
+			if (cancelled()) {
+				this.logger.info('Registration prompt cancelled', { sessionName, reason: String(signal.reason) });
+				return;
+			}
+			this.logger.warn('Failed to send registration prompt asynchronously', {
+				sessionName,
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			});
+		} finally {
+			this.registrationFlows.end(flow);
+		}
+	}
+
+	/**
+	 * Whether the runtime is sitting on its sign-in screen. Typing the kickoff
+	 * there after the input-ready timeout put the instruction text into
+	 * Codex's "Provide your own API key" box: it became the "API key", every
+	 * call 401'd, and the 401 set off a re-login that wiped the owner's fresh
+	 * ChatGPT sign-in (2026-09-26, Nova). Nothing is typed; the login monitor
+	 * sees the screen and asks the owner to sign in.
+	 *
+	 * @param sessionName - Session
+	 * @returns True when the screen is a sign-in / login prompt
+	 */
+	private async isOnSignInScreen(sessionName: string): Promise<boolean> {
+		let screen = '';
+		try {
+			screen = (await this.getSessionHelper()).capturePane(sessionName);
+		} catch {
+			return false;
+		}
+		if (!isSignInScreen(screen)) return false;
+		this.logger.warn('Runtime is on its sign-in screen — not typing the registration instruction into it', { sessionName });
+		return true;
+	}
+
+	/**
+	 * Poll the PTY screen until the runtime is idle at its input prompt
+	 * (`RuntimeAgentService.isReadyForInput`) or the timeout elapses.
+	 *
+	 * On timeout we log a warning and return `false` but the caller still
+	 * sends the instruction — a late instruction is recoverable (re-delivery,
+	 * `POST /api/terminal/:s/deliver`), a never-sent one is not.
+	 *
+	 * @param sessionName - PTY session name
+	 * @param runtimeType - Runtime whose prompt heuristics to use
+	 * @param abortSignal - Aborts the wait when the runtime exits
+	 * @param timeoutMs - Maximum time to wait (defaults to RUNTIME_INPUT_READY_TIMEOUT_MS)
+	 * @returns true when the idle prompt was observed, false on timeout/abort
+	 */
+	private async waitForRuntimeInputReady(
+		sessionName: string,
+		runtimeType: RuntimeType,
+		abortSignal?: AbortSignal,
+		timeoutMs: number = REGISTRATION_DELIVERY_CONSTANTS.RUNTIME_INPUT_READY_TIMEOUT_MS
+	): Promise<boolean> {
+		const runtimeService = this.createRuntimeService(runtimeType);
+		// Mocked / non-TUI runtimes without the predicate: nothing to wait for.
+		if (typeof runtimeService.isReadyForInput !== 'function') {
+			return true;
+		}
+
+		const sessionHelper = await this.getSessionHelper();
+		const pollMs = this.testAwareInterval(REGISTRATION_DELIVERY_CONSTANTS.RUNTIME_INPUT_READY_POLL_MS);
+		const startedAt = Date.now();
+		let polls = 0;
+
+		while (!this.isFlowCancelled(sessionName, abortSignal)) {
+			let screen = '';
+			try {
+				screen = sessionHelper.capturePane(sessionName);
+			} catch (captureError) {
+				this.logger.debug('Runtime input-ready capture failed (will retry)', {
+					sessionName,
+					error: captureError instanceof Error ? captureError.message : String(captureError),
+				});
+			}
+			polls++;
+
+			// A known start-up question (codex's resume directory picker) can
+			// appear after the ready banner: answer it instead of timing out
+			// and typing the kickoff into it.
+			if (typeof runtimeService.answerKnownPrompt === 'function' && (await runtimeService.answerKnownPrompt(sessionName, screen))) {
+				await delay(pollMs);
+				continue;
+			}
+
+			if (runtimeService.isReadyForInput(screen) || this.claudeIdlePromptFromBox(sessionHelper, sessionName, screen, runtimeType) === true) {
+				this.logger.info('Runtime idle at input prompt — delivering registration instruction', {
+					sessionName,
+					runtimeType,
+					waitedMs: Date.now() - startedAt,
+					polls,
+				});
+				return true;
+			}
+
+			if (Date.now() - startedAt >= timeoutMs) {
+				const lastLines = screen.split('\n').filter((l) => l.trim()).slice(-5);
+				this.logger.warn('Timed out waiting for runtime input prompt — sending registration instruction anyway', {
+					sessionName,
+					runtimeType,
+					timeoutMs,
+					polls,
+					lastTerminalLines: lastLines,
+				});
+				return false;
+			}
+
+			await delay(pollMs);
+		}
+
+		this.logger.info('Runtime input-ready wait aborted (runtime exited)', { sessionName });
+		return false;
+	}
+
+	/**
+	 * Resolve how long an agent gets to register after its prompt is delivered.
+	 * Mirrors the timeout selection used when the session is created.
+	 *
+	 * @param role - Agent role
+	 * @param runtimeType - Agent runtime
+	 * @returns Registration timeout in milliseconds
+	 */
+	private resolveRegistrationTimeout(role: string, runtimeType: RuntimeType): number {
+		if (role === ORCHESTRATOR_ROLE) return AGENT_TIMEOUTS.ORCHESTRATOR_INITIALIZATION;
+		if (runtimeType === RUNTIME_TYPES.CLAUDE_CODE) return AGENT_TIMEOUTS.CLAUDE_CODE_INITIALIZATION;
+		return AGENT_TIMEOUTS.REGULAR_AGENT_INITIALIZATION;
+	}
+
+	/**
+	 * After the registration instruction was delivered, wait the registration
+	 * timeout for the agent to flip to `active`. If it does not, log an error
+	 * (this used to be completely silent) and re-deliver the instruction once,
+	 * gated again on the runtime being idle at its prompt.
+	 *
+	 * @param sessionName - PTY session name
+	 * @param role - Agent role
+	 * @param prompt - The full registration prompt (re-written to the prompt file)
+	 * @param runtimeType - Agent runtime
+	 * @param abortSignal - Aborts when the runtime exits
+	 */
+	private async redeliverIfUnregistered(
+		sessionName: string,
+		role: string,
+		prompt: string,
+		runtimeType: RuntimeType,
+		abortSignal: AbortSignal
+	): Promise<void> {
+		const timeout = this.resolveRegistrationTimeout(role, runtimeType);
+		const checkInterval = this.testAwareInterval(REGISTRATION_DELIVERY_CONSTANTS.REGISTRATION_CHECK_INTERVAL_MS);
+
+		for (let redelivery = 0; redelivery <= REGISTRATION_DELIVERY_CONSTANTS.MAX_REDELIVERIES; redelivery++) {
+			const startedAt = Date.now();
+			while (Date.now() - startedAt < timeout) {
+				if (this.isFlowCancelled(sessionName, abortSignal)) return;
+				if (await this.checkAgentRegistration(sessionName, role)) {
+					this.logger.info('Agent registration confirmed after prompt delivery', {
+						sessionName, role, redeliveries: redelivery, waitedMs: Date.now() - startedAt,
+					});
+					return;
+				}
+				await delay(checkInterval);
+			}
+
+			if (this.isFlowCancelled(sessionName, abortSignal)) return;
+
+			if (redelivery >= REGISTRATION_DELIVERY_CONSTANTS.MAX_REDELIVERIES) {
+				this.logger.error('Agent never registered after registration prompt delivery', {
+					sessionName, role, runtimeType, timeoutMs: timeout, redeliveries: redelivery,
+					hint: `POST /api/terminal/${sessionName}/deliver {force:true} with the prompt-file instruction`,
+				});
+				return;
+			}
+
+			const sessionHelper = await this.getSessionHelper();
+			if (!sessionHelper.sessionExists(sessionName)) {
+				this.logger.warn('Registration re-delivery skipped — session no longer exists', { sessionName, role });
+				return;
+			}
+
+			this.logger.warn('No registration within timeout — re-delivering registration instruction', {
+				sessionName, role, runtimeType, timeoutMs: timeout,
+			});
+			const readyAgain = await this.waitForRuntimeInputReady(sessionName, runtimeType, abortSignal);
+			if (this.isFlowCancelled(sessionName, abortSignal)) return;
+			if (!readyAgain && (await this.isOnSignInScreen(sessionName))) return;
+			const resent = await this.sendPromptRobustly(sessionName, prompt, runtimeType, abortSignal);
+			this.logger.info('registration re-delivered', { sessionName, role, runtimeType, resent });
+		}
+	}
+
+	/**
+	 * Step 3: Kill session and recreate completely
+	 * Most aggressive approach - completely recreates the session from scratch
+	 */
+	private async tryFullRecreation(
+		sessionName: string,
+		role: string,
+		timeout: number,
+		projectPath?: string,
+		memberId?: string,
+		runtimeType: RuntimeType = RUNTIME_TYPES.CLAUDE_CODE,
+		runtimeFlags?: string[]
+	): Promise<boolean> {
+		// Kill existing session. Same D2(a) rule as forceRecreate: a monitor entry
+		// for the old incarnation must not outlive it, or it false-declares the
+		// replacement PTY dead before startMonitoring() below replaces it.
+		RuntimeExitMonitorService.getInstance().stopMonitoring(sessionName);
+		this.cancelPendingRegistration(sessionName, 'session-killed');
+		await (await this.getSessionHelper()).killSession(sessionName);
+
+		// Wait for cleanup
+		await delay(1000);
+
+		// Conversation id (see planSessionRecovery): preset, resumed, or discovered.
+		const effectiveFlags = runtimeFlags ? [...runtimeFlags] : [];
+		// Remote MCP servers (Zoho MCP …) the role may use — files under CREWLY_HOME, never the project.
+		effectiveFlags.push(...(await buildRemoteMcpLaunchFlags({ sessionName, role, runtimeType })).flags);
+		const sessionPlan = await this.planSessionRecovery(sessionName, runtimeType, effectiveFlags, projectPath);
+
+		// Write prompt file before launching runtime so --agent (Claude Code) or --append-system-prompt-file works
+		let promptFilePath: string | undefined;
+		let agentName: string | undefined;
+		if (runtimeType === RUNTIME_TYPES.CLAUDE_CODE) {
+			try {
+				const prompt = await this.loadRegistrationPrompt(role, sessionName, memberId, runtimeType);
+				promptFilePath = await this.writePromptFile(sessionName, prompt, {
+					runtimeType,
+					projectPath,
+					role,
+				});
+				agentName = sessionName;
+			} catch (promptError) {
+				this.logger.warn('Failed to pre-write prompt file in full recreation (non-fatal)', {
+					sessionName,
+					error: promptError instanceof Error ? promptError.message : String(promptError),
+				});
+			}
+		}
+
+		// Recreate session based on role
+		if (role === ORCHESTRATOR_ROLE) {
+			// Same deterministic cwd for the PTY and the runtime `cd` — this site
+			// used to `cd` into process.cwd() (the package install dir under
+			// systemd) while the PTY was created elsewhere.
+			const orchestratorCwd = projectPath || (await this.resolveOrchestratorCwd());
+			await this.createOrchestratorSession({
+				sessionName,
+				projectPath: orchestratorCwd,
+				runtimeType,
+			});
+			// D3: let the shell print its prompt before the init sequence's Ctrl-C.
+			await this.waitForShellReady(sessionName);
+
+			// Initialize runtime for orchestrator using script (always fresh start)
+			const runtimeService = this.createRuntimeService(runtimeType);
+			const launchedAtMs = Date.now();
+			await runtimeService.executeRuntimeInitScript(sessionName, orchestratorCwd, effectiveFlags, promptFilePath, agentName, sessionPlan.resumeSessionId ?? undefined);
+			this.recordRuntimeSessionAfterLaunch(sessionName, runtimeType, orchestratorCwd, launchedAtMs, sessionPlan);
+			this.noteResumedLaunch(sessionName, ORCHESTRATOR_ROLE, sessionPlan);
+
+			// Wait for runtime to be ready
+			const checkInterval = this.getCheckInterval();
+			// runtimeService3: Separate instance for orchestrator ready-state detection
+			// Isolated from runtimeService to prevent interference between init and ready checks
+			const runtimeService3 = this.createRuntimeService(runtimeType);
+			const isReady = await runtimeService3.waitForRuntimeReady(
+				sessionName,
+				45000,
+				checkInterval
+			);
+			if (!isReady) {
+				throw new Error(
+					`Failed to initialize ${runtimeType} in recreated orchestrator session within timeout`
+				);
+			}
+
+			// Start runtime exit monitoring immediately after runtime is ready
+			RuntimeExitMonitorService.getInstance().startMonitoring(
+				sessionName, runtimeType, role
+			);
+
+			// Start OAuth relogin monitoring for automatic re-authentication
+			OAuthReloginMonitorService.getInstance().startMonitoring(sessionName, runtimeType);
+
+			// Additional verification: Use runtime detection to confirm runtime is responding
+			// Wait a bit longer for runtime to fully load after showing welcome message
+			this.logger.debug(
+				'Runtime ready detected for orchestrator, waiting for full startup before verification',
+				{ sessionName, runtimeType }
+			);
+			await delay(5000);
+
+			// Codex CLI is sensitive to active key-probe verification (it may drop to
+			// the shell when probe keys are interpreted outside the TUI). We already
+			// passed waitForRuntimeReady above, so skip the extra command probe here.
+			if (runtimeType !== RUNTIME_TYPES.CODEX_CLI) {
+				this.logger.debug('Verifying orchestrator runtime responsiveness', {
+					sessionName,
+					runtimeType,
+				});
+				// runtimeService4: Final verification instance for orchestrator responsiveness
+				// Clean instance for post-initialization responsiveness testing
+				const runtimeService4 = this.createRuntimeService(runtimeType);
+				const runtimeResponding = await runtimeService4.detectRuntimeWithCommand(sessionName);
+				if (!runtimeResponding) {
+					throw new Error(
+						`${runtimeType} not responding to commands after orchestrator recreation`
+					);
+				}
+			} else {
+				this.logger.debug('Skipping active runtime probe for Codex orchestrator recreation', {
+					sessionName,
+					runtimeType,
+				});
+			}
+
+			this.logger.debug(
+				'Runtime confirmed ready for orchestrator in Step 3',
+				{ sessionName, runtimeType }
+			);
+		} else {
+			// For other roles, create basic session and initialize Claude (always fresh start).
+			// D1 (2026-09-21): spawn with the identity env exactly like the primary
+			// path — this branch used to spawn env-less, so every agent that came
+			// through Step 2 ran without CREWLY_SESSION_NAME (unattributed heartbeats
+			// and channel replies).
+			// API keys ride in the spawn env too (never typed in) — this path had no
+			// settings keys at all before, so a recreated agent ran without them.
+			const recreationCwd = projectPath || process.cwd();
+			const recreationKeyEnv = await this.buildApiKeyEnv(runtimeType);
+			await (await this.getSessionHelper()).createSession(sessionName, recreationCwd, {
+				env: { ...this.buildAgentIdentityEnv(sessionName, role, recreationCwd, runtimeType), ...recreationKeyEnv },
+			});
+			// D3: let the shell print its prompt before the init sequence's Ctrl-C.
+			await this.waitForShellReady(sessionName);
+
+			const runtimeService = this.createRuntimeService(runtimeType);
+			const launchedAtMs = Date.now();
+			await runtimeService.executeRuntimeInitScript(sessionName, projectPath, effectiveFlags, promptFilePath, agentName, sessionPlan.resumeSessionId ?? undefined);
+			this.recordRuntimeSessionAfterLaunch(sessionName, runtimeType, projectPath, launchedAtMs, sessionPlan);
+		this.noteResumedLaunch(sessionName, role, sessionPlan);
+
+			// Wait for runtime to be ready (simplified detection)
+			const checkInterval = this.getCheckInterval();
+			const isReady = await this.createRuntimeService(runtimeType)
+				.waitForRuntimeReady(sessionName, 25000, checkInterval); // 25s timeout
+			if (!isReady) {
+				throw new Error(
+					`Failed to initialize ${runtimeType} in recreated session within timeout`
+				);
+			}
+
+			// Start runtime exit monitoring immediately after runtime is ready
+			RuntimeExitMonitorService.getInstance().startMonitoring(
+				sessionName, runtimeType, role
+			);
+
+			// Start OAuth relogin monitoring for automatic re-authentication
+			OAuthReloginMonitorService.getInstance().startMonitoring(sessionName, runtimeType);
+		}
+
+		// Look up per-agent browser automation override from member config
+		let browserOverrideForRecreation: boolean | undefined;
+		if (memberId) {
+			try {
+				const teams = await this.storageService.getTeams();
+				for (const team of teams) {
+					const member = team.members?.find((m) => m.id === memberId || m.sessionName === sessionName);
+					if (member?.enableBrowserAutomation !== undefined) {
+						browserOverrideForRecreation = member.enableBrowserAutomation;
+						break;
+					}
+				}
+			} catch {
+				// Non-fatal — will use global setting
+			}
+		}
+
+		// Run post-initialization hook (e.g., Gemini CLI directory allowlist)
+		try {
+			const postInitService = this.createRuntimeService(runtimeType);
+			await postInitService.postInitialize(sessionName, projectPath, undefined, browserOverrideForRecreation);
+			// Drain stale terminal escape sequences (e.g. DA1 [?1;2c) that may have
+			// arrived during postInitialize commands, so they don't leak into the prompt input
+			await delay(500);
+			// No blind Ctrl+C / Ctrl+U (crewly#1014): see post-initialization above.
+		} catch (postInitError) {
+			this.logger.warn('Post-initialization hook failed after recreation (non-fatal)', {
+				sessionName,
+				runtimeType,
+				error: postInitError instanceof Error ? postInitError.message : String(postInitError),
+			});
+		}
+
+		// For PTY sessions, once runtime is detected as ready, consider initialization successful
+		this.logger.info('Runtime detected as ready after full recreation, session initialization successful', {
+			sessionName,
+			role,
+			runtimeType,
+		});
+
+		// Background: detect and store session ID for resume-on-restart
+		if (runtimeType === RUNTIME_TYPES.CLAUDE_CODE) {
+			const detectPath = projectPath || process.cwd();
+			setTimeout(() => {
+				this.detectAndStoreSessionId(sessionName, detectPath).catch(() => {});
+			}, 10000);
+		}
+
+		// Send the registration prompt in background (don't block on it)
+		this.sendRegistrationPromptAsync(sessionName, role, memberId, runtimeType).catch((err) => {
+			this.logger.warn('Background registration prompt failed after recreation (non-blocking)', {
+				sessionName,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
+
+		// Update agent status to 'started' since the runtime is running
+		// The agent will become 'active' only after it registers via the API endpoint
+		try {
+			await this.storageService.updateAgentStatus(
+				sessionName,
+				CREWLY_CONSTANTS.AGENT_STATUSES.STARTED
+			);
+			this.logger.info('Agent status updated to started after recreation (awaiting registration)', { sessionName, role });
+		} catch (statusError) {
+			this.logger.warn('Failed to update agent status after recreation (non-critical)', {
+				sessionName,
+				error: statusError instanceof Error ? statusError.message : String(statusError),
+			});
+		}
+
+		return true;
+	}
+
+	/**
+	 * Register a crewly-agent member as active by updating its team config directly.
+	 * In-process agents cannot run bash scripts, so this performs the registration
+	 * that the register-self skill would normally do for PTY-based runtimes.
+	 *
+	 * @param sessionName - Agent session name
+	 * @param role - Agent role
+	 * @param memberId - Optional member UUID
+	 * @returns True if registration succeeded
+	 */
+	private async registerMemberActive(
+		sessionName: string,
+		role: string,
+		memberId?: string,
+	): Promise<boolean> {
+		try {
+			// Handle orchestrator separately — its config is stored outside getTeams()
+			if (sessionName === ORCHESTRATOR_SESSION_NAME) {
+				await this.storageService.updateOrchestratorStatus(CREWLY_CONSTANTS.AGENT_STATUSES.ACTIVE);
+				this.logger.info('Orchestrator registered as active via config', { sessionName });
+				return true;
+			}
+
+			const teams = await this.storageService.getTeams();
+			for (const team of teams) {
+				const member = team.members.find(
+					(m) =>
+						(m.sessionName === sessionName) ||
+						(memberId !== undefined && m.id === memberId),
+				);
+				if (member) {
+					member.agentStatus = 'active';
+					member.workingStatus = 'idle';
+					member.updatedAt = new Date().toISOString();
+					// Pre-populate sessionName so register_self tool can find this member
+					if (!member.sessionName && sessionName) {
+						member.sessionName = sessionName;
+					}
+					await this.storageService.saveTeam(team);
+					this.logger.info('Member registered as active', { sessionName, teamId: team.id });
+
+					// #167: Drain dead-letter queue for newly active agent
+					if (this.schedulerService) {
+						this.schedulerService.drainDeadLetterQueue(sessionName).catch((err: Error) => {
+							this.logger.warn('Failed to drain DLQ on activation (non-critical)', {
+								sessionName,
+								error: err.message,
+							});
+						});
+					}
+
+					// Architecture Upgrade Phase 6: set up standing task event subscriptions
+					this.setupStandingSubscriptions(sessionName, canMemberDelegate(team, member) ? 'team-lead' : 'executor', team.id);
+
+					return true;
+				}
+			}
+			this.logger.warn('Could not find member to register as active', { sessionName, memberId });
+			return false;
+		} catch (error) {
+			this.logger.error('Failed to register member as active', {
+				sessionName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Set up standing event subscriptions for task workflow events based on org role.
+	 * Called once at agent registration. Subscriptions are long-lived (24h TTL)
+	 * and NOT oneShot — they persist for the agent's session lifetime.
+	 *
+	 * Orchestrator: task:verified, task:blocked, task:failed (all teams)
+	 * Team Lead: task:done, task:blocked, task:failed, task:needs_clarification (own team)
+	 * Executor: task:assigned (self scope)
+	 *
+	 * @param sessionName - Agent session name
+	 * @param orgRole - Organizational role (orchestrator, team-lead, executor)
+	 * @param teamId - Team ID for scoping (optional for orchestrator)
+	 */
+	private setupStandingSubscriptions(sessionName: string, orgRole: string, teamId?: string): void {
+		if (!this.eventBusService) {
+			this.logger.debug('EventBusService not available, skipping standing subscriptions', { sessionName });
+			return;
+		}
+
+		const TTL_MINUTES = 60 * 24; // 24 hours
+
+		try {
+			if (orgRole === 'orchestrator') {
+				// Orchestrator: awareness-only subscriptions for all teams
+				for (const eventType of ['task:verified', 'task:blocked', 'task:failed', 'team:all_tasks_done'] as const) {
+					this.eventBusService.subscribe({
+						eventType,
+						filter: {},
+						subscriberSession: sessionName,
+						oneShot: false,
+						ttlMinutes: TTL_MINUTES,
+					});
+				}
+				this.logger.info('Standing subscriptions set up for orchestrator', { sessionName });
+			} else if (orgRole === 'team-lead') {
+				// TL: own team scope
+				for (const eventType of ['task:done', 'task:blocked', 'task:failed', 'task:needs_clarification'] as const) {
+					this.eventBusService.subscribe({
+						eventType,
+						filter: teamId ? { teamId } : {},
+						subscriberSession: sessionName,
+						oneShot: false,
+						ttlMinutes: TTL_MINUTES,
+					});
+				}
+				this.logger.info('Standing subscriptions set up for team-lead', { sessionName, teamId });
+			} else {
+				// Executor: self scope only
+				this.eventBusService.subscribe({
+					eventType: 'task:assigned',
+					filter: { sessionName },
+					subscriberSession: sessionName,
+					oneShot: false,
+					ttlMinutes: TTL_MINUTES,
+				});
+				this.logger.info('Standing subscription set up for executor', { sessionName });
+			}
+		} catch (err) {
+			this.logger.warn('Failed to set up standing subscriptions (non-fatal)', {
+				sessionName,
+				orgRole,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	/**
+	 * Load registration prompt from config files (with caching to prevent file I/O contention)
+	 */
+	/**
+	 * The `{{MEMBER_SKILLS_JSON}}` value for a session: the member's declared
+	 * skills, else its reported capabilities, else `[]`. Storage failures
+	 * degrade to `[]` so registration never blocks on it.
+	 *
+	 * @param sessionName - Session whose member to look up
+	 * @returns A JSON array literal
+	 */
+	private async resolveMemberSkillsJson(sessionName: string): Promise<string> {
+		try {
+			const found = await this.storageService.findMemberBySessionName(sessionName);
+			return memberSkillsJson({ skills: found?.member.skills, capabilities: found?.member.capabilities });
+		} catch {
+			return '[]';
+		}
+	}
+
+	private async loadRegistrationPrompt(
+		role: string,
+		sessionName: string,
+		memberId?: string,
+		runtimeType: RuntimeType = RUNTIME_TYPES.CLAUDE_CODE
+	): Promise<string> {
+		try {
+			// Cache key is role only - the template file is the same regardless of memberId
+			const cacheKey = role;
+
+			// Check cache first to avoid file I/O during concurrent operations
+			if (!this.promptCache.has(cacheKey)) {
+				this.logger.debug('Loading prompt template from file', { role, cacheKey });
+
+				// Get the prompt file path from team roles configuration
+				const promptPath = await this.getPromptFileForRole(role);
+				const promptTemplate = await readFile(promptPath, 'utf8');
+				this.promptCache.set(cacheKey, promptTemplate);
+				this.logger.debug('Prompt template cached', { role, cacheKey, promptPath });
+			} else {
+				this.logger.debug('Using cached prompt template', { role, cacheKey });
+			}
+
+			// Get cached template and apply variable replacements
+			let prompt = this.promptCache.get(cacheKey)!;
+
+			// Replace all template placeholders
+			prompt = prompt.replace(/\{\{SESSION_ID\}\}/g, sessionName);
+			prompt = prompt.replace(/\{\{SESSION_NAME\}\}/g, sessionName);
+			prompt = prompt.replace(/\{\{ROLE\}\}/g, role);
+			// The member's own skill tags for poll-tasks (2026-09-18): role prompts
+			// used to ship a literal `["typescript","react"]` example, so every
+			// agent polled the pool with those two tags whatever its job was.
+			if (prompt.includes('{{MEMBER_SKILLS_JSON}}')) {
+				prompt = prompt.replace(/\{\{MEMBER_SKILLS_JSON\}\}/g, await this.resolveMemberSkillsJson(sessionName));
+			}
+			if (memberId) {
+				prompt = prompt.replace(/\{\{MEMBER_ID\}\}/g, memberId);
+			} else {
+				// For orchestrator or cases without member ID, remove the memberId parameter
+				prompt = prompt.replace(/,\s*"memberId":\s*"\{\{MEMBER_ID\}\}"/g, '');
+			}
+
+			// Look up project path and TL hierarchy for team members
+			let projectPath = process.cwd();
+			let foundTeam: Team | null = null;
+			let foundMember: TeamMember | null = null;
+			try {
+				const teams = await this.storageService.getTeams();
+				for (const team of teams) {
+					const member = team.members?.find((m) => m.sessionName === sessionName);
+					if (member) {
+						foundTeam = team;
+						foundMember = member;
+						if (team.projectIds[0]) {
+							const projects = await this.storageService.getProjects();
+							const project = projects.find((p) => p.id === team.projectIds[0]);
+							if (project?.path) {
+								projectPath = project.path;
+							}
+						}
+						break;
+					}
+				}
+			} catch {
+				// Non-critical - use default project path
+			}
+
+			// Write runtime-specific project config file so the agent CLI
+			// recognizes Crewly as a legitimate project configuration (fixes #33)
+			// Claude Code → .crewly/CLAUDE.md, Gemini CLI → GEMINI.md, Codex / OpenCode → AGENTS.md
+			if (role !== ORCHESTRATOR_ROLE) {
+				await this.provisionRuntimeConfigFile(projectPath, runtimeType);
+			}
+
+			// Replace project path placeholder (must happen after project path lookup above)
+			prompt = prompt.replace(/\{\{PROJECT_PATH\}\}/g, projectPath);
+
+			// Replace agent skills path placeholder
+			const agentSkillsPath = path.join(this.projectRoot, 'config', 'skills', 'agent');
+			prompt = prompt.replace(/\{\{AGENT_SKILLS_PATH\}\}/g, agentSkillsPath);
+
+			// Replace orchestrator skills path placeholder — ensures skill scripts
+			// resolve correctly regardless of the orchestrator's working directory
+			const orchestratorSkillsPath = path.join(this.projectRoot, 'config', 'skills', 'orchestrator');
+			prompt = prompt.replace(/\{\{ORCHESTRATOR_SKILLS_PATH\}\}/g, orchestratorSkillsPath);
+
+			// Replace marketplace skills path placeholder
+			const marketplaceSkillsPath = path.join(os.homedir(), '.crewly', 'marketplace', 'skills');
+			prompt = prompt.replace(/\{\{MARKETPLACE_SKILLS_PATH\}\}/g, marketplaceSkillsPath);
+
+			// #210: Inject member's systemPrompt if available
+			// This contains role context and authorization info that the agent needs at startup
+			if (foundTeam && foundMember?.id) {
+				try {
+					const memberPrompt = await this.storageService.getMemberPrompt(foundTeam.id, foundMember.id);
+					if (memberPrompt && memberPrompt.trim()) {
+						prompt = memberPrompt.trim() + '\n\n' + prompt;
+						this.logger.info('Member systemPrompt prepended to init prompt', {
+							sessionName,
+							memberId: foundMember.id,
+							systemPromptLength: memberPrompt.length,
+						});
+					}
+				} catch (err) {
+					this.logger.warn('Failed to load member systemPrompt (non-critical)', {
+						sessionName,
+						memberId: foundMember.id,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			}
+
+			// Inject skill authorization section — tells agents about available capabilities
+			prompt += '\n\n## Available Capabilities\n\n'
+				+ 'Bash skills in the Crewly skills directory are available for team communication and status reporting.'
+				+ '\n\n' + BROWSER_PRIORITY_CONSTANTS.promptSection(path.join(agentSkillsPath, 'remote-browser', 'execute.sh'))
+				// specs/2026-10-01-reply-open-items.md — promises and questions in replies are tracked.
+				+ '\n\n' + OPEN_ITEMS_CONSTANTS.PROMPT_LINE
+				// crewly#1078 — a 40 GB runaway file in a scratch dir filled a disk.
+				+ '\n\n' + WORKTREE_JANITOR_CONSTANTS.PROMPT_HINT;
+
+			// Inject Team Lead addon for members that may delegate (a lead by the
+			// team-lead rule, or canDelegate=true) and have members to direct.
+			if (foundMember && foundTeam && canMemberDelegate(foundTeam, foundMember)) {
+				try {
+					const subordinates: SubordinateInfo[] = getLeadSubordinates(foundTeam, foundMember).map((subMember) => ({
+						name: subMember.name,
+						sessionName: subMember.sessionName || subMember.agentId || '',
+						role: subMember.role || 'developer',
+						memberId: subMember.id,
+					}));
+
+					if (subordinates.length > 0) {
+						const tlConfig: TeamMemberSessionConfig = {
+							name: sessionName,
+							role: role as TeamMemberSessionConfig['role'],
+							systemPrompt: '',
+							projectPath,
+							memberId,
+							teamId: foundTeam.id,
+							canDelegate: true,
+							subordinates,
+						};
+
+						const promptBuilder = new PromptBuilderService(this.projectRoot);
+						const tlSection = await promptBuilder.buildTeamLeadSection(tlConfig);
+
+						if (tlSection) {
+							prompt += `\n\n---\n\n${tlSection}`;
+							this.logger.info('TL addon injected into init prompt', {
+								sessionName,
+								subordinateCount: subordinates.length,
+								subordinateNames: subordinates.map((s) => s.name),
+								tlSectionLength: tlSection.length,
+							});
+						}
+					}
+				} catch (tlError) {
+					this.logger.warn('Failed to inject TL addon (non-critical)', {
+						sessionName,
+						error: tlError instanceof Error ? tlError.message : String(tlError),
+					});
+				}
+			}
+
+			// Issue #395: Inject the authoritative active-work briefing FIRST,
+			// so the agent's reading order is "what am I on the hook for RIGHT
+			// NOW" before the supplementary memory context. Soft-fail with WARN
+			// — TaskPool/Request hiccups must not block agent boot.
+			//
+			// #816: both briefings are captured here and handed to the modular
+			// assembler below (ActiveWorkModule / SessionBriefingModule). The
+			// modular path returns its own prompt, so appending to `prompt`
+			// alone used to drop them on the default path.
+			let activeWorkBriefingMd: string | undefined;
+			let sessionBriefingMd: string | undefined;
+			try {
+				// ActiveWorkBriefingService.getInstance() is async — see service
+				// JSDoc. Dynamic-import migration was the build-fix for PR #494's
+				// broken relative-path resolution under entry-script anchoring.
+				const activeWorkService = await ActiveWorkBriefingService.getInstance();
+				const activeWorkBriefing = await activeWorkService.generateActiveWorkBriefing(
+					sessionName,
+					role,
+				);
+				const activeWorkMd = activeWorkService.formatBriefingAsMarkdown(activeWorkBriefing);
+				if (activeWorkMd && activeWorkMd.length > 30) {
+					activeWorkBriefingMd = activeWorkMd;
+					this.logger.info('Active-work briefing injected into prompt', {
+						sessionName,
+						role,
+						openRequests: activeWorkBriefing.openRequests.length,
+						activeWorkItems: activeWorkBriefing.activeWorkItems.length,
+						pendingReviews: activeWorkBriefing.pendingReviews.length,
+						outboundDelegations: activeWorkBriefing.outboundDelegations.length,
+						recentlyAutoResolved: activeWorkBriefing.recentlyAutoResolved.length,
+						truncated: activeWorkBriefing.truncated,
+						briefingLength: activeWorkMd.length,
+					});
+				}
+			} catch (activeWorkError) {
+				this.logger.warn('Failed to generate active-work briefing (non-critical)', {
+					sessionName,
+					error: activeWorkError instanceof Error ? activeWorkError.message : String(activeWorkError),
+				});
+			}
+			// Always emit the section: the briefing, or an explicit "not
+			// injected" notice, so the recovery protocol's "section above" is
+			// true on this (legacy, non-modular) path too.
+			prompt += `\n\n---\n\n${renderActiveWorkSection(activeWorkBriefingMd, {
+				agentSkillsPath: path.join(this.projectRoot, 'config', 'skills', 'agent'),
+				sessionName,
+				role,
+			})}`;
+
+			// Generate and inject startup briefing from session memory
+			try {
+				const sessionMemoryService = SessionMemoryService.getInstance();
+				await sessionMemoryService.onSessionStart(sessionName, role, projectPath);
+				const briefing = await sessionMemoryService.generateStartupBriefing(sessionName, role, projectPath);
+				const briefingMd = sessionMemoryService.formatBriefingAsMarkdown(briefing);
+				if (briefingMd && briefingMd.length > 30) {
+					sessionBriefingMd = briefingMd;
+					prompt += `\n\n---\n\n${briefingMd}`;
+					this.logger.info('Startup briefing injected into prompt', { sessionName, role, briefingLength: briefingMd.length });
+				}
+			} catch (briefingError) {
+				this.logger.warn('Failed to generate startup briefing (non-critical)', {
+					sessionName,
+					error: briefingError instanceof Error ? briefingError.message : String(briefingError),
+				});
+			}
+
+			// #1345: project wiki pages, the agent's recent lessons and open owner
+			// threads. Travels with the session briefing (same module, compactable).
+			try {
+				const knowledgeMd = await StartupBriefingService.getInstance().build({ sessionName, role, projectPath });
+				if (knowledgeMd) {
+					sessionBriefingMd = sessionBriefingMd ? `${sessionBriefingMd}\n\n${knowledgeMd}` : knowledgeMd;
+					prompt += `\n\n---\n\n${knowledgeMd}`;
+					this.logger.info('Startup knowledge briefing injected into prompt', { sessionName, role, briefingLength: knowledgeMd.length });
+				}
+			} catch (knowledgeError) {
+				this.logger.warn('Failed to generate startup knowledge briefing (non-critical)', {
+					sessionName,
+					error: knowledgeError instanceof Error ? knowledgeError.message : String(knowledgeError),
+				});
+			}
+
+			// Inject mandatory session recovery protocol (recall + get-my-context)
+			try {
+				const recoveryBuilder = new PromptBuilderService(this.projectRoot);
+				const recoverySection = recoveryBuilder.buildSessionRecoverySection(sessionName, role, projectPath);
+				prompt += `\n\n---\n\n${recoverySection}`;
+				this.logger.info('Session recovery protocol injected into prompt', { sessionName, role });
+			} catch (recoveryError) {
+				this.logger.warn('Failed to inject session recovery protocol (non-critical)', {
+					sessionName,
+					error: recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+				});
+			}
+
+			// Append identity section so the agent knows its session name and project path
+			prompt += `\n\n---\n\n## Your Identity\n- **Session Name:** ${sessionName}\n- **Project Path:** ${projectPath}`;
+			if (memberId) {
+				prompt += `\n- **Member ID:** ${memberId}`;
+			}
+
+			// Conditionally append Self Evolution instructions for the orchestrator
+			if (role === ORCHESTRATOR_ROLE) {
+				try {
+					const settings = await getSettingsService().getSettings();
+					if (settings.general.enableSelfEvolution) {
+						const selfEvoPath = path.join(
+							this.projectRoot, 'config', 'roles', 'orchestrator', 'self-evolution.md'
+						);
+						const selfEvoPrompt = await readFile(selfEvoPath, 'utf8');
+						prompt += `\n\n---\n\n${selfEvoPrompt}`;
+						this.logger.info('Self Evolution prompt injected', { sessionName });
+					}
+				} catch (selfEvoError) {
+					this.logger.warn('Failed to load self-evolution prompt (non-critical)', {
+						sessionName,
+						error: selfEvoError instanceof Error ? selfEvoError.message : String(selfEvoError),
+					});
+				}
+			}
+
+			// Phase 5: Use modular prompt assembly (enabled by default, disable with CREWLY_USE_MODULAR_PROMPTS=false).
+			// Replaces the entire monolithic template with PromptAssemblyService — handling identity,
+			// skills, communication, recovery, lifecycle, memory, soul, and team-reference modules
+			// with token budget enforcement.
+			if (process.env.CREWLY_USE_MODULAR_PROMPTS !== 'false') {
+				this.logger.info('Using modular prompt assembly (Phase 5)', { sessionName, role });
+
+				const agentSkillsPath = path.join(this.projectRoot, 'config', 'skills', 'agent');
+				const tlSkillsPath = path.join(this.projectRoot, 'config', 'skills', 'team-leader');
+
+				// Pre-compute the subordinate roster — used by both the helper
+				// path (passed via runtime.subordinates) and the orchestrator
+				// fallback path below.
+				// A lead by the team-lead rule with no explicit reports directs the
+				// rest of the team (utils/team.utils getLeadSubordinates).
+				const subordinateMembers = foundMember && foundTeam ? getLeadSubordinates(foundTeam, foundMember) : [];
+				const subordinates = subordinateMembers.length > 0
+					? subordinateMembers.map((subMember) => ({
+						name: subMember.name,
+						sessionName: subMember.sessionName || subMember.agentId || '',
+						role: subMember.role || 'developer',
+						memberId: subMember.id,
+					}))
+					: undefined;
+
+				const teamNormsPath = foundTeam?.id
+					? path.join(os.homedir(), CREWLY_CONSTANTS.PATHS.CREWLY_HOME, 'teams', foundTeam.id, 'norms')
+					: undefined;
+
+				let moduleConfig: ModuleConfig;
+				if (foundMember && foundTeam) {
+					// WIRE-2: When the agent is a TeamMember of a Team, build the
+					// canonical ModuleConfig via the shared helper so every
+					// autonomy / org / team-level field reaches the assembler.
+					// Caller-side overlay covers the two registration-specific
+					// fields the helper doesn't know about (teamNormsPath +
+					// the registration's `memberId` override which may differ
+					// from member.id when the caller passed an explicit id).
+					const runtime: SessionRuntimeContext = {
+						sessionName,
+						projectPath,
+						runtimeType: runtimeType as ModuleConfig['runtimeType'],
+						subordinates,
+						agentSkillsPath,
+						tlSkillsPath,
+						projectRoot: this.projectRoot,
+					};
+					moduleConfig = {
+						...buildModuleConfigFromTeamMember(foundMember, foundTeam, runtime),
+						memberId: memberId ?? foundMember.id ?? '',
+						teamNormsPath,
+					};
+				} else {
+					// Orchestrator + legacy paths: foundMember/foundTeam not
+					// present (orchestrator config lives outside getTeams()).
+					// Keep the inline fallback so registration still works for
+					// the orchestrator and any caller without team context.
+					moduleConfig = {
+						sessionName,
+						memberId: memberId ?? '',
+						role,
+						teamId: foundTeam?.id,
+						projectPath,
+						runtimeType: runtimeType as ModuleConfig['runtimeType'],
+						canDelegate: foundMember?.canDelegate,
+						subordinates,
+						agentSkillsPath,
+						tlSkillsPath,
+						projectRoot: this.projectRoot,
+						orgRole: role === 'orchestrator' ? 'orchestrator'
+							: foundMember?.canDelegate ? 'team-lead'
+							: 'executor',
+						autonomyLevel: foundMember?.autonomyLevel ?? 'directed',
+						teamNormsPath,
+					};
+				}
+
+				// #816: startup state rides in the module config so the modular
+				// prompt carries it (ActiveWorkModule / SessionBriefingModule).
+				moduleConfig.activeWorkBriefing = activeWorkBriefingMd;
+				moduleConfig.sessionBriefing = sessionBriefingMd;
+
+				// Prompt tiering: the orchestrator is re-registered on every
+				// cold start and re-reads the whole system prompt at full price.
+				// CREWLY_ORC_PROMPT_PROFILE=lite drops the planning/onboarding
+				// modules; the default stays `full`. Both tiers are assembled
+				// for the orchestrator so the operator can compare their size
+				// in the log before flipping the env.
+				const requestedProfile: PromptProfile | undefined =
+					role === ORCHESTRATOR_ROLE ? resolveOrcPromptProfile() : undefined;
+				if (requestedProfile) moduleConfig.promptProfile = requestedProfile;
+
+				const assembler = new PromptAssemblyService();
+				const { prompt: modularPrompt, report } = await assembler.assemble(moduleConfig);
+
+				this.logger.info('Modular prompt assembled for registration', {
+					sessionName,
+					role,
+					profile: report.profile,
+					totalTokens: report.totalTokens,
+					moduleCount: report.moduleBreakdown.length,
+					truncatedCount: report.truncated.length,
+					modules: report.moduleBreakdown.map(m => m.name),
+				});
+
+				if (requestedProfile) {
+					await this.logPromptProfileComparison(assembler, moduleConfig, report);
+				}
+
+				return modularPrompt;
+			}
+
+			return prompt;
+		} catch (error) {
+			// Fallback to inline prompt if file doesn't exist
+			const attemptedPath = await this.getPromptFileForRole(role);
+
+			// Distinguish "role prompt simply absent" (team-config uses a
+			// custom role string, fallback covers it) from genuine read
+			// failures (permission denied, corrupt file). ENOENT is a
+			// common case — e.g. CE team config currently uses
+			// `role: "tech-lead"` while the filesystem canonical is
+			// `team-leader`. The fallback inline prompt is functionally
+			// sufficient; ERROR-level noise just buries real issues.
+			const msg = error instanceof Error ? error.message : String(error);
+			const isMissingFile = /ENOENT/.test(msg);
+			this.logger[isMissingFile ? 'warn' : 'error']('Could not load prompt from config, using fallback', {
+				role,
+				promptPath: attemptedPath,
+				error: msg,
+				...(isMissingFile ? {} : { stack: error instanceof Error ? error.stack : undefined }),
+			});
+
+			const memberIdJson = memberId ? `,"teamMemberId":"${memberId}"` : '';
+			const skillsPath = path.join(this.projectRoot, 'config', 'skills', 'agent');
+
+			return `Hey! I need your help with some tasks on this project.
+
+## Quick context about this setup
+
+This project uses Crewly for team coordination. You have bash skills available at \`${skillsPath}/\` that communicate with the Crewly backend running locally. Read the skills catalog at \`~/.crewly/skills/AGENT_SKILLS_CATALOG.md\` for a full reference of available skills.
+
+## First thing - please check in
+
+Please run the register-self skill to let the team dashboard know you're available:
+\`\`\`bash
+bash ${skillsPath}/core/register-self/execute.sh '{"role":"${role}","sessionName":"${sessionName}"${memberIdJson}}'
+\`\`\`
+All it does is update a local status flag so the web UI shows you as online - nothing more.
+
+## Default Execution Loop
+
+When assigned a task, do not wait passively.
+
+Loop until done, blocked, or explicitly reassigned:
+1. Restate the expected outcome in one sentence.
+2. Identify the fastest safe path to produce a usable result.
+3. Execute immediately.
+4. Run cheapest meaningful validation.
+5. If validation fails, fix and retry.
+6. If blocked by missing goal/outcome/eval, escalate to your TL.
+7. If blocked by implementation detail, decide reasonably and continue.
+8. Report only when you have a result, blocker, or decision exceeding your authority.`;
+		}
+	}
+
+	/**
+	 * Write the registration prompt to a file on disk.
+	 *
+	 * For Claude Code agents (#207): writes to `{projectPath}/.claude/agents/{sessionName}.md`
+	 * with YAML frontmatter so the `--agent` flag can load it as a custom agent definition.
+	 * For other runtimes: writes to `~/.crewly/prompts/{sessionName}-init.md`.
+	 *
+	 * @param sessionName - Session name (used for filename)
+	 * @param prompt - The full prompt content
+	 * @param options - Optional: projectPath, runtimeType, and role for claude-code agent mode
+	 * @returns The absolute path to the written file, or undefined on error
+	 */
+	private async writePromptFile(
+		sessionName: string,
+		prompt: string,
+		options?: { projectPath?: string; runtimeType?: RuntimeType; role?: string }
+	): Promise<string | undefined> {
+		const isClaudeAgent = options?.runtimeType === RUNTIME_TYPES.CLAUDE_CODE && options?.projectPath;
+		const promptFilePath = isClaudeAgent
+			? path.join(options.projectPath!, '.claude', 'agents', `${sessionName}.md`)
+			: this.getInitPromptFilePath(sessionName);
+		const promptsDir = path.dirname(promptFilePath);
+
+		// Quote YAML values to prevent injection via sessionName or role containing special chars
+		const yamlSafeName = sessionName.replace(/"/g, '\\"');
+		const yamlSafeRole = (options?.role || 'developer').replace(/"/g, '\\"');
+		const fileContent = isClaudeAgent
+			? `---\nname: "${yamlSafeName}"\ndescription: "${yamlSafeRole} agent for Crewly orchestration"\n---\n\n${prompt}`
+			: prompt;
+
+		try {
+			await mkdir(promptsDir, { recursive: true });
+			await writeFile(promptFilePath, fileContent, 'utf8');
+			this.logger.debug('Wrote init prompt to file', {
+				sessionName,
+				promptFilePath,
+				promptLength: fileContent.length,
+				mode: isClaudeAgent ? 'claude-agent' : 'legacy',
+			});
+			return promptFilePath;
+		} catch (error) {
+			this.logger.warn('Failed to write init prompt file', {
+				sessionName,
+				promptFilePath,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return undefined;
+		}
+	}
+
+	/**
+	 * Build the unified init prompt path used by non-Claude-Code runtimes.
+	 *
+	 * Anchored on {@link getCrewlyHomePath} so test profiles, KR3 livewalk
+	 * dry-runs, and ESTestNode acceptance harnesses that export
+	 * `CREWLY_HOME=/tmp/...` write into the test profile, not the
+	 * developer's real `~/.crewly/prompts`. WI-F (2026-05-07): the
+	 * previous `path.join(os.homedir(), CREWLY_CONSTANTS.PATHS.CREWLY_HOME,
+	 * ...)` form ignored the env var and let Mia's KR3 livewalk overwrite
+	 * 27 occurrences of `~/.crewly/prompts/crewly-orc-init.md` and 26 of
+	 * `crewly-auditor-init.md` in Steve's user-prod tree at 02:37Z.
+	 */
+	private getInitPromptFilePath(sessionName: string): string {
+		return path.join(
+			getCrewlyHomePath(),
+			'prompts',
+			`${sessionName}-init.md`
+		);
+	}
+
+	/**
+	 * Wait for agent registration to complete
+	 */
+	private async waitForRegistration(
+		sessionName: string,
+		role: string,
+		timeout: number
+	): Promise<boolean> {
+		const startTime = Date.now();
+		const checkInterval = 5000; // Check every 5 seconds to prevent overlapping with `/` detection
+
+		while (Date.now() - startTime < timeout) {
+			try {
+				if (await this.checkAgentRegistration(sessionName, role)) {
+					this.logger.info('Agent registration confirmed', { sessionName, role });
+					return true;
+				}
+
+				await delay(checkInterval);
+			} catch (error) {
+				this.logger.warn('Error checking registration', {
+					sessionName,
+					role,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				await delay(checkInterval);
+			}
+		}
+
+		this.logger.warn('Timeout waiting for agent registration', { sessionName, role, timeout });
+		return false;
+	}
+
+	/**
+	 * Check if agent is properly registered
+	 */
+	private async checkAgentRegistration(sessionName: string, role: string): Promise<boolean> {
+		try {
+			if (role === ORCHESTRATOR_ROLE) {
+				// For orchestrator, check agentStatus is active
+				const orchestratorStatus = await this.storageService.getOrchestratorStatus();
+				return orchestratorStatus?.agentStatus === CREWLY_CONSTANTS.AGENT_STATUSES.ACTIVE;
+			}
+
+			// For team members, check teams data
+			const teams = await this.storageService.getTeams();
+
+			// Find team member with matching sessionName and check agentStatus
+			for (const team of teams) {
+				if (team.members) {
+					for (const member of team.members) {
+						if (member.sessionName === sessionName && member.role === role) {
+							return member.agentStatus === CREWLY_CONSTANTS.AGENT_STATUSES.ACTIVE;
+						}
+					}
+				}
+			}
+
+			return false;
+		} catch (error) {
+			this.logger.debug('Error checking agent registration', {
+				sessionName,
+				role,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Fast registration with verification and retry mechanism
+	 * Sends system prompt to runtime which triggers MCP registration via teams.json
+	 * @param skipInitialCleanup If true, skips Ctrl+C on first attempt (when runtime was just initialized)
+	 */
+	private async attemptRegistrationWithVerification(
+		sessionName: string,
+		role: string,
+		timeout: number,
+		memberId?: string,
+		maxRetries: number = 3,
+		skipInitialCleanup: boolean = false,
+		runtimeType: RuntimeType = RUNTIME_TYPES.CLAUDE_CODE
+	): Promise<boolean> {
+		for (let attempt = 1; attempt <= maxRetries; attempt++) {
+			this.logger.info('Attempting system prompt registration with MCP flow', {
+				sessionName,
+				role,
+				runtimeType,
+				attempt,
+				maxRetries,
+			});
+
+			try {
+				// Step 1 (crewly#1014): no blind Ctrl+C / Ctrl+U before the
+				// registration prompt — the guarded writer refuses a box that is
+				// not empty, and only our own leftover text is ever cleared.
+				if (!skipInitialCleanup || attempt > 1) {
+					await delay(500);
+					this.logger.debug('Settled before the registration prompt (no clearing keys)', {
+						sessionName,
+						attempt,
+					});
+				} else {
+					this.logger.debug(
+						'Skipping Ctrl+C on first attempt (Claude was just initialized)',
+						{ sessionName, attempt }
+					);
+				}
+
+				// Step 2: Verify runtime is running (skip detection if runtime was just initialized and verified)
+				let runtimeRunning = true; // Assume true if we skip detection
+
+				if (!skipInitialCleanup || attempt > 1) {
+					// Only do runtime detection on retries or when runtime wasn't just initialized
+					const forceRefresh = attempt > 1; // Force refresh on retry attempts
+					const runtimeService5 = this.createRuntimeService(runtimeType);
+					runtimeRunning = await runtimeService5.detectRuntimeWithCommand(
+						sessionName,
+						forceRefresh
+					);
+
+					if (!runtimeRunning) {
+						this.logger.warn('Runtime not detected, cannot send system prompt', {
+							sessionName,
+							runtimeType,
+							attempt,
+							forceRefresh,
+						});
+
+						// Clear detection cache before continuing to retry
+						const runtimeService6 = this.createRuntimeService(runtimeType);
+						runtimeService6.clearDetectionCache(sessionName);
+
+						// Add longer delay between failed detection attempts
+						if (attempt < maxRetries) {
+							await delay(2000);
+						}
+						continue; // Try again
+					}
+				} else {
+					this.logger.debug(
+						'Skipping runtime detection (runtime was just initialized and verified)',
+						{
+							sessionName,
+							runtimeType,
+							attempt,
+						}
+					);
+				}
+
+				// Step 3: Send system prompt with robust delivery mechanism
+				const prompt = await this.loadRegistrationPrompt(role, sessionName, memberId, runtimeType);
+				const promptDelivered = await this.sendPromptRobustly(sessionName, prompt, runtimeType);
+
+				if (!promptDelivered) {
+					this.logger.warn('Failed to deliver system prompt reliably', {
+						sessionName,
+						attempt,
+						promptLength: prompt.length,
+					});
+					continue; // Try again
+				}
+
+				this.logger.debug('System prompt delivered successfully', {
+					sessionName,
+					promptLength: prompt.length,
+				});
+
+				this.logger.debug('Terminal activity detected, waiting for MCP registration', {
+					sessionName,
+				});
+
+				// Step 5: Wait for registration API call to update teams.json (agentStatus: activating -> active)
+				const registrationTimeout = Math.min(timeout, 25000); // Max 25s per attempt
+				const registered = await this.waitForRegistrationFast(
+					sessionName,
+					role,
+					registrationTimeout
+				);
+
+				if (registered) {
+					this.logger.info('MCP registration successful (teams.json updated)', {
+						sessionName,
+						role,
+						attempt,
+					});
+					return true;
+				}
+
+				this.logger.warn('MCP registration timeout, retrying', {
+					sessionName,
+					role,
+					attempt,
+					nextAttempt: attempt < maxRetries,
+				});
+			} catch (error) {
+				this.logger.error('System prompt registration attempt failed', {
+					sessionName,
+					role,
+					attempt,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+
+			// Short delay before retry
+			if (attempt < maxRetries) {
+				await delay(1000);
+			}
+		}
+
+		this.logger.warn('Background MCP registration did not complete within timeout (agent still running)', {
+			sessionName,
+			role,
+			runtimeType,
+			maxRetries,
+		});
+		return false;
+	}
+
+	/**
+	 * Fast registration polling with shorter intervals
+	 */
+	private async waitForRegistrationFast(
+		sessionName: string,
+		role: string,
+		timeout: number
+	): Promise<boolean> {
+		const startTime = Date.now();
+		const fastCheckInterval = 2000; // Check every 2 seconds (faster than original 5s)
+
+		while (Date.now() - startTime < timeout) {
+			try {
+				if (await this.checkAgentRegistration(sessionName, role)) {
+					this.logger.info('Fast registration confirmation', { sessionName, role });
+					return true;
+				}
+
+				await delay(fastCheckInterval);
+			} catch (error) {
+				this.logger.debug('Error in fast registration check', {
+					sessionName,
+					role,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				await delay(1000); // Shorter error delay
+			}
+		}
+
+		this.logger.warn('Fast registration timeout', { sessionName, role, timeout });
+		return false;
+	}
+
+	/**
+	 * Resolve the orchestrator's working directory deterministically:
+	 * `CREWLY_ORC_CWD` env → first stored project whose path exists → CREWLY_HOME.
+	 *
+	 * Never the package install dir or the server's `process.cwd()`: under
+	 * systemd that is `/usr/lib/node_modules/crewly`, and the orchestrator
+	 * would see a different filesystem depending on which code path started it.
+	 *
+	 * @returns Absolute directory to spawn the orchestrator PTY in
+	 */
+	async resolveOrchestratorCwd(): Promise<string> {
+		const envCwd = process.env[ENV_CONSTANTS.CREWLY_ORC_CWD]?.trim();
+		if (envCwd) {
+			const resolved = path.resolve(envCwd);
+			this.logger.info('Orchestrator cwd resolved from CREWLY_ORC_CWD', { cwd: resolved });
+			return resolved;
+		}
+
+		try {
+			const projects = await this.storageService.getProjects();
+			const firstProject = projects.find((project) => project.path && existsSync(project.path));
+			if (firstProject) {
+				this.logger.info('Orchestrator cwd resolved from first assigned project', {
+					cwd: firstProject.path,
+					projectId: firstProject.id,
+					projectName: firstProject.name,
+				});
+				return firstProject.path;
+			}
+		} catch (error) {
+			this.logger.debug('Could not read projects for orchestrator cwd (falling back to CREWLY_HOME)', {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+
+		const home = getCrewlyHomePath();
+		this.logger.info('Orchestrator cwd resolved to CREWLY_HOME (no env override, no project)', { cwd: home });
+		return home;
+	}
+
+	/**
+	 * Create orchestrator session - extracted from the original tmux service
+	 */
+	private async createOrchestratorSession(config: OrchestratorConfig): Promise<void> {
+		this.logger.info('Creating orchestrator session', {
+			sessionName: config.sessionName,
+			projectPath: config.projectPath,
+		});
+
+		// Check if session already exists
+		if (await (await this.getSessionHelper()).sessionExists(config.sessionName)) {
+			this.logger.info('Orchestrator session already exists', {
+				sessionName: config.sessionName,
+			});
+			return;
+		}
+
+		// Create new session for orchestrator — with the identity env (D1), the
+		// same object the primary path spawns with, plus the settings API keys in
+		// the spawn env (never typed in). windowName not used in PTY backend.
+		const apiKeyEnv = await this.buildApiKeyEnv(config.runtimeType ?? RUNTIME_TYPES.CLAUDE_CODE);
+		await (await this.getSessionHelper()).createSession(config.sessionName, config.projectPath, {
+			env: { ...this.buildAgentIdentityEnv(config.sessionName, ORCHESTRATOR_ROLE, config.projectPath, config.runtimeType), ...apiKeyEnv },
+		});
+
+		this.logger.info('Orchestrator session created successfully', {
+			sessionName: config.sessionName,
+		});
+	}
+
+	/**
+	 * Telemetry env for a PTY runtime: `CLAUDE_CODE_ENABLE_TELEMETRY=1` for
+	 * Claude Code when token tracking is on in settings. Passed at spawn (it
+	 * used to be typed in as an `export` after the shell started).
+	 *
+	 * @param runtimeType - Runtime the session will run
+	 * @returns Env map to merge into the spawn env (empty when off)
+	 */
+	private async buildTelemetryEnv(runtimeType: RuntimeType): Promise<Record<string, string>> {
+		if (runtimeType !== RUNTIME_TYPES.CLAUDE_CODE) return {};
+		try {
+			const settings = await getSettingsService().getSettings();
+			return settings.general?.tokenTracking ? { [ENV_CONSTANTS.CLAUDE_CODE_ENABLE_TELEMETRY]: '1' } : {};
+		} catch {
+			return {};
+		}
+	}
+
+	/**
+	 * The directory an agent last ran in, for a restart that does not say
+	 * where. Claude Code keeps conversations per directory, so launching in
+	 * the backend's own cwd instead made the stored conversation "not exist"
+	 * and handed over another agent's transcript.
+	 *
+	 * @param sessionName - Agent session
+	 * @returns The registered session's cwd, else the last-conversations entry's, if it is a directory
+	 */
+	private lastKnownCwd(sessionName: string): string | undefined {
+		try {
+			const persistence = getSessionStatePersistence();
+			const candidates = [
+				persistence.getSessionMetadata(sessionName)?.cwd,
+				readLastConversation(persistence.lastConversationsFile(), sessionName)?.cwd,
+			];
+			for (const dir of candidates) {
+				if (dir && existsSync(dir)) return dir;
+			}
+		} catch {
+			// persistence unavailable
+		}
+		return undefined;
+	}
+
+	/**
+	 * Where a Claude Code session keeps its conversations when it runs on
+	 * another of the owner's Claude Code accounts (issue #942).
+	 *
+	 * @param sessionName - PTY session name
+	 * @param runtimeType - Runtime the session runs
+	 * @returns `{ claudeHome }` for an account session, else `{}` (the default `~/.claude`)
+	 */
+	private claudeHomeOverride(sessionName: string, runtimeType: string): { claudeHome?: string } {
+		if (runtimeType !== RUNTIME_TYPES.CLAUDE_CODE) return {};
+		const account = effectiveClaudeAccount(sessionName);
+		return account ? { claudeHome: claudeAccountConfigDir(account) } : {};
+	}
+
+	/**
+	 * The identity environment every agent PTY is spawned with.
+	 *
+	 * One source of truth for the primary spawn path, the Step-2 full
+	 * recreation path and the orchestrator session: `CREWLY_SESSION_NAME`
+	 * is what every skill sends as `X-Agent-Session`, so a session spawned
+	 * without it produces unattributed heartbeats and channel replies. Passing
+	 * the env at spawn (rather than only typing `export`s afterwards) is what
+	 * makes it survive a shell that is still initialising.
+	 *
+	 * It also carries the harness env (harnessEnvForAgents): PATH with the
+	 * user npm prefix (`~/.crewly/npm-global/bin`, where a harness lands when
+	 * `npm install -g` hit EACCES) and the Claude credential Crewly holds from
+	 * onboarding (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`). For an
+	 * Antigravity session it adds the saved Gemini key as `GEMINI_API_KEY`
+	 * (agy reads the key only from its environment) — in the spawn env, so it
+	 * is never typed into the terminal.
+	 *
+	 * A Claude Code session the runtime fallback moved to another of the
+	 * owner's Claude Code accounts (issue #942) gets that account's config
+	 * dir (`CLAUDE_CONFIG_DIR`) and token instead of the default login.
+	 *
+	 * @param sessionName - PTY session name (also the agent's identity)
+	 * @param role - Agent role (orchestrator, developer, …)
+	 * @param cwd - Working directory the PTY is spawned in (exposed as CREWLY_PROJECT_PATH)
+	 * @param runtimeType - Runtime the session will run, when known
+	 * @returns Env map to pass as `createSession(..., { env })`
+	 */
+	private buildAgentIdentityEnv(sessionName: string, role: string, cwd: string, runtimeType?: RuntimeType): Record<string, string> {
+		const account = runtimeType === RUNTIME_TYPES.CLAUDE_CODE ? effectiveClaudeAccount(sessionName) : null;
+		return {
+			...harnessEnvForAgents(process.env, runtimeType),
+			...(account ? claudeAccountEnv(account) : {}),
+			// No predicted "user" text in the input box (2026-10-03 incident).
+			...(runtimeType === RUNTIME_TYPES.CLAUDE_CODE ? RUNTIME_INPUT_SAFETY.CLAUDE_CODE_ENV : {}),
+			[ENV_CONSTANTS.CREWLY_SESSION_NAME]: sessionName,
+			// The agent's credential (#999): every skill sends it, and a request
+			// carrying it is this agent — never the owner.
+			[OWNER_AUTH_CONSTANTS.AGENT_BADGE_ENV]: mintAgentBadge(sessionName),
+			[ENV_CONSTANTS.CREWLY_ROLE]: role,
+			// The port this instance actually runs on, not the default (#777).
+			[ENV_CONSTANTS.CREWLY_API_URL]: getLocalApiBaseUrl(),
+			[ENV_CONSTANTS.CREWLY_PROJECT_PATH]: cwd,
+			[ENV_CONSTANTS.CREWLY_INSTALL_DIR]: this.projectRoot,
+			// Where the credential guard's hook finds its paths file
+			// (specs/2026-10-04-agent-credential-isolation.md).
+			...credentialGuardEnvFor(getCrewlyHomePath(), this.projectRoot),
+		};
+	}
+
+	/**
+	 * The API-key environment for a PTY runtime, resolved from settings (with
+	 * the per-runtime override chain).
+	 *
+	 * These are secrets, so they are only ever passed as the PTY's spawn
+	 * environment (`createSession(..., { env })`), never typed in as `export`
+	 * — a typed export is echoed by the shell into scrollback, the persistent
+	 * session log and the terminal-output API.
+	 *
+	 * Used by the PTY runtimes (claude-code, gemini-cli, codex-cli,
+	 * antigravity-cli, opencode-cli). crewly-agent gets its keys via
+	 * CrewlyAgentExternalRuntimeService.buildChildEnv instead.
+	 *
+	 * Two runtimes get an override on top of the plain settings lookup, both
+	 * carried over from the primary spawn path's inline key resolution:
+	 * - Antigravity: a key already saved in Settings → Runtimes is applied at
+	 *   spawn via buildAgentIdentityEnv (harnessEnvForAgents); a settings
+	 *   Gemini key must not override it here.
+	 * - Codex: it prefers OPENAI_API_KEY over its own login, so a stale
+	 *   settings key overrides a working ChatGPT sign-in ("Incorrect API
+	 *   key", Nova 2026-09-26). When Codex already has its own login, the
+	 *   settings key is withheld.
+	 *
+	 * @param runtimeType - Runtime the session will run (selects key overrides)
+	 * @returns Env entries for every key that is configured; empty when none are
+	 */
+	private async buildApiKeyEnv(runtimeType: RuntimeType): Promise<Record<string, string>> {
+		const settingsService = getSettingsService();
+		const runtimeContext = { runtime: runtimeType };
+		const env: Record<string, string> = {};
+
+		// Gemini key — needed by gemini-cli. An Antigravity session whose key
+		// was saved in Settings → Runtimes already got it at spawn
+		// (buildAgentIdentityEnv); a settings key must not override it.
+		const antigravityKeyAtSpawn =
+			runtimeType === RUNTIME_TYPES.ANTIGRAVITY_CLI && getHarnessCredentialsStore().getAntigravityGeminiApiKey() !== null;
+		const geminiKey = antigravityKeyAtSpawn ? undefined : await settingsService.getApiKey('gemini', runtimeContext);
+		if (geminiKey) {
+			env.GOOGLE_GENERATIVE_AI_API_KEY = geminiKey;
+			env[ENV_CONSTANTS.GEMINI_API_KEY] = geminiKey;
+		}
+
+		// Anthropic key — needed by claude-code
+		const anthropicKey = await settingsService.getApiKey('anthropic', runtimeContext);
+		if (anthropicKey) env.ANTHROPIC_API_KEY = anthropicKey;
+
+		// OpenAI key — needed by codex-cli and opencode-cli. Skipped for Codex
+		// when it already has its own login (see docstring above).
+		const openaiKey = await settingsService.getApiKey('openai', runtimeContext);
+		if (openaiKey && !(runtimeType === RUNTIME_TYPES.CODEX_CLI && codexHasOwnLogin())) {
+			env.OPENAI_API_KEY = openaiKey;
+		}
+
+		return env;
+	}
+
+	/**
+	 * Wait — bounded — for a freshly spawned shell to print its prompt before
+	 * anything is written to it.
+	 *
+	 * D3 (2026-09-21): Step 2 full recreation used to write the runtime init
+	 * sequence ~8 ms after spawn. That sequence leads with Ctrl-C, and a zsh that
+	 * young has not installed its interactive SIGINT handling, so the TTY-delivered
+	 * SIGINT ends the shell (exit 0, 11 ms after spawn). The primary path never
+	 * hits this only because it types five `export`s first (~0.5 s).
+	 *
+	 * Checks the buffer first (the prompt may have landed before we subscribe),
+	 * then waits for the first non-whitespace output up to
+	 * `SESSION_RECREATION_CONSTANTS.SHELL_READY_TIMEOUT_MS`. Never throws: on
+	 * timeout it logs a warning and lets the caller proceed, so a silent shell
+	 * degrades to today's behaviour rather than blocking recreation.
+	 *
+	 * @param sessionName - The just-created PTY session
+	 * @returns True when a prompt was seen, false when the window elapsed
+	 */
+	private async waitForShellReady(sessionName: string): Promise<boolean> {
+		const { SHELL_READY_PATTERN, SHELL_READY_TIMEOUT_MS, SHELL_READY_CAPTURE_LINES } = SESSION_RECREATION_CONSTANTS;
+		const helper = await this.getSessionHelper();
+		try {
+			if (SHELL_READY_PATTERN.test(helper.capturePane(sessionName, SHELL_READY_CAPTURE_LINES))) {
+				return true;
+			}
+			await helper.waitForPattern(sessionName, SHELL_READY_PATTERN, SHELL_READY_TIMEOUT_MS);
+			return true;
+		} catch (error) {
+			this.logger.warn('Fresh shell printed nothing within the readiness window — proceeding with runtime init anyway', {
+				sessionName,
+				timeoutMs: SHELL_READY_TIMEOUT_MS,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Unified session creation that handles both orchestrator and team members
+	 * @param config Session configuration
+	 * @returns Promise with success/error information
+	 */
+	async createAgentSession(config: {
+		sessionName: string;
+		role: string;
+		projectPath?: string;
+		windowName?: string;
+		memberId?: string;
+		runtimeType?: RuntimeType;
+		teamId?: string;
+		/**
+		 * Skip intelligent recovery and force immediate session kill + recreation.
+		 * Use during server startup to avoid expensive recovery on stale sessions.
+		 * @default false
+		 */
+		forceRecreate?: boolean;
+		/**
+		 * Additional paths to add to Gemini CLI's /directory allowlist during
+		 * postInitialize, before the registration prompt is sent. Used by the
+		 * orchestrator to include all existing project paths so they don't
+		 * race with the "Read the file..." prompt.
+		 */
+		additionalAllowlistPaths?: string[];
+	}): Promise<{
+		success: boolean;
+		sessionName?: string;
+		message?: string;
+		error?: string;
+		/** Set to RUNTIME_STARTUP_BLOCKED when retrying cannot help. */
+		errorCode?: string;
+	}> {
+		// Fail fast if role is unusable. Without this guard, an undefined role
+		// flows through the entire pipeline, gets stringified to "undefined" in
+		// the CREWLY_ROLE env var, and silently breaks prompt resolution. We
+		// surface the misconfiguration here instead of spawning a dead session.
+		try {
+			validateAgentRole(config.role, 'createAgentSession');
+		} catch (err) {
+			const error = err instanceof Error ? err.message : String(err);
+			this.logger.error('Refusing to create agent session with invalid role', {
+				sessionName: config.sessionName,
+				memberId: config.memberId,
+				teamId: config.teamId,
+				receivedRole: config.role,
+				error,
+			});
+			return {
+				success: false,
+				sessionName: config.sessionName,
+				error,
+			};
+		}
+
+		// Winding down for a shutdown / restart: no new agent starts. They come
+		// back after the next start (messages for them stay queued).
+		if (RestartDrainService.getInstance().isWindingDown()) {
+			this.logger.info('Wind-down in progress — not starting an agent session', { sessionName: config.sessionName });
+			return {
+				success: false,
+				sessionName: config.sessionName,
+				error: 'Crewly is shutting down or restarting; the agent starts again after that.',
+			};
+		}
+
+		// Daily token cap (specs/2026-10-02-spend-cap.md): waking a capped
+		// agent is refused with the reason. The orchestrator's session may still
+		// start (an idle session costs nothing); its turns are held by the
+		// delivery gate and its queue.
+		if (config.sessionName !== ORCHESTRATOR_SESSION_NAME) {
+			const spendStop = spendCapStopOf(config.sessionName);
+			if (spendStop) {
+				const error = `${spendCapReason(spendStop)}; it starts again at midnight or when the owner boosts it`;
+				this.logger.info('Refusing to wake an agent stopped by a daily token cap', { sessionName: config.sessionName, capTokens: spendStop.capTokens, scope: spendStop.scope });
+				return { success: false, sessionName: config.sessionName, error, errorCode: SPEND_CAP_CONSTANTS.ERROR_CODE };
+			}
+		}
+
+		// Staggered boot restore: an agent still waiting in the restore queue is
+		// started by the queue, not in parallel by whoever woke it. An owner
+		// message waiting for it moves it to the front; other wakes keep order.
+		if (!config.forceRecreate) {
+			const restoreQueue = getRestoreQueue();
+			if (restoreQueue.isPending(config.sessionName)) {
+				const { SubAgentMessageQueue } = await import('../messaging/sub-agent-message-queue.service.js');
+				const owner = SubAgentMessageQueue.getInstance().peek(config.sessionName).some((m) => m.meta?.owner === true) || isDriveWarm(config.sessionName);
+				if (restoreQueue.wake(config.sessionName, owner)) {
+					return { success: true, sessionName: config.sessionName, message: 'Agent is queued for the staggered restore and starts shortly' };
+				}
+			}
+		}
+
+		// Pressure mode: cap on concurrently running agents. The start waits for
+		// a slot (freed by stopping the longest-idle agent); on timeout the
+		// agent stays down and its messages stay queued. The orchestrator is exempt.
+		if (config.sessionName !== ORCHESTRATOR_SESSION_NAME && !this.sessionCreationLocks.has(config.sessionName)) {
+			const { SubAgentMessageQueue } = await import('../messaging/sub-agent-message-queue.service.js');
+			// An owner message, or the owner talking to it in Drive mode (kept warm), goes ahead of ordinary starts.
+			const owner = SubAgentMessageQueue.getInstance().peek(config.sessionName).some((m) => m.meta?.owner === true) || isDriveWarm(config.sessionName);
+			if (!(await ResourceModeService.getInstance().requestStart(config.sessionName, owner))) {
+				return {
+					success: false,
+					sessionName: config.sessionName,
+					error: 'Machine is under resource pressure and the running-agent cap is reached; the start is deferred and messages stay queued',
+					errorCode: RESOURCE_MODE_CONSTANTS.START_DEFERRED_ERROR_CODE,
+				};
+			}
+		}
+
+		// Single-flight per session name. A second caller while a creation is
+		// in flight joins it (same result, one PTY, one kickoff flow) — team
+		// start, reconciler wake and activateAgentBySession all land here.
+		const existingLock = this.sessionCreationLocks.get(config.sessionName);
+		if (existingLock && !config.forceRecreate) {
+			this.logger.info('Joining in-flight session creation (single-flight)', { sessionName: config.sessionName });
+			try {
+				return await existingLock;
+			} catch {
+				// Previous creation failed, proceed with our own attempt
+				this.logger.info('Previous session creation failed, proceeding with new attempt', { sessionName: config.sessionName });
+			}
+		}
+
+		// forceRecreate does not join: it waits for the in-flight creation to
+		// settle, then kills that session (aborting its registration flow) and
+		// builds its own. Chaining through the lock — set synchronously below —
+		// keeps it single-flight: later callers join the forceRecreate run, and
+		// two creations for one name never run at the same time.
+		const predecessor = existingLock && config.forceRecreate ? existingLock : undefined;
+		if (predecessor) {
+			this.logger.info('forceRecreate queued behind in-flight session creation', { sessionName: config.sessionName });
+		}
+		const creationPromise = predecessor
+			? predecessor.catch(() => undefined).then(() => this._createAgentSessionImpl(config))
+			: this._createAgentSessionImpl(config);
+		this.sessionCreationLocks.set(config.sessionName, creationPromise);
+		try {
+			const result = await creationPromise;
+			return result;
+		} finally {
+			// Only delete lock if it's still ours — a concurrent caller may have
+			// replaced it with a new promise after our catch path above.
+			if (this.sessionCreationLocks.get(config.sessionName) === creationPromise) {
+				this.sessionCreationLocks.delete(config.sessionName);
+			}
+		}
+	}
+
+	/**
+	 * Internal implementation of createAgentSession, guarded by sessionCreationLocks.
+	 * @param config Session configuration
+	 * @returns Promise with success/error information
+	 */
+	private async _createAgentSessionImpl(config: {
+		sessionName: string;
+		role: string;
+		projectPath?: string;
+		windowName?: string;
+		memberId?: string;
+		runtimeType?: RuntimeType;
+		teamId?: string;
+		forceRecreate?: boolean;
+		additionalAllowlistPaths?: string[];
+	}): Promise<{
+		success: boolean;
+		sessionName?: string;
+		message?: string;
+		error?: string;
+		/** Set to RUNTIME_STARTUP_BLOCKED when retrying cannot help. */
+		errorCode?: string;
+	}> {
+		const { sessionName, role, windowName, memberId } = config;
+		// The orchestrator's cwd is resolved deterministically (env > first
+		// project > CREWLY_HOME) regardless of which boot path called us — the
+		// boot path, /orchestrator/setup and the restart service used to pass
+		// three different directories (server-install finding 4).
+		const projectPath = role === ORCHESTRATOR_ROLE
+			? await this.resolveOrchestratorCwd()
+			: (config.projectPath ?? this.lastKnownCwd(sessionName) ?? process.cwd());
+		const forceRecreate = config.forceRecreate ?? false;
+
+		// Get runtime type from config or default to claude-code
+		let runtimeType = config.runtimeType || RUNTIME_TYPES.CLAUDE_CODE;
+
+		// Resolve runtime flags from the agent's effective skills
+		let runtimeFlags: string[] = [];
+
+		// For team members, try to get runtime type from storage and resolve skill flags
+		if (!config.runtimeType && role !== ORCHESTRATOR_ROLE) {
+			try {
+				const teams = await this.storageService.getTeams();
+				for (const team of teams) {
+					const member = team.members?.find((m) => m.sessionName === sessionName);
+					if (member) {
+						if (member.runtimeType) {
+							runtimeType = member.runtimeType as RuntimeType;
+						}
+						// Resolve runtime flags from role skills + member overrides,
+						// then the member's own model / effort choice.
+						runtimeFlags = [
+							...(await this.resolveRuntimeFlags(role, runtimeType, member.skillOverrides, member.excludedRoleSkills)),
+							...this.resolveModelFlags(sessionName, runtimeType, effectiveMemberModelId(team, { ...member, runtimeType }), member.reasoningEffort),
+						];
+						break;
+					}
+				}
+			} catch (error) {
+				this.logger.warn('Failed to get runtime type or flags from storage, using defaults', {
+					sessionName,
+					role,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		} else if (role !== ORCHESTRATOR_ROLE) {
+			// Config-provided runtimeType, still resolve flags
+			try {
+				const teams = await this.storageService.getTeams();
+				for (const team of teams) {
+					const member = team.members?.find((m) => m.sessionName === sessionName);
+					if (member) {
+						runtimeFlags = [
+							...(await this.resolveRuntimeFlags(role, runtimeType, member.skillOverrides, member.excludedRoleSkills)),
+							...this.resolveModelFlags(sessionName, runtimeType, effectiveMemberModelId(team, { ...member, runtimeType }), member.reasoningEffort),
+						];
+						break;
+					}
+				}
+			} catch (error) {
+				this.logger.warn('Failed to resolve runtime flags', {
+					sessionName, role,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+
+		// For orchestrator, try to get runtime type (and model) from orchestrator status
+		if (role === ORCHESTRATOR_ROLE) {
+			try {
+				const orchestratorStatus = await this.storageService.getOrchestratorStatus();
+				if (!config.runtimeType && orchestratorStatus?.runtimeType) {
+					runtimeType = orchestratorStatus.runtimeType as RuntimeType;
+				}
+				runtimeFlags = [
+					...runtimeFlags,
+					...this.resolveModelFlags(sessionName, runtimeType, orchestratorStatus?.modelId, orchestratorStatus?.reasoningEffort),
+				];
+			} catch (error) {
+				this.logger.warn(
+					'Failed to get orchestrator runtime type from storage, using default',
+					{
+						sessionName,
+						role,
+						error: error instanceof Error ? error.message : String(error),
+					}
+				);
+			}
+		}
+
+		// Runtime fallback: an agent whose runtime is out of usage launches on
+		// its fallback (specs/2026-10-01-runtime-fallback.md). The member's
+		// configured runtime is not changed; flags are rebuilt for the runtime
+		// that really runs, without the member's model (it belongs to the
+		// configured runtime).
+		let fallbackCrewlyAgentModel: string | undefined;
+		{
+			const launch = await resolveLaunchRuntime({
+				sessionName,
+				configured: runtimeType,
+				memberId: config.memberId,
+				teamId: config.teamId,
+				isOrchestrator: role === ORCHESTRATOR_ROLE,
+			});
+			if (launch.claudeAccount) {
+				// Same runtime, another of the owner's accounts: buildAgentIdentityEnv adds its env.
+				this.logger.info('Launching on another Claude Code account', { sessionName, account: launch.claudeAccount });
+			}
+			if (launch.overridden && launch.runtime !== runtimeType) {
+				this.logger.info('Launching on the fallback runtime', { sessionName, configured: runtimeType, runtime: launch.runtime });
+				runtimeType = launch.runtime as RuntimeType;
+				fallbackCrewlyAgentModel = launch.crewlyAgentModel;
+				try {
+					const found = role === ORCHESTRATOR_ROLE ? null : await this.storageService.findMemberBySessionName(sessionName);
+					// The model is resolved for the runtime that really runs: a
+					// model meant for the configured runtime is not passed on, and
+					// reviewed members get that runtime's default (Sonnet on Claude).
+					const fallbackModel = found ? fallbackRuntimeModelId(found.team, found.member, runtimeType) : undefined;
+					runtimeFlags = [
+						...(await this.resolveRuntimeFlags(role, runtimeType, found?.member.skillOverrides, found?.member.excludedRoleSkills)),
+						...this.resolveModelFlags(sessionName, runtimeType, fallbackModel, undefined),
+					];
+				} catch {
+					runtimeFlags = [];
+				}
+			}
+		}
+
+		try {
+			// Starting by any path (owner, reconciler, retry) ends the memory-stop hold.
+			clearMemoryStop(sessionName);
+			this.logger.info('Creating agent session (unified approach)', {
+				sessionName,
+				role,
+				runtimeType,
+				projectPath,
+				windowName,
+				memberId,
+			});
+
+			// Get session helper first
+			this.logger.debug('Getting session helper for session creation');
+			const sessionHelper = await this.getSessionHelper();
+			this.logger.debug('Session helper obtained', {
+				hasHelper: !!sessionHelper,
+			});
+
+			// Check if session already exists
+			const sessionExists = sessionHelper.sessionExists(sessionName);
+			this.logger.debug('Checked if session exists', {
+				sessionName,
+				sessionExists,
+			});
+
+			if (!sessionExists) {
+				// Session doesn't exist, go directly to creating a new session
+				this.logger.info('Session does not exist, will create new session', { sessionName });
+			} else if (forceRecreate) {
+				// Skip recovery, kill immediately (used during server startup for stale sessions)
+				this.logger.info('Session exists but forceRecreate is set, killing for clean restart', { sessionName });
+				try {
+					// D2(a) (2026-09-21): the previous incarnation's RuntimeExitMonitor
+					// entry must go BEFORE the kill. It resolves the child by session
+					// NAME and its 30s poll grace is long expired, so left alive it
+					// judges the seconds-old replacement PTY (no runtime child yet)
+					// dead and force-kills it — Step 1 then fails and Step 2 runs.
+					RuntimeExitMonitorService.getInstance().stopMonitoring(sessionName);
+					// The killed incarnation's registration flow must die with it:
+					// stopMonitoring above means no exit callback will cancel it, and
+					// left alive it would find the replacement PTY by name and type
+					// a second kickoff into it (2026-09-25 startup-prompt loop).
+					this.cancelPendingRegistration(sessionName, 'session-killed');
+					const runtimeService = this.createRuntimeService(runtimeType);
+					runtimeService.clearDetectionCache(sessionName);
+					await (await this.getSessionHelper()).killSession(sessionName);
+					await delay(1000);
+				} catch (killError) {
+					this.logger.warn('Failed to kill session during forceRecreate, continuing with recreation', {
+						sessionName,
+						error: killError instanceof Error ? killError.message : String(killError),
+					});
+				}
+			} else {
+				// A registration flow for this session is still running (e.g. the
+				// boot restore is waiting for the resumed runtime): it will deliver
+				// the kickoff. Sending a second one from here gave Sam two
+				// "Crewly restarted" messages 80 s apart (2026-09-25, 1.20.135).
+				if (this.registrationFlows.has(sessionName)) {
+					this.logger.info('Session is already registering — joining the running flow, no second kickoff', {
+						sessionName,
+					});
+					return {
+						success: true,
+						sessionName,
+						message: 'Agent session is already starting; registration in progress',
+					};
+				}
+
+				// A healthy agent that is mid-turn cannot answer the runtime probe, and
+				// the Ctrl+C fallback below would interrupt it and exit Claude Code
+				// (2026-10-12 Sage/Atlas/Milo runtime_exited, #1260). Leave it alone.
+				if (await this.isAgentWorkingNow(sessionName, INPUT_BLOCKED_RETRY_CONSTANTS.RESTART_QUIET_MS)) {
+					this.logger.info('Session already exists and its agent is mid-turn — leaving it running, no recovery probe', {
+						sessionName,
+					});
+					return {
+						success: true,
+						sessionName,
+						message: 'Agent session is already running; recovery skipped',
+					};
+				}
+
+				this.logger.info(
+					'Session already exists, attempting intelligent recovery instead of killing',
+					{
+						sessionName,
+					}
+				);
+
+				// Step 1: Try to detect if runtime is already running using slash command
+				const runtimeService = this.createRuntimeService(runtimeType);
+
+				let recoverySuccess = false;
+
+				try {
+					const runtimeRunning = await runtimeService.detectRuntimeWithCommand(
+						sessionName
+					);
+
+					if (runtimeRunning) {
+						this.logger.info(
+							'Runtime detected in existing session, attempting direct registration',
+							{
+								sessionName,
+							}
+						);
+
+						// Try to send registration prompt directly
+						const registrationResult = await this.attemptRegistrationWithVerification(
+							sessionName,
+							role,
+							25000, // 25 second timeout
+							memberId,
+							1, // single attempt for now
+							true, // skip initial cleanup since runtime is confirmed running
+							runtimeType
+						);
+
+						if (registrationResult) {
+							recoverySuccess = true;
+							this.logger.info(
+								'Successfully registered existing session with runtime',
+								{ sessionName }
+							);
+						}
+					}
+
+					// Step 2: If runtime not detected or registration failed, try Ctrl+C restart
+					// only for Claude. Gemini/Codex treat Ctrl+C as destructive at prompt
+					// and can exit the runtime instead of recovering.
+					if (!recoverySuccess) {
+						if (runtimeType !== RUNTIME_TYPES.CLAUDE_CODE) {
+							this.logger.info(
+								'Skipping Ctrl+C recovery for non-Claude runtime; falling back to recreation',
+								{ sessionName, runtimeType }
+							);
+							throw new Error(`${runtimeType} recovery requires full recreation`);
+						}
+
+						// Never interrupt a session that is registered: Ctrl+C at a live
+						// Claude Code prompt exits the runtime (#1260).
+						if (await this.checkAgentRegistration(sessionName, role)) {
+							this.logger.info('Session is already registered — not sending Ctrl+C', { sessionName });
+							return {
+								success: true,
+								sessionName,
+								message: 'Agent session is already running and registered; recovery skipped',
+							};
+						}
+
+						this.logger.info(
+							'Runtime not detected or registration failed, attempting Ctrl+C restart',
+							{
+								sessionName,
+							}
+						);
+
+						// Send Ctrl+C twice to try to restart Claude
+						await (await this.getSessionHelper()).sendCtrlC(sessionName);
+						await delay(1000);
+						await (await this.getSessionHelper()).sendCtrlC(sessionName);
+						await delay(2000);
+
+						// Clear runtime detection cache after Ctrl+C restart
+						runtimeService.clearDetectionCache(sessionName);
+
+						// Try registration after Ctrl+C restart
+						const postCtrlCResult = await this.attemptRegistrationWithVerification(
+							sessionName,
+							role,
+							25000,
+							memberId,
+							1, // single attempt
+							false, // don't skip cleanup after Ctrl+C
+							runtimeType
+						);
+
+						if (postCtrlCResult) {
+							recoverySuccess = true;
+							this.logger.info(
+								'Successfully recovered session after Ctrl+C restart',
+								{ sessionName }
+							);
+						}
+					}
+				} catch (error) {
+					this.logger.warn('Error during intelligent session recovery', {
+						sessionName,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+
+				// If recovery succeeded, register for persistence, start monitoring, and return early
+				if (recoverySuccess) {
+					// Register session for state persistence so it survives restarts
+					try {
+						const persistence = getSessionStatePersistence();
+						persistence.registerSession(sessionName, {
+							cwd: projectPath || process.cwd(),
+							command: process.env.SHELL || '/bin/bash',
+							args: [],
+						}, runtimeType, role, config.teamId, config.memberId);
+					} catch (persistError) {
+						this.logger.warn('Failed to register recovered session for persistence (non-critical)', {
+							sessionName,
+							error: persistError instanceof Error ? persistError.message : String(persistError),
+						});
+					}
+
+					// Start context window monitoring for recovered non-orchestrator session
+					if (role !== ORCHESTRATOR_ROLE && config.teamId && config.memberId) {
+						ContextWindowMonitorService.getInstance().startSessionMonitoring(
+							sessionName, config.memberId, config.teamId, role, runtimeType
+						);
+					}
+
+					// Start OAuth relogin monitoring for recovered session
+					OAuthReloginMonitorService.getInstance().startMonitoring(sessionName, runtimeType);
+
+					return {
+						success: true,
+						sessionName,
+						message: 'Agent session recovered and registered successfully',
+					};
+				}
+
+				// Step 3: Last resort - fall back to killing session for clean restart
+				this.logger.warn(
+					'All recovery attempts failed, falling back to session recreation',
+					{
+						sessionName,
+					}
+				);
+				this.cancelPendingRegistration(sessionName, 'session-killed');
+				await (await this.getSessionHelper()).killSession(sessionName);
+				await delay(1000); // Wait for cleanup
+			}
+
+			// ===== In-process Crewly Agent branch =====
+			// Crewly Agent runs inside the Node.js process — no PTY session needed.
+			if (runtimeType === RUNTIME_TYPES.CREWLY_AGENT) {
+				this.logger.info('Starting in-process Crewly Agent runtime', { sessionName, role });
+
+				const crewlyRuntime = this.createRuntimeService(runtimeType) as CrewlyAgentExternalRuntimeService;
+
+				// Look up modelId for this session.
+				//
+				// Resolution order:
+				//   1. Team-member lookup (storage.service.getTeams iterates persisted
+				//      team configs, matched by config.memberId).
+				//   2. Orchestrator fallback — storage.service.getTeams() explicitly
+				//      EXCLUDES the orchestrator directory (storage.service.ts:413),
+				//      so the orchestrator's modelId lives in teams/orchestrator/config.json
+				//      and must be read separately via getOrchestratorStatus().
+				//
+				// Without this orchestrator branch, the orchestrator's modelId would
+				// silently default to DEFAULT_MODEL even when configured.
+				let memberModelId: string | undefined;
+				if (config.memberId) {
+					try {
+						const teams = await this.storageService.getTeams();
+						for (const team of teams) {
+							const member = team.members?.find(m => m.id === config.memberId);
+							if (member?.modelId) {
+								memberModelId = member.modelId;
+								break;
+							}
+						}
+					} catch {
+						// Non-critical — fall back to orchestrator/default model
+					}
+				}
+
+				// Orchestrator fallback: getTeams() doesn't surface the orchestrator,
+				// so look it up via getOrchestratorStatus when this is the orchestrator
+				// session (or its virtual member id) and no team-level modelId was found.
+				const isOrchestrator = sessionName === ORCHESTRATOR_SESSION_NAME
+					|| config.memberId === 'orchestrator-member';
+				if (!memberModelId && isOrchestrator) {
+					try {
+						const orchestratorStatus = await this.storageService.getOrchestratorStatus();
+						if (orchestratorStatus?.modelId) {
+							memberModelId = orchestratorStatus.modelId;
+						}
+					} catch {
+						// Non-critical — fall back to default model
+					}
+				}
+
+				// On a fallback the member's model belongs to its own runtime: run
+				// the model the fallback settings name (DeepSeek by default).
+				if (fallbackCrewlyAgentModel) memberModelId = fallbackCrewlyAgentModel;
+
+				// Parse modelId into model config (falls back to DEFAULT_MODEL)
+				const { parseModelId } = await import('./crewly-agent/types.js');
+				const modelConfig = memberModelId ? { model: parseModelId(memberModelId) } : {};
+
+				// Determine role name for system prompt lookup
+				const roleName = role === ORCHESTRATOR_ROLE ? 'orchestrator' : role.toLowerCase().replace(/\s+/g, '-');
+				const memberId = config.memberId;
+				await crewlyRuntime.initializeInProcess(sessionName, { projectPath, memberId, ...modelConfig }, roleName);
+
+				// Track the in-process runtime for message routing.
+				// Mirror to the module-level registry so callers without an
+				// AgentRegistrationService reference (e.g. orchestrator-status
+				// service) can probe runtime liveness — fixes B0 isActive bug.
+				this.inProcessRuntimes.set(sessionName, crewlyRuntime);
+				registerInProcessRuntime(sessionName, crewlyRuntime);
+
+				// Auto-register agent as active — crewly-agent cannot run bash scripts,
+				// so we register on its behalf instead of relying on the register_self tool.
+				try {
+					const registerResult = await this.registerMemberActive(sessionName, role, memberId);
+					this.logger.info('Auto-registered crewly-agent as active', {
+						sessionName, role, success: registerResult,
+					});
+				} catch (registerErr) {
+					this.logger.warn('Auto-registration failed (non-fatal)', {
+						sessionName,
+						error: registerErr instanceof Error ? registerErr.message : String(registerErr),
+					});
+				}
+
+				// For crewly-agent, the system prompt is already loaded during initializeInProcess().
+				// Do NOT deliver the full registration prompt as a message — that would trigger
+				// a redundant generateText call (60K chars → rate limits). Instead, send a
+				// lightweight activation message that tells the agent to start working.
+				//
+				// B0/B1 cold-start invariant: the orchestrator's `register_self` is performed
+				// by registerMemberActive() above (which writes directly to storage), so the
+				// orchestrator does NOT need an activation message. Skipping it here keeps
+				// `conversationHistory.messageCount === 0` after a fresh setup, which B1's
+				// fresh-install detector relies on. Subordinate agents still receive the
+				// activation kickoff because they are not auto-registered via storage.
+				// A runtime switch leaves a one-time note (handover + WorkItem).
+				const switchNote = takeRuntimeSwitchKickoffNote(sessionName);
+				if (sessionName !== ORCHESTRATOR_SESSION_NAME || switchNote) {
+					crewlyRuntime.handleMessage(
+						`You are now active as "${role}" (session: ${sessionName}). ` +
+						'Your system prompt is already loaded. Begin by calling register_self, ' +
+						(switchNote ? `then: ${switchNote}` : 'then wait for tasks.')
+					).catch(promptError => {
+						this.logger.warn('Initial activation message failed (non-fatal for crewly-agent)', {
+							sessionName,
+							error: promptError instanceof Error ? promptError.message : String(promptError),
+						});
+					});
+				} else {
+					this.logger.debug('Skipping initial activation message for orchestrator (cold-start invariant)', {
+						sessionName,
+					});
+				}
+
+				// Start context window monitoring if applicable
+				if (role !== ORCHESTRATOR_ROLE && config.teamId && config.memberId) {
+					ContextWindowMonitorService.getInstance().startSessionMonitoring(
+						sessionName, config.memberId, config.teamId, role, runtimeType
+					);
+				}
+
+				return {
+					success: true,
+					sessionName,
+					message: 'Crewly Agent in-process runtime initialized and registered',
+				};
+			}
+
+			// Create new session (same approach for both orchestrator and team members)
+			// #222: Use projectRoot (crewly install dir) as fallback instead of process.cwd()
+			const cwdToUse = projectPath || this.projectRoot || process.cwd();
+			this.logger.info('Creating PTY session', {
+				sessionName,
+				cwd: cwdToUse,
+			});
+
+			try {
+				// Everything the agent shell needs goes in at spawn time — nothing
+				// is typed in as `export`. Identity (CREWLY_SESSION_NAME, CREWLY_ROLE,
+				// CREWLY_API_URL, CREWLY_PROJECT_PATH, CREWLY_INSTALL_DIR): typed
+				// exports could be lost while the shell was still initialising, and
+				// every skill then ran without CREWLY_SESSION_NAME (Think Tank,
+				// 2026-09-18); they also echoed into scrollback and shell history.
+				// Same env object as the Step-2 recreation path (buildAgentIdentityEnv).
+				//
+				// API keys go ONLY into the spawn environment. They used to be typed
+				// in as `export KEY="…"`, which echoed the key into the PTY: it then
+				// sat in scrollback, in ~/.crewly/logs/sessions/*.log, in
+				// ~/.bash_history and in the terminal-output API.
+				// setEnvironmentVariable refuses secrets.
+				const apiKeyEnv = await this.buildApiKeyEnv(runtimeType);
+				const telemetryEnv = await this.buildTelemetryEnv(runtimeType);
+				const createdSession = await sessionHelper.createSession(sessionName, cwdToUse, {
+					env: { ...this.buildAgentIdentityEnv(sessionName, role, cwdToUse, runtimeType), ...telemetryEnv, ...apiKeyEnv },
+				});
+				this.logger.info('PTY session created successfully', {
+					sessionName,
+					pid: createdSession.pid,
+					cwd: createdSession.cwd,
+				});
+			} catch (createError) {
+				this.logger.error('Failed to create PTY session', {
+					sessionName,
+					cwd: cwdToUse,
+					error: createError instanceof Error ? createError.message : String(createError),
+					stack: createError instanceof Error ? createError.stack : undefined,
+				});
+				throw createError;
+			}
+
+			// Verify session was created
+			const sessionCreatedCheck = sessionHelper.sessionExists(sessionName);
+			this.logger.info('Session creation verification', {
+				sessionName,
+				exists: sessionCreatedCheck,
+			});
+
+			if (!sessionCreatedCheck) {
+				throw new Error(`Session '${sessionName}' was not created successfully`);
+			}
+
+			// Register session for state persistence so it survives restarts
+			try {
+				const persistence = getSessionStatePersistence();
+				persistence.registerSession(sessionName, {
+					cwd: cwdToUse,
+					command: process.env.SHELL || '/bin/bash',
+					args: [],
+				}, runtimeType, role, config.teamId, config.memberId);
+			} catch (persistError) {
+				this.logger.warn('Failed to register session for persistence (non-critical)', {
+					sessionName,
+					error: persistError instanceof Error ? persistError.message : String(persistError),
+				});
+			}
+
+			// Identity, telemetry and API-key env all went in with the spawn env
+			// above (buildAgentIdentityEnv / buildTelemetryEnv / buildApiKeyEnv);
+			// nothing is typed into the shell here. The Antigravity-harness-key and
+			// codex-has-own-login overrides live in buildApiKeyEnv() itself.
+
+			this.logger.info('Agent session created and environment variables set, initializing with registration', {
+				sessionName,
+				role,
+				runtimeType,
+			});
+
+			// Use the existing unified registration system
+			// #227: Claude Code gets extended timeout for PI protection evaluation
+			const timeout = this.resolveRegistrationTimeout(role, runtimeType);
+			const initResult = await this.initializeAgentWithRegistration(
+				sessionName,
+				role,
+				projectPath,
+				timeout,
+				memberId,
+				runtimeType,
+				runtimeFlags,
+				config.additionalAllowlistPaths
+			);
+
+			if (!initResult.success) {
+				return {
+					success: false,
+					sessionName,
+					error: initResult.error || 'Failed to initialize and register agent',
+					...(initResult.errorCode && { errorCode: initResult.errorCode }),
+				};
+			}
+
+			// Start context window monitoring for newly created non-orchestrator session
+			if (role !== ORCHESTRATOR_ROLE && config.teamId && config.memberId) {
+				ContextWindowMonitorService.getInstance().startSessionMonitoring(
+					sessionName, config.memberId, config.teamId, role, runtimeType
+				);
+			}
+
+			// Start OAuth relogin monitoring for newly created session
+			OAuthReloginMonitorService.getInstance().startMonitoring(sessionName, runtimeType);
+
+			return {
+				success: true,
+				sessionName,
+				message: initResult.message || 'Agent session created and registered successfully',
+			};
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			this.logger.error('Failed to create agent session', {
+				sessionName,
+				role,
+				error: errorMessage,
+			});
+
+			return {
+				success: false,
+				sessionName,
+				error: errorMessage,
+			};
+		}
+	}
+
+	/**
+	 * Stop a session so it can be launched again right away (runtime switch):
+	 * the runtime goes (PTY or in-process) but the session stays registered,
+	 * its conversation id and its member status are kept.
+	 *
+	 * @param sessionName - Session to stop
+	 * @returns True when nothing of it is left running
+	 */
+	async stopSessionForRelaunch(sessionName: string): Promise<boolean> {
+		try {
+			RuntimeExitMonitorService.getInstance().stopMonitoring(sessionName);
+			this.cancelPendingRegistration(sessionName, 'session-killed');
+			OAuthReloginMonitorService.getInstance().stopMonitoring(sessionName);
+			ContextWindowMonitorService.getInstance().stopSessionMonitoring(sessionName);
+			const inProcessRuntime = this.inProcessRuntimes.get(sessionName);
+			if (inProcessRuntime) {
+				inProcessRuntime.shutdown();
+				this.inProcessRuntimes.delete(sessionName);
+				unregisterInProcessRuntime(sessionName);
+			}
+			const sessionHelper = await this.getSessionHelper();
+			if (sessionHelper.sessionExists(sessionName)) {
+				this.createRuntimeService(await this.resolveSessionRuntimeType(sessionName)).clearDetectionCache(sessionName);
+				await sessionHelper.killSession(sessionName);
+			}
+			return true;
+		} catch (error) {
+			this.logger.warn('Could not stop session for relaunch', {
+				sessionName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Unified session termination that handles both orchestrator and team members
+	 * @param sessionName The session to terminate
+	 * @param role The role for proper status updates
+	 * @returns Promise with success/error information
+	 */
+	async terminateAgentSession(
+		sessionName: string,
+		role: string = 'unknown'
+	): Promise<{
+		success: boolean;
+		message?: string;
+		error?: string;
+	}> {
+		try {
+			this.logger.info('Terminating agent session (unified approach)', { sessionName, role });
+
+			// The heartbeat monitor must not call this a ghost while the session
+			// is gone but storage still says active (#1464).
+			markPlannedStop(sessionName);
+
+			// Stop runtime exit monitoring before killing the session
+			RuntimeExitMonitorService.getInstance().stopMonitoring(sessionName);
+			// ...and with it the session's pending registration flow, which no
+			// exit callback will cancel now.
+			this.cancelPendingRegistration(sessionName, 'session-killed');
+
+			// Stop OAuth relogin monitoring before killing the session
+			OAuthReloginMonitorService.getInstance().stopMonitoring(sessionName);
+
+			// Stop context window monitoring before killing the session
+			ContextWindowMonitorService.getInstance().stopSessionMonitoring(sessionName);
+
+			// Shut down in-process Crewly Agent runtime if present.
+			// Both maps must stay in sync: the local instance map and the
+			// module-level registry consumed by orchestrator-status service.
+			const inProcessRuntime = this.inProcessRuntimes.get(sessionName);
+			if (inProcessRuntime) {
+				inProcessRuntime.shutdown();
+				this.inProcessRuntimes.delete(sessionName);
+				unregisterInProcessRuntime(sessionName);
+				this.logger.info('In-process Crewly Agent runtime shut down', { sessionName });
+			}
+
+			// Get session helper once to avoid repeated async calls
+			const sessionHelper = await this.getSessionHelper();
+			const sessionExists = sessionHelper.sessionExists(sessionName);
+
+			if (sessionExists) {
+				// Kill the tmux session
+				await sessionHelper.killSession(sessionName);
+				this.logger.info('Session terminated successfully', { sessionName });
+			} else if (!inProcessRuntime) {
+				this.logger.info('Session already terminated or does not exist', { sessionName });
+			}
+
+			// Capture session end for memory persistence
+			try {
+				const sessionMemoryService = SessionMemoryService.getInstance();
+				await sessionMemoryService.onSessionEnd(sessionName, role, process.cwd());
+				this.logger.info('Session memory captured on termination', { sessionName, role });
+			} catch (memoryError) {
+				this.logger.warn('Failed to capture session memory on termination (non-critical)', {
+					sessionName,
+					error: memoryError instanceof Error ? memoryError.message : String(memoryError),
+				});
+			}
+
+			// Update agent status to inactive (works for both orchestrator and team members)
+			await this.storageService.updateAgentStatus(
+				sessionName,
+				CREWLY_CONSTANTS.AGENT_STATUSES.INACTIVE
+			);
+			this.logger.info('Agent status updated to inactive', { sessionName, role });
+			clearPlannedStop(sessionName);
+
+			// Unregister from persistence so explicitly stopped agents don't reappear in resume popup
+			try {
+				const persistence = getSessionStatePersistence();
+				persistence.unregisterSession(sessionName);
+			} catch (persistError) {
+				this.logger.warn('Failed to unregister session from persistence (non-critical)', {
+					sessionName,
+					error: persistError instanceof Error ? persistError.message : String(persistError),
+				});
+			}
+
+			return {
+				success: true,
+				message: sessionExists
+					? 'Agent session terminated successfully'
+					: 'Agent session was already terminated',
+			};
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			this.logger.error('Failed to terminate agent session', {
+				sessionName,
+				role,
+				error: errorMessage,
+			});
+
+			return {
+				success: false,
+				error: errorMessage,
+			};
+		}
+	}
+
+	/**
+	 * Whether a member's registration is still pending: its runtime is being
+	 * started or is running but has not called register-self yet. Unknown
+	 * sessions (orchestrator, ad-hoc) report 'unknown' and are not gated.
+	 *
+	 * @param sessionName - Session name
+	 * @returns 'pending' | 'ready' | 'unknown'
+	 */
+	private async registrationStateOf(sessionName: string): Promise<'pending' | 'ready' | 'unknown'> {
+		try {
+			const found = await this.storageService.findMemberBySessionName(sessionName);
+			if (!found) return 'unknown';
+			const status = found.member.agentStatus;
+			if (status === CREWLY_CONSTANTS.AGENT_STATUSES.STARTING || status === CREWLY_CONSTANTS.AGENT_STATUSES.STARTED) return 'pending';
+			return 'ready';
+		} catch {
+			return 'unknown';
+		}
+	}
+
+	/**
+	 * Send a message to any agent session with reliable delivery.
+	 * Uses robust delivery mechanism with retry logic to ensure messages
+	 * are properly delivered to Claude Code's input.
+	 *
+	 * @param sessionName - The agent session name
+	 * @param message - The message to send
+	 * @returns Promise with success status and optional error message
+	 *
+	 * @example
+	 * ```typescript
+	 * const result = await agentRegistrationService.sendMessageToAgent(
+	 *   'crewly-orc',
+	 *   '[CHAT:123] Hello, orchestrator!'
+	 * );
+	 * if (result.success) {
+	 *   console.log('Message delivered');
+	 * } else {
+	 *   console.error('Delivery failed:', result.error);
+	 * }
+	 * ```
+	 */
+	async sendMessageToAgent(
+		sessionName: string,
+		message: string,
+		runtimeType?: RuntimeType
+	): Promise<{
+		success: boolean;
+		message?: string;
+		error?: string;
+		queued?: boolean;
+	}> {
+		// Per-session delivery serialization: chain this delivery after any
+		// in-flight delivery to the same session. This prevents concurrent
+		// sendMessageWithRetry calls that each send Ctrl+C on retry attempts,
+		// which can kill the runtime when 25+ scheduled checks fire at once.
+		const previousDelivery = this.sessionDeliveryMutex.get(sessionName);
+		let releaseMutex!: () => void;
+		const currentDelivery = new Promise<void>((r) => { releaseMutex = r; });
+		this.sessionDeliveryMutex.set(sessionName, currentDelivery);
+		// No fresh-conversation / context-cap `/clear` may start while this
+		// message is on its way in (it would be wiped before it is read).
+		const endFreshDelivery = this.beginFreshDelivery(sessionName);
+
+		if (previousDelivery) {
+			this.logger.info('Waiting for in-flight delivery to complete before sending', {
+				sessionName,
+				messageLength: message.length,
+			});
+			await previousDelivery.catch(() => {});
+		}
+
+		try {
+			// A clear that was already running when this started finishes first.
+			await this.waitIfFreshClearing(sessionName);
+			if (!message || typeof message !== 'string') {
+				return {
+					success: false,
+					error: 'Message is required and must be a string',
+				};
+			}
+
+			// Safe restart: once shutdown has begun nothing new is written into an
+			// agent. Writing now would start a turn the drain then has to wait for
+			// (or cut off). The persistent queue carries it across the restart and
+			// register-self flushes it on the next boot.
+			if (RestartDrainService.getInstance().isDeliveryPaused()) {
+				SubAgentMessageQueue.getInstance().enqueue(sessionName, message);
+				this.logger.info('Shutdown in progress — message queued for delivery after restart', {
+					sessionName,
+					messageLength: message.length,
+				});
+				return {
+					success: true,
+					queued: true,
+					message: '[RESTART_DRAIN] Message queued for delivery after the restart',
+				};
+			}
+
+			// Auto-resolve runtime type if not provided.
+			// CRITICAL: defaulting to CLAUDE_CODE is dangerous because
+			// Ctrl+C cleanup (Claude Code behavior) triggers /quit on Gemini CLI.
+			if (!runtimeType) {
+				runtimeType = await this.resolveSessionRuntimeType(sessionName);
+			}
+			// A caller that passed the member's configured runtime still writes
+			// to whatever runs now (a fallback while its runtime is out of usage).
+			runtimeType = effectiveRuntimeType(sessionName, runtimeType);
+
+			// Runtime fallback: the session's runtime is out of usage (or it is
+			// being moved to its fallback right now). The message waits in the
+			// persistent queue; the new session's registration writes it out.
+			if (runtimeFallbackBeforeDelivery(sessionName, runtimeType) === 'queue') {
+				SubAgentMessageQueue.getInstance().enqueue(sessionName, message);
+				this.logger.info('Runtime switch in progress — message queued for the new session', {
+					sessionName,
+					messageLength: message.length,
+				});
+				return {
+					success: true,
+					queued: true,
+					message: '[RUNTIME_FALLBACK] Message queued while the agent moves to its fallback runtime',
+				};
+			}
+
+			// Daily token cap (specs/2026-10-02-spend-cap.md): a capped agent
+			// starts no new turn. The message waits in the persistent queue and is
+			// delivered when the cap resets at midnight or the owner boosts it.
+			const spendStop = spendCapStopOf(sessionName);
+			if (spendStop) {
+				SubAgentMessageQueue.getInstance().enqueue(sessionName, message);
+				this.logger.info('Daily token cap reached — message queued, no new turn', {
+					sessionName,
+					capTokens: spendStop.capTokens,
+					scope: spendStop.scope,
+					messageLength: message.length,
+				});
+				return {
+					success: true,
+					queued: true,
+					message: `${SPEND_CAP_CONSTANTS.QUEUED_MARKER} ${spendCapReason(spendStop)}; message queued`,
+				};
+			}
+
+			// Out of usage (e.g. Claude Code's weekly limit): typing into it would
+			// only be lost (or land in its usage-limit menu). Hold the message and
+			// write it out once the limit has reset.
+			const usageLimit = usageLimitOf(sessionName);
+			if (usageLimit) {
+				SubAgentMessageQueue.getInstance().enqueue(sessionName, message);
+				this.scheduleUsageLimitFlush(sessionName, usageLimitRemainingMs(usageLimit));
+				this.logger.info('Agent is out of usage — message queued until the limit resets', {
+					sessionName,
+					until: usageLimit.until ?? null,
+					retryAt: usageLimit.retryAt,
+					messageLength: message.length,
+				});
+				return {
+					success: true,
+					queued: true,
+					message: `${USAGE_LIMIT_STATE_CONSTANTS.QUEUED_MARKER} ${usageLimitReason(sessionName, usageLimit)}; message queued`,
+				};
+			}
+
+			// ===== In-process Crewly Agent delivery =====
+			// Route directly to the in-process runtime, bypassing PTY entirely.
+			// Fire-and-forget: mirrors PTY runtimes where the write returns immediately.
+			// The LLM processes the message asynchronously in the background.
+			//
+			// IMPORTANT: Always check inProcessRuntimes map first, regardless of
+			// the runtimeType parameter. This makes delivery robust against runtime
+			// type misresolution — e.g., when storage lookup fails and defaults to
+			// claude-code for what is actually a crewly-agent session. Without this
+			// fallback, messages to crewly-agent sessions silently fail when routed
+			// through the PTY path (no PTY session exists).
+			const crewlyRuntime = this.inProcessRuntimes.get(sessionName);
+			if (crewlyRuntime || runtimeType === RUNTIME_TYPES.CREWLY_AGENT) {
+				if (!crewlyRuntime || !crewlyRuntime.isReady()) {
+					return {
+						success: false,
+						error: `Crewly Agent runtime for '${sessionName}' is not initialized`,
+					};
+				}
+
+				// Extract conversationId from [CHAT:xxx] or [GCHAT:xxx ...] prefix for response routing
+				const chatPrefixMatch = message.match(/^\[(?:G?CHAT):([^\]\s]+)[^\]]*\]\s*/);
+				const incomingConversationId = chatPrefixMatch?.[1];
+				// The Slack thread this delivery came from ([SLACK-THREAD:<key>]).
+				// The turn's text answers that thread, so the DM bridge posts it
+				// there rather than in whichever thread was written in last.
+				const incomingThreadKeys = extractSlackThreadKeys(message);
+				const incomingThreadKey =
+					incomingThreadKeys.length === 1
+						? formatSlackThreadKey(incomingThreadKeys[0].slackChannelId, incomingThreadKeys[0].threadTs)
+						: undefined;
+
+				// Extract Slack context from [SLACK:channelId:threadTs] marker if present (Bug 5).
+				// This allows crewly-agent to auto-fill reply_slack with the correct thread.
+				let slackMetadata: Record<string, string> | undefined;
+				const slackPrefixMatch = message.match(/\[SLACK:([^:\]]+)(?::([^\]]+))?\]/);
+				if (slackPrefixMatch) {
+					slackMetadata = { channelId: slackPrefixMatch[1] };
+					if (slackPrefixMatch[2]) slackMetadata.threadTs = slackPrefixMatch[2];
+				}
+
+				// In-process turns end exactly when handleMessage settles; the
+				// restart drain waits on this record until then.
+				const inFlight = InFlightTurnTracker.getInstance().recordDelivery(sessionName, message, 'in-process');
+				noteTurnDelivery(sessionName, message, 'in-process');
+				// Busy period for the autonomy metrics (#984); ended in `finally`.
+				traceTurnActivity(sessionName, true, 'in-process');
+				// Remember where a user turn came from, so a reply posted in this
+				// turn or a system turn right after it lands there (2026-09-26).
+				OrcReplyRouteService.getInstance().noteDelivery(sessionName, message);
+
+				// Process message asynchronously — don't block the caller
+				crewlyRuntime.handleMessage(message, slackMetadata)
+					.then((result) => {
+						// A turn completed: an agent whose turns were failing gets the
+						// owner messages it still owes again (crewly#1015 §2).
+						getInProcessTurnFailureService()?.onTurnSucceeded(sessionName);
+						// Usage goes in the main log, not only the per-session buffer: this
+						// is the line an operator greps to see what a run cost (2026-09-18).
+						// cachedInput is the cached portion of input, so the rate is cached / input.
+						const cachedInput = result.usage?.cachedInput ?? 0;
+						const promptTokens = Math.max(result.usage?.input ?? 0, cachedInput);
+						this.logger.info('Crewly Agent finished processing message', {
+							sessionName, messageLength: message.length,
+							responseLength: result.text?.length ?? 0,
+							steps: result.steps,
+							toolCalls: result.toolCalls?.length ?? 0,
+							finishReason: result.finishReason,
+							...(result.incomplete ? { incomplete: result.incomplete } : {}),
+							usage: {
+								input: result.usage?.input ?? 0,
+								output: result.usage?.output ?? 0,
+								cachedInput,
+								cacheHitPercent: promptTokens > 0 ? Math.round((cachedInput / promptTokens) * 100) : 0,
+							},
+						});
+
+						// Route response text back to the originating chat conversation.
+						// Without this, crewly-agent responses are discarded — the agent
+						// has no terminal output for the NOTIFY pathway used by PTY runtimes.
+						//
+						// For Slack-sourced messages: check if the agent already sent a
+						// reply via reply_slack tool during processing. If so, skip routing
+						// to avoid duplicates. If not, route normally to ensure delivery.
+						const agentAlreadyReplied = result.toolCalls?.some(
+							tc => tc.toolName === 'reply_slack' || tc.toolName === 'reply-slack'
+						) ?? false;
+
+						// A model sometimes writes its function-call envelope into the
+						// *text* part as well as making the real call. The PTY runtimes
+						// never surface that, but this runtime forwards text straight to
+						// Slack and chat — so strip it before anyone sees it
+						// (2026-09-19: an orc reply reached #crewly-support as a wall of
+						// `<invoke name="Bash">…`). An answer that is nothing but markup
+						// is not posted at all: the delivery enforcer then nudges the
+						// agent, which beats showing the user the envelope.
+						// A turn the runtime could not finish must not read as an answer:
+						// the agent that says "I'll create the team" and gets cut off has
+						// created nothing, and staying silent about that is worse than a
+						// short answer (2026-09-19).
+						if (result.incomplete) {
+							this.logger.warn('In-process agent turn ended incomplete', {
+								sessionName,
+								reason: result.incomplete.reason,
+								finishReason: result.incomplete.finishReason,
+								recoveryAttempts: result.incomplete.recoveryAttempts,
+								textLength: result.text?.length ?? 0,
+							});
+						}
+
+						// A turn report ("I've sent the reply. Here's my status: *What
+						// I did* … *Next step*") or a claim of having sent a link with
+						// no reply tool call in the turn is not an answer: it reached
+						// the owner's Slack DM several times in a row (2026-09-26).
+						// Filtered before the incomplete notice, which stays honest.
+						const turnFilter = filterAgentTurnReply(result.text ?? '', result.toolCalls);
+						if (turnFilter.suppressed) {
+							this.logger.warn('In-process agent turn text not posted', {
+								sessionName,
+								reason: turnFilter.suppressed,
+								textLength: result.text?.length ?? 0,
+								toolCalls: result.toolCalls?.length ?? 0,
+							});
+						}
+						const { text: replyText, stripped: replyHadMarkup } = stripToolCallMarkup(
+							stripTraceMarkers(appendIncompleteNotice(turnFilter.text, result.incomplete)),
+						);
+						if (replyHadMarkup) {
+							this.logger.warn('Stripped tool-call markup from in-process agent response', {
+								sessionName,
+								rawLength: result.text?.length ?? 0,
+								cleanLength: replyText.length,
+								dropped: replyText.length === 0,
+							});
+						}
+
+						if (replyText && incomingConversationId && !agentAlreadyReplied) {
+							if (incomingThreadKey) {
+								this.routeInProcessResponseToChat(sessionName, replyText, incomingConversationId, incomingThreadKey);
+							} else {
+								this.routeInProcessResponseToChat(sessionName, replyText, incomingConversationId);
+							}
+						} else if (agentAlreadyReplied) {
+							this.logger.debug('Skipping chat routing — agent already replied via reply_slack', {
+								sessionName, conversationId: incomingConversationId,
+							});
+						}
+
+						// Auto-route to Slack when the message originated from Slack and the
+						// agent finished with text-only output (toolCalls=0, finishReason=stop)
+						// without explicitly invoking the reply_slack tool. Without this hook,
+						// the in-process AI SDK runtime drops Slack replies silently — unlike
+						// claude-code PTY where TerminalGateway tails stdout into SlackBridge,
+						// the in-process runtime has no stream the bridge can listen to.
+						//
+						// Skipped when the agent already called reply_slack (which posts via
+						// /slack/send) to prevent double-posting on the same thread.
+						if (slackMetadata?.channelId && replyText && !agentAlreadyReplied) {
+							this.routeInProcessResponseToSlack(
+								sessionName,
+								replyText,
+								{
+									channelId: slackMetadata.channelId,
+									threadTs: slackMetadata.threadTs,
+								},
+							);
+						}
+					})
+					.catch(async (agentError) => {
+						const errMsg = agentError instanceof Error ? agentError.message : String(agentError);
+						traceTurnError(sessionName, agentError);
+						this.logger.error('Crewly Agent message handling failed', {
+							sessionName, error: errMsg,
+							messageLength: message.length,
+							messagePreview: message.substring(0, 200),
+						});
+						// The message is not dropped: delivered once more, then the
+						// owner / orchestrator is told (crewly#1015 §2).
+						getInProcessTurnFailureService()?.onTurnFailed(sessionName, message, agentError);
+
+						// Log to InProcessLogBuffer so orchestrator can see the error via get-agent-logs
+						try {
+							const { InProcessLogBuffer } = await import('./crewly-agent/in-process-log-buffer.js');
+							InProcessLogBuffer.getInstance().append(sessionName, 'error', `Message handling failed: ${errMsg}`);
+						} catch { /* non-critical */ }
+
+						// Update workingStatus to idle so the agent is not stuck as in_progress
+						try {
+							const memberInfo = await this.storageService.findMemberBySessionName(sessionName);
+							if (memberInfo) {
+								memberInfo.member.workingStatus = 'idle';
+								memberInfo.member.updatedAt = new Date().toISOString();
+								await this.storageService.saveTeam(memberInfo.team);
+								this.logger.info('Reset workingStatus to idle after crewly-agent error', { sessionName });
+							}
+						} catch (statusError) {
+							this.logger.warn('Failed to reset workingStatus after error', {
+								sessionName,
+								error: statusError instanceof Error ? statusError.message : String(statusError),
+							});
+						}
+					})
+					.finally(() => {
+						InFlightTurnTracker.getInstance().completeMessage(sessionName, inFlight);
+						traceTurnActivity(sessionName, false, 'in-process');
+					});
+
+				this.logger.info('Message dispatched to in-process Crewly Agent', {
+					sessionName, messageLength: message.length,
+				});
+				return { success: true, message: 'Message delivered to Crewly Agent' };
+			}
+
+			// Get session helper once for this method
+			const sessionHelper = await this.getSessionHelper();
+
+			// Check if session exists
+			if (!sessionHelper.sessionExists(sessionName)) {
+				return {
+					success: false,
+					error: `Session '${sessionName}' does not exist`,
+				};
+			}
+
+			// Guard: an agent that is still starting/registering has no TUI
+			// ready to take input — text typed now lands in the shell or in
+			// the middle of the init prompt and is lost (steamfun-ops
+			// 2026-09-19: a channel question written 4s after the PTY was
+			// spawned never reached Jordan; only the [TL_REPORT] came back).
+			// Queue it; the register-self handler flushes the queue.
+			const registrationState = await this.registrationStateOf(sessionName);
+			if (registrationState === 'pending') {
+				SubAgentMessageQueue.getInstance().enqueue(sessionName, message);
+				this.logger.info('Agent still registering — message queued until register-self', {
+					sessionName,
+					messageLength: message.length,
+				});
+				return {
+					success: true,
+					queued: true,
+					message: '[AGENT_STARTING] Message queued for delivery once the agent has registered',
+				};
+			}
+
+			// Guard: refuse to deliver if the runtime process has exited.
+			// When Claude Code exits (e.g. context exhaustion), the PTY shell
+			// stays alive. Writing to it would execute garbage as shell commands.
+			const backend =
+				typeof (sessionHelper as { getBackend?: () => { isChildProcessAlive?: (name: string) => boolean } }).getBackend === 'function'
+					? (sessionHelper as { getBackend: () => { isChildProcessAlive?: (name: string) => boolean } }).getBackend()
+					: getSessionBackendSync();
+			const childAlive = backend?.isChildProcessAlive?.(sessionName);
+			if (childAlive === false) {
+				this.logger.error('Runtime process not alive, refusing to deliver message', {
+					sessionName,
+					messageLength: message.length,
+				});
+				return {
+					success: false,
+					error: 'Runtime has exited — no child process in session',
+				};
+			}
+
+			// Use robust message delivery with proper waiting mechanism.
+			// Gemini CLI: use 2 attempts — one retry is needed for TUI focus
+			// issues (Tab+Enter recovery). Previously set to 1 which caused
+			// Google Chat messages to fail permanently on first TUI hiccup.
+			const maxDeliveryAttempts = runtimeType === RUNTIME_TYPES.GEMINI_CLI ? 2 : 3;
+			// Settle before writing: a resting agent's earlier deliveries belong to
+			// a finished turn. After the write the echo makes it look busy.
+			const turnTracker = InFlightTurnTracker.getInstance();
+			turnTracker.settle(sessionName);
+			this.lastGuardRefusal.delete(sessionName);
+			this.busyHold.delete(sessionName);
+			const delivered = await this.sendMessageWithRetry(sessionName, message, maxDeliveryAttempts, runtimeType);
+			const refusal = this.lastGuardRefusal.get(sessionName);
+			if (!delivered && this.busyHold.delete(sessionName)) {
+				SubAgentMessageQueue.getInstance().enqueue(sessionName, message);
+				this.scheduleBusyHoldRecheck(sessionName);
+				const since = this.busyHoldSince.get(sessionName) ?? { at: Date.now(), message };
+				this.busyHoldSince.set(sessionName, since);
+				InputBlockedRetryService.getInstance().noteBusyHold(sessionName, Date.now() - since.at, since.message);
+				return {
+					success: true,
+					queued: true,
+					message: '[AGENT_BUSY] Message queued for delivery when agent becomes idle',
+				};
+			}
+			if (delivered) {
+				// Never re-send a confirmed delivery (the scanner's re-queue).
+				for (const e of this.sentMessageTracker.get(sessionName) ?? []) if (e.message === message) e.confirmed = true;
+				this.guardRefusalCount.delete(sessionName);
+				this.busyHoldSince.delete(sessionName);
+				InputBlockedRetryService.getInstance().noteDelivered(sessionName);
+			}
+			if (!delivered && refusal) {
+				// The harness would not type into, or submit, the agent's input box
+				// (unreadable, or holding text it did not write). Keep the message
+				// queued — it is retried when the agent is idle — and say so.
+				SubAgentMessageQueue.getInstance().enqueue(sessionName, message);
+				// Retried on a timer with backoff, and the owner told if it stays blocked.
+				InputBlockedRetryService.getInstance().noteRefusal(sessionName, {
+					state: refusal.reading.state,
+					inputLength: refusal.reading.text.length,
+					message,
+				});
+				const count = (this.guardRefusalCount.get(sessionName) ?? 0) + 1;
+				this.guardRefusalCount.set(sessionName, count);
+				const log = count >= TUI_INPUT_GUARD.ESCALATE_AFTER_REFUSALS ? this.logger.error.bind(this.logger) : this.logger.warn.bind(this.logger);
+				log('Message held: the agent input box is unreadable or holds text the harness did not write — queued for retry', {
+					sessionName,
+					stage: refusal.stage,
+					state: refusal.reading.state,
+					layout: refusal.reading.layout,
+					inputPreview: refusal.reading.text.slice(0, 80),
+					consecutiveRefusals: count,
+				});
+				return {
+					success: true,
+					queued: true,
+					message: '[INPUT_NOT_OURS] Message queued: the agent\'s input box is unreadable or holds text the harness did not write. It will be retried.',
+				};
+			}
+			if (delivered) {
+				turnTracker.recordDelivery(sessionName, message, 'pty');
+				noteTurnDelivery(sessionName, message, 'pty');
+				OrcReplyRouteService.getInstance().noteDelivery(sessionName, message);
+			}
+
+			if (!delivered) {
+				// Check if the agent is actively processing (busy) — queue for later delivery.
+				// Use PTY idle time instead of regex patterns for robust cross-runtime detection.
+				const idleMs = PtyActivityTrackerService.getInstance().getIdleTimeMs(sessionName);
+				const isBusy = idleMs < SESSION_COMMAND_DELAYS.AGENT_BUSY_IDLE_THRESHOLD_MS;
+
+				if (isBusy) {
+					// #236: Queue message for delivery when agent becomes idle
+					SubAgentMessageQueue.getInstance().enqueue(sessionName, message);
+					this.logger.info('Agent busy — message queued for later delivery', {
+						sessionName,
+						messageLength: message.length,
+					});
+					return {
+						success: true,
+						queued: true,
+						message: '[AGENT_BUSY] Message queued for delivery when agent becomes idle',
+					};
+				}
+
+				return {
+					success: false,
+					error: 'Failed to deliver message after multiple attempts',
+				};
+			}
+
+			this.logger.info('Message sent to agent successfully', {
+				sessionName,
+				messageLength: message.length,
+			});
+
+			return {
+				success: true,
+				message: 'Message sent to agent successfully',
+			};
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			this.logger.error('Failed to send message to agent', {
+				sessionName,
+				error: errorMessage,
+			});
+
+			return {
+				success: false,
+				error: errorMessage,
+			};
+		} finally {
+			endFreshDelivery();
+			releaseMutex();
+			if (this.sessionDeliveryMutex.get(sessionName) === currentDelivery) {
+				this.sessionDeliveryMutex.delete(sessionName);
+			}
+		}
+	}
+
+	/**
+	 * Mark a delivery to a session with the fresh-conversation service so no
+	 * `/clear` starts during it. Never throws.
+	 *
+	 * @param sessionName - Session being written to
+	 * @returns Function ending the mark
+	 */
+	private beginFreshDelivery(sessionName: string): () => void {
+		try {
+			return FreshTaskConversationService.getInstance().beginDelivery(sessionName);
+		} catch {
+			return () => undefined;
+		}
+	}
+
+	/**
+	 * Wait (bounded) for a running fresh-conversation / context-cap clear of
+	 * the session. Never throws.
+	 *
+	 * @param sessionName - Session about to be written to
+	 */
+	private async waitIfFreshClearing(sessionName: string): Promise<void> {
+		try {
+			await FreshTaskConversationService.getInstance().waitIfClearing(sessionName);
+		} catch {
+			// Best-effort: delivery proceeds regardless.
+		}
+	}
+
+	/**
+	 * Wait for an agent session to be at a ready prompt before sending messages.
+	 *
+	 * Subscribes to terminal output and polls capturePane to detect when the
+	 * agent returns to an input prompt. This is critical for sequential message
+	 * processing: after the orchestrator responds to a message it may continue
+	 * working (managing agents, running commands) before returning to prompt.
+	 *
+	 * @param sessionName - The session name to wait on
+	 * @param timeoutMs - Maximum time to wait (default 120s)
+	 * @returns true if agent is ready, false if timed out
+	 */
+	async waitForAgentReady(
+		sessionName: string,
+		timeoutMs: number = EVENT_DELIVERY_CONSTANTS.AGENT_READY_TIMEOUT,
+		runtimeType?: RuntimeType
+	): Promise<boolean> {
+		// In-process Crewly Agent is always "ready" (no prompt to wait for)
+		const inProcessRuntime = this.inProcessRuntimes.get(sessionName);
+		if (inProcessRuntime) {
+			return inProcessRuntime.isReady();
+		}
+
+		const sessionHelper = await this.getSessionHelper();
+
+		// Check if session exists
+		if (!sessionHelper.sessionExists(sessionName)) {
+			this.logger.warn('Session does not exist for waitForAgentReady', { sessionName });
+			return false;
+		}
+
+		// Quick check - already at prompt?
+		// A prompt on screen does not mean the turn is over: an agent waiting
+		// on a tool or a long API call shows one while still working, and a
+		// message written then is swallowed into that turn — the agent goes
+		// busy, then idle, and never answers. ActivityMonitor knew: Pia was
+		// `in_progress` 1.2s before the write (2026-09-21, #pro-flopost).
+		// idle-detection already refuses to suspend on this signal; delivery
+		// now refuses to write on it.
+		const currentOutput = sessionHelper.capturePane(sessionName);
+
+		// Out of usage (Claude Code's weekly-limit menu, a "You've hit your …
+		// limit" line): its prompt will not come back before the reset, so do
+		// not wait for it (2026-10-16: "Waiting for agent to return to prompt …
+		// Timed out" every ~17s for ~38 hours).
+		const limited = await inspectUsageLimitScreen(sessionName, currentOutput, runtimeType ?? null, {
+			io: {
+				sendKey: (s, key) => sessionHelper.sendKey(s, key),
+				sendEnter: (s) => sessionHelper.sendEnter(s),
+				capture: (s) => sessionHelper.capturePane(s),
+			},
+			logger: this.logger,
+		});
+		if (limited) {
+			this.logger.debug('Agent is out of usage — not waiting for its prompt', { sessionName, retryAt: limited.retryAt });
+			return false;
+		}
+
+		if (this.isAtIdlePrompt(sessionHelper, sessionName, currentOutput, runtimeType) && !(await this.isBusyByWorkingStatus(sessionName))) {
+			this.logger.debug('Agent already at prompt', { sessionName });
+			return true;
+		}
+
+		this.logger.info('Waiting for agent to return to prompt', { sessionName, timeoutMs });
+
+		const session = sessionHelper.getSession(sessionName);
+		if (!session) {
+			return false;
+		}
+
+		const waitStartMs = Date.now();
+
+		return new Promise<boolean>((resolve) => {
+			let resolved = false;
+			let pollCount = 0;
+			const pollInterval = EVENT_DELIVERY_CONSTANTS.AGENT_READY_POLL_INTERVAL;
+
+			const cleanup = () => {
+				if (resolved) return;
+				resolved = true;
+				clearTimeout(timeoutId);
+				clearInterval(pollId);
+				clearInterval(deepScanId);
+				unsubscribe();
+			};
+
+			// Timeout - give up waiting
+			const timeoutId = setTimeout(() => {
+				this.logger.warn('Timed out waiting for agent to be ready', { sessionName, timeoutMs });
+				cleanup();
+				resolve(false);
+			}, timeoutMs);
+
+			// Poll capturePane periodically as a fallback
+			const pollId = setInterval(() => {
+				if (resolved) return;
+				pollCount++;
+				// Marked out of usage meanwhile (by the screen sweep): stop waiting.
+				if (usageLimitOf(sessionName)) {
+					this.logger.info('Agent is out of usage — stopped waiting for its prompt', { sessionName, pollCount });
+					cleanup();
+					resolve(false);
+					return;
+				}
+				const output = sessionHelper.capturePane(sessionName);
+				if (this.isAtIdlePrompt(sessionHelper, sessionName, output, runtimeType)) {
+					void this.isBusyByWorkingStatus(sessionName).then((busy) => {
+						if (resolved || busy) return;
+						const elapsedMs = Date.now() - waitStartMs;
+						this.logger.info('Agent ready after polling', { sessionName, pollCount, elapsedMs });
+						cleanup();
+						resolve(true);
+					});
+				}
+			}, pollInterval);
+
+			// Deep scan with larger buffer every DEEP_SCAN_INTERVAL to catch prompts
+			// that the fast poll misses (e.g. when prompt is beyond the default 200 lines)
+			const deepScanId = setInterval(() => {
+				if (resolved) return;
+				pollCount++;
+				const output = sessionHelper.capturePane(sessionName, EVENT_DELIVERY_CONSTANTS.DEEP_SCAN_LINES);
+				if (this.isAtIdlePrompt(sessionHelper, sessionName, output, runtimeType)) {
+					void this.isBusyByWorkingStatus(sessionName).then((busy) => {
+						if (resolved || busy) return;
+						const elapsedMs = Date.now() - waitStartMs;
+						this.logger.info('Agent ready after polling', { sessionName, pollCount, elapsedMs });
+						cleanup();
+						resolve(true);
+					});
+				}
+			}, EVENT_DELIVERY_CONSTANTS.DEEP_SCAN_INTERVAL);
+
+			// Also subscribe to terminal data for faster detection
+			const unsubscribe = session.onData((data) => {
+				if (resolved) return;
+				// Strip ANSI escape sequences before testing — raw PTY data contains
+				// cursor positioning, color codes, etc. that break pattern matching (#106)
+				const cleanData = stripAnsiCodes(data);
+				// Check each line for prompt pattern (string-based, no regex)
+				const hasPromptInStream = cleanData.split('\n').some(
+					line => line.trim().length > 0 && isPromptLine(line, runtimeType)
+				);
+				if (hasPromptInStream) {
+					// Double-check with capturePane to avoid false positives from partial data
+					const output = sessionHelper.capturePane(sessionName);
+					if (this.isAtIdlePrompt(sessionHelper, sessionName, output, runtimeType)) {
+						this.logger.debug('Agent at prompt (detected via stream)', { sessionName });
+						cleanup();
+						resolve(true);
+					}
+				}
+			});
+		});
+	}
+
+	/**
+	 * Queue a message for an agent that is busy, without waiting for it. The
+	 * message is delivered when the agent goes idle (agent:idle drains the
+	 * queue) or by the busy-hold re-check timer, exactly like a message
+	 * {@link sendMessageToAgent} holds for a mid-turn agent. For agent-to-agent
+	 * traffic whose sender must not wait (2026-10-05: the orchestrator sat in
+	 * `send-message` for minutes while the recipient was busy).
+	 *
+	 * @param sessionName - The busy agent
+	 * @param message - The message
+	 * @returns Its 1-based position in the agent's queue (1 = next) and the queue size
+	 */
+	holdForBusyAgent(sessionName: string, message: string): { position: number; queueSize: number } {
+		const queue = SubAgentMessageQueue.getInstance();
+		queue.enqueue(sessionName, message);
+		this.scheduleBusyHoldRecheck(sessionName);
+		const since = this.busyHoldSince.get(sessionName) ?? { at: Date.now(), message };
+		this.busyHoldSince.set(sessionName, since);
+		InputBlockedRetryService.getInstance().noteBusyHold(sessionName, Date.now() - since.at, since.message);
+		const queueSize = queue.getQueueSize(sessionName);
+		return { position: queue.positionOf(sessionName, message) ?? queueSize, queueSize };
+	}
+
+	/**
+	 * Make a session's runtime redraw its screen (SIGWINCH): one column and
+	 * row larger, then back to its current size. Uses the backend's resize
+	 * (PTY and screen buffer together) at the session's real size, never a
+	 * fixed 80x24 — that would shrink an agent's terminal back to the size
+	 * whose too-short window hid the input box (2026-10-08 Ella).
+	 *
+	 * @param sessionHelper - The session helper
+	 * @param sessionName - The session
+	 */
+	private async repaintBySigwinch(sessionHelper: SessionCommandHelper, sessionName: string): Promise<void> {
+		const backend = typeof (sessionHelper as { getBackend?: unknown }).getBackend === 'function' ? sessionHelper.getBackend() : null;
+		const dims = backend?.getTerminalDimensions?.(sessionName) ?? { cols: DEFAULT_TERMINAL_COLS, rows: DEFAULT_TERMINAL_ROWS };
+		const resize = (cols: number, rows: number): void => {
+			if (backend?.resizeSession) backend.resizeSession(sessionName, cols, rows);
+			else sessionHelper.getSession(sessionName)?.resize(cols, rows);
+		};
+		resize(dims.cols + 1, dims.rows + 1);
+		await delay(200);
+		resize(dims.cols, dims.rows);
+	}
+
+	/**
+	 * Whether an agent is mid-turn, for the unreadable-input restart: a live
+	 * turn on screen (busy bar / spinner that is repainting), or agent output
+	 * within `quietMs` (Crewly's own resize redraws are not counted, see
+	 * PtyActivityTrackerService.ignoreOutputFor). Unsure counts as mid-turn.
+	 *
+	 * @param sessionName - The agent
+	 * @param quietMs - How long without output counts as not mid-turn
+	 * @returns True when the agent may be working
+	 */
+	async isMidTurnForRecovery(sessionName: string, quietMs: number): Promise<boolean> {
+		try {
+			const helper = await this.getSessionHelper();
+			if (!helper.sessionExists(sessionName)) return true;
+		} catch {
+			return true;
+		}
+		return this.isAgentWorkingNow(sessionName, quietMs);
+	}
+
+	/**
+	 * Whether an existing session shows a live turn or agent output within
+	 * `quietMs`. Unsure (any error) counts as working.
+	 *
+	 * @param sessionName - The agent
+	 * @param quietMs - How long without output counts as not working
+	 * @returns True when the agent may be working
+	 */
+	private async isAgentWorkingNow(sessionName: string, quietMs: number): Promise<boolean> {
+		try {
+			const helper = await this.getSessionHelper();
+			if (await helper.isAgentBusy(sessionName)) return true;
+			const tracker = PtyActivityTrackerService.getInstance();
+			if (!tracker.hasActivity(sessionName)) return false;
+			return tracker.getIdleTimeMs(sessionName) < quietMs;
+		} catch {
+			return true;
+		}
+	}
+
+	/**
+	 * For a Claude Code agent that is mid-turn, queue the message instead of
+	 * pasting it into the running turn (see {@link holdForBusyAgent}). Other
+	 * runtimes, and an agent that is not busy, are left to the caller.
+	 *
+	 * Why not let Claude Code queue it natively: checked on 2.1.289
+	 * (2026-10-05), a message submitted mid-turn is injected into the running
+	 * turn at its next tool call, and the agent may finish that turn without
+	 * ever answering it.
+	 *
+	 * @param sessionName - The recipient
+	 * @param message - The message
+	 * @returns Queue position and size when it was queued, null when the caller should deliver
+	 */
+	async holdIfMidTurn(sessionName: string, message: string): Promise<{ position: number; queueSize: number } | null> {
+		try {
+			const runtimeType = await this.resolveSessionRuntimeType(sessionName);
+			if (runtimeType !== RUNTIME_TYPES.CLAUDE_CODE) return null;
+			const helper = await this.getSessionHelper();
+			if (!helper.sessionExists(sessionName)) return null;
+			if (!(await helper.isAgentBusy(sessionName))) return null;
+		} catch {
+			return null;
+		}
+		return this.holdForBusyAgent(sessionName, message);
+	}
+
+	/**
+	 * Write out the messages held for a usage-limited agent once its limit
+	 * has reset. One timer per agent; the flush re-checks (still limited
+	 * means held again and a new timer).
+	 *
+	 * @param sessionName - The agent session
+	 * @param delayMs - Time until the limit's retry time
+	 */
+	private scheduleUsageLimitFlush(sessionName: string, delayMs: number): void {
+		if (this.usageLimitFlushTimers.has(sessionName)) return;
+		const timer = setTimeout(() => {
+			this.usageLimitFlushTimers.delete(sessionName);
+			const queue = SubAgentMessageQueue.getInstance();
+			if (!queue.hasPending(sessionName)) return;
+			void queue
+				.flush(sessionName, (data) => this.sendMessageToAgent(sessionName, data), SUB_AGENT_QUEUE_CONSTANTS.FLUSH_INTER_MESSAGE_DELAY)
+				.catch((err) => this.logger.warn('Writing out messages held for a usage-limited agent failed', {
+					sessionName,
+					error: err instanceof Error ? err.message : String(err),
+				}));
+		}, delayMs);
+		timer.unref?.();
+		this.usageLimitFlushTimers.set(sessionName, timer);
+	}
+
+	/**
+	 * Messages held for a busy agent are normally sent when it goes idle
+	 * (agent:idle drains the queue). A busy screen the activity monitor has
+	 * not yet registered produces no idle transition, so the queue is also
+	 * retried on a timer until it is empty. Each retry re-checks: still busy
+	 * means held again.
+	 *
+	 * @param sessionName - The agent session
+	 */
+	private scheduleBusyHoldRecheck(sessionName: string): void {
+		if (this.busyHoldTimers.has(sessionName)) return;
+		const timer = setTimeout(() => {
+			this.busyHoldTimers.delete(sessionName);
+			const queue = SubAgentMessageQueue.getInstance();
+			if (!queue.hasPending(sessionName)) return;
+			void queue
+				.flush(sessionName, (data) => this.sendMessageToAgent(sessionName, data), SUB_AGENT_QUEUE_CONSTANTS.FLUSH_INTER_MESSAGE_DELAY)
+				.catch((err) => this.logger.warn('Retrying messages held for a busy agent failed', {
+					sessionName,
+					error: err instanceof Error ? err.message : String(err),
+				}));
+		}, TUI_INPUT_GUARD.BUSY_HOLD_RECHECK_MS);
+		timer.unref?.();
+		this.busyHoldTimers.set(sessionName, timer);
+	}
+
+	/**
+	 * Send message with retry logic for reliable delivery to Claude Code.
+	 * Uses SessionCommandHelper.sendMessage() (proven two-step write pattern)
+	 * with stuck-message detection and retry on failure.
+	 *
+	 * @param sessionName - The session name
+	 * @param message - The message to send
+	 * @param maxAttempts - Maximum number of delivery attempts
+	 * @returns true if message was delivered successfully
+	 */
+	private async sendMessageWithRetry(
+		sessionName: string,
+		message: string,
+		maxAttempts: number = 3,
+		runtimeType: RuntimeType = RUNTIME_TYPES.CLAUDE_CODE
+	): Promise<boolean> {
+		const delivered = await this.sendMessageWithRetryAttempts(sessionName, message, maxAttempts, runtimeType);
+		if (!delivered) return false;
+		// Whatever the checks above concluded (a fast reply, a weak output
+		// change), a collapsed paste of ours still in the box means its Enter
+		// was lost: press Enter once and look again (crewly#1014 review #4).
+		try {
+			const outcome = await (await this.getSessionHelper()).ensureOwnPasteSubmitted(sessionName);
+			if (outcome === 'stuck') {
+				this.logger.warn('Delivery looked confirmed but our paste is still in the input box — not delivered', { sessionName });
+				return false;
+			}
+			if (outcome === 'submitted') {
+				this.logger.warn('Delivery looked confirmed but its Enter was lost — submitted it now', { sessionName });
+			}
+		} catch {
+			// No session helper / session gone: the checks above stand.
+		}
+		return true;
+	}
+
+	/**
+	 * The delivery attempts behind {@link sendMessageWithRetry}.
+	 *
+	 * @param sessionName - Target session
+	 * @param message - Message to deliver
+	 * @param maxAttempts - Attempts before giving up
+	 * @param runtimeType - The session's runtime
+	 * @returns Whether the checks saw the message accepted
+	 */
+	private async sendMessageWithRetryAttempts(
+		sessionName: string,
+		message: string,
+		maxAttempts: number = 3,
+		runtimeType: RuntimeType = RUNTIME_TYPES.CLAUDE_CODE
+	): Promise<boolean> {
+		const sessionHelper = await this.getSessionHelper();
+		const isClaudeCode = runtimeType === RUNTIME_TYPES.CLAUDE_CODE;
+		const isCodexCli = runtimeType === RUNTIME_TYPES.CODEX_CLI;
+		const isGeminiCli = runtimeType === RUNTIME_TYPES.GEMINI_CLI;
+		const isAntigravity = runtimeType === RUNTIME_TYPES.ANTIGRAVITY_CLI;
+
+		// Register TUI sessions for TUI prompt-line scanning (Part 1 of scanner).
+		// The scanner itself is started lazily by trackSentMessage() which
+		// runs after every message send, covering all runtimes.
+		if (!isClaudeCode) {
+			this.tuiSessionRegistry.set(sessionName, runtimeType);
+		}
+
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				this.logger.debug('Attempting message delivery', {
+					sessionName,
+					attempt,
+					maxAttempts,
+					messageLength: message.length,
+					runtimeType,
+				});
+
+				// Never paste into a busy Claude Code box: mid-turn it renders a
+				// paste late, so the guard sees an empty box, presses no Enter, and
+				// the paste then sits there. The message is queued instead and
+				// delivered when the agent goes idle. Checked before the resize
+				// below, which repaints the screen.
+				const busyCheck = (sessionHelper as { isAgentBusy?: (s: string) => Promise<boolean> }).isAgentBusy;
+				if (isClaudeCode && typeof busyCheck === 'function' && await busyCheck.call(sessionHelper, sessionName)) {
+					this.logger.info('Agent is mid-turn — not pasting into its input box; queued for when it is idle', { sessionName, attempt });
+					this.busyHold.add(sessionName);
+					return false;
+				}
+
+				// Verify agent is at prompt before sending
+				const output = sessionHelper.capturePane(sessionName);
+
+				// Gemini CLI stuck-connectivity guard (#128): If the CLI is in a
+				// "Trying to reach <model>" retry loop, it will never process
+				// new messages. Bail out immediately so the caller gets a clear
+				// failure signal and the runtime-exit-monitor can trigger recovery.
+				if (runtimeType === RUNTIME_TYPES.GEMINI_CLI && GEMINI_STUCK_CONNECTIVITY_PATTERN.test(output)) {
+					this.logger.warn('Gemini CLI stuck in connectivity retry loop, aborting message delivery (#128)', {
+						sessionName,
+						attempt,
+					});
+					return false;
+				}
+				if (!this.isAtIdlePrompt(sessionHelper, sessionName, output, runtimeType)) {
+					if (attempt === maxAttempts) {
+						// On the final attempt, check if the agent is DEFINITELY busy
+						// before force-delivering. Use PTY idle time for robust
+						// cross-runtime detection instead of fragile regex patterns.
+						const idleMs = PtyActivityTrackerService.getInstance().getIdleTimeMs(sessionName);
+						const isBusy = idleMs < SESSION_COMMAND_DELAYS.AGENT_BUSY_IDLE_THRESHOLD_MS;
+
+						if (isBusy) {
+							this.logger.warn('Agent is busy (processing indicators detected), skipping force delivery', {
+								sessionName,
+								attempt,
+								runtimeType,
+							});
+							return false;
+						}
+
+						// Not clearly busy — fall back to direct delivery. The agent
+						// may be at a prompt that doesn't match our detection patterns,
+						// or the terminal buffer may be stale.
+						this.logger.warn('Prompt detection failed on final attempt, delivering message directly', {
+							sessionName,
+							attempt,
+							runtimeType,
+						});
+						// Fall through to message delivery below
+					} else {
+						this.logger.debug('Not at prompt, waiting before retry', { sessionName, attempt });
+						await delay(SESSION_COMMAND_DELAYS.CLAUDE_RECOVERY_DELAY);
+						continue;
+					}
+				}
+
+				// Gemini CLI shell mode guard: if the prompt shows `!` instead of `>`,
+				// input will be executed as a shell command. Send Escape to exit first.
+				if (runtimeType === RUNTIME_TYPES.GEMINI_CLI && this.isGeminiInShellMode(output)) {
+					const escaped = await this.escapeGeminiShellMode(sessionName, sessionHelper);
+					if (!escaped) {
+						this.logger.warn('Could not exit Gemini shell mode, skipping attempt', {
+							sessionName,
+							attempt,
+						});
+						await delay(SESSION_COMMAND_DELAYS.MESSAGE_RETRY_DELAY);
+						continue;
+					}
+				}
+
+				// Clear any stale text before sending.
+				// Claude Code: Ctrl+C to cancel any pending input — but ONLY on
+				// retry attempts. On the first attempt, waitForAgentReady already
+				// confirmed the agent is idle at the prompt, so Ctrl+C is
+				// unnecessary and can disrupt Claude Code's input handler if the
+				// 300ms settling delay isn't enough.
+				// Gemini CLI (Ink TUI): escalating recovery to refocus input box.
+				// The TUI input can lose focus after idle periods, auto-update
+				// notifications, or dialog overlays. When defocused, writes are
+				// silently consumed by the Ink framework but NOT routed to the
+				// InputPrompt.
+				// Do NOT send Escape (defocuses permanently), Ctrl+C (triggers
+				// /quit on empty prompt), or Ctrl+U (ignored by TUI).
+				//
+				// Recovery strategies (escalating per attempt):
+				// 1. Tab + Enter: Tab triggers Ink's focusNext() which cycles
+				//    focus through focusable components. If InputPrompt is the
+				//    only/next focusable element, it gets refocused. Enter then
+				//    dismisses any overlay or acts as safe no-op on empty prompt.
+				// 2-3. PTY resize + Tab + Enter: Resize sends SIGWINCH to the
+				//    child process, forcing Ink to re-render the entire TUI.
+				//    This may restore the internal focus state. Then Tab + Enter
+				//    for focus cycling and overlay dismissal.
+				if (isClaudeCode) {
+					// No Ctrl+C on retry (2026-10-03 review): it wipes whatever is in
+					// the box — possibly the owner's half-typed text — and cancels a
+					// running turn. The guarded write only types into an empty box.
+
+					// PTY resize on ALL attempts to force SIGWINCH → Ink TUI re-render.
+					// Claude Code's Ink TUI can lose internal input focus after stop hooks
+					// (especially ones that error), state transitions, or idle periods.
+					// When defocused, the `❯` prompt is visible in the terminal buffer
+					// but writes are silently consumed by the framework — NOT routed to
+					// the InputPrompt. Tab alone was insufficient; PTY resize forces a
+					// full TUI re-render that reliably restores focus state.
+					// This matches the manual workaround where pressing a key in the
+					// frontend terminal "wakes up" the input handler.
+					try {
+						if (sessionHelper.getSession(sessionName)) {
+							await this.repaintBySigwinch(sessionHelper, sessionName);
+							await delay(300);
+						}
+					} catch { /* non-fatal */ }
+					// No Tab here (2026-10-03): in an empty Claude Code input, Tab
+					// ACCEPTS the faint prompt suggestion — a predicted user message —
+					// which the paste below then got appended to and submitted as if
+					// the owner had typed it. The resize above restores focus.
+				} else if (isAntigravity) {
+					// Antigravity CLI: Ctrl+U clears stale input (verified on agy
+					// 1.2.11). No Tab/Enter nudges: Tab completes slash commands and
+					// the binary labels its spinner "Generating... (Enter/Esc to
+					// cancel)", so a stray Enter or Esc can cancel a running turn.
+					// No blind Ctrl+U: only text proven ours is ever cleared.
+				} else if (isCodexCli) {
+					// #246: Codex CLI TUI recovery — simpler than Gemini.
+					// Codex uses Ink-based TUI with › prompt. Avoid Gemini-specific
+					// F12/compress/error-state logic which is irrelevant for Codex.
+					if (attempt > 1) {
+						// PTY resize to trigger SIGWINCH → Ink re-render
+						try {
+							if (sessionHelper.getSession(sessionName)) {
+								await this.repaintBySigwinch(sessionHelper, sessionName);
+								await delay(300);
+							}
+						} catch { /* non-fatal */ }
+						// No blind Ctrl+U: only text proven ours is ever cleared.
+					}
+				} else {
+					// Gemini CLI TUI recovery
+					// Detect recent /compress — Ink TUI loses internal focus after
+					// /compress re-renders, causing subsequent messages to be silently
+					// dropped even though the prompt `>` is visible (#114).
+					// Always force PTY resize on attempt 1 if /compress detected.
+					// Also detect ✖ error state (#130) — MCP connection errors
+					// cause a persistent error indicator that steals TUI focus.
+					const recentOutput = sessionHelper.capturePane(sessionName, 40);
+					const compressDetected = recentOutput.includes('/compress') ||
+						recentOutput.includes('Context compressed') ||
+						recentOutput.includes('Compressing context');
+					// Check for Gemini CLI error indicators ONLY in the status bar area (#130).
+					// The ✖ marker must be in the bottom status lines, not in content area —
+					// checking the full 40-line output causes false positives when ✖ appears
+					// in normal response content (e.g., diffs, lists), triggering spurious
+					// F12 keypresses that open DevTools or disrupt the TUI.
+					const statusArea = recentOutput.split('\n').slice(-GEMINI_ERROR_STATE_CONSTANTS.STATUS_AREA_LINES).join('\n');
+					const errorStateDetected = statusArea.includes(GEMINI_ERROR_STATE_CONSTANTS.ERROR_MARKER) ||
+						GEMINI_ERROR_STATE_CONSTANTS.ERROR_COUNT_PATTERN.test(statusArea);
+					const needsResize = attempt > 1 || compressDetected || errorStateDetected;
+
+					// Force a PTY resize to trigger SIGWINCH, making Ink
+					// re-render the TUI and potentially restore focus state.
+					if (needsResize) {
+						try {
+							if (sessionHelper.getSession(sessionName)) {
+								await this.repaintBySigwinch(sessionHelper, sessionName);
+								await delay(500);
+								this.logger.debug('PTY resize sent to trigger TUI re-render', {
+									sessionName,
+									attempt,
+									compressDetected,
+								});
+							}
+						} catch (resizeErr) {
+							this.logger.debug('PTY resize failed (non-fatal)', {
+								sessionName,
+								error: resizeErr instanceof Error ? resizeErr.message : String(resizeErr),
+							});
+						}
+					}
+
+					// If error state detected (✖), dismiss the error overlay first (#130).
+				// F12 toggles the error details panel in Gemini CLI, Enter dismisses
+				// any overlay/notification, and the combination restores the TUI to a
+				// state where the InputPrompt can accept input.
+					if (errorStateDetected) {
+						this.logger.info('Gemini CLI error state detected (✖), dismissing before delivery (#130)', {
+							sessionName,
+							attempt,
+						});
+						// F12 to close error details panel if open
+						await sessionHelper.sendKey(sessionName, 'F12');
+						await delay(300);
+					}
+
+					// No Tab/Enter focus nudges (2026-10-03): the harness never presses
+					// Tab or Enter unless its own text is in the input box. Tab can
+					// accept a completion/suggestion and Enter submits whatever the box
+					// holds. The resize above re-renders the TUI to restore focus.
+					// Extra settling time after /compress or error state to let Ink TUI stabilize
+					await delay((compressDetected || errorStateDetected) ? 1000 : 500);
+				}
+
+				// For Gemini CLI: detect and gently escape interactive modes before
+				// sending the message. Avoid Ctrl-C here — Gemini interprets it as
+				// destructive cancellation/quit in some states.
+				if (isGeminiCli) {
+					const preOutput = sessionHelper.capturePane(sessionName, 10);
+					const interactiveModePatterns = [
+						'Select a file',       // /resume file picker
+						'❯',                   // Interactive list selector
+						'Choose an option',    // Generic interactive prompt
+						'/resume',             // Resume command active
+					];
+					const inInteractiveMode = interactiveModePatterns.some(p => preOutput.includes(p));
+					if (inInteractiveMode) {
+						// No Tab/Enter: they would pick an entry in the picker. Skip
+						// this attempt and look again; the input guard in sendMessage
+						// refuses to type while the box is not an empty prompt.
+						this.logger.warn('Gemini CLI in interactive mode, skipping this delivery attempt', {
+							sessionName,
+							detectedPattern: interactiveModePatterns.find(p => preOutput.includes(p)),
+						});
+						await delay(SESSION_COMMAND_DELAYS.MESSAGE_RETRY_DELAY);
+						continue;
+					}
+				}
+
+				// Capture output BEFORE sending to detect changes for ALL runtimes.
+				// Claude Code: progressive output-change detection prevents false-positive
+				// Ctrl+C by giving Claude up to 6.5s to start rendering output.
+				// TUI runtimes: same output-change detection as before.
+				// Use a small pane capture (20 lines) to reduce noise from TUI
+				// border redraws that can cause length changes unrelated to delivery.
+				const beforeOutput = sessionHelper.capturePane(sessionName, 20);
+				const beforeLength = beforeOutput.length;
+
+				// Deduplication guard (#128): Check if the agent is already
+				// processing on ALL attempts (not just retries). A previous
+				// write may have succeeded but verification failed. Re-writing
+				// the same message creates a duplicate in the input buffer.
+				//
+				// IMPORTANT: Only skip the write when we have a positive hash
+				// match (isRecentDuplicate). The `attempt > 1` condition was
+				// removed because the spinner could be from a DIFFERENT message
+				// that the agent is still processing — skipping the write for
+				// a new message causes silent message loss.
+				{
+					const preWriteCheck = sessionHelper.capturePane(sessionName);
+					const hasSpinner = containsSpinnerOrWorkingIndicator(preWriteCheck);
+
+					if (hasSpinner) {
+						// Hash-based dedup: if the same message was recently sent
+						// and the agent is processing, it's very likely our message.
+						// Whole message, not its first 200 characters: every chat
+						// delivery starts with the same header and "之前的对话"
+						// context block, so two different messages from one
+						// conversation matched and the second was dropped while
+						// reported as sent (2026-09-22: the owner's question to Sam).
+						const msgHash = messageDedupKey(message);
+						const lastSent = this.lastSentMessageHash.get(sessionName);
+						const isRecentDuplicate = lastSent
+							&& lastSent.hash === msgHash
+							&& (Date.now() - lastSent.sentAt) < 60000;
+
+						if (isRecentDuplicate) {
+							this.logger.info('Agent already processing — skipping write to prevent duplicate (#128)', {
+								sessionName,
+								attempt,
+								isRecentDuplicate: true,
+							});
+							return true;
+						}
+
+						// Agent is busy with a different message. On retries,
+						// log but still proceed to write — the message will be
+						// queued in the PTY input buffer for when the agent
+						// finishes its current work.
+						if (attempt > 1) {
+							this.logger.info('Agent busy with different message, proceeding with write on retry', {
+								sessionName,
+								attempt,
+							});
+						}
+					}
+
+					// On retries: log informationally if the agent is mid-task and
+					// our message text isn't visible at the bottom of the pane.
+					// Historically this branch returned `true` (silent skip) on
+					// `notAtPrompt && !textStuck`, which silently dropped Slack
+					// messages whenever the orc was busy on a prior task and the
+					// force-deliver fallback's first internal write had been
+					// suppressed by the spinner-dedup guard above. Steve's
+					// 2026-04-30 UTC 17:28 / 18:37 incident: messages acked by
+					// the queue, never reached the orc PTY.
+					//
+					// Correct semantics: the only safe condition for skipping is
+					// a positive recent-duplicate hash match (handled in the
+					// `hasSpinner` block above via `isRecentDuplicate`). If we
+					// reach this point we KNOW the new message has not been
+					// confirmed-written this round, so proceed to the actual
+					// `session.write` below — the PTY input buffer will queue
+					// the bytes until the agent is ready to consume them. A
+					// duplicate is recoverable on the agent side; a silent loss
+					// is not.
+					if (attempt > 1) {
+						const notAtPrompt = !this.isAtIdlePrompt(sessionHelper, sessionName, preWriteCheck, runtimeType);
+						if (notAtPrompt) {
+							const msgSnippet = (message.length > 20
+								? message.substring(0, 80)
+								: message).replace(/\s+/g, ' ').trim();
+							const bottomLines = preWriteCheck.split('\n').slice(-10).join(' ').replace(/\s+/g, ' ');
+							const textStuck = bottomLines.includes(msgSnippet);
+							this.logger.info('Agent busy on retry — proceeding to write (no silent skip)', {
+								sessionName,
+								attempt,
+								textStuck,
+							});
+							// No early return — fall through to session.write.
+						}
+					}
+				}
+
+				// Use SessionCommandHelper.sendMessage() — proven two-step write:
+				// 1. session.write(message)    — triggers bracketed paste
+				// 2. await delay(scaled)       — waits for paste processing
+				// 3. session.write('\r')       — sends Enter separately
+				// 4. await delay(KEY_DELAY)    — waits for key processing
+				await sessionHelper.sendMessage(sessionName, message);
+
+				// Register for background stuck-detection safety net (all runtimes).
+				// If progressive verification below misses an Enter drop, the
+				// background scanner will catch it within 30s.
+				this.trackSentMessage(sessionName, message);
+
+				// Track message hash for deduplication on retry (#128)
+				this.lastSentMessageHash.set(sessionName, {
+					hash: messageDedupKey(message),
+					sentAt: Date.now(),
+				});
+
+				// Wait for agent to start processing, then verify delivery.
+				// TUI runtimes need a longer delay (3s) for the TUI to redraw
+				// and show processing indicators after accepting input.
+				const processingDelay = isClaudeCode
+					? SESSION_COMMAND_DELAYS.MESSAGE_PROCESSING_DELAY
+					: 3000;
+				await delay(processingDelay);
+
+				// === Delivery verification ===
+				// Claude Code: prompt disappears during processing, so check
+				// isMessageStuckAtPrompt (text still at prompt = stuck).
+				// TUI runtimes (Gemini CLI): use TWO-PHASE verification:
+				//   Phase 1: Direct check — is the message text sitting ON the
+				//            `> ` prompt line? If yes, Enter was dropped. Try
+				//            pressing Enter to recover before falling through to retry.
+				//   Phase 2: Output-change detection — compare before/after captures
+				//            to see if the agent started processing.
+				if (isClaudeCode) {
+					// Progressive verification for Claude Code.
+					// Claude Code routinely takes 3-8s to start rendering with large
+					// context. The old 2.5s window caused false-positive Ctrl+C that
+					// cancelled valid in-progress prompts. Now we progressively check
+					// at [1s, 2s, 3s] intervals (total ~6.5s including processing delay).
+					//
+					// Progressive verification: check at [1s, 2s, 3s] intervals whether
+					// the agent accepted the message and started processing it.
+					//
+					// Uses runtime-agnostic detection — no hardcoded prompt characters.
+					// This stays correct when the agent runtime upgrades its prompt.
+					//
+					// Three signals checked per interval:
+					// 1. Processing indicators (⠋ ⏺ spinners) — definitive success
+					// 2. isClaudeAtPrompt() — if still true, agent is idle, wait more
+					// 3. Message text in bottom lines — if found, Enter was dropped
+					//    (message pasted at prompt but not submitted)
+					// If prompt gone AND message text NOT at bottom → success
+					let claudeDelivered = false;
+					for (const intervalMs of SESSION_COMMAND_DELAYS.CLAUDE_VERIFICATION_INTERVALS) {
+						const currentOutput = sessionHelper.capturePane(sessionName);
+
+						// 1. Processing indicators (spinners, working marker) are
+						//    definitive proof the agent accepted and is working.
+						//    Only check spinner/⏺ chars — NOT text words like
+						//    "thinking" which appear in historical response text.
+						if (containsSpinnerOrWorkingIndicator(currentOutput)) {
+							this.logger.debug('Processing indicators detected — message accepted', {
+								sessionName,
+								attempt,
+							});
+							claudeDelivered = true;
+							break;
+						}
+
+						// 2. Is the agent still at its standard idle prompt?
+						//    Reuse isClaudeAtPrompt() — the single source of truth
+						//    for prompt detection. This avoids hardcoding prompt
+						//    characters and stays correct when the runtime upgrades.
+						if (this.isClaudeAtPrompt(currentOutput, runtimeType)) {
+							// Prompt is visible. Before just waiting, check if our
+							// message text is also at the bottom — this means the
+							// text was pasted but Enter was dropped. Press Enter.
+							// Normalize whitespace: enhanced messages contain literal \n from
+							// addContinuationInstructions(). join(' ') replaces line breaks with
+							// spaces, but the snippet still has \n chars, so includes() fails.
+							const promptMsgSnippet = (message.length > 20
+								? message.substring(0, 80)
+								: message).replace(/\s+/g, ' ').trim();
+							const promptBottomLines = currentOutput.split('\n').slice(-10).join(' ').replace(/\s+/g, ' ');
+							if (promptBottomLines.includes(promptMsgSnippet)) {
+								// Our text near the bottom may be the transcript echo of a
+								// message already submitted. Press Enter only if the input
+								// box itself holds exactly our text (never Tab: it accepts a
+								// prompt suggestion — the 2026-10-03 phantom owner input).
+								const pressed = (await sessionHelper.submitIfInputIsOurs(sessionName, message)).state === 'ours';
+								this.logger.warn('At prompt with message text at bottom', {
+									sessionName,
+									attempt,
+									intervalMs,
+									enterPressed: pressed,
+								});
+
+								await delay(SESSION_COMMAND_DELAYS.MESSAGE_PROCESSING_DELAY);
+
+								// Verify recovery
+								const postEnterOutput = sessionHelper.capturePane(sessionName);
+								if (containsSpinnerOrWorkingIndicator(postEnterOutput) ||
+									!this.isClaudeAtPrompt(postEnterOutput, runtimeType)) {
+									this.logger.info('Enter recovery from prompt successful', {
+										sessionName,
+										attempt,
+									});
+									claudeDelivered = true;
+									break;
+								}
+							}
+
+							// Fast-response detection: if the terminal output changed since
+							// we sent the message, Claude processed it and returned to prompt
+							// before our first check. Without this, fast responses (e.g.,
+							// simple IP queries) cause false "delivery unconfirmed" verdicts
+							// and trigger duplicate sends (#retry-storm).
+							const outputChanged = currentOutput !== beforeOutput;
+							if (outputChanged) {
+								this.logger.info('Agent at prompt but output changed — fast response detected, delivery confirmed', {
+									sessionName,
+									attempt,
+									intervalMs,
+									beforeLength: beforeOutput.length,
+									currentLength: currentOutput.length,
+								});
+								claudeDelivered = true;
+								break;
+							}
+
+							this.logger.debug('Agent still at prompt, waiting before re-check', {
+								sessionName,
+								attempt,
+								intervalMs,
+							});
+							await delay(intervalMs);
+							continue;
+						}
+
+						// 3. Prompt not in its standard idle form. Before declaring
+						//    success, check if our message text is stuck at the
+						//    bottom of the terminal. When Enter is dropped, the
+						//    pasted text appears on the prompt line — the terminal
+						//    shows the prompt char followed by our message text.
+						//    This check is runtime-agnostic: it works regardless
+						//    of what prompt character the runtime uses.
+						// Normalize whitespace in snippet (see Step 2 comment above).
+						const msgSnippet = (message.length > 20
+							? message.substring(0, 80)
+							: message).replace(/\s+/g, ' ').trim();
+						const bottomLines = currentOutput.split('\n').slice(-10).join(' ').replace(/\s+/g, ' ');
+						if (bottomLines.includes(msgSnippet)) {
+							// Message text is at the bottom of the terminal but the
+							// prompt is no longer in its idle form — Enter was dropped.
+							// Instead of waiting and doing a full Ctrl+C + resend retry,
+							// use Tab to restore TUI focus, then Enter to submit.
+							// Enter only when the input box holds exactly our text.
+							const pressed = (await sessionHelper.submitIfInputIsOurs(sessionName, message)).state === 'ours';
+							this.logger.warn('Message text stuck at bottom', {
+								sessionName,
+								attempt,
+								intervalMs,
+								enterPressed: pressed,
+							});
+
+							// Give the agent a moment to start processing after Enter
+							await delay(SESSION_COMMAND_DELAYS.MESSAGE_PROCESSING_DELAY);
+
+							// Verify recovery: check if processing started
+							const recoveryOutput = sessionHelper.capturePane(sessionName);
+							if (containsSpinnerOrWorkingIndicator(recoveryOutput)) {
+								this.logger.info('Enter recovery successful — processing started', {
+									sessionName,
+									attempt,
+								});
+								claudeDelivered = true;
+								break;
+							}
+
+							// Check if prompt reappeared (Enter submitted but processed instantly)
+							// or if output changed from the stuck state
+							const recoveryBottom = recoveryOutput.split('\n').slice(-10).join(' ').replace(/\s+/g, ' ');
+							if (!recoveryBottom.includes(msgSnippet)) {
+								this.logger.info('Enter recovery successful — stuck text cleared', {
+									sessionName,
+									attempt,
+								});
+								claudeDelivered = true;
+								break;
+							}
+
+							// Still stuck after Enter recovery — continue to next interval
+							this.logger.debug('Still stuck after Enter recovery, continuing verification', {
+								sessionName,
+								attempt,
+							});
+							await delay(intervalMs);
+							continue;
+						}
+
+						// Prompt gone AND no stuck text → agent started processing
+						this.logger.debug('Prompt gone, no stuck text — message delivered', {
+							sessionName,
+							attempt,
+						});
+						claudeDelivered = true;
+						break;
+					}
+
+					// --- Extended confirmation loop ---
+					// If progressive verification didn't confirm delivery, run an
+					// extended check loop (every 3s, up to 30s total). Each iteration
+					// captures the pane, checks for spinner/working indicators, and
+					// presses Enter if our message text is still in the input box.
+					if (!claudeDelivered) {
+						const CONFIRM_INTERVAL_MS = 3000;
+						const CONFIRM_MAX_MS = 30000;
+						const confirmStart = Date.now();
+						let confirmAttempt = 0;
+
+						// Normalize snippet once for reuse
+						const confirmSnippet = (message.length > 20
+							? message.substring(0, 80)
+							: message).replace(/\s+/g, ' ').trim();
+
+						while (Date.now() - confirmStart < CONFIRM_MAX_MS) {
+							await delay(CONFIRM_INTERVAL_MS);
+							confirmAttempt++;
+
+							const loopOutput = sessionHelper.capturePane(sessionName);
+							const loopBottom = loopOutput.split('\n').slice(-10).join(' ').replace(/\s+/g, ' ');
+							const textStuck = loopBottom.includes(confirmSnippet);
+
+							// Spinner or working indicator → delivered
+							if (containsSpinnerOrWorkingIndicator(loopOutput)) {
+								this.logger.info('Confirmation loop: processing detected', {
+									sessionName, attempt, confirmAttempt,
+								});
+								claudeDelivered = true;
+								break;
+							}
+
+							// Text still stuck → Enter was dropped, NOT delivered. Try
+							// Enter (only if the box holds our text) and re-check next iteration. This is
+							// checked BEFORE the output-change shortcut below: when our
+							// own pasted message is echoed at the prompt the output DID
+							// change vs the pre-send baseline, but that change is the
+							// stuck echo, not a response — treating it as "delivered"
+							// is the false-positive that masked the orc 假死 (#686
+							// follow-up: a hung session looked "delivered" forever).
+							if (textStuck) {
+								const pressed = (await sessionHelper.submitIfInputIsOurs(sessionName, message)).state === 'ours';
+								this.logger.warn('Confirmation loop: text still stuck', {
+									sessionName, attempt, confirmAttempt, enterPressed: pressed,
+								});
+								continue;
+							}
+
+							// Fast-response detection: output changed since send AND our
+							// message text is NOT stuck at the prompt → a real response
+							// landed and returned to prompt before we looked. Delivered.
+							if (loopOutput !== beforeOutput) {
+								this.logger.info('Confirmation loop: output changed from pre-send — fast response confirmed', {
+									sessionName, attempt, confirmAttempt,
+								});
+								claudeDelivered = true;
+								break;
+							}
+
+							// Not at prompt and text not stuck → delivered
+							if (!this.isClaudeAtPrompt(loopOutput, runtimeType)) {
+								this.logger.info('Confirmation loop: prompt gone, text cleared', {
+									sessionName, attempt, confirmAttempt,
+								});
+								claudeDelivered = true;
+								break;
+							}
+						}
+
+						if (!claudeDelivered) {
+							this.logger.error('Confirmation loop exhausted — delivery unconfirmed', {
+								sessionName, attempt, confirmAttempts: confirmAttempt,
+							});
+						}
+					}
+
+					if (claudeDelivered) {
+						return true;
+					}
+				} else {
+					// --- Gemini CLI: lightweight verification ---
+					// Gemini CLI's PTY write is reliable. The aggressive verification
+					// (stuck detection + Tab+Enter recovery + output-change diff) causes
+					// false "stuck" judgments that trigger visible retry error spam even
+					// when the message was successfully delivered (#retry-storm fix).
+					//
+					// Strategy: only check for the definitive stuck signal (message text
+					// literally sitting on the `> ` prompt line). If not stuck, trust the
+					// write. Skip the output-change heuristics that cause false negatives.
+					const isGemini = runtimeType === RUNTIME_TYPES.GEMINI_CLI;
+
+					if (isAntigravity) {
+						// --- Antigravity CLI: prompt-box check only ---
+						// agy echoes every submitted message as `> text` above its
+						// prompt box, so the generic "text on a `>` line" check would
+						// call a delivered message stuck. Only the box itself counts.
+						const screen = sessionHelper.capturePane(sessionName);
+						if (!isTextInAntigravityInputBox(screen, message)) {
+							this.logger.debug('Antigravity: message left the prompt box — delivery trusted', { sessionName, attempt });
+							return true;
+						}
+						// Enter only when the box holds exactly our message.
+						const pressed = (await sessionHelper.submitIfInputIsOurs(sessionName, message)).state === 'ours';
+						this.logger.warn('Antigravity: message still in the prompt box', { sessionName, attempt, enterPressed: pressed });
+						await delay(SESSION_COMMAND_DELAYS.MESSAGE_PROCESSING_DELAY);
+						if (!isTextInAntigravityInputBox(sessionHelper.capturePane(sessionName), message)) {
+							return true;
+						}
+						this.logger.warn('Antigravity: message still in the prompt box after Enter', { sessionName, attempt });
+					} else if (isGemini) {
+						// Single stuck-at-prompt check — the only reliable failure signal
+						const stuckAtPrompt = this.isTextStuckAtTuiPrompt(sessionName, message);
+						if (stuckAtPrompt) {
+							const recovered = await this.recoverStuckTuiMessage(sessionName, message);
+							if (recovered) {
+								this.logger.info('Gemini CLI: message recovered via Enter re-press', {
+									sessionName,
+									attempt,
+								});
+								return true;
+							}
+							this.logger.warn('Gemini CLI: message still stuck after Enter recovery', {
+								sessionName,
+								attempt,
+							});
+							// Fall through to retry cleanup below
+						} else {
+							// Not stuck at prompt — PTY write succeeded, trust delivery.
+							// The old code did output-change detection here, but TUI redraws
+							// and minimal length diffs caused false "not delivered" verdicts.
+							this.logger.debug('Gemini CLI: message not stuck at prompt — delivery trusted', {
+								sessionName,
+								attempt,
+							});
+							return true;
+						}
+					} else {
+						// --- Non-Gemini TUI runtimes: full verification ---
+						// Phase 0: read the box. The guarded writer pressed Enter only
+						// on our own text; a box that now reads empty in a verified
+						// layout means it went in — the output-length heuristics below
+						// miss that (Codex: "did not change" → a retry → a duplicate).
+						{
+							const boxAfter = sessionHelper.readInputBox(sessionName, message, 'recovery');
+							if (boxAfter.state === 'empty' && boxAfter.verified) {
+								this.logger.debug('Input box empty after our Enter — delivery confirmed', { sessionName, attempt, layout: boxAfter.layout });
+								return true;
+							}
+						}
+						// Phase 1: Direct stuck-at-prompt detection
+						const stuckAtPrompt = this.isTextStuckAtTuiPrompt(sessionName, message);
+						if (stuckAtPrompt) {
+							const recovered = await this.recoverStuckTuiMessage(sessionName, message);
+							if (recovered) {
+								this.logger.info('Message recovered via Enter re-press', {
+									sessionName,
+									attempt,
+								});
+								return true;
+							}
+							this.logger.warn('Message still stuck after Enter recovery, will retry', {
+								sessionName,
+								attempt,
+							});
+						} else {
+							// Phase 2: Output-change detection
+							const afterOutput = sessionHelper.capturePane(sessionName, 20);
+							const lengthDiff = afterOutput.length - beforeLength;
+							const contentChanged = beforeOutput !== afterOutput;
+
+							let newContent = '';
+							if (contentChanged && afterOutput.length > beforeOutput.length) {
+								newContent = afterOutput.slice(beforeLength);
+							} else if (contentChanged) {
+								const beforeLines = new Set(beforeOutput.split('\n'));
+								newContent = afterOutput
+									.split('\n')
+									.filter((line) => !beforeLines.has(line))
+									.join('\n');
+							}
+
+							const hasProcessingIndicators = containsProcessingIndicator(
+								newContent || afterOutput.slice(-500)
+							);
+
+							const significantLengthChange = Math.abs(lengthDiff) > 10;
+							const delivered = (lengthDiff > 20)
+								|| (contentChanged && significantLengthChange)
+								|| hasProcessingIndicators;
+
+							if (delivered) {
+								const hasStrongSignal = hasProcessingIndicators;
+								const logLevel = hasStrongSignal ? 'debug' : 'warn';
+								this.logger[logLevel](`Message delivery verified (${hasStrongSignal ? 'strong' : 'weak'} signal)`, {
+									sessionName,
+									attempt,
+									lengthDiff,
+									contentChanged,
+									hasProcessingIndicators,
+									newContentLength: newContent.length,
+									signal: hasStrongSignal ? 'processing-indicators' : 'output-length-change-only',
+								});
+								return true;
+							}
+
+							this.logger.warn('TUI output did not change after send — message may not have been accepted', {
+								sessionName,
+								attempt,
+								lengthDiff,
+								contentChanged,
+								hasProcessingIndicators,
+								newContentLength: newContent.length,
+							});
+						}
+					}
+				}
+
+				// Message stuck at prompt — clear line and retry.
+				this.logger.warn('Message stuck at prompt after send, clearing for retry', {
+					sessionName,
+					attempt,
+				});
+				// Clear the box only when it holds exactly our message (2026-10-03
+				// review): never Ctrl+C (cancels a turn; twice exits Claude Code;
+				// /quit in Gemini), never wipe text we cannot prove is ours.
+				{
+					const box = sessionHelper.readInputBox(sessionName, message, 'before-write');
+					// Not our earlier paste(s) still waiting to be submitted (ledger):
+					// those are someone's messages, submitted on the next attempt.
+					if (box.state === 'ours' && !box.ownPasteMarker) await sessionHelper.clearInputBox(sessionName, message, box);
+				}
+				await delay(SESSION_COMMAND_DELAYS.CLEAR_COMMAND_DELAY);
+
+				if (attempt < maxAttempts) {
+					await delay(SESSION_COMMAND_DELAYS.MESSAGE_RETRY_DELAY);
+				}
+			} catch (error) {
+				if (error instanceof TuiPasteHoldError) {
+					// An earlier paste of ours may still land in the box: queue this
+					// message like one held for a busy agent (re-checked on idle and
+					// every BUSY_HOLD_RECHECK_MS) — never paste on top of it.
+					this.logger.info('Delivery held: an earlier paste of ours may still be pending in the input box — queued', { sessionName, attempt, reason: error.reason });
+					this.busyHold.add(sessionName);
+					return false;
+				}
+				if (error instanceof TuiInputGuardError) {
+					this.lastGuardRefusal.set(sessionName, error);
+				}
+				this.logger.error('Error during message delivery', {
+					sessionName,
+					attempt,
+					error: error instanceof Error ? error.message : String(error),
+				});
+
+				if (attempt < maxAttempts) {
+					await delay(SESSION_COMMAND_DELAYS.MESSAGE_RETRY_DELAY);
+				}
+			}
+		}
+
+		this.logger.warn('Message delivery verification failed — all attempts exhausted', {
+			sessionName,
+			maxAttempts,
+			messageLength: message.length,
+		});
+
+		this.logger.error('Message delivery failed after all retry attempts', {
+			sessionName,
+			maxAttempts,
+			messageLength: message.length,
+		});
+
+		return false;
+	}
+
+
+	/**
+	 * Check if a sent message is stuck at the terminal prompt (Enter was not accepted).
+	 *
+	 * Captures the current terminal pane and looks for the message text still visible
+	 * on the last few lines. If the text is found, Enter was not processed and the
+	 * message is stuck.
+	 *
+	 * @param sessionName - The session to check
+	 * @param message - The original message that was sent
+	 * @returns true if the message text is still visible at the prompt (stuck)
+	 */
+	private async isMessageStuckAtPrompt(sessionName: string, message: string): Promise<boolean> {
+		try {
+			const sessionHelper = await this.getSessionHelper();
+			const output = sessionHelper.capturePane(sessionName);
+
+			if (!output || output.trim().length === 0) {
+				return false;
+			}
+
+			// Extract a search token from the message:
+			// Strip [CHAT:uuid] prefix if present, then take the first 40 chars
+			const { prefixLength } = extractChatPrefix(message);
+			const contentAfterPrefix = prefixLength > 0
+				? message.slice(prefixLength)
+				: message;
+			const searchToken = contentAfterPrefix.slice(0, 40).trim();
+
+			// Also use [CHAT: as a secondary token if message has a CHAT prefix
+			const chatToken = prefixLength > 0 ? '[CHAT:' : null;
+
+			// Check last 20 non-empty lines for either token.
+			// Gemini CLI TUI has status bars at the bottom (branch, sandbox, model info)
+			// that push input content further up. 5 lines was insufficient.
+			const lines = output.split('\n').filter((line) => line.trim().length > 0);
+			const linesToCheck = lines.slice(-20);
+
+			const isStuck = linesToCheck.some((line) => {
+				// Strip TUI box-drawing borders before checking (Gemini CLI wraps content in │...│)
+				const stripped = stripTuiLineBorders(line);
+				if (searchToken && (line.includes(searchToken) || stripped.includes(searchToken))) return true;
+				if (chatToken && (line.includes(chatToken) || stripped.includes(chatToken))) return true;
+				return false;
+			});
+
+			this.logger.debug('isMessageStuckAtPrompt result', {
+				sessionName,
+				isStuck,
+				searchToken: searchToken.slice(0, 20),
+				linesChecked: linesToCheck.length,
+			});
+
+			return isStuck;
+		} catch (error) {
+			this.logger.warn('Error checking if message stuck at prompt', {
+				sessionName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Check if message text is stuck at the TUI prompt line (Enter was not pressed).
+	 *
+	 * Unlike `isMessageStuckAtPrompt` which checks the last 20 lines for the message
+	 * text ANYWHERE, this method specifically checks whether the message text appears
+	 * ON the prompt line itself (the line starting with `> ` or `│ > `).
+	 *
+	 * After Enter is successfully pressed, the text moves from the prompt line to the
+	 * chat history area. So if the text is still on the prompt line, Enter was dropped.
+	 *
+	 * This avoids the false positive problem where `isMessageStuckAtPrompt` matches
+	 * the message text in the TUI's chat history (which echoes submitted messages).
+	 *
+	 * @param sessionName - The session to check
+	 * @param message - The original message that was sent
+	 * @returns true if the message text is visible on the TUI prompt line (stuck)
+	 */
+	private isTextStuckAtTuiPrompt(sessionName: string, message: string): boolean {
+		try {
+			const sessionHelper = this._sessionHelper;
+			if (!sessionHelper) return false;
+
+			const output = sessionHelper.capturePane(sessionName);
+			if (!output || output.trim().length === 0) return false;
+
+			// Extract search token: first 30 chars of the message content
+			// (after stripping any [CHAT:uuid] prefix)
+			const { prefixLength } = extractChatPrefix(message);
+			const contentAfterPrefix = prefixLength > 0
+				? message.slice(prefixLength)
+				: message;
+			const searchToken = contentAfterPrefix.slice(0, 30).trim();
+
+			if (!searchToken) return false;
+
+			// Find lines that look like a TUI prompt with text after it.
+			// Gemini CLI TUI wraps content in box-drawing borders: │ > text │
+			// Or without borders: > text
+			// The prompt line is the line with `> ` followed by actual content.
+			const lines = output.split('\n');
+
+			for (let i = lines.length - 1; i >= Math.max(0, lines.length - 25); i--) {
+				const line = lines[i];
+				const promptContent = matchTuiPromptLine(line);
+				if (promptContent !== null) {
+					const trimmedContent = stripTuiLineBorders(promptContent).trim();
+					// Check if the prompt line content contains our message text.
+					// Only check the BOTTOMMOST prompt line — historical echoes of
+					// submitted messages also appear as `> text` further up in the
+					// TUI conversation history. Without this break, those echoes
+					// cause false "stuck" detections even after the message was
+					// successfully delivered.
+					if (trimmedContent.length > 5 && trimmedContent.includes(searchToken)) {
+						this.logger.warn('Text stuck at TUI prompt — Enter was not pressed', {
+							sessionName,
+							searchToken: searchToken.slice(0, 20),
+							promptContent: promptContent.slice(0, 60),
+						});
+						return true;
+					}
+					break; // Only check the first (bottommost) prompt line
+				}
+			}
+
+			return false;
+		} catch (error) {
+			this.logger.debug('Error in isTextStuckAtTuiPrompt', {
+				sessionName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Attempt to recover from text stuck at TUI prompt by pressing Enter.
+	 * Checks if text is stuck, sends Enter, waits, then verifies.
+	 *
+	 * @param sessionName - The session to recover
+	 * @param message - The original message
+	 * @returns true if recovery succeeded (text is no longer at prompt)
+	 */
+	private async recoverStuckTuiMessage(sessionName: string, message: string): Promise<boolean> {
+		const sessionHelper = await this.getSessionHelper();
+
+		// Enter only when the input box holds exactly our text — never Tab
+		// (accepts a suggestion) and no blind backup Enter (submits whatever
+		// the box holds once ours is gone).
+		const reading = await sessionHelper.submitIfInputIsOurs(sessionName, message);
+		// Enter only for text read as ours — never on an unreadable box.
+		const pressed = reading.state === 'ours';
+		this.logger.info('Stuck TUI message: Enter only if the box holds our text', { sessionName, enterPressed: pressed, state: reading.state });
+		if (!pressed) return false;
+		await delay(2000);
+
+		// Verify text is no longer at prompt
+		const stillStuck = this.isTextStuckAtTuiPrompt(sessionName, message);
+		if (!stillStuck) {
+			this.logger.info('TUI message recovery succeeded — Enter accepted', { sessionName });
+			return true;
+		}
+
+		this.logger.warn('TUI message still stuck after Enter recovery', { sessionName });
+		return false;
+	}
+
+	/**
+	 * Start a background scanner that periodically checks all registered TUI
+	 * sessions for text stuck at the prompt (Enter not pressed).
+	 *
+	 * This is a safety net that catches messages missed by the per-send
+	 * verification in `sendMessageWithRetry`. It scans every 30 seconds.
+	 *
+	 * When stuck text is detected, the scanner presses Enter to recover.
+	 * If text has been sitting at the prompt for multiple consecutive scans,
+	 * it escalates to Tab + Enter (TUI focus recovery).
+	 */
+	startStuckMessageDetector(): void {
+		if (this.stuckMessageDetectorTimer) {
+			this.logger.debug('Stuck message detector already running');
+			return;
+		}
+
+		const SCAN_INTERVAL_MS = 30000; // 30 seconds
+		this.logger.info('Starting background stuck-message detector', {
+			intervalMs: SCAN_INTERVAL_MS,
+		});
+
+		this.stuckMessageDetectorTimer = setInterval(async () => {
+			try {
+				await this.scanForStuckMessages();
+			} catch (error) {
+				this.logger.debug('Stuck message scan error (non-fatal)', {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}, SCAN_INTERVAL_MS);
+	}
+
+	/**
+	 * Stop the background stuck-message detector.
+	 */
+	stopStuckMessageDetector(): void {
+		if (this.stuckMessageDetectorTimer) {
+			clearInterval(this.stuckMessageDetectorTimer);
+			this.stuckMessageDetectorTimer = null;
+			this.logger.info('Stopped background stuck-message detector');
+		}
+	}
+
+	/**
+	 * Scan all sessions for stuck messages. Two complementary strategies:
+	 *
+	 * 1. TUI prompt-line scanning (existing): checks registered TUI sessions
+	 *    for text sitting on the `> ` prompt line.
+	 * 2. Tracked-message scanning (new, all runtimes): checks if any recently
+	 *    sent message text is still visible at the bottom of the terminal
+	 *    after 15+ seconds — runtime-agnostic Enter-drop detection.
+	 */
+	private async scanForStuckMessages(): Promise<void> {
+		const sessionHelper = this._sessionHelper;
+		if (!sessionHelper) return;
+
+		// --- Part 0: Rewind mode detection (all sessions) ---
+		// If Claude Code is stuck in Rewind mode (triggered by ESC during
+		// processing), send 'q' to exit before any other recovery attempts.
+		for (const sessionName of sessionHelper.listSessions()) {
+			try {
+				const output = sessionHelper.capturePane(sessionName);
+				if (containsRewindMode(output)) {
+					this.logger.warn('Rewind mode detected, sending q to exit', { sessionName });
+					sessionHelper.writeRaw(sessionName, 'q');
+					await delay(500);
+				}
+			} catch {
+				// Non-fatal: session may have been destroyed
+			}
+		}
+
+		// --- Part 1 (removed 2026-10-03) ---
+		// The old Part 1 pressed Tab+Enter on ANY text sitting on a TUI prompt
+		// line — text the harness never wrote (a prompt suggestion accepted by
+		// the Tab, or someone's half-typed input) got submitted. The harness
+		// now only submits its own tracked messages (Part 2), and only when
+		// the input box holds exactly that text.
+
+		// --- Part 2: Tracked-message scanning (non-Gemini runtimes) ---
+		const now = Date.now();
+		const MIN_AGE_MS = 10000; // Check messages older than 10s
+		const MAX_RECOVERY_ATTEMPTS = 5; // Give up after 5 Enter attempts
+
+		for (const [sessionName, entries] of this.sentMessageTracker) {
+			if (!sessionHelper.sessionExists(sessionName)) {
+				this.sentMessageTracker.delete(sessionName);
+				continue;
+			}
+
+			// Skip Gemini CLI sessions — Enter recovery causes more harm
+			// than good because the Gemini TUI handles input differently.
+			const trackedRuntime = this.tuiSessionRegistry.get(sessionName);
+			if (trackedRuntime === RUNTIME_TYPES.GEMINI_CLI || trackedRuntime === RUNTIME_TYPES.ANTIGRAVITY_CLI) {
+				continue;
+			}
+
+			try {
+				const output = sessionHelper.capturePane(sessionName);
+				if (!output || output.trim().length === 0) continue;
+				const bottomText = output.split('\n').slice(-15).join(' ').replace(/\s+/g, ' ');
+
+				for (const entry of entries) {
+					if (entry.recovered) continue;
+					if (now - entry.sentAt < MIN_AGE_MS) continue;
+					if (entry.recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+						entry.recovered = true;
+						const alreadyQueued = !!entry.message && SubAgentMessageQueue.getInstance().contains(sessionName, entry.message);
+						if (entry.unreadable && entry.message && (entry.confirmed || alreadyQueued)) {
+							// Delivery was confirmed earlier (or the message is queued
+							// already): re-sending would duplicate it.
+							this.logger.warn('Background scan: input box stayed unreadable — message was already delivered or queued, not re-sending', {
+								sessionName,
+								snippet: entry.snippet.slice(0, 50),
+								confirmed: !!entry.confirmed,
+							});
+							continue;
+						}
+						if (entry.unreadable && entry.message) {
+							// The box never became readable: we cannot tell whether
+							// the message went in. Hand it back to the queue (retried
+							// with backoff, the owner told if it stays blocked) rather
+							// than give up on it (review #3 of crewly#1014).
+							SubAgentMessageQueue.getInstance().enqueue(sessionName, entry.message);
+							InputBlockedRetryService.getInstance().noteRefusal(sessionName, { state: 'unknown', inputLength: 0, message: entry.message });
+							this.logger.error('Background scan: input box stayed unreadable — message re-queued', {
+								sessionName,
+								snippet: entry.snippet.slice(0, 50),
+								attempts: entry.recoveryAttempts,
+							});
+							continue;
+						}
+						this.logger.error('Background scan: max recovery attempts exhausted — the message may not have been delivered', {
+							sessionName,
+							snippet: entry.snippet.slice(0, 50),
+							attempts: entry.recoveryAttempts,
+						});
+						continue;
+					}
+
+					if (bottomText.includes(entry.snippet)) {
+						// The text near the bottom is often only the transcript echo
+						// of a message already submitted. Enter is pressed only when
+						// the input box itself holds exactly this message — never on
+						// an empty box (it may show a ghost prompt suggestion; Enter
+						// or Tab would submit it as the owner — 2026-10-03).
+						const reading = await sessionHelper.submitIfInputIsOurs(sessionName, entry.message);
+						if (reading.state === 'empty') {
+							// The box is empty: our message was submitted (the text
+							// seen was its echo). Nothing to do.
+							entry.recovered = true;
+							continue;
+						}
+						if (reading.state === 'foreign') {
+							const squashed = (t: string): string => t.replace(/\s+/g, '');
+							if (squashed(reading.text).includes(squashed(entry.snippet))) {
+								// Our message is in the box mixed with text we did not
+								// write. Never wipe text we cannot prove is ours: leave the
+								// box as it is and hand the message back to delivery, which
+								// keeps it queued until the box is empty. The entry is marked
+								// recovered only once delivery has it (2026-10-03 review).
+								this.logger.warn('Background scan: tracked message stuck with foreign text in the box — not touching it, re-queuing the message', {
+									sessionName,
+									snippet: entry.snippet.slice(0, 50),
+								});
+								this.logger.warn('Background scan: input box text (not ours)', { sessionName, inputPreview: reading.text.slice(0, 80) });
+								try {
+									const result = await this.sendMessageToAgent(sessionName, entry.message);
+									if (result.success) {
+										entry.recovered = true;
+									} else {
+										entry.recoveryAttempts++;
+										this.logger.error('Background scan: re-delivery failed — will try again next scan', { sessionName, error: result.error });
+									}
+								} catch (err) {
+									entry.recoveryAttempts++;
+									this.logger.error('Background scan: re-delivery threw — will try again next scan', {
+										sessionName,
+										error: err instanceof Error ? err.message : String(err),
+									});
+								}
+								break;
+							}
+							// Our text is not in the box (someone else's is): ours was submitted.
+							entry.recovered = true;
+							continue;
+						}
+						entry.recoveryAttempts++;
+						entry.unreadable = reading.state === 'unknown';
+						if (reading.state === 'unknown') {
+							// Cannot see the box: never press Enter blindly, never mark
+							// it recovered — look again next scan; exhausting attempts
+							// is logged as an error above.
+							this.logger.warn('Background scan: tracked message near the bottom but the input box cannot be read — not pressing Enter', {
+								sessionName,
+								snippet: entry.snippet.slice(0, 50),
+								attempt: entry.recoveryAttempts,
+							});
+							break;
+						}
+						this.logger.warn('Background scan: tracked message stuck in the input box, pressed Enter', {
+							sessionName,
+							snippet: entry.snippet.slice(0, 50),
+							ageMs: now - entry.sentAt,
+							attempt: entry.recoveryAttempts,
+							maxAttempts: MAX_RECOVERY_ATTEMPTS,
+						});
+						break; // One recovery per session per scan cycle
+					}
+				}
+			} catch (error) {
+				this.logger.debug('Error scanning tracked messages for session', {
+					sessionName,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+
+		// Clean up old tracked-message entries
+		for (const [sessionName, entries] of this.sentMessageTracker) {
+			const fresh = entries.filter(e => now - e.sentAt < 5 * 60 * 1000);
+			if (fresh.length === 0) {
+				this.sentMessageTracker.delete(sessionName);
+			} else {
+				this.sentMessageTracker.set(sessionName, fresh);
+			}
+		}
+	}
+
+	/**
+	 * Unregister a TUI session from the stuck-message detector.
+	 * Call this when a session is destroyed or agent is stopped.
+	 *
+	 * @param sessionName - The session to unregister
+	 */
+	unregisterTuiSession(sessionName: string): void {
+		this.tuiSessionRegistry.delete(sessionName);
+		this.sentMessageTracker.delete(sessionName);
+	}
+
+	/**
+	 * Register a message that was sent to a session for background
+	 * stuck-detection. The scanner will periodically check if the
+	 * message text is still visible at the bottom of the terminal.
+	 *
+	 * @param sessionName - The session the message was sent to
+	 * @param message - The full message text
+	 */
+	trackSentMessage(sessionName: string, message: string): void {
+		// Extract a search snippet: skip [CHAT:uuid] prefix, take first 80 chars
+		const { prefixLength } = extractChatPrefix(message);
+		const contentStart = prefixLength;
+		// Normalize whitespace: messages may contain \n from enhanced templates.
+		// Terminal bottom text is join(' '), so \n in snippet would never match.
+		const snippet = message.slice(contentStart, contentStart + 80).replace(/\s+/g, ' ').trim();
+		if (snippet.length < 10) return; // Too short to reliably match
+
+		const entries = this.sentMessageTracker.get(sessionName) || [];
+		entries.push({ snippet, message, sentAt: Date.now(), recovered: false, recoveryAttempts: 0 });
+
+		// Keep only last 5 minutes of entries
+		const cutoff = Date.now() - 5 * 60 * 1000;
+		this.sentMessageTracker.set(
+			sessionName,
+			entries.filter(e => e.sentAt > cutoff)
+		);
+
+		// Ensure the background scanner is running
+		this.startStuckMessageDetector();
+	}
+
+	/**
+	 * Check if the agent appears to be at an input prompt.
+	 * Delegates to the regex-free isAgentAtPrompt() from terminal-string-ops,
+	 * with additional logging and per-line prompt detection using isPromptLine().
+	 *
+	 * @param terminalOutput - The terminal output to check
+	 * @param runtimeType - The runtime type for pattern selection
+	 * @returns true if the agent appears to be at a prompt
+	 */
+	/**
+	 * Claude Code's idle prompt read from the faint-free input box rather
+	 * than from screen text. The text check ({@link isClaudeAtPrompt}) wants
+	 * `❯` alone on its line, but an idle box shows a faint placeholder or
+	 * prompt suggestion (`❯ Try "edit <filepath> to..."`) that plain capture
+	 * includes — so idle read as "not at prompt" and deliveries went through
+	 * only on the final attempt — while a busy box with nothing typed reads
+	 * as a bare `❯`. Here: idle at the prompt = a readable Claude Code box
+	 * (bare or labelled top rule) that is empty or holds our own pending
+	 * paste, and no turn on screen (busy bar or spinner line).
+	 *
+	 * @param sessionHelper - Session helper (needs `readInputBox`)
+	 * @param sessionName - The session
+	 * @param screen - Captured screen text (for the turn-in-progress check)
+	 * @param runtimeType - The session's runtime, if known
+	 * @returns true/false when decided from the box; null when it cannot be
+	 *   (another runtime, no styled capture, unreadable screen)
+	 */
+	private claudeIdlePromptFromBox(
+		sessionHelper: unknown,
+		sessionName: string,
+		screen: string,
+		runtimeType?: RuntimeType,
+	): boolean | null {
+		if (runtimeType !== undefined && runtimeType !== RUNTIME_TYPES.CLAUDE_CODE) return null;
+		const read = (sessionHelper as { readInputBox?: (s: string, m: string, st: 'recovery') => TuiInputReading } | null)?.readInputBox;
+		if (typeof read !== 'function') return null;
+		let reading: TuiInputReading;
+		try {
+			reading = read.call(sessionHelper, sessionName, '', 'recovery');
+		} catch {
+			return null;
+		}
+		if (!reading || reading.state === 'unknown' || reading.layout !== 'claude-code') return null;
+		const tail = (screen || '').split('\n').slice(-TUI_INPUT_GUARD.BUSY_BAR_TAIL_LINES).join('\n');
+		if (screenShowsTurnInProgress(tail)) return false;
+		return reading.state === 'empty' || reading.ownPasteMarker === true;
+	}
+
+	/**
+	 * Whether the agent is idle at its input prompt, for deciding when to
+	 * write: the input box for Claude Code ({@link claudeIdlePromptFromBox}),
+	 * the screen-text check otherwise.
+	 *
+	 * @param sessionHelper - Session helper
+	 * @param sessionName - The session
+	 * @param screen - Captured screen text
+	 * @param runtimeType - The session's runtime, if known
+	 * @returns True when idle at the prompt
+	 */
+	private isAtIdlePrompt(sessionHelper: unknown, sessionName: string, screen: string, runtimeType?: RuntimeType): boolean {
+		return this.claudeIdlePromptFromBox(sessionHelper, sessionName, screen, runtimeType) ?? this.isClaudeAtPrompt(screen, runtimeType);
+	}
+
+	/**
+	 * Whether ActivityMonitor says this agent is mid-task.
+	 *
+	 * Used to qualify "at the prompt": Claude Code paints one while waiting
+	 * on a tool, and a message written then is absorbed into the running
+	 * turn and never answered. Only a positive answer is trusted — the
+	 * monitor polls on a 30s cadence, so `idle` may merely be stale, while
+	 * `in_progress` is a fact.
+	 *
+	 * Bounded: `getWorkingStatusForSession` has hung before (the 2026-05-14
+	 * incident), and delivery must not wedge behind it. A timeout answers
+	 * "not busy", which is the old behaviour.
+	 *
+	 * @param sessionName - The agent session
+	 * @returns True only when the monitor positively reports in_progress
+	 */
+	private async isBusyByWorkingStatus(sessionName: string): Promise<boolean> {
+		try {
+			const { ActivityMonitorService } = await import('../monitoring/activity-monitor.service.js');
+			const status = await Promise.race([
+				ActivityMonitorService.getInstance().getWorkingStatusForSession(sessionName),
+				new Promise<null>((r) => setTimeout(() => r(null), SESSION_COMMAND_DELAYS.WORKING_STATUS_PROBE_TIMEOUT_MS)),
+			]);
+			if (status === 'in_progress') {
+				this.logger.info('Agent shows a prompt but is still working — holding the message', { sessionName });
+				return true;
+			}
+			return false;
+		} catch {
+			return false;
+		}
+	}
+
+	private isClaudeAtPrompt(terminalOutput: string, runtimeType?: RuntimeType): boolean {
+		// Handle null/undefined/empty input — return false since an empty buffer
+		// may indicate a crashed session or one that hasn't started yet
+		if (!terminalOutput || typeof terminalOutput !== 'string') {
+			this.logger.debug('Terminal output is empty or invalid, cannot detect prompt', { runtimeType });
+			return false;
+		}
+
+		// Only analyze the tail of the buffer to avoid matching historical prompts.
+		// Use 5000 chars to accommodate large tool outputs that push the prompt
+		// further back in the buffer (#106).
+		const tailSection = terminalOutput.slice(-5000);
+
+		// Check for prompt FIRST. Processing indicators like "thinking" or "analyzing"
+		// can appear in the agent's previous response text and persist in the terminal
+		// scroll buffer, causing false negatives if checked before the prompt.
+		const lines = tailSection.split('\n').filter((line) => line.trim().length > 0);
+		const linesToCheck = lines.slice(-10);
+
+		const hasPrompt = linesToCheck.some(line => isPromptLine(line, runtimeType));
+		if (hasPrompt) {
+			return true;
+		}
+
+		// No prompt found — check if still processing.
+		// Check last 10 lines (not just 5) because tool output can push processing
+		// indicators further up while the status bar stays at the bottom.
+		const recentLines = linesToCheck.join('\n');
+		if (containsProcessingIndicator(recentLines)) {
+			this.logger.debug('Processing indicators present near bottom of output');
+			return false;
+		}
+
+		// Check for "esc to interrupt" in the status bar — this is a definitive
+		// busy signal. Claude Code only shows this text while actively processing.
+		// It disappears when the agent returns to idle at the prompt.
+		if (containsBusyStatusBar(recentLines)) {
+			this.logger.debug('Busy status bar detected (esc to interrupt)');
+			return false;
+		}
+
+		this.logger.debug('No prompt detected in terminal output', {
+			tailLength: tailSection.length,
+			lastLines: linesToCheck.slice(-3).map(l => l.substring(0, 80)),
+			runtimeType,
+		});
+
+		return false;
+	}
+
+	/**
+	 * Detect if Gemini CLI is currently in shell mode.
+	 *
+	 * In shell mode, Gemini CLI changes its prompt from `>` to `!`. Any input
+	 * sent in this mode is executed as a shell command instead of being passed
+	 * to the model. This method examines the last few lines of terminal output
+	 * for shell mode prompt indicators.
+	 *
+	 * @param terminalOutput - Captured terminal pane content
+	 * @returns true if the terminal shows a shell mode prompt
+	 */
+	private isGeminiInShellMode(terminalOutput: string): boolean {
+		if (!terminalOutput || typeof terminalOutput !== 'string') {
+			return false;
+		}
+
+		const lines = terminalOutput.split('\n').filter((line) => line.trim().length > 0);
+		const linesToCheck = lines.slice(-10);
+
+		return linesToCheck.some((line) => {
+			const trimmed = line.trim();
+			// Strip TUI box-drawing borders
+			const stripped = trimmed.replace(/^[│┃|]+\s*/, '').replace(/\s*[│┃|]+$/, '');
+
+			// Shell mode prompt: `!` alone or `! ` with text (not `> ` which is normal mode)
+			// Check stripped line — after removing box-drawing, if it starts with `! ` or equals `!`
+			if (stripped === '!' || stripped.startsWith('! ')) {
+				return true;
+			}
+
+			// Also check pattern-based detection for bordered prompts
+			return GEMINI_SHELL_MODE_CONSTANTS.SHELL_MODE_PROMPT_PATTERNS.some(
+				(pattern) => pattern.test(trimmed)
+			);
+		});
+	}
+
+	/**
+	 * Escape from Gemini CLI shell mode by sending Escape key.
+	 *
+	 * Sends Escape and waits for the prompt to change from `!` back to `>`.
+	 * Retries up to MAX_ESCAPE_ATTEMPTS times.
+	 *
+	 * @param sessionName - The session running Gemini CLI
+	 * @param sessionHelper - SessionCommandHelper instance
+	 * @returns true if successfully escaped shell mode, false if still in shell mode
+	 */
+	private async escapeGeminiShellMode(
+		sessionName: string,
+		sessionHelper: SessionCommandHelper
+	): Promise<boolean> {
+		for (let attempt = 1; attempt <= GEMINI_SHELL_MODE_CONSTANTS.MAX_ESCAPE_ATTEMPTS; attempt++) {
+			this.logger.info('Gemini CLI in shell mode, sending Escape to exit', {
+				sessionName,
+				attempt,
+			});
+
+			await sessionHelper.sendEscape(sessionName);
+			await delay(GEMINI_SHELL_MODE_CONSTANTS.ESCAPE_DELAY_MS);
+
+			// Check if we're back to normal mode
+			const output = sessionHelper.capturePane(sessionName);
+			if (!this.isGeminiInShellMode(output)) {
+				this.logger.info('Successfully exited Gemini CLI shell mode', {
+					sessionName,
+					attempt,
+				});
+				return true;
+			}
+		}
+
+		this.logger.warn('Failed to exit Gemini CLI shell mode after max attempts', {
+			sessionName,
+			maxAttempts: GEMINI_SHELL_MODE_CONSTANTS.MAX_ESCAPE_ATTEMPTS,
+		});
+		return false;
+	}
+
+	/**
+	 * Generic key sending to any agent session
+	 * @param sessionName The agent session name
+	 * @param key The key to send (e.g., 'Enter', 'Ctrl+C')
+	 * @returns Promise with success/error information
+	 */
+	async sendKeyToAgent(
+		sessionName: string,
+		key: string
+	): Promise<{
+		success: boolean;
+		message?: string;
+		error?: string;
+	}> {
+		try {
+			// Get session helper once to avoid repeated async calls
+			const sessionHelper = await this.getSessionHelper();
+
+			// Check if session exists
+			const sessionExists = sessionHelper.sessionExists(sessionName);
+			if (!sessionExists) {
+				return {
+					success: false,
+					error: `Session '${sessionName}' does not exist`,
+				};
+			}
+
+			// Send key using session command helper
+			await sessionHelper.sendKey(sessionName, key);
+
+			this.logger.info('Key sent to agent successfully', {
+				sessionName,
+				key,
+			});
+
+			return {
+				success: true,
+				message: `${key} key sent to agent successfully`,
+			};
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			this.logger.error('Failed to send key to agent', {
+				sessionName,
+				key,
+				error: errorMessage,
+			});
+
+			return {
+				success: false,
+				error: errorMessage,
+			};
+		}
+	}
+
+	/**
+	 * Generic health check for any agent session
+	 * @param sessionName The agent session name
+	 * @param role The agent role for additional context
+	 * @param timeout Timeout for health check in milliseconds
+	 * @returns Promise with health status information
+	 */
+	async checkAgentHealth(
+		sessionName: string,
+		role?: string,
+		timeout: number = 1000
+	): Promise<{
+		success: boolean;
+		data?: {
+			agent: {
+				sessionName: string;
+				role?: string;
+				running: boolean;
+				status: (typeof CREWLY_CONSTANTS.AGENT_STATUSES)[keyof typeof CREWLY_CONSTANTS.AGENT_STATUSES];
+			};
+			timestamp: string;
+		};
+		error?: string;
+	}> {
+		try {
+			// Lightweight health check with timeout
+			const agentRunning = await Promise.race([
+				(await this.getSessionHelper()).sessionExists(sessionName),
+				new Promise<boolean>((_, reject) =>
+					setTimeout(() => reject(new Error('Health check timeout')), timeout)
+				),
+			]).catch(() => false);
+
+			return {
+				success: true,
+				data: {
+					agent: {
+						sessionName,
+						role,
+						running: agentRunning,
+						status: agentRunning
+							? CREWLY_CONSTANTS.AGENT_STATUSES.ACTIVE
+							: CREWLY_CONSTANTS.AGENT_STATUSES.INACTIVE,
+					},
+					timestamp: new Date().toISOString(),
+				},
+			};
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			this.logger.error('Failed to check agent health', {
+				sessionName,
+				role,
+				error: errorMessage,
+			});
+
+			return {
+				success: false,
+				error: errorMessage,
+			};
+		}
+	}
+
+	/**
+	 * Write the prompt to a file and send a short instruction to the agent to read it.
+	 *
+	 * Instead of pasting large multi-line prompts directly into the terminal (which
+	 * causes bracketed paste issues, shell interpretation errors, and truncation),
+	 * we write the prompt to ~/.crewly/prompts/{sessionName}-init.md and send a
+	 * single-line instruction telling the agent to read that file.
+	 *
+	 * @param sessionName The session name
+	 * @param prompt The full system prompt to deliver
+	 * @param runtimeType The agent runtime type
+	 * @param abortSignal Optional signal to cancel the operation (e.g. on runtime exit)
+	 * @returns true if the instruction was delivered successfully
+	 */
+	private async sendPromptRobustly(
+		sessionName: string,
+		prompt: string,
+		runtimeType: RuntimeType = RUNTIME_TYPES.CLAUDE_CODE,
+		abortSignal?: AbortSignal
+	): Promise<boolean> {
+		const isClaudeCode = runtimeType === RUNTIME_TYPES.CLAUDE_CODE;
+		const sessionHelper = await this.getSessionHelper();
+
+		// Step 1: Write prompt to a file (idempotent — may already exist from pre-launch write).
+		const promptFilePath = await this.writePromptFile(sessionName, prompt);
+		if (!promptFilePath) {
+			// File write failure is fatal — all runtimes use the file-read approach.
+			return false;
+		}
+
+		// Step 2: Build the message to send.
+		// Claude Code: prompt was already loaded via --agent flag at launch (#207),
+		// so the agent already has all instructions as its agent definition. Just send a short
+		// kickoff trigger — no need to ask it to read the file again.
+		// Gemini CLI / other runtimes: need the file-read instruction since the prompt
+		// was NOT loaded via system prompt.
+		const resumedRole = this.resumedSessions.get(sessionName);
+		const handover = this.pendingHandovers.get(sessionName);
+		if (handover) this.pendingHandovers.delete(sessionName);
+		// A resumed conversation (Claude `--resume`, Codex `resume`) already went
+		// through its startup steps; the full kickoff would read as a restart
+		// from scratch (2026-09-25). It gets the short "register again, then
+		// carry on" message instead — for every runtime. A genuinely fresh
+		// conversation (new session, or the orc handover case, which is never
+		// marked resumed) keeps the full kickoff.
+		const restartNote = this.pendingRestartNotes.get(sessionName);
+		if (restartNote) this.pendingRestartNotes.delete(sessionName);
+		const switchNote = [takeRuntimeSwitchKickoffNote(sessionName), handover || resumedRole ? null : restartNote]
+			.filter(Boolean)
+			.join(' ') || null;
+		const baseMessage = resumedRole
+			? this.resumedKickoff(sessionName, resumedRole, isClaudeCode ? undefined : promptFilePath)
+			: isClaudeCode
+				? 'Begin your work now. Follow the step-by-step instructions in your agent definition EXACTLY — start with Step 1, then Step 2, then Step 3 (register-self). Do NOT skip or reorder steps. Registration is required before the system will deliver messages to you.' +
+					(handover
+						? ` This is a fresh conversation: your previous one had grown to ${handover.tokens} tokens and was closed. After registering, read ${handover.path} once — it holds the end of what was said before.`
+						: '')
+				: `Read the file at ${promptFilePath} and follow all instructions in it.`;
+		// After a runtime switch (usage limit) the kickoff carries the handover
+		// and the WorkItem to continue.
+		const messageToSend = switchNote ? `${baseMessage} ${switchNote}` : baseMessage;
+		// Note: kickoff message is intentionally imperative for reliable agent bootstrapping.
+		// The --agent flag (Claude Code) loads the prompt as trusted system context, so this
+		// short trigger is not subject to PI detection.
+
+		// Single attempt for all runtimes. Retrying causes duplicate messages because:
+		// - Claude Code: returns to its prompt between tool calls, making retry
+		//   checks think the first message wasn't received.
+		// - Gemini CLI: the echoed message "Read the file at..." starts with `> `
+		//   which isClaudeAtPrompt misdetects as an idle prompt, and the TUI's
+		//   input box shows `> ` even during processing. Both cause false-negative
+		//   delivery verification and unnecessary retries.
+		// The sendMessage helper reliably writes to the PTY — if it succeeds,
+		// the message was delivered.
+		const maxAttempts = 1;
+
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			// Check abort before each attempt
+			if (this.isFlowCancelled(sessionName, abortSignal)) {
+				this.logger.info('Prompt delivery aborted (runtime exited)', { sessionName, attempt });
+				return false;
+			}
+
+			try {
+				this.logger.info('Sending prompt to agent', {
+					sessionName,
+					attempt,
+					runtimeType,
+					promptFilePath,
+					deliveryMethod: isClaudeCode ? 'system-prompt-kickoff' : 'file-read',
+				});
+
+				// Check abort before sending to terminal
+				if (this.isFlowCancelled(sessionName, abortSignal)) {
+					this.logger.info('Prompt delivery aborted before send (runtime exited)', { sessionName });
+					return false;
+				}
+
+				// No pre-clearing (2026-10-03 review): Escape / Ctrl+U would wipe
+				// whatever the box holds without knowing whose it is. The guarded
+				// sendMessage below types only into a box it reads as empty.
+
+				// Check abort right before writing instruction to terminal
+				if (this.isFlowCancelled(sessionName, abortSignal)) {
+					this.logger.info('Prompt delivery aborted before instruction send (runtime exited)', { sessionName });
+					return false;
+				}
+
+				// Send the kickoff / file-read instruction
+				await sessionHelper.sendMessage(sessionName, messageToSend);
+
+				// Claude Code: rapid-check verification.
+				// Check every 1s for up to 24s (Claude v2 first-token can be slow: MCP/skill load) whether Claude started processing.
+				// If Claude leaves the prompt at any point, the message was received.
+				// This avoids the old length-comparison approach which was unreliable
+				// (Claude's TUI redraws change output length unpredictably).
+				if (isClaudeCode) {
+					for (let i = 0; i < 24; i++) {
+						await delay(1000);
+						if (this.isFlowCancelled(sessionName, abortSignal)) return false;
+
+						const currentOutput = sessionHelper.capturePane(sessionName);
+
+						// Processing indicators (spinners) = definitive success
+						if (containsSpinnerOrWorkingIndicator(currentOutput)) {
+							this.logger.debug('Kickoff delivered — processing indicators detected', {
+								sessionName, checkIndex: i,
+							});
+							return true;
+						}
+
+						// Claude left the prompt = started working on the message
+						if (!this.isClaudeAtPrompt(currentOutput, RUNTIME_TYPES.CLAUDE_CODE)) {
+							this.logger.debug('Kickoff delivered — Claude left prompt', {
+								sessionName, checkIndex: i,
+							});
+							return true;
+						}
+					}
+
+					// Claude still at prompt after 8s — message likely not received.
+					// For Claude Code with --append-system-prompt-file, don't retry
+					// (would cause duplicate). Log warning and return false.
+					// Still at prompt — the kickoff was likely typed but not submitted (PTY submit
+					// can be dropped). A missing agent costs far more than a duplicate kickoff
+					// (idempotent: it just re-reads the prompt file), so resend ONCE and re-poll.
+					this.logger.warn('Kickoff unconfirmed after 24s — resending once', { sessionName, runtimeType });
+					if (this.isFlowCancelled(sessionName, abortSignal)) return false;
+					await sessionHelper.sendMessage(sessionName, messageToSend);
+					for (let j = 0; j < 12; j++) {
+						await delay(1000);
+						if (this.isFlowCancelled(sessionName, abortSignal)) return false;
+						const out2 = sessionHelper.capturePane(sessionName);
+						if (containsSpinnerOrWorkingIndicator(out2) || !this.isClaudeAtPrompt(out2, RUNTIME_TYPES.CLAUDE_CODE)) {
+							this.logger.debug('Kickoff delivered on resend', { sessionName, checkIndex: j });
+							return true;
+						}
+					}
+					this.logger.warn('Kickoff delivery unconfirmed after resend — giving up', { sessionName, runtimeType });
+					return false;
+				}
+
+				// Gemini CLI / other runtimes: trust the PTY delivery.
+				// sendMessage writes directly to the PTY — if it didn't throw,
+				// the message was delivered. Terminal-based verification is unreliable
+				// because Gemini's TUI always shows `> ` (even during processing)
+				// and our echoed message starts with `> `, both causing false
+				// "at prompt" detection.
+				this.logger.info('Prompt instruction sent to PTY (trusting delivery)', {
+					sessionName, attempt, runtimeType,
+					messageLength: messageToSend.length,
+				});
+				return true;
+			} catch (error) {
+				this.logger.error('Error during prompt instruction delivery', {
+					sessionName,
+					attempt,
+					runtimeType,
+					error: error instanceof Error ? error.message : String(error),
+				});
+
+				if (attempt === maxAttempts) {
+					return false;
+				}
+			}
+		}
+
+		this.logger.warn('Prompt instruction delivery unconfirmed after all attempts (agent may still process it)', {
+			sessionName,
+			maxAttempts,
+			runtimeType,
+		});
+		return false;
+	}
+
+	/**
+	 * Capture the current PTY output of a running agent session.
+	 *
+	 * Used by the queue processor to verify that a force-delivered message
+	 * was actually seen by the agent (pending-ack verification).
+	 *
+	 * @param sessionName - The agent session name
+	 * @param lines - Number of lines to capture (default 200)
+	 * @returns The captured terminal output, or empty string if session not found
+	 */
+	async captureAgentOutput(sessionName: string, lines = 200): Promise<string> {
+		try {
+			const sessionHelper = await this.getSessionHelper();
+			if (!sessionHelper.sessionExists(sessionName)) {
+				return '';
+			}
+			return sessionHelper.capturePane(sessionName, lines);
+		} catch {
+			return '';
+		}
+	}
+}
+
+
+/**
+ * Whether Codex has its own stored login (`$CODEX_HOME/auth.json`, written by
+ * `codex login` for ChatGPT or an API key).
+ *
+ * @param env - Environment (tests)
+ * @returns True when the auth file exists
+ */
+export function codexHasOwnLogin(env: NodeJS.ProcessEnv = process.env): boolean {
+	const home = env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : path.join(os.homedir(), '.codex');
+	return existsSync(path.join(home, 'auth.json'));
+}
+
+
+/** Sign-in prompts of the CLI runtimes (compared with spaces removed: TUIs drop them). */
+const SIGN_IN_SCREEN = /signinwithchatgpt|provideyourownapikey|signinwithdevicecode|pastecodehereifprompted|usetheurlbelowtosignin|loginwithgoogle/i;
+
+/**
+ * Whether a captured screen is a runtime's sign-in / login prompt.
+ *
+ * @param screen - Captured terminal text
+ * @returns True for a sign-in screen
+ */
+export function isSignInScreen(screen: string): boolean {
+	return SIGN_IN_SCREEN.test((screen ?? '').replace(/\s+/g, ''));
+}

@@ -1,0 +1,20 @@
+/**
+ * Channel Filter Bar Styles
+ *
+ * Layout only — filter chips use Button + Badge UI library components.
+ */
+
+.channel-filter-bar {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+
+/* Mobile responsive */
+@media (max-width: 768px) {
+  .channel-filter-bar {
+    padding: 0.5rem 0.75rem;
+  }
+}

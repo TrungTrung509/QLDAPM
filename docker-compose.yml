@@ -1,0 +1,30 @@
+services:
+  crewly:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: crewly
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - crewly_data:/home/node/.crewly
+      - ${HOST_PROJECT_PATH:-..}:/home/node/project
+    environment:
+      - NODE_ENV=production
+      - WEB_PORT=8787
+      - DEFAULT_RUNTIME=antigravity-cli
+      - CREWLY_FORCE_EMPTY_BOOT=1
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  crewly_data:
+    driver: local

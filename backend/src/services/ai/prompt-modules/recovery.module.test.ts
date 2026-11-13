@@ -1,0 +1,219 @@
+import * as fsMocked from 'fs';
+import { RecoveryModule } from './recovery.module.js';
+import { ModuleConfig } from './prompt-module.interface.js';
+import { ACTIVE_WORK_HEADING } from './active-work.module.js';
+
+// Mock fs for fragment loading
+jest.mock('fs', () => ({
+	existsSync: jest.fn().mockReturnValue(false),
+	readFileSync: jest.fn().mockReturnValue(''),
+}));
+
+describe('RecoveryModule', () => {
+	let module: RecoveryModule;
+
+	const baseConfig: ModuleConfig = {
+		sessionName: 'crewly-product-sam-217bfbbf',
+		memberId: '217bfbbf-9c90-41ec-bf93-b7fca1b5934f',
+		role: 'developer',
+		teamId: '817a1aeb-b04e-45dd-bdbc-be5cbc4345f1',
+		projectPath: '/Users/user/projects/crewly',
+		agentSkillsPath: '/path/to/skills/agent',
+		tlSkillsPath: '/path/to/skills/team-leader',
+		projectRoot: '/path/to/project',
+	};
+
+	beforeEach(() => {
+		module = new RecoveryModule();
+	});
+
+	it('should have correct metadata', () => {
+		expect(module.name).toBe('recovery');
+		expect(module.priority).toBe(2);
+		expect(module.maxTokens).toBe(600);
+		expect(module.compactable).toBe(false);
+	});
+
+	it('should always be included', () => {
+		expect(module.shouldInclude(baseConfig)).toBe(true);
+		expect(module.shouldInclude({ ...baseConfig, role: 'orchestrator' })).toBe(true);
+	});
+
+	it('should build recovery protocol with all steps', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain('## Session Recovery Protocol (MANDATORY)');
+		expect(result).toContain('### Step 1: Load your context (one memory search)');
+		expect(result).toContain('### Step 2: Read your active work');
+		expect(result).toContain('### Step 3: Register yourself as active');
+		expect(result).toContain('### Step 4: Assess and report');
+	});
+
+	it('runs one memory search at startup: get-my-context with the startup context, no separate recall (#857)', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).not.toContain('core/recall/execute.sh');
+		expect(result).toContain('core/get-my-context/execute.sh');
+		expect(result).toContain(`"context":"${baseConfig.role} session startup, recent tasks, unfinished work, blockers, key decisions"`);
+		// Task history is not fetched on top of the active-work briefing.
+		expect(result).not.toContain('core/get-my-tasks/execute.sh');
+		expect(result).toContain('read-task');
+		expect(result).toContain('workingNotes');
+	});
+
+	it('should reference get-my-active-work skill in Step 2 (issue #395)', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain('core/get-my-active-work/execute.sh');
+		expect(result).toContain('--session');
+		expect(result).toContain(baseConfig.sessionName);
+		// State precedence rule must be highlighted so the agent does not silently
+		// override the briefing with their own memory.
+		expect(result).toContain('State always wins over memory');
+	});
+
+	it('refers to the Active Work section by the heading ActiveWorkModule emits (#816)', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain(`\`${ACTIVE_WORK_HEADING}\` section above`);
+		// The old wording claimed the system "has already injected" the
+		// section unconditionally, which was false on the modular path.
+		expect(result).not.toContain('has already injected');
+		// It must tell the agent what to do when the section is the
+		// "not injected" notice rather than the briefing.
+		expect(result).toMatch(/Run this skill now if that section says it was \*\*not injected\*\*/);
+	});
+
+	it('points Step 1 at the Standing Answers section before the context search (#816 part B)', async () => {
+		const result = await module.build(baseConfig);
+		const step1 = result.slice(result.indexOf('### Step 1:'), result.indexOf('### Step 1.5'));
+		expect(step1).toContain('`## Standing Answers` section appears above');
+		expect(step1.indexOf('Standing Answers')).toBeLessThan(step1.indexOf('core/get-my-context/execute.sh'));
+	});
+
+	it('should carry the startup search in the get-my-context command (#857)', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).not.toContain('core/recall/execute.sh');
+		expect(result).toContain(`"agentId":"${baseConfig.sessionName}"`);
+		expect(result).toContain(`"context":"${baseConfig.role} session startup`);
+		expect(result).toContain(`"projectPath":"${baseConfig.projectPath}"`);
+	});
+
+	it('should include get-my-context command with correct parameters', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain('core/get-my-context/execute.sh');
+		expect(result).toContain(`"agentId":"${baseConfig.sessionName}"`);
+		expect(result).toContain(`"agentRole":"${baseConfig.role}"`);
+	});
+
+	it('should include assessment checklist', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain('Check for unfinished work');
+		expect(result).toContain('Check for pending blockers');
+		expect(result).toContain('Report status');
+	});
+
+	it('should include mandatory warning', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain('Do NOT skip these steps');
+		expect(result).toContain('Context recovery prevents duplicate work');
+	});
+
+	it('should use agentSkillsPath for commands', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain(`bash ${baseConfig.agentSkillsPath}/core/get-my-context`);
+		expect(result).toContain(`bash ${baseConfig.agentSkillsPath}/core/get-my-active-work`);
+	});
+
+	it('should use projectRoot when projectPath is undefined', async () => {
+		const noPathConfig: ModuleConfig = {
+			...baseConfig,
+			projectPath: undefined,
+		};
+		const result = await module.build(noPathConfig);
+
+		expect(result).toContain(baseConfig.projectRoot);
+		expect(result).not.toContain('undefined');
+	});
+
+	it('should adapt role in recall context string', async () => {
+		const orchConfig: ModuleConfig = { ...baseConfig, role: 'orchestrator' };
+		const result = await module.build(orchConfig);
+
+		expect(result).toContain('"context":"orchestrator session startup');
+	});
+
+	it('should produce output in markdown format', async () => {
+		const result = await module.build(baseConfig);
+		const lines = result.split('\n');
+
+		// First line is the heading
+		expect(lines[0]).toBe('## Session Recovery Protocol (MANDATORY)');
+		// Contains code blocks
+		expect(result).toContain('```bash');
+		expect(result).toContain('```');
+	});
+
+	it('should include workingNotes recovery instruction in Step 2 (read-task, #857)', async () => {
+		const result = await module.build(baseConfig);
+
+		expect(result).toContain('workingNotes');
+		expect(result).toContain('read-task');
+		expect(result).toContain('resume from there');
+	});
+
+	describe('fragment loading', () => {
+		it('should load fragment for orchestrator when available', async () => {
+			const fs = require('fs');
+			fs.existsSync.mockReturnValueOnce(true);
+			fs.readFileSync.mockReturnValueOnce('# Orchestrator Recovery\nCustom startup sequence');
+
+			const orchConfig: ModuleConfig = { ...baseConfig, role: 'orchestrator' };
+			const result = await module.build(orchConfig);
+
+			expect(result).toContain('Orchestrator Recovery');
+			expect(result).toContain('Custom startup sequence');
+		});
+
+		it('substitutes skill-path and session placeholders in the orchestrator fragment (finding 12)', async () => {
+			jest.mocked(fsMocked.existsSync).mockReturnValueOnce(true);
+			jest.mocked(fsMocked.readFileSync).mockReturnValueOnce(
+				[
+					'bash {{ORCHESTRATOR_SKILLS_PATH}}/register-self/execute.sh \'{"sessionName":"{{SESSION_ID}}"}\'',
+					'bash {{AGENT_SKILLS_PATH}}/core/recall/execute.sh \'{"projectPath":"{{PROJECT_PATH}}"}\'',
+				].join('\n'),
+			);
+
+			const orchConfig: ModuleConfig = { ...baseConfig, role: 'orchestrator', sessionName: 'crewly-orc' };
+			const result = await module.build(orchConfig);
+
+			expect(result).not.toContain('{{');
+			expect(result).toContain(`${baseConfig.projectRoot}/config/skills/orchestrator/register-self/execute.sh`);
+			expect(result).toContain(`${baseConfig.agentSkillsPath}/core/recall/execute.sh`);
+			expect(result).toContain('"sessionName":"crewly-orc"');
+			expect(result).toContain(`"projectPath":"${baseConfig.projectPath || baseConfig.projectRoot}"`);
+		});
+
+		it('should fall back to inline content for orchestrator when no fragment', async () => {
+			const fs = require('fs');
+			fs.existsSync.mockReturnValue(false);
+
+			const orchConfig: ModuleConfig = { ...baseConfig, role: 'orchestrator' };
+			const result = await module.build(orchConfig);
+
+			expect(result).toContain('Session Recovery Protocol');
+		});
+
+		it('should not attempt fragment loading for worker roles', async () => {
+			const result = await module.build(baseConfig);
+
+			expect(result).toContain('Session Recovery Protocol');
+			expect(result).toContain('recall');
+		});
+	});
+});

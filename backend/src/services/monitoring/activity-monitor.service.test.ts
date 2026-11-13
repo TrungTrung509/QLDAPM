@@ -1,0 +1,1521 @@
+import { ActivityMonitorService, TeamWorkingStatusFile } from './activity-monitor.service';
+import { StorageService } from '../core/storage.service.js';
+import * as sessionModule from '../session/index.js';
+import { AgentHeartbeatService } from '../agent/agent-heartbeat.service.js';
+import { LoggerService, ComponentLogger } from '../core/logger.service.js';
+import { readFile, writeFile, rename, unlink } from 'fs/promises';
+import { join } from 'path';
+import { homedir } from 'os';
+import { existsSync } from 'fs';
+import { CREWLY_CONSTANTS, CONTINUATION_CONSTANTS, PTY_CONSTANTS, ACTIVITY_MONITOR_CONSTANTS, AGENT_ATTENTION_CONSTANTS } from '../../constants.js';
+import { stripAnsiCodes } from '../../utils/terminal-output.utils.js';
+import { PtyActivityTrackerService } from '../agent/pty-activity-tracker.service.js';
+import { getWaiting, resetWaitingRegistry } from './agent-attention-registry.js';
+
+// Mock dependencies
+jest.mock('node-pty', () => ({ spawn: jest.fn() }));
+jest.mock('../core/storage.service.js');
+jest.mock('../session/index.js');
+jest.mock('../agent/agent-heartbeat.service.js');
+// Factory mock, not automock: a module on this suite's import chain creates a
+// component logger in a static initializer at import time, before
+// beforeEach can stub getInstance(); an automocked getInstance() returns
+// undefined there and the whole suite fails to load. Tests still override
+// getInstance() per test.
+jest.mock('../core/logger.service.js', () => {
+  const noopLogger = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
+  return {
+    LoggerService: {
+      getInstance: jest.fn(() => ({ createComponentLogger: jest.fn(() => noopLogger) })),
+    },
+  };
+});
+jest.mock('../orchestrator/orchestrator-restart.service.js', () => ({
+  OrchestratorRestartService: {
+    getInstance: () => ({
+      attemptRestart: jest.fn().mockResolvedValue(true),
+    }),
+  },
+}));
+jest.mock('../../utils/terminal-output.utils.js', () => ({
+  stripAnsiCodes: jest.fn((s: string) => s),
+}));
+jest.mock('../agent/pty-activity-tracker.service.js', () => ({
+  PtyActivityTrackerService: {
+    getInstance: jest.fn().mockReturnValue({
+      getIdleTimeMs: jest.fn().mockReturnValue(0),
+      recordActivity: jest.fn(),
+    }),
+  },
+}));
+const mockRecordAgentWaitingOnHuman = jest.fn().mockResolvedValue('esc-1');
+const mockResolveAgentWaitingOnHuman = jest.fn().mockResolvedValue(1);
+const mockListPendingEscalations = jest.fn().mockResolvedValue([]);
+jest.mock('../v3/escalation-router.service.js', () => ({
+  EscalationRouterService: {
+    getInstance: () => ({
+      recordAgentWaitingOnHuman: mockRecordAgentWaitingOnHuman,
+      resolveAgentWaitingOnHuman: mockResolveAgentWaitingOnHuman,
+      listPending: mockListPendingEscalations,
+    }),
+  },
+}));
+jest.mock('fs/promises');
+jest.mock('fs');
+jest.mock('path');
+jest.mock('os');
+
+describe('ActivityMonitorService', () => {
+  let service: ActivityMonitorService;
+  let mockLogger: jest.Mocked<ComponentLogger>;
+  let mockStorageService: jest.Mocked<StorageService>;
+  let mockSessionBackend: jest.Mocked<sessionModule.ISessionBackend>;
+  let mockAgentHeartbeatService: jest.Mocked<AgentHeartbeatService>;
+  let mockLoggerService: jest.Mocked<LoggerService>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    // Reset singleton instance
+    (ActivityMonitorService as any).instance = undefined;
+
+    // Setup mocks
+    mockLogger = {
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+      debug: jest.fn()
+    } as any;
+
+    mockLoggerService = {
+      createComponentLogger: jest.fn().mockReturnValue(mockLogger)
+    } as any;
+
+    (LoggerService.getInstance as jest.Mock).mockReturnValue(mockLoggerService);
+
+    mockStorageService = {
+      getTeams: jest.fn().mockResolvedValue([]),
+      getProjects: jest.fn().mockResolvedValue([]),
+      updateAgentStatus: jest.fn().mockResolvedValue(undefined),
+      saveTeam: jest.fn().mockResolvedValue(undefined),
+    } as any;
+    (StorageService.getInstance as jest.Mock).mockReturnValue(mockStorageService);
+
+    mockSessionBackend = {
+      sessionExists: jest.fn().mockReturnValue(true),
+      captureOutput: jest.fn().mockReturnValue('some terminal output'),
+      getRawHistory: jest.fn().mockReturnValue('raw history'),
+      listSessions: jest.fn().mockReturnValue([]),
+      getSession: jest.fn().mockReturnValue(undefined),
+      killSession: jest.fn().mockResolvedValue(undefined),
+      createSession: jest.fn().mockResolvedValue({} as any),
+      getTerminalBuffer: jest.fn().mockReturnValue(''),
+      destroy: jest.fn().mockResolvedValue(undefined),
+    } as any;
+    mockAgentHeartbeatService = {
+      detectStaleAgents: jest.fn().mockResolvedValue([]),
+      getAllAgentHeartbeats: jest.fn().mockResolvedValue({
+        orchestrator: {
+          agentId: 'orchestrator',
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          agentStatus: 'active',
+          lastActiveTime: new Date().toISOString(),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+        teamMembers: {},
+        metadata: { lastUpdated: new Date().toISOString(), version: '1.0.0' },
+      }),
+      updateAgentHeartbeat: jest.fn().mockResolvedValue(undefined),
+      getInstance: jest.fn()
+    } as any;
+
+    // Source uses getSessionBackendSync (not getSessionBackend)
+    (sessionModule.getSessionBackendSync as jest.Mock).mockReturnValue(mockSessionBackend);
+    (AgentHeartbeatService.getInstance as jest.Mock).mockReturnValue(mockAgentHeartbeatService);
+
+    // Mock file system
+    (existsSync as jest.Mock).mockReturnValue(false);
+    (homedir as jest.Mock).mockReturnValue('/mock/home');
+    (join as jest.Mock).mockImplementation((...args) => args.join('/'));
+
+    // Mock rename for atomic writes in saveTeamWorkingStatusFile
+    (rename as jest.Mock).mockResolvedValue(undefined);
+    (unlink as jest.Mock).mockResolvedValue(undefined);
+
+    service = ActivityMonitorService.getInstance();
+  });
+
+  afterEach(() => {
+    // Clean up any running intervals
+    service.stopPolling();
+    jest.clearAllTimers();
+  });
+
+  describe('getInstance', () => {
+    it('should return singleton instance', () => {
+      const instance1 = ActivityMonitorService.getInstance();
+      const instance2 = ActivityMonitorService.getInstance();
+
+      expect(instance1).toBe(instance2);
+    });
+
+    it('should initialize logger and services', () => {
+      expect(LoggerService.getInstance).toHaveBeenCalled();
+      expect(mockLoggerService.createComponentLogger).toHaveBeenCalledWith('ActivityMonitor');
+    });
+  });
+
+  describe('startPolling', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('should start polling with immediate first check', () => {
+      const performActivityCheckSpy = jest.spyOn(service as any, 'performActivityCheck').mockResolvedValue(undefined);
+
+      service.startPolling();
+
+      expect(performActivityCheckSpy).toHaveBeenCalledTimes(1);
+      expect(mockLogger.info).toHaveBeenCalledWith(expect.stringContaining('Starting activity monitoring'));
+      expect(service.isRunning()).toBe(true);
+    });
+
+    it('should set up recurring polling', () => {
+      const performActivityCheckSpy = jest.spyOn(service as any, 'performActivityCheck').mockResolvedValue(undefined);
+
+      service.startPolling();
+
+      // Fast forward one polling interval (30s)
+      jest.advanceTimersByTime(30000);
+
+      expect(performActivityCheckSpy).toHaveBeenCalledTimes(2); // Initial + 1 interval
+    });
+
+    it('should warn if already running', () => {
+      service.startPolling();
+      service.startPolling();
+
+      expect(mockLogger.warn).toHaveBeenCalledWith('Activity monitoring already running');
+    });
+  });
+
+  describe('stopPolling', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('should stop polling and clear interval', () => {
+      service.startPolling();
+      expect(service.isRunning()).toBe(true);
+
+      service.stopPolling();
+
+      expect(service.isRunning()).toBe(false);
+      expect(mockLogger.info).toHaveBeenCalledWith('Activity monitoring stopped');
+    });
+
+    it('should do nothing if not running', () => {
+      service.stopPolling();
+
+      expect(mockLogger.info).not.toHaveBeenCalledWith('Activity monitoring stopped');
+    });
+  });
+
+  describe('performActivityCheck', () => {
+    const mockTeam = {
+      id: 'test-team',
+      name: 'Test Team',
+      projectIds: [],
+      createdAt: '2023-01-01T00:00:00.000Z',
+      updatedAt: '2023-01-01T00:00:00.000Z',
+      members: [
+        {
+          id: 'member-1',
+          name: 'Test Member 1',
+          role: 'developer' as const,
+          runtimeType: 'claude-code' as const,
+          systemPrompt: 'Test prompt',
+          agentStatus: 'active' as const,
+          workingStatus: 'idle' as const,
+          sessionName: 'test-session-1',
+          createdAt: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z'
+        },
+        {
+          id: 'member-2',
+          name: 'Test Member 2',
+          role: 'qa' as const,
+          runtimeType: 'claude-code' as const,
+          systemPrompt: 'Test prompt 2',
+          agentStatus: 'inactive' as const,
+          workingStatus: 'idle' as const,
+          sessionName: 'test-session-2',
+          createdAt: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z'
+        }
+      ]
+    };
+
+    const mockWorkingStatusData: TeamWorkingStatusFile = {
+      orchestrator: {
+        sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+        workingStatus: 'idle',
+        lastActivityCheck: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z'
+      },
+      teamMembers: {},
+      metadata: {
+        lastUpdated: '2023-01-01T00:00:00.000Z',
+        version: '1.0.0'
+      }
+    };
+
+    beforeEach(() => {
+      mockStorageService.getTeams.mockResolvedValue([mockTeam]);
+      mockSessionBackend.sessionExists.mockReturnValue(true);
+      mockSessionBackend.captureOutput.mockReturnValue('some terminal output');
+      mockAgentHeartbeatService.detectStaleAgents.mockResolvedValue([]);
+
+      // Mock file operations
+      (readFile as jest.Mock).mockResolvedValue(JSON.stringify(mockWorkingStatusData));
+      (writeFile as jest.Mock).mockResolvedValue(undefined);
+      (existsSync as jest.Mock).mockReturnValue(true);
+    });
+
+    it('should detect stale agents using AgentHeartbeatService', async () => {
+      const staleAgents = ['member-1', 'member-2'];
+      mockAgentHeartbeatService.detectStaleAgents.mockResolvedValue(staleAgents);
+      mockAgentHeartbeatService.getAllAgentHeartbeats.mockResolvedValue({
+        orchestrator: {
+          agentId: 'orchestrator',
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          agentStatus: 'active',
+          lastActiveTime: new Date().toISOString(),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+        teamMembers: {
+          'member-1': {
+            agentId: 'member-1',
+            sessionName: 'test-session-1',
+            teamMemberId: 'member-1',
+            agentStatus: 'active',
+            lastActiveTime: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
+          'member-2': {
+            agentId: 'member-2',
+            sessionName: 'test-session-2',
+            teamMemberId: 'member-2',
+            agentStatus: 'active',
+            lastActiveTime: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
+        },
+        metadata: { lastUpdated: new Date().toISOString(), version: '1.0.0' },
+      });
+      // Sessions are dead
+      mockSessionBackend.sessionExists.mockReturnValue(false);
+
+      await (service as any).performActivityCheck();
+
+      const expectedThreshold = CONTINUATION_CONSTANTS.DETECTION.STALE_THRESHOLD_MINUTES;
+      expect(mockAgentHeartbeatService.detectStaleAgents).toHaveBeenCalledWith(expectedThreshold);
+      expect(mockLogger.debug).toHaveBeenCalledWith('Detected stale agents for potential inactivity', {
+        staleAgents,
+        thresholdMinutes: expectedThreshold
+      });
+      // Heartbeat file should be updated for dead agents
+      expect(mockAgentHeartbeatService.updateAgentHeartbeat).toHaveBeenCalledWith(
+        'test-session-1', 'member-1', 'inactive'
+      );
+      expect(mockAgentHeartbeatService.updateAgentHeartbeat).toHaveBeenCalledWith(
+        'test-session-2', 'member-2', 'inactive'
+      );
+      // Team members are now batch-updated and persisted once per modified team
+      expect(mockStorageService.updateAgentStatus).not.toHaveBeenCalledWith('test-session-1', 'inactive');
+      expect(mockStorageService.updateAgentStatus).not.toHaveBeenCalledWith('test-session-2', 'inactive');
+      expect(mockStorageService.saveTeam).toHaveBeenCalledWith(expect.objectContaining({
+        id: 'test-team',
+        members: expect.arrayContaining([
+          expect.objectContaining({ sessionName: 'test-session-1', agentStatus: 'inactive' }),
+          expect.objectContaining({ sessionName: 'test-session-2', agentStatus: 'inactive' }),
+        ])
+      }));
+    });
+
+    it('should skip orchestrator in stale check (managed by OrchestratorHeartbeatMonitor)', async () => {
+      mockAgentHeartbeatService.detectStaleAgents.mockResolvedValue(['orchestrator']);
+      mockAgentHeartbeatService.getAllAgentHeartbeats.mockResolvedValue({
+        orchestrator: {
+          agentId: 'orchestrator',
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          agentStatus: 'active',
+          lastActiveTime: new Date().toISOString(),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+        teamMembers: {},
+        metadata: { lastUpdated: new Date().toISOString(), version: '1.0.0' },
+      });
+      mockSessionBackend.sessionExists.mockReturnValue(false);
+
+      await (service as any).performActivityCheck();
+
+      // Orchestrator should NOT be marked inactive — managed by its own monitor
+      expect(mockAgentHeartbeatService.updateAgentHeartbeat).not.toHaveBeenCalledWith(
+        CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+        undefined,
+        'inactive'
+      );
+      expect(mockStorageService.updateAgentStatus).not.toHaveBeenCalledWith(
+        CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+        'inactive'
+      );
+    });
+
+    it('should leave stale agent as active when session is still alive', async () => {
+      mockAgentHeartbeatService.detectStaleAgents.mockResolvedValue(['orchestrator']);
+      mockAgentHeartbeatService.getAllAgentHeartbeats.mockResolvedValue({
+        orchestrator: {
+          agentId: 'orchestrator',
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          agentStatus: 'active',
+          lastActiveTime: new Date().toISOString(),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+        teamMembers: {},
+        metadata: { lastUpdated: new Date().toISOString(), version: '1.0.0' },
+      });
+      // Session is alive — agent is just idle, leave it
+      mockSessionBackend.sessionExists.mockReturnValue(true);
+
+      await (service as any).performActivityCheck();
+
+      expect(mockStorageService.updateAgentStatus).not.toHaveBeenCalled();
+    });
+
+    it('should handle errors during stale agent cleanup gracefully', async () => {
+      mockAgentHeartbeatService.detectStaleAgents.mockResolvedValue(['orchestrator']);
+      mockAgentHeartbeatService.getAllAgentHeartbeats.mockRejectedValue(new Error('Heartbeat file error'));
+
+      await (service as any).performActivityCheck();
+
+      expect(mockLogger.error).toHaveBeenCalledWith('Error during stale agent cleanup', {
+        error: 'Heartbeat file error'
+      });
+      expect(mockStorageService.updateAgentStatus).not.toHaveBeenCalled();
+    });
+
+    it('should check orchestrator working status and update teamWorkingStatus.json', async () => {
+      mockSessionBackend.sessionExists.mockReturnValueOnce(true); // orchestrator session
+      mockSessionBackend.captureOutput.mockReturnValue('new terminal output');
+
+      await (service as any).performActivityCheck();
+
+      expect(mockSessionBackend.sessionExists).toHaveBeenCalledWith(CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME);
+      expect(mockSessionBackend.captureOutput).toHaveBeenCalledWith(CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME, 5);
+    });
+
+    it('should check team member sessions for working status', async () => {
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false); // orchestrator session (inactive)
+      mockSessionBackend.sessionExists.mockReturnValueOnce(true); // member session
+
+      await (service as any).performActivityCheck();
+
+      expect(mockSessionBackend.sessionExists).toHaveBeenCalledWith('test-session-1');
+      expect(mockSessionBackend.captureOutput).toHaveBeenCalledWith('test-session-1', 5);
+    });
+
+    it('should set member working status to idle if session no longer exists', async () => {
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false); // orchestrator session
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false); // member session doesn't exist
+
+      await (service as any).performActivityCheck();
+
+      expect(writeFile).toHaveBeenCalled();
+      const savedData = JSON.parse((writeFile as jest.Mock).mock.calls[0][1]);
+      expect(savedData.teamMembers['test-session-1'].workingStatus).toBe('idle');
+    });
+
+    it('should detect activity and update working status to in_progress', async () => {
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false); // orchestrator session
+      mockSessionBackend.sessionExists.mockReturnValueOnce(true); // member session exists
+      mockSessionBackend.captureOutput.mockReturnValue('new terminal output');
+
+      // Simulate different output from cache (activity detected)
+      (service as any).lastTerminalOutputs.set('test-session-1', 'old terminal output');
+
+      await (service as any).performActivityCheck();
+
+      expect(writeFile).toHaveBeenCalled();
+      const savedData = JSON.parse((writeFile as jest.Mock).mock.calls[0][1]);
+      expect(savedData.teamMembers['test-session-1'].workingStatus).toBe('in_progress');
+    });
+
+    it('tells working-status listeners about a change at once and remembers it (harness "working on it", 2026-09-30)', async () => {
+      // agent:busy is held back MIN_BUSY_DURATION_MS and never published for
+      // a turn shorter than one poll; listeners hear every observed change.
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false); // orchestrator session
+      mockSessionBackend.sessionExists.mockReturnValueOnce(true); // member session exists
+      mockSessionBackend.captureOutput.mockReturnValue('new terminal output');
+      (service as any).lastTerminalOutputs.set('test-session-1', 'old terminal output');
+      const seen: Array<[string, string]> = [];
+      const unsubscribe = service.onWorkingStatusChange((session, status) => seen.push([session, status]));
+
+      await (service as any).performActivityCheck();
+
+      expect(seen).toContainEqual(['test-session-1', 'in_progress']);
+      expect(service.getObservedWorkingStatus('test-session-1')).toBe('in_progress');
+      expect(service.getObservedWorkingStatus('never-polled')).toBeNull();
+
+      // Same status on the next poll: no second call. Unsubscribed: none at all.
+      const before = seen.filter(([s]) => s === 'test-session-1').length;
+      (service as any).observeStatus('test-session-1', 'in_progress', 'in_progress');
+      expect(seen.filter(([s]) => s === 'test-session-1').length).toBe(before);
+      unsubscribe();
+      (service as any).observeStatus('test-session-1', 'idle', 'in_progress');
+      expect(seen.filter(([s]) => s === 'test-session-1').length).toBe(before);
+    });
+
+    it('should not update status if no activity detected (same output)', async () => {
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false); // orchestrator session
+      mockSessionBackend.sessionExists.mockReturnValueOnce(true); // member session exists
+      mockSessionBackend.captureOutput.mockReturnValue('same terminal output');
+
+      // Simulate same output as cache (no activity)
+      (service as any).lastTerminalOutputs.set('test-session-1', 'same terminal output');
+
+      await (service as any).performActivityCheck();
+
+      // Should still update metadata but status should remain idle
+      expect(writeFile).toHaveBeenCalled();
+      const savedData = JSON.parse((writeFile as jest.Mock).mock.calls[0][1]);
+      expect(savedData.teamMembers['test-session-1'].workingStatus).toBe('idle');
+    });
+
+    it('should detect Gemini CLI activity via PTY tracker when terminal output unchanged', async () => {
+      // Set up a Gemini CLI team member
+      const geminiTeam = {
+        id: 'test-team',
+        name: 'Test Team',
+        projectIds: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+        members: [{
+          id: 'gemini-member',
+          name: 'Gemini Agent',
+          role: 'developer' as const,
+          runtimeType: 'gemini-cli' as const,
+          systemPrompt: 'Test',
+          agentStatus: 'active' as const,
+          workingStatus: 'idle' as const,
+          sessionName: 'gemini-session',
+          createdAt: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z'
+        }]
+      };
+      mockStorageService.getTeams.mockResolvedValue([geminiTeam]);
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false); // orchestrator
+      mockSessionBackend.sessionExists.mockReturnValueOnce(true);  // gemini session
+      mockSessionBackend.captureOutput.mockReturnValue('same TUI output');
+      (service as any).lastTerminalOutputs.set('gemini-session', 'same TUI output');
+
+      // PTY activity within polling interval → should detect as active
+      const mockTracker = PtyActivityTrackerService.getInstance();
+      (mockTracker.getIdleTimeMs as jest.Mock).mockReturnValue(5000); // 5s < 30s polling
+
+      await (service as any).performActivityCheck();
+
+      expect(writeFile).toHaveBeenCalled();
+      const savedData = JSON.parse((writeFile as jest.Mock).mock.calls[0][1]);
+      expect(savedData.teamMembers['gemini-session'].workingStatus).toBe('in_progress');
+    });
+
+    it('should NOT detect Gemini CLI activity when PTY idle exceeds polling interval', async () => {
+      const geminiTeam = {
+        id: 'test-team',
+        name: 'Test Team',
+        projectIds: [],
+        createdAt: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z',
+        members: [{
+          id: 'gemini-member',
+          name: 'Gemini Agent',
+          role: 'developer' as const,
+          runtimeType: 'gemini-cli' as const,
+          systemPrompt: 'Test',
+          agentStatus: 'active' as const,
+          workingStatus: 'idle' as const,
+          sessionName: 'gemini-session',
+          createdAt: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z'
+        }]
+      };
+      mockStorageService.getTeams.mockResolvedValue([geminiTeam]);
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false); // orchestrator
+      mockSessionBackend.sessionExists.mockReturnValueOnce(true);  // gemini session
+      mockSessionBackend.captureOutput.mockReturnValue('same TUI output');
+      (service as any).lastTerminalOutputs.set('gemini-session', 'same TUI output');
+
+      // PTY idle exceeds polling interval → should remain idle
+      const mockTracker = PtyActivityTrackerService.getInstance();
+      (mockTracker.getIdleTimeMs as jest.Mock).mockReturnValue(60000); // 60s > 30s polling
+
+      await (service as any).performActivityCheck();
+
+      expect(writeFile).toHaveBeenCalled();
+      const savedData = JSON.parse((writeFile as jest.Mock).mock.calls[0][1]);
+      expect(savedData.teamMembers['gemini-session'].workingStatus).toBe('idle');
+    });
+
+    it('should check all members with sessions regardless of status', async () => {
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false); // orchestrator session
+      mockSessionBackend.sessionExists.mockReturnValueOnce(true); // member-1 session
+      mockSessionBackend.sessionExists.mockReturnValueOnce(true); // member-2 session
+
+      await (service as any).performActivityCheck();
+
+      expect(mockSessionBackend.sessionExists).toHaveBeenCalledWith('test-session-1');
+      expect(mockSessionBackend.sessionExists).toHaveBeenCalledWith('test-session-2');
+    });
+
+    it('should handle member working status check errors gracefully', async () => {
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false); // orchestrator session
+      // Make sessionExists throw synchronously for member check
+      // This propagates past Promise.resolve() before the Promise.race .catch() can handle it
+      mockSessionBackend.sessionExists.mockImplementationOnce(() => { throw new Error('Session check error'); });
+
+      await (service as any).performActivityCheck();
+
+      expect(mockLogger.error).toHaveBeenCalledWith('Error checking member working status', {
+        teamId: 'test-team',
+        memberId: 'member-1',
+        memberName: 'Test Member 1',
+        sessionName: 'test-session-1',
+        error: 'Session check error'
+      });
+    });
+
+    it('should handle overall activity check errors gracefully', async () => {
+      mockAgentHeartbeatService.detectStaleAgents.mockRejectedValue(new Error('Heartbeat service error'));
+
+      await (service as any).performActivityCheck();
+
+      expect(mockLogger.error).toHaveBeenCalledWith('Error during activity check', {
+        error: 'Heartbeat service error'
+      });
+    });
+  });
+
+  describe('teamWorkingStatus.json file management', () => {
+    it('should create default teamWorkingStatus.json if it does not exist', async () => {
+      (existsSync as jest.Mock).mockReturnValue(false);
+      (writeFile as jest.Mock).mockResolvedValue(undefined);
+
+      const result = await (service as any).loadTeamWorkingStatusFile();
+
+      expect(result.orchestrator.sessionName).toBe(CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME);
+      expect(result.orchestrator.workingStatus).toBe('idle');
+      expect(result.teamMembers).toEqual({});
+      expect(result.metadata.version).toBe('1.0.0');
+    });
+
+    it('should load existing teamWorkingStatus.json file', async () => {
+      const mockData = {
+        orchestrator: {
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          workingStatus: 'in_progress',
+          lastActivityCheck: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z'
+        },
+        teamMembers: {},
+        metadata: {
+          lastUpdated: '2023-01-01T00:00:00.000Z',
+          version: '1.0.0'
+        }
+      };
+      (existsSync as jest.Mock).mockReturnValue(true);
+      (readFile as jest.Mock).mockResolvedValue(JSON.stringify(mockData));
+
+      const result = await (service as any).loadTeamWorkingStatusFile();
+
+      expect(result.orchestrator.workingStatus).toBe('in_progress');
+      expect(result.metadata.version).toBe('1.0.0');
+    });
+
+    it('should handle corrupted teamWorkingStatus.json file', async () => {
+      (existsSync as jest.Mock).mockReturnValue(true);
+      (readFile as jest.Mock).mockResolvedValue('invalid json');
+      (writeFile as jest.Mock).mockResolvedValue(undefined);
+
+      const result = await (service as any).loadTeamWorkingStatusFile();
+
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        'Failed to load teamWorkingStatus.json, creating new file',
+        expect.objectContaining({ error: expect.any(String) })
+      );
+      expect(result.orchestrator.workingStatus).toBe('idle');
+    });
+  });
+
+  describe('getTeamWorkingStatus', () => {
+    it('should return current team working status data', async () => {
+      const mockData = {
+        orchestrator: {
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          workingStatus: 'idle',
+          lastActivityCheck: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z'
+        },
+        teamMembers: {},
+        metadata: {
+          lastUpdated: '2023-01-01T00:00:00.000Z',
+          version: '1.0.0'
+        }
+      };
+      (existsSync as jest.Mock).mockReturnValue(true);
+      (readFile as jest.Mock).mockResolvedValue(JSON.stringify(mockData));
+
+      const result = await service.getTeamWorkingStatus();
+
+      expect(result).toEqual(mockData);
+    });
+  });
+
+  describe('getWorkingStatusForSession', () => {
+    beforeEach(() => {
+      const mockData = {
+        orchestrator: {
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          workingStatus: 'in_progress',
+          lastActivityCheck: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z'
+        },
+        teamMembers: {
+          'test-session': {
+            sessionName: 'test-session',
+            teamMemberId: 'member-1',
+            workingStatus: 'idle',
+            lastActivityCheck: '2023-01-01T00:00:00.000Z',
+            updatedAt: '2023-01-01T00:00:00.000Z'
+          }
+        },
+        metadata: {
+          lastUpdated: '2023-01-01T00:00:00.000Z',
+          version: '1.0.0'
+        }
+      };
+      (existsSync as jest.Mock).mockReturnValue(true);
+      (readFile as jest.Mock).mockResolvedValue(JSON.stringify(mockData));
+    });
+
+    it('should return orchestrator working status', async () => {
+      const result = await service.getWorkingStatusForSession(CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME);
+      expect(result).toBe('in_progress');
+    });
+
+    it('should return team member working status', async () => {
+      const result = await service.getWorkingStatusForSession('test-session');
+      expect(result).toBe('idle');
+    });
+
+    it('should return null for non-existent session', async () => {
+      const result = await service.getWorkingStatusForSession('non-existent-session');
+      expect(result).toBe(null);
+    });
+  });
+
+  describe('isRunning', () => {
+    it('should return false initially', () => {
+      expect(service.isRunning()).toBe(false);
+    });
+
+    it('should return true when polling is active', () => {
+      jest.useFakeTimers();
+      service.startPolling();
+
+      expect(service.isRunning()).toBe(true);
+
+      jest.useRealTimers();
+      service.stopPolling();
+    });
+  });
+
+  describe('getPollingInterval', () => {
+    it('should return the correct polling interval', () => {
+      expect(service.getPollingInterval()).toBe(30000); // 30 seconds (#124: reduced from 2min)
+    });
+  });
+
+  describe('ANSI stripping and busy-duration gating', () => {
+    const mockTeam = {
+      id: 'test-team',
+      name: 'Test Team',
+      projectIds: [],
+      createdAt: '2023-01-01T00:00:00.000Z',
+      updatedAt: '2023-01-01T00:00:00.000Z',
+      members: [
+        {
+          id: 'member-1',
+          name: 'Test Member 1',
+          role: 'developer' as const,
+          runtimeType: 'claude-code' as const,
+          systemPrompt: 'Test prompt',
+          agentStatus: 'active' as const,
+          workingStatus: 'idle' as const,
+          sessionName: 'test-session-1',
+          createdAt: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z'
+        }
+      ]
+    };
+
+    const mockWorkingStatusData: TeamWorkingStatusFile = {
+      orchestrator: {
+        sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+        workingStatus: 'idle',
+        lastActivityCheck: '2023-01-01T00:00:00.000Z',
+        updatedAt: '2023-01-01T00:00:00.000Z'
+      },
+      teamMembers: {},
+      metadata: {
+        lastUpdated: '2023-01-01T00:00:00.000Z',
+        version: '1.0.0'
+      }
+    };
+
+    beforeEach(() => {
+      mockStorageService.getTeams.mockResolvedValue([mockTeam]);
+      mockSessionBackend.sessionExists.mockReturnValue(true);
+      mockAgentHeartbeatService.detectStaleAgents.mockResolvedValue([]);
+      (readFile as jest.Mock).mockResolvedValue(JSON.stringify(mockWorkingStatusData));
+      (writeFile as jest.Mock).mockResolvedValue(undefined);
+      (existsSync as jest.Mock).mockReturnValue(true);
+    });
+
+    it('should NOT trigger in_progress when output changes are ANSI-only', async () => {
+      // stripAnsiCodes mock strips ANSI, so both raw outputs differ but
+      // after stripping they produce the same cleaned text.
+      const mockedStripAnsi = stripAnsiCodes as jest.Mock;
+      mockedStripAnsi.mockImplementation(() => 'same clean output');
+
+      // First call: raw output A (stores cleaned "same clean output")
+      mockSessionBackend.captureOutput.mockReturnValue('\x1b[32msame clean output\x1b[0m');
+
+      // Orchestrator session inactive for simplicity
+      mockSessionBackend.sessionExists
+        .mockReturnValueOnce(false)   // orchestrator
+        .mockReturnValueOnce(true);   // member
+
+      await (service as any).performActivityCheck();
+
+      // Now second call with different ANSI codes but same cleaned text
+      mockSessionBackend.captureOutput.mockReturnValue('\x1b[33msame clean output\x1b[0m');
+      mockSessionBackend.sessionExists
+        .mockReturnValueOnce(false)   // orchestrator
+        .mockReturnValueOnce(true);   // member
+
+      await (service as any).performActivityCheck();
+
+      // The status should remain idle because stripped output is identical
+      const savedCalls = (writeFile as jest.Mock).mock.calls;
+      const lastSaved = JSON.parse(savedCalls[savedCalls.length - 1][1]);
+      expect(lastSaved.teamMembers['test-session-1'].workingStatus).toBe('idle');
+    });
+
+    it('should NOT emit events for brief in_progress cycles (< MIN_BUSY_DURATION_MS)', async () => {
+      const mockEventBus = { publish: jest.fn() };
+      service.setEventBusService(mockEventBus as any);
+
+      const mockedStripAnsi = stripAnsiCodes as jest.Mock;
+      mockedStripAnsi.mockImplementation((s: string) => s);
+
+      // Seed previous output so first check sees a change
+      (service as any).lastTerminalOutputs.set('test-session-1', 'old output');
+
+      // First check: output changed → in_progress (but < MIN_BUSY_DURATION_MS)
+      mockSessionBackend.captureOutput.mockReturnValue('new output');
+      mockSessionBackend.sessionExists
+        .mockReturnValueOnce(false)   // orchestrator
+        .mockReturnValueOnce(true);   // member
+
+      await (service as any).performActivityCheck();
+
+      // Verify status file updated to in_progress
+      let savedCalls = (writeFile as jest.Mock).mock.calls;
+      let lastSaved = JSON.parse(savedCalls[savedCalls.length - 1][1]);
+      expect(lastSaved.teamMembers['test-session-1'].workingStatus).toBe('in_progress');
+
+      // But no agent:busy event should be emitted (too soon)
+      const busyEvents = mockEventBus.publish.mock.calls.filter(
+        (c: any[]) => c[0].type === 'agent:busy' && c[0].sessionName === 'test-session-1'
+      );
+      expect(busyEvents).toHaveLength(0);
+
+      // Second check: output same → idle (brief cycle)
+      mockSessionBackend.captureOutput.mockReturnValue('new output');
+      mockSessionBackend.sessionExists
+        .mockReturnValueOnce(false)   // orchestrator
+        .mockReturnValueOnce(true);   // member
+
+      await (service as any).performActivityCheck();
+
+      // back to idle
+      savedCalls = (writeFile as jest.Mock).mock.calls;
+      lastSaved = JSON.parse(savedCalls[savedCalls.length - 1][1]);
+      expect(lastSaved.teamMembers['test-session-1'].workingStatus).toBe('idle');
+
+      // Neither agent:busy nor agent:idle should have been emitted
+      const allMemberEvents = mockEventBus.publish.mock.calls.filter(
+        (c: any[]) => c[0].sessionName === 'test-session-1'
+      );
+      expect(allMemberEvents).toHaveLength(0);
+    });
+
+    it('should emit agent:busy then agent:idle for sustained in_progress (>= MIN_BUSY_DURATION_MS)', async () => {
+      const mockEventBus = { publish: jest.fn() };
+      service.setEventBusService(mockEventBus as any);
+
+      const mockedStripAnsi = stripAnsiCodes as jest.Mock;
+      mockedStripAnsi.mockImplementation((s: string) => s);
+
+      // Make readFile return the last written data so status persists across checks
+      let lastWrittenData = JSON.stringify(mockWorkingStatusData);
+      (writeFile as jest.Mock).mockImplementation((_path: string, content: string) => {
+        lastWrittenData = content;
+        return Promise.resolve();
+      });
+      (readFile as jest.Mock).mockImplementation(() => Promise.resolve(lastWrittenData));
+
+      // Seed previous output so first check detects a change
+      (service as any).lastTerminalOutputs.set('test-session-1', 'old output');
+
+      // First check: output changed → in_progress
+      mockSessionBackend.captureOutput.mockReturnValue('new output');
+      mockSessionBackend.sessionExists
+        .mockReturnValueOnce(false)   // orchestrator
+        .mockReturnValueOnce(true);   // member
+
+      await (service as any).performActivityCheck();
+
+      // Manually backdate the busy transition timestamp to simulate elapsed time
+      const memberKey = 'test-session-1';
+      (service as any).busyTransitionTimestamps.set(
+        memberKey,
+        Date.now() - PTY_CONSTANTS.MIN_BUSY_DURATION_MS - 1
+      );
+
+      // Second check: still in_progress (different output), should now emit agent:busy
+      mockSessionBackend.captureOutput.mockReturnValue('even newer output');
+      mockSessionBackend.sessionExists
+        .mockReturnValueOnce(false)   // orchestrator
+        .mockReturnValueOnce(true);   // member
+
+      await (service as any).performActivityCheck();
+
+      const busyEvents = mockEventBus.publish.mock.calls.filter(
+        (c: any[]) => c[0].type === 'agent:busy' && c[0].sessionName === 'test-session-1'
+      );
+      expect(busyEvents).toHaveLength(1);
+
+      // Third check: output same → idle, should emit agent:idle
+      mockSessionBackend.captureOutput.mockReturnValue('even newer output');
+      mockSessionBackend.sessionExists
+        .mockReturnValueOnce(false)   // orchestrator
+        .mockReturnValueOnce(true);   // member
+
+      await (service as any).performActivityCheck();
+
+      const idleEvents = mockEventBus.publish.mock.calls.filter(
+        (c: any[]) => c[0].type === 'agent:idle' && c[0].sessionName === 'test-session-1'
+      );
+      expect(idleEvents).toHaveLength(1);
+
+      // 2026-05-20 follow-up — the precise post-task variant must fire
+      // alongside the generic event so peer-watch triggers can filter on
+      // `agent:idle_after_task` and avoid registration-idle false wakes.
+      const idleAfterTaskEvents = mockEventBus.publish.mock.calls.filter(
+        (c: any[]) => c[0].type === 'agent:idle_after_task' && c[0].sessionName === 'test-session-1'
+      );
+      expect(idleAfterTaskEvents).toHaveLength(1);
+      // ...and crucially, NOT the registration variant — the agent was
+      // observed in_progress before reaching this idle transition.
+      const idleAfterRegEvents = mockEventBus.publish.mock.calls.filter(
+        (c: any[]) => c[0].type === 'agent:idle_after_registration' && c[0].sessionName === 'test-session-1'
+      );
+      expect(idleAfterRegEvents).toHaveLength(0);
+    });
+
+    it('does not call a silent agent idle while its runtime reports a turn (long tool call, 2026-10-02 Eve)', async () => {
+      const mockEventBus = { publish: jest.fn() };
+      service.setEventBusService(mockEventBus as any);
+      (stripAnsiCodes as jest.Mock).mockImplementation((s: string) => s);
+      let lastWrittenData = JSON.stringify(mockWorkingStatusData);
+      (writeFile as jest.Mock).mockImplementation((_path: string, content: string) => {
+        lastWrittenData = content;
+        return Promise.resolve();
+      });
+      (readFile as jest.Mock).mockImplementation(() => Promise.resolve(lastWrittenData));
+      let midTurn = true;
+      service.setRuntimeTurnCheck((session) => session === 'test-session-1' && midTurn);
+
+      // Busy on output, long enough to have published agent:busy.
+      (service as any).lastTerminalOutputs.set('test-session-1', 'old output');
+      mockSessionBackend.captureOutput.mockReturnValue('new output');
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false).mockReturnValueOnce(true);
+      await (service as any).performActivityCheck();
+      (service as any).busyTransitionTimestamps.set('test-session-1', Date.now() - PTY_CONSTANTS.MIN_BUSY_DURATION_MS - 1);
+      mockSessionBackend.captureOutput.mockReturnValue('newer output');
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false).mockReturnValueOnce(true);
+      await (service as any).performActivityCheck();
+
+      // The screen stops changing (a long tool call) — the runtime still says mid-turn.
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false).mockReturnValueOnce(true);
+      await (service as any).performActivityCheck();
+      const idle = (): any[] => mockEventBus.publish.mock.calls.filter(
+        (c: any[]) => (c[0].type === 'agent:idle' || c[0].type === 'agent:idle_after_task') && c[0].sessionName === 'test-session-1'
+      );
+      expect(idle()).toHaveLength(0);
+      expect(service.getObservedWorkingStatus('test-session-1')).toBe('in_progress');
+
+      // The runtime reports the turn ended: now it is idle.
+      midTurn = false;
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false).mockReturnValueOnce(true);
+      await (service as any).performActivityCheck();
+      expect(idle().map((c) => c[0].type).sort()).toEqual(['agent:idle', 'agent:idle_after_task']);
+      service.setRuntimeTurnCheck(null);
+    });
+  });
+
+  describe('workingStatus stuck in_progress auto-reset', () => {
+    const mockTeam = {
+      id: 'test-team',
+      name: 'Test Team',
+      projectIds: [],
+      createdAt: '2023-01-01T00:00:00.000Z',
+      updatedAt: '2023-01-01T00:00:00.000Z',
+      members: [
+        {
+          id: 'member-1',
+          name: 'Test Member 1',
+          role: 'developer' as const,
+          runtimeType: 'claude-code' as const,
+          systemPrompt: 'Test prompt',
+          agentStatus: 'active' as const,
+          workingStatus: 'idle' as const,
+          sessionName: 'test-session-1',
+          createdAt: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z'
+        }
+      ]
+    };
+
+    beforeEach(() => {
+      mockStorageService.getTeams.mockResolvedValue([mockTeam]);
+      mockSessionBackend.sessionExists.mockReturnValue(true);
+      mockAgentHeartbeatService.detectStaleAgents.mockResolvedValue([]);
+      (writeFile as jest.Mock).mockResolvedValue(undefined);
+      (existsSync as jest.Mock).mockReturnValue(true);
+      (stripAnsiCodes as unknown as jest.Mock).mockImplementation((s: string) => s);
+    });
+
+    it('should auto-reset orchestrator in_progress loaded from file after MAX_IN_PROGRESS_MS', async () => {
+      // File already has orchestrator as in_progress with old updatedAt
+      const staleUpdatedAt = new Date(Date.now() - ACTIVITY_MONITOR_CONSTANTS.MAX_IN_PROGRESS_MS - 60_000).toISOString();
+      const stuckData: TeamWorkingStatusFile = {
+        orchestrator: {
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          workingStatus: 'in_progress',
+          lastActivityCheck: staleUpdatedAt,
+          updatedAt: staleUpdatedAt,
+        },
+        teamMembers: {},
+        metadata: { lastUpdated: staleUpdatedAt, version: '1.0.0' },
+      };
+      (readFile as jest.Mock).mockResolvedValue(JSON.stringify(stuckData));
+
+      // Terminal output changes (so raw detection says in_progress)
+      mockSessionBackend.captureOutput.mockReturnValue('new output');
+      mockStorageService.getTeams.mockResolvedValue([]);
+
+      await (service as any).performActivityCheck();
+
+      // Should auto-reset to idle because updatedAt is older than MAX_IN_PROGRESS_MS
+      expect(writeFile).toHaveBeenCalled();
+      const savedCalls = (writeFile as jest.Mock).mock.calls;
+      const lastSaved = JSON.parse(savedCalls[savedCalls.length - 1][1]);
+      expect(lastSaved.orchestrator.workingStatus).toBe('idle');
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        'Auto-resetting orchestrator workingStatus from in_progress to idle (exceeded max duration)',
+        expect.objectContaining({ maxMs: ACTIVITY_MONITOR_CONSTANTS.MAX_IN_PROGRESS_MS })
+      );
+    });
+
+    it('should auto-reset member in_progress loaded from file after MAX_IN_PROGRESS_MS', async () => {
+      const staleUpdatedAt = new Date(Date.now() - ACTIVITY_MONITOR_CONSTANTS.MAX_IN_PROGRESS_MS - 60_000).toISOString();
+      const stuckData: TeamWorkingStatusFile = {
+        orchestrator: {
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          workingStatus: 'idle',
+          lastActivityCheck: staleUpdatedAt,
+          updatedAt: staleUpdatedAt,
+        },
+        teamMembers: {
+          'test-session-1': {
+            sessionName: 'test-session-1',
+            teamMemberId: 'member-1',
+            workingStatus: 'in_progress',
+            lastActivityCheck: staleUpdatedAt,
+            updatedAt: staleUpdatedAt,
+          },
+        },
+        metadata: { lastUpdated: staleUpdatedAt, version: '1.0.0' },
+      };
+      (readFile as jest.Mock).mockResolvedValue(JSON.stringify(stuckData));
+
+      // Orchestrator session not running (simplify test)
+      mockSessionBackend.sessionExists
+        .mockReturnValueOnce(false)   // orchestrator
+        .mockReturnValueOnce(true);   // member
+
+      // Terminal output changes (raw detection says in_progress)
+      (service as any).lastTerminalOutputs.set('test-session-1', 'old output');
+      mockSessionBackend.captureOutput.mockReturnValue('new output');
+
+      await (service as any).performActivityCheck();
+
+      expect(writeFile).toHaveBeenCalled();
+      const savedCalls = (writeFile as jest.Mock).mock.calls;
+      const lastSaved = JSON.parse(savedCalls[savedCalls.length - 1][1]);
+      expect(lastSaved.teamMembers['test-session-1'].workingStatus).toBe('idle');
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        'Auto-resetting member workingStatus from in_progress to idle (exceeded max duration)',
+        expect.objectContaining({
+          sessionName: 'test-session-1',
+          maxMs: ACTIVITY_MONITOR_CONSTANTS.MAX_IN_PROGRESS_MS,
+        })
+      );
+    });
+
+    it('should NOT auto-reset when in_progress is fresh (within MAX_IN_PROGRESS_MS)', async () => {
+      const freshUpdatedAt = new Date(Date.now() - 60_000).toISOString(); // 1 min ago
+      const freshData: TeamWorkingStatusFile = {
+        orchestrator: {
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          workingStatus: 'in_progress',
+          lastActivityCheck: freshUpdatedAt,
+          updatedAt: freshUpdatedAt,
+        },
+        teamMembers: {},
+        metadata: { lastUpdated: freshUpdatedAt, version: '1.0.0' },
+      };
+      (readFile as jest.Mock).mockResolvedValue(JSON.stringify(freshData));
+
+      // Terminal output changes
+      mockSessionBackend.captureOutput.mockReturnValue('new output');
+      mockStorageService.getTeams.mockResolvedValue([]);
+
+      await (service as any).performActivityCheck();
+
+      // Should NOT auto-reset (still within timeout)
+      expect(mockLogger.info).not.toHaveBeenCalledWith(
+        'Auto-resetting orchestrator workingStatus from in_progress to idle (exceeded max duration)',
+        expect.anything()
+      );
+    });
+
+    it('does not force a mid-turn orchestrator idle after MAX_IN_PROGRESS_MS (PR #1013 review)', async () => {
+      const staleUpdatedAt = new Date(Date.now() - ACTIVITY_MONITOR_CONSTANTS.MAX_IN_PROGRESS_MS - 60_000).toISOString();
+      const stuckData: TeamWorkingStatusFile = {
+        orchestrator: {
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          workingStatus: 'in_progress',
+          lastActivityCheck: staleUpdatedAt,
+          updatedAt: staleUpdatedAt,
+        },
+        teamMembers: {},
+        metadata: { lastUpdated: staleUpdatedAt, version: '1.0.0' },
+      };
+      (readFile as jest.Mock).mockResolvedValue(JSON.stringify(stuckData));
+      mockSessionBackend.captureOutput.mockReturnValue('new output');
+      mockStorageService.getTeams.mockResolvedValue([]);
+      const mockEventBus = { publish: jest.fn() };
+      service.setEventBusService(mockEventBus as any);
+      service.setRuntimeTurnCheck((session) => session === CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME);
+
+      await (service as any).performActivityCheck();
+
+      expect(mockLogger.info).not.toHaveBeenCalledWith(
+        'Auto-resetting orchestrator workingStatus from in_progress to idle (exceeded max duration)',
+        expect.anything()
+      );
+      expect(service.getObservedWorkingStatus(CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME)).toBe('in_progress');
+      expect(mockEventBus.publish.mock.calls.filter((c: any[]) => c[0].type === 'agent:idle')).toHaveLength(0);
+      service.setRuntimeTurnCheck(null);
+    });
+
+    it('does not force a mid-turn member idle after MAX_IN_PROGRESS_MS (PR #1013 review)', async () => {
+      const staleUpdatedAt = new Date(Date.now() - ACTIVITY_MONITOR_CONSTANTS.MAX_IN_PROGRESS_MS - 60_000).toISOString();
+      const stuckData: TeamWorkingStatusFile = {
+        orchestrator: {
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          workingStatus: 'idle',
+          lastActivityCheck: staleUpdatedAt,
+          updatedAt: staleUpdatedAt,
+        },
+        teamMembers: {
+          'test-session-1': {
+            sessionName: 'test-session-1',
+            teamMemberId: 'member-1',
+            workingStatus: 'in_progress',
+            lastActivityCheck: staleUpdatedAt,
+            updatedAt: staleUpdatedAt,
+          },
+        },
+        metadata: { lastUpdated: staleUpdatedAt, version: '1.0.0' },
+      };
+      (readFile as jest.Mock).mockResolvedValue(JSON.stringify(stuckData));
+      mockSessionBackend.sessionExists.mockReturnValueOnce(false).mockReturnValueOnce(true);
+      // The screen is silent (a long tool call); only the runtime says mid-turn.
+      (service as any).lastTerminalOutputs.set('test-session-1', 'same output');
+      mockSessionBackend.captureOutput.mockReturnValue('same output');
+      const mockEventBus = { publish: jest.fn() };
+      service.setEventBusService(mockEventBus as any);
+      service.setRuntimeTurnCheck((session) => session === 'test-session-1');
+
+      await (service as any).performActivityCheck();
+
+      expect(mockLogger.info).not.toHaveBeenCalledWith(
+        'Auto-resetting member workingStatus from in_progress to idle (exceeded max duration)',
+        expect.anything()
+      );
+      expect(service.getObservedWorkingStatus('test-session-1')).toBe('in_progress');
+      expect(mockEventBus.publish.mock.calls.filter(
+        (c: any[]) => c[0].type === 'agent:idle' && c[0].sessionName === 'test-session-1'
+      )).toHaveLength(0);
+      service.setRuntimeTurnCheck(null);
+    });
+
+    it('should seed busyTransitionTimestamps for members with no prior transition observed', async () => {
+      // Status file has member as in_progress, but busyTransitionTimestamps is empty (service restart scenario)
+      const recentUpdatedAt = new Date(Date.now() - 30_000).toISOString();
+      const stuckData: TeamWorkingStatusFile = {
+        orchestrator: {
+          sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME,
+          workingStatus: 'idle',
+          lastActivityCheck: recentUpdatedAt,
+          updatedAt: recentUpdatedAt,
+        },
+        teamMembers: {
+          'test-session-1': {
+            sessionName: 'test-session-1',
+            teamMemberId: 'member-1',
+            workingStatus: 'in_progress',
+            lastActivityCheck: recentUpdatedAt,
+            updatedAt: recentUpdatedAt,
+          },
+        },
+        metadata: { lastUpdated: recentUpdatedAt, version: '1.0.0' },
+      };
+      (readFile as jest.Mock).mockResolvedValue(JSON.stringify(stuckData));
+
+      mockSessionBackend.sessionExists
+        .mockReturnValueOnce(false)   // orchestrator
+        .mockReturnValueOnce(true);   // member
+
+      (service as any).lastTerminalOutputs.set('test-session-1', 'old output');
+      mockSessionBackend.captureOutput.mockReturnValue('new output');
+
+      // Verify busyTransitionTimestamps is empty before
+      expect((service as any).busyTransitionTimestamps.has('test-session-1')).toBe(false);
+
+      await (service as any).performActivityCheck();
+
+      // Should have seeded the timestamp
+      expect((service as any).busyTransitionTimestamps.has('test-session-1')).toBe(true);
+    });
+
+    it('should seed busyTransitionTimestamps in handleDurationGatedEmission when status is already in_progress', async () => {
+      // Simulate: status is in_progress in file, no transition, no busyTransitionTimestamp
+      const identity = {
+        teamId: 'test-team',
+        teamName: 'Test Team',
+        memberId: 'member-1',
+        memberName: 'Test Member 1',
+        sessionName: 'test-session-1',
+      };
+
+      // Call handleDurationGatedEmission with no status change and in_progress
+      (service as any).handleDurationGatedEmission(
+        'test-session-1',
+        'in_progress',
+        'in_progress',
+        false,
+        identity,
+        new Date().toISOString()
+      );
+
+      // Should have seeded busyTransitionTimestamps
+      expect((service as any).busyTransitionTimestamps.has('test-session-1')).toBe(true);
+    });
+  });
+
+  describe('waiting_on_human (#815)', () => {
+    // fs and path are mocked in this file; read the real captured screens.
+    const realFs = jest.requireActual('fs') as typeof import('fs');
+    const realPath = jest.requireActual('path') as typeof import('path');
+    const screen = (file: string): string =>
+      realFs.readFileSync(realPath.join(__dirname, '__fixtures__', 'agent-screens', file), 'utf8');
+    const team = {
+      id: 'team-a', name: 'Team A', projectIds: [], createdAt: '', updatedAt: '',
+      members: [{
+        id: 'm-1', name: 'Dev', role: 'developer' as const, runtimeType: 'claude-code' as const,
+        systemPrompt: '', agentStatus: 'active' as const, workingStatus: 'idle' as const,
+        sessionName: 'dev-1', createdAt: '', updatedAt: '',
+      }],
+    };
+    let publish: jest.Mock;
+
+    beforeEach(() => {
+      resetWaitingRegistry();
+      mockRecordAgentWaitingOnHuman.mockClear();
+      mockResolveAgentWaitingOnHuman.mockClear();
+      mockStorageService.getTeams.mockResolvedValue([team] as never);
+      (readFile as jest.Mock).mockResolvedValue(JSON.stringify({
+        orchestrator: { sessionName: CREWLY_CONSTANTS.SESSIONS.ORCHESTRATOR_NAME, workingStatus: 'idle', lastActivityCheck: '', updatedAt: '' },
+        teamMembers: {}, metadata: { lastUpdated: '', version: '1.0.0' },
+      }));
+      (writeFile as jest.Mock).mockResolvedValue(undefined);
+      (existsSync as jest.Mock).mockReturnValue(true);
+      publish = jest.fn();
+      service.setEventBusService({ publish } as never);
+    });
+
+    it('one poll puts a blocked agent in the owner queue (poll interval keeps it under 1 minute)', async () => {
+      mockSessionBackend.captureOutput.mockReturnValue(screen('claude-bash-permission.txt'));
+
+      await (service as any).performActivityCheck();
+
+      expect(getWaiting('dev-1')).toMatchObject({ kind: 'permission' });
+      expect(mockRecordAgentWaitingOnHuman).toHaveBeenCalledWith(expect.objectContaining({ sessionName: 'dev-1', kind: 'permission' }));
+      expect(publish).toHaveBeenCalledWith(expect.objectContaining({ type: 'agent:waiting_on_human', sessionName: 'dev-1', newValue: 'waiting_on_human:permission' }));
+      expect(mockSessionBackend.captureOutput).toHaveBeenCalledWith('dev-1', 60);
+      // One poll is enough; crewly-mobile polls /escalations every 15s, so
+      // poll interval + 15s must stay within the 1-minute acceptance bound.
+      expect(ACTIVITY_MONITOR_CONSTANTS.POLLING_INTERVAL_MS + 15_000).toBeLessThanOrEqual(60_000);
+    });
+
+    it('an agent whose background (fork) agent is still running stays in_progress and is never auto-reset (2026-10-26 Pia)', async () => {
+      // The screen has not changed since the last poll and no turn is reported:
+      // only the status line and the agent panel say work is in flight.
+      mockSessionBackend.captureOutput.mockReturnValue(screen('claude-idle-background-agent.txt'));
+      (service as any).lastTerminalOutputs.set('dev-1', screen('claude-idle-background-agent.txt'));
+      (service as any).busyTransitionTimestamps.set('dev-1', Date.now() - ACTIVITY_MONITOR_CONSTANTS.MAX_IN_PROGRESS_MS - 60_000);
+
+      await (service as any).performActivityCheck();
+
+      expect(service.getObservedWorkingStatus('dev-1')).toBe('in_progress');
+      expect(getWaiting('dev-1')).toBeUndefined();
+      expect(mockRecordAgentWaitingOnHuman).not.toHaveBeenCalled();
+
+      // The fork finishes and the panel goes away: idle on the next poll.
+      mockSessionBackend.captureOutput.mockReturnValue(screen('claude-idle.txt'));
+      (service as any).lastTerminalOutputs.set('dev-1', screen('claude-idle.txt'));
+      await (service as any).performActivityCheck();
+      expect(service.getObservedWorkingStatus('dev-1')).toBe('idle');
+    });
+
+    describe('self-answered prompts (dangerous rm)', () => {
+      let write: jest.Mock;
+      let sendMessageToAgent: jest.Mock;
+
+      beforeEach(() => {
+        write = jest.fn();
+        sendMessageToAgent = jest.fn().mockResolvedValue({ success: true, queued: true });
+        mockSessionBackend.getSession.mockReturnValue({ write } as never);
+        service.setAgentRegistrationService({ sendMessageToAgent } as never);
+        mockSessionBackend.captureOutput.mockReturnValue(screen('claude-dangerous-rm.txt'));
+      });
+
+      it('answers "No" itself, tells the agent, and does not put the owner in the loop', async () => {
+        await (service as any).performActivityCheck();
+
+        const { DOWN, ENTER } = AGENT_ATTENTION_CONSTANTS.SELF_ANSWER.KEYS;
+        expect(write).toHaveBeenCalledWith(DOWN + ENTER);
+        expect(sendMessageToAgent).toHaveBeenCalledWith('dev-1', AGENT_ATTENTION_CONSTANTS.SELF_ANSWER.DANGEROUS_RM_MESSAGE);
+        expect(mockRecordAgentWaitingOnHuman).not.toHaveBeenCalled();
+        expect(getWaiting('dev-1')).toBeUndefined();
+        expect(publish).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'agent:waiting_on_human' }));
+      });
+
+      it('presses the keys once while the screen is still redrawing', async () => {
+        await (service as any).performActivityCheck();
+        await (service as any).performActivityCheck();
+
+        expect(write).toHaveBeenCalledTimes(1);
+        expect(sendMessageToAgent).toHaveBeenCalledTimes(1);
+        expect(mockRecordAgentWaitingOnHuman).not.toHaveBeenCalled();
+      });
+
+      it('escalates to the owner when the prompt survives the decline', async () => {
+        (service as any).selfAnsweredAt.set('dev-1', Date.now() - AGENT_ATTENTION_CONSTANTS.SELF_ANSWER.RETRY_AFTER_MS - 1);
+
+        await (service as any).performActivityCheck();
+
+        expect(write).not.toHaveBeenCalled();
+        expect(mockRecordAgentWaitingOnHuman).toHaveBeenCalledWith(expect.objectContaining({ sessionName: 'dev-1', kind: 'permission' }));
+        expect(getWaiting('dev-1')).toMatchObject({ kind: 'permission' });
+      });
+
+      it('forgets the decline once the prompt is gone', async () => {
+        await (service as any).performActivityCheck();
+        mockSessionBackend.captureOutput.mockReturnValue(screen('claude-busy.txt'));
+        await (service as any).performActivityCheck();
+
+        expect((service as any).selfAnsweredAt.has('dev-1')).toBe(false);
+      });
+
+      it('leaves the prompt to the owner when the PTY is not reachable', async () => {
+        mockSessionBackend.getSession.mockReturnValue(undefined);
+
+        await (service as any).performActivityCheck();
+
+        expect(mockRecordAgentWaitingOnHuman).toHaveBeenCalledWith(expect.objectContaining({ sessionName: 'dev-1' }));
+      });
+    });
+
+    it('does not file again on the next poll while still waiting, and keeps since', async () => {
+      mockSessionBackend.captureOutput.mockReturnValue(screen('claude-trust-dialog.txt'));
+      await (service as any).performActivityCheck();
+      const since = getWaiting('dev-1')?.since;
+      await (service as any).performActivityCheck();
+
+      expect(mockRecordAgentWaitingOnHuman).toHaveBeenCalledTimes(1);
+      expect(getWaiting('dev-1')?.since).toBe(since);
+    });
+
+    it('clears the wait and closes the escalation once the prompt is gone', async () => {
+      mockSessionBackend.captureOutput.mockReturnValue(screen('claude-plan-menu.txt'));
+      await (service as any).performActivityCheck();
+      mockSessionBackend.captureOutput.mockReturnValue(screen('claude-busy.txt'));
+      await (service as any).performActivityCheck();
+
+      expect(getWaiting('dev-1')).toBeUndefined();
+      expect(mockResolveAgentWaitingOnHuman).toHaveBeenCalledWith('dev-1');
+      expect(publish).toHaveBeenCalledWith(expect.objectContaining({ type: 'agent:waiting_resolved', sessionName: 'dev-1' }));
+    });
+
+    it('a busy or idle agent is never reported as waiting', async () => {
+      for (const f of ['claude-busy.txt', 'claude-idle.txt', 'codex-busy.txt', 'codex-idle.txt']) {
+        mockSessionBackend.captureOutput.mockReturnValue(screen(f));
+        await (service as any).performActivityCheck();
+      }
+      expect(getWaiting('dev-1')).toBeUndefined();
+      expect(mockRecordAgentWaitingOnHuman).not.toHaveBeenCalled();
+    });
+
+    it('uses the terminal title: a Codex "Action Required" title alone counts', async () => {
+      mockSessionBackend.captureOutput.mockReturnValue('› Ask Codex to do anything');
+      (mockSessionBackend as unknown as { getTerminalTitle: jest.Mock }).getTerminalTitle = jest.fn().mockReturnValue('[ ! ] Action Required | ⠸ | repo');
+      await (service as any).performActivityCheck();
+      expect(getWaiting('dev-1')).toMatchObject({ kind: 'unspecified' });
+    });
+
+    describe('escalations left open across a restart (#851)', () => {
+      /** An escalation the previous run opened for a session. */
+      const openEscalation = (sessionName: string) => ({
+        id: `esc-${sessionName}`,
+        source: 'agent_waiting_on_human',
+        status: 'pending',
+        details: { sessionName, kind: 'permission' },
+      });
+
+      beforeEach(() => {
+        mockListPendingEscalations.mockReset();
+      });
+
+      it('closes the escalation when the owner answered the prompt while the backend was down', async () => {
+        // The registry starts empty after the restart; the agent is working again.
+        mockListPendingEscalations.mockResolvedValue([openEscalation('dev-1')]);
+        mockSessionBackend.captureOutput.mockReturnValue(screen('claude-busy.txt'));
+
+        await (service as any).performActivityCheck();
+
+        expect(getWaiting('dev-1')).toBeUndefined();
+        expect(mockResolveAgentWaitingOnHuman).toHaveBeenCalledWith('dev-1');
+      });
+
+      it('reads the escalation list once per run, not on every poll', async () => {
+        mockListPendingEscalations.mockResolvedValue([openEscalation('dev-1')]);
+        mockSessionBackend.captureOutput.mockReturnValue(screen('claude-busy.txt'));
+
+        await (service as any).performActivityCheck();
+        await (service as any).performActivityCheck();
+        await (service as any).performActivityCheck();
+
+        expect(mockListPendingEscalations).toHaveBeenCalledTimes(1);
+      });
+
+      it('keeps the escalation open when the prompt is still on screen', async () => {
+        mockListPendingEscalations.mockResolvedValue([openEscalation('dev-1')]);
+        mockSessionBackend.captureOutput.mockReturnValue(screen('claude-bash-permission.txt'));
+
+        await (service as any).performActivityCheck();
+
+        expect(getWaiting('dev-1')).toMatchObject({ kind: 'permission' });
+        expect(mockResolveAgentWaitingOnHuman).not.toHaveBeenCalled();
+      });
+
+      it('closes the escalation of a session that is down after the restart', async () => {
+        mockListPendingEscalations.mockResolvedValue([openEscalation('dev-1')]);
+        mockSessionBackend.sessionExists.mockReturnValue(false);
+
+        await (service as any).performActivityCheck();
+
+        expect(mockResolveAgentWaitingOnHuman).toHaveBeenCalledWith('dev-1');
+      });
+
+      it('closes the escalation of a session no member is bound to any more', async () => {
+        mockListPendingEscalations.mockResolvedValue([openEscalation('renamed-old-session')]);
+        mockSessionBackend.captureOutput.mockReturnValue(screen('claude-idle.txt'));
+
+        await (service as any).performActivityCheck();
+
+        expect(mockResolveAgentWaitingOnHuman).toHaveBeenCalledWith('renamed-old-session');
+      });
+
+      it('retries on the next poll when the escalation list cannot be read', async () => {
+        mockListPendingEscalations.mockRejectedValueOnce(new Error('store busy'));
+        mockListPendingEscalations.mockResolvedValue([openEscalation('dev-1')]);
+        mockSessionBackend.captureOutput.mockReturnValue(screen('claude-busy.txt'));
+
+        await (service as any).performActivityCheck();
+        expect(mockResolveAgentWaitingOnHuman).not.toHaveBeenCalled();
+        await (service as any).performActivityCheck();
+        expect(mockResolveAgentWaitingOnHuman).toHaveBeenCalledWith('dev-1');
+      });
+    });
+
+    it('clears the wait when the session is gone', async () => {
+      mockSessionBackend.captureOutput.mockReturnValue(screen('claude-bash-permission.txt'));
+      await (service as any).performActivityCheck();
+      mockSessionBackend.sessionExists.mockReturnValue(false);
+      await (service as any).performActivityCheck();
+      expect(getWaiting('dev-1')).toBeUndefined();
+      expect(mockResolveAgentWaitingOnHuman).toHaveBeenCalledWith('dev-1');
+    });
+  });
+});

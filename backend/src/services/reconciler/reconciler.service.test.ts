@@ -1,0 +1,2266 @@
+/**
+ * Tests for ReconcilerService
+ *
+ * @module services/reconciler/reconciler.service.test
+ */
+
+import { inputCircuitStats, noteInputRefused, resetInputCircuitsForTesting } from '../session/input-circuit-breaker.js';
+import { ReconcilerService, DEFAULT_WAKE_TUNING } from './reconciler.service.js';
+import { RestartDrainService } from '../restart/restart-drain.service.js';
+import { LoggerService } from '../core/logger.service.js';
+import type { ReconcilerDataProvider } from './reconciler.service.js';
+import { createWorkItem, createRequest, createTaskClaim, isValidWorkItemTransition } from '../../types/v2/index.js';
+import type { WorkItem, WorkItemStatus, Request, TaskClaim, ReconcileCorrection, WakeAction } from '../../types/v2/index.js';
+import type { AgentHealth } from './reconcile-rules.js';
+import {
+  WORK_ITEM_STATUSES,
+  WORK_ITEM_TRANSITIONS,
+  DISPOSITION_METADATA_KEY,
+  WORK_ITEM_BLOCK_SOURCES,
+} from '../../types/v2/work-item.types.js';
+
+// ---------------------------------------------------------------------------
+// Mock settings service for maxConcurrentAgents tests
+// ---------------------------------------------------------------------------
+
+const mockGetSettings = jest.fn().mockResolvedValue({
+  general: { maxConcurrentAgents: 10 },
+});
+
+jest.mock('../settings/index.js', () => ({
+  getSettingsService: () => ({
+    getSettings: mockGetSettings,
+  }),
+}));
+
+// ---------------------------------------------------------------------------
+// Mock escalation router
+//
+// `enforceVerification` dynamically imports EscalationRouterService to escalate
+// overdue `done_by_worker` items. Stub it so the verification-enforcement
+// invariant is observable (and so the real singleton is never constructed).
+// ---------------------------------------------------------------------------
+
+const mockEscalateUnverified = jest.fn().mockResolvedValue(undefined);
+const mockEscalateToOwner = jest.fn().mockResolvedValue('esc-owner');
+
+jest.mock('../v3/escalation-router.service.js', () => ({
+  EscalationRouterService: {
+    getInstance: () => ({
+      escalateUnverifiedWorkItem: mockEscalateUnverified,
+      escalateUnreviewedToOwner: mockEscalateToOwner,
+    }),
+  },
+}));
+
+// `disposeStrandedWorkItems` dynamically imports TaskPoolService to run the
+// disposition funnel. Stub it so the safety net is observable without standing
+// up the real pool singleton.
+const mockDisposeFailedWorkItem = jest.fn().mockResolvedValue({ kind: 'terminal' });
+const mockStampReviewEscalation = jest.fn().mockResolvedValue(true);
+
+jest.mock('../task-pool/task-pool.service.js', () => ({
+  TaskPoolService: {
+    getInstance: () => ({
+      disposeFailedWorkItem: mockDisposeFailedWorkItem,
+      stampReviewEscalation: mockStampReviewEscalation,
+    }),
+  },
+}));
+
+// Trace events are asserted by the wake-pacing tests (CREW-304).
+const mockTraceHarness = jest.fn().mockReturnValue(true);
+jest.mock('../trace/trace-recorder.js', () => ({
+  ...jest.requireActual('../trace/trace-recorder.js'),
+  traceHarness: (...args: unknown[]) => mockTraceHarness(...args),
+}));
+
+// ---------------------------------------------------------------------------
+// Mock Data Provider
+// ---------------------------------------------------------------------------
+
+function createMockProvider(overrides: Partial<ReconcilerDataProvider> = {}): ReconcilerDataProvider {
+  return {
+    getActiveWorkItems: jest.fn().mockResolvedValue([]),
+    getActiveRequests: jest.fn().mockResolvedValue([]),
+    getActiveClaims: jest.fn().mockResolvedValue([]),
+    getAgentHealthMap: jest.fn().mockResolvedValue(new Map()),
+    getWorkItemsForRequest: jest.fn().mockResolvedValue([]),
+    applyCorrection: jest.fn().mockResolvedValue(undefined),
+    releaseToPool: jest.fn().mockResolvedValue(undefined),
+    requeueWorkItem: jest.fn().mockResolvedValue(undefined),
+    markClaimExpiring: jest.fn().mockResolvedValue(undefined),
+    revokeClaimAndRelease: jest.fn().mockResolvedValue(undefined),
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makeWorkItem(overrides: Partial<WorkItem> = {}): WorkItem {
+  return {
+    ...createWorkItem({ type: 'delegate', owner: 'agent', title: 'Test', target: 'agent-1' }),
+    ...overrides,
+  };
+}
+
+function makeRequest(overrides: Partial<Request> = {}): Request {
+  return {
+    ...createRequest({ sourceConversationItemId: 'conv-1', title: 'Test', description: 'Test desc' }),
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+describe('ReconcilerService', () => {
+  let service: ReconcilerService;
+  let provider: ReconcilerDataProvider;
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    mockEscalateToOwner.mockClear();
+    mockStampReviewEscalation.mockClear();
+    provider = createMockProvider();
+    service = new ReconcilerService(provider, {
+      fastLoopIntervalMs: 10_000,
+      fullLoopIntervalMs: 60_000,
+    });
+    // Reset settings mock to default
+    mockGetSettings.mockResolvedValue({
+      general: { maxConcurrentAgents: 10 },
+    });
+    mockEscalateUnverified.mockClear();
+    mockDisposeFailedWorkItem.mockClear();
+  });
+
+  afterEach(() => {
+    service.stop();
+    jest.useRealTimers();
+  });
+
+  describe('wind-down hold', () => {
+    afterEach(() => RestartDrainService.resetInstance());
+
+    it('runs no pass while Crewly winds down for a shutdown / restart', async () => {
+      RestartDrainService.getInstance().beginWindDown('test');
+      const full = await service.runFull();
+      const fast = await service.runFast();
+      expect(full.corrections).toEqual([]);
+      expect(fast.corrections).toEqual([]);
+      expect(provider.getActiveWorkItems).not.toHaveBeenCalled();
+      RestartDrainService.getInstance().abortWindDown();
+      await service.runFull();
+      expect(provider.getActiveWorkItems).toHaveBeenCalled();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Lifecycle
+  // -----------------------------------------------------------------------
+  describe('start / stop', () => {
+    it('should start and stop without error', () => {
+      expect(() => service.start()).not.toThrow();
+      expect(() => service.stop()).not.toThrow();
+    });
+
+    it('should stop previous loops when starting again', () => {
+      service.start();
+      expect(() => service.start()).not.toThrow();
+      service.stop();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // runFull
+  // -----------------------------------------------------------------------
+  describe('runFull', () => {
+    it('should return a ReconcileResult with type full', async () => {
+      const result = await service.runFull();
+      expect(result.type).toBe('full');
+      expect(result.durationMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it('should detect stuck WorkItems with dead agents', async () => {
+      const wi = makeWorkItem({
+        status: 'running',
+        target: 'agent-dead',
+        startedAt: new Date().toISOString(),
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-dead', { sessionName: 'agent-dead', status: 'inactive' }],
+      ]);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+      expect(result.workItemsTimedOut).toBe(1);
+      expect(result.corrections.length).toBeGreaterThan(0);
+      expect(provider.applyCorrection).toHaveBeenCalled();
+    });
+
+    it('should reconcile Request status when all WorkItems done', async () => {
+      const request = makeRequest({ status: 'running', workItemIds: ['wi-1'] });
+      const wi = makeWorkItem({ id: 'wi-1', status: 'done' });
+
+      provider = createMockProvider({
+        getActiveRequests: jest.fn().mockResolvedValue([request]),
+        getWorkItemsForRequest: jest.fn().mockResolvedValue([wi]),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+      expect(result.requestsUpdated).toBe(1);
+    });
+
+    it('should detect orphan WorkItems', async () => {
+      const parent = makeWorkItem({ id: 'parent-1', status: 'cancelled' });
+      const child = makeWorkItem({ id: 'child-1', status: 'running', parentWorkItemId: 'parent-1' });
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([parent, child]),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+      expect(result.staleItemsCleaned).toBeGreaterThan(0);
+    });
+
+    it('does not TTL-cancel work waiting on an open owner decision card (crewly#1369 §5)', async () => {
+      const now = Date.now();
+      const waiting = makeWorkItem({ id: 'ttl-waiting-card', status: 'running', createdAt: new Date(now - 30 * 3600000).toISOString() });
+      const stale = makeWorkItem({ id: 'ttl-stale', status: 'running', createdAt: new Date(now - 30 * 3600000).toISOString() });
+      const getOpenDecisionHolds = jest.fn().mockResolvedValue([{ workItemId: 'ttl-waiting-card' }]);
+      provider = createMockProvider({ getActiveWorkItems: jest.fn().mockResolvedValue([waiting, stale]), getOpenDecisionHolds });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+
+      expect(getOpenDecisionHolds).toHaveBeenCalled();
+      expect(result.corrections.find((c) => c.entityId === 'ttl-waiting-card' && c.newState === 'cancelled')).toBeUndefined();
+      expect(result.corrections.find((c) => c.entityId === 'ttl-stale' && c.newState === 'cancelled')).toBeDefined();
+    });
+
+    it('a failing decision lookup does not stop the TTL pass', async () => {
+      const stale = makeWorkItem({ id: 'ttl-stale-2', status: 'running', createdAt: new Date(Date.now() - 30 * 3600000).toISOString() });
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([stale]),
+        getOpenDecisionHolds: jest.fn().mockRejectedValue(new Error('store down')),
+      });
+      service = new ReconcilerService(provider);
+      const result = await service.runFull();
+      expect(result.corrections.find((c) => c.entityId === 'ttl-stale-2' && c.newState === 'cancelled')).toBeDefined();
+    });
+
+    it('counts a TTL-cancelled item in staleItemsCleaned but NOT a TTL auto-verified one', async () => {
+      // `staleItemsCleaned` must mean exactly one thing: work that was
+      // DISCARDED. The TTL rule produces two opposite outcomes —
+      // `running → cancelled` (discarded) and `done_by_worker → verified`
+      // (the 24h implicit-acceptance fallback, i.e. ACCEPTED). Summing the
+      // old combined `ttlExpiredCount` reported the accepted item to
+      // operators as thrown away.
+      // #813: the second outcome no longer exists — an expired
+      // done_by_worker item is left for review and escalated to the owner.
+      const now = Date.now();
+      const awaiting = makeWorkItem({
+        id: 'ttl-awaiting',
+        status: 'done_by_worker',
+        createdAt: new Date(now - 25 * 3600000).toISOString(),
+        completedAt: new Date(now - 25 * 3600000).toISOString(),
+      });
+      const discarded = makeWorkItem({
+        id: 'ttl-discarded',
+        status: 'running',
+        createdAt: new Date(now - 25 * 3600000).toISOString(),
+      });
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([awaiting, discarded]),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+
+      expect(result.staleItemsCleaned).toBe(1);
+      expect(result.corrections.find((c) => c.entityId === 'ttl-awaiting')).toBeUndefined();
+      expect(result.corrections.map((c) => c.newState)).not.toContain('verified');
+      expect(result.corrections.find((c) => c.entityId === 'ttl-discarded' && c.newState === 'cancelled'))
+        .toBeDefined();
+      expect(mockEscalateToOwner).toHaveBeenCalledWith(expect.objectContaining({ id: 'ttl-awaiting' }), expect.any(Number));
+    });
+
+    it('should detect recoverable blocked WorkItems', async () => {
+      const wi = makeWorkItem({
+        status: 'blocked',
+        target: 'agent-1',
+        retryCount: 0,
+        maxRetries: 3,
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-1', { sessionName: 'agent-1', status: 'active', lastSeenAt: new Date().toISOString() }],
+      ]);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+      expect(result.workItemsRequeued).toBe(1);
+      expect(provider.requeueWorkItem).toHaveBeenCalled();
+    });
+
+    it('lifts an explicit block whose until time has passed, flagging the requeue as the due-block one (block-task until)', async () => {
+      const wi = makeWorkItem({
+        status: 'blocked',
+        blockSource: 'explicit',
+        target: 'agent-1',
+        metadata: { blockedUntil: new Date(Date.now() - 60_000).toISOString() },
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-1', { sessionName: 'agent-1', status: 'active', lastSeenAt: new Date().toISOString() }],
+      ]);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+      expect(result.workItemsRequeued).toBe(1);
+      expect(provider.requeueWorkItem).toHaveBeenCalledTimes(1);
+      expect(provider.requeueWorkItem).toHaveBeenCalledWith(wi.id, { allowWaitingOnHuman: false, allowExplicitWhenDue: true });
+    });
+
+    it('leaves a timed explicit block alone while its time is ahead, and an open-ended one always', async () => {
+      const timed = makeWorkItem({
+        status: 'blocked',
+        blockSource: 'explicit',
+        target: 'agent-1',
+        metadata: { blockedUntil: new Date(Date.now() + 60 * 60_000).toISOString() },
+      });
+      const openEnded = makeWorkItem({ status: 'blocked', blockSource: 'explicit', target: 'agent-1' });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-1', { sessionName: 'agent-1', status: 'active', lastSeenAt: new Date().toISOString() }],
+      ]);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([timed, openEnded]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+      expect(result.workItemsRequeued).toBe(0);
+      expect(provider.requeueWorkItem).not.toHaveBeenCalled();
+    });
+
+    it('should handle errors gracefully', async () => {
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockRejectedValue(new Error('DB connection failed')),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+      expect(result.errors.length).toBeGreaterThan(0);
+      expect(result.errors[0]).toContain('DB connection failed');
+    });
+
+    it('should not run concurrently', async () => {
+      // Make the data provider slow
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockImplementation(
+          () => new Promise(resolve => setTimeout(() => resolve([]), 100)),
+        ),
+      });
+      service = new ReconcilerService(provider);
+
+      // Start two concurrent runs
+      jest.useRealTimers();
+      const [result1, result2] = await Promise.all([
+        service.runFull(),
+        service.runFull(),
+      ]);
+      jest.useFakeTimers();
+
+      // One should be empty (skipped)
+      const totalCorrections = result1.corrections.length + result2.corrections.length;
+      // At least one ran; the second got skipped (empty result)
+      expect(result1.type).toBe('full');
+      expect(result2.type).toBe('full');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // runFast
+  // -----------------------------------------------------------------------
+  describe('runFast', () => {
+    it('should return a ReconcileResult with type fast', async () => {
+      const result = await service.runFast();
+      expect(result.type).toBe('fast');
+    });
+
+    it('should detect expired claims', async () => {
+      const claim = createTaskClaim({ workItemId: 'wi-1', agentId: 'agent-1' });
+      const expiredClaim: TaskClaim = {
+        ...claim,
+        leaseExpiresAt: new Date(Date.now() - 1000).toISOString(),
+      };
+
+      provider = createMockProvider({
+        getActiveClaims: jest.fn().mockResolvedValue([expiredClaim]),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFast();
+      expect(result.corrections.length).toBeGreaterThan(0);
+    });
+
+    it('should check running WorkItems for stuck agents', async () => {
+      const wi = makeWorkItem({
+        status: 'running',
+        target: 'agent-dead',
+        startedAt: new Date().toISOString(),
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-dead', { sessionName: 'agent-dead', status: 'inactive' }],
+      ]);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFast();
+      expect(result.workItemsTimedOut).toBe(1);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // reconcileRequest
+  // -----------------------------------------------------------------------
+  describe('reconcileRequest', () => {
+    it('should reconcile a specific request', async () => {
+      const request = makeRequest({ id: 'req-1', status: 'running' });
+      const wi = makeWorkItem({ id: 'wi-1', status: 'done' });
+
+      provider = createMockProvider({
+        getActiveRequests: jest.fn().mockResolvedValue([request]),
+        getWorkItemsForRequest: jest.fn().mockResolvedValue([wi]),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.reconcileRequest('req-1');
+      expect(result.type).toBe('targeted_request');
+      expect(result.requestsUpdated).toBe(1);
+    });
+
+    it('should do nothing if request not found', async () => {
+      provider = createMockProvider({
+        getActiveRequests: jest.fn().mockResolvedValue([]),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.reconcileRequest('nonexistent');
+      expect(result.requestsUpdated).toBe(0);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // getStatus
+  // -----------------------------------------------------------------------
+  describe('getStatus', () => {
+    it('should return correct initial status', () => {
+      const status = service.getStatus();
+      expect(status.isRunning).toBe(false);
+      expect(status.totalPasses).toBe(0);
+      expect(status.totalCorrections).toBe(0);
+      expect(status.lastResult).toBeUndefined();
+    });
+
+    it('should update after a reconcile pass', async () => {
+      await service.runFull();
+      const status = service.getStatus();
+      expect(status.totalPasses).toBe(1);
+      expect(status.lastResult).toBeDefined();
+      expect(status.lastResult!.type).toBe('full');
+    });
+
+    it('should show next reconcile times when started', () => {
+      service.start();
+      const status = service.getStatus();
+      expect(status.nextFullReconcileAt).toBeDefined();
+      expect(status.nextFastReconcileAt).toBeDefined();
+    });
+
+    it('should not show next reconcile times when stopped', () => {
+      const status = service.getStatus();
+      expect(status.nextFullReconcileAt).toBeUndefined();
+      expect(status.nextFastReconcileAt).toBeUndefined();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // getHistory
+  // -----------------------------------------------------------------------
+  describe('getHistory', () => {
+    it('should return empty array initially', () => {
+      expect(service.getHistory()).toEqual([]);
+    });
+
+    it('should return results newest first', async () => {
+      await service.runFull();
+      await service.runFast();
+
+      const history = service.getHistory();
+      expect(history).toHaveLength(2);
+      expect(history[0].type).toBe('fast');  // newest first
+      expect(history[1].type).toBe('full');
+    });
+
+    it('should respect limit parameter', async () => {
+      await service.runFull();
+      await service.runFull();
+      await service.runFull();
+
+      const history = service.getHistory(2);
+      expect(history).toHaveLength(2);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // updateConfig
+  // -----------------------------------------------------------------------
+  describe('updateConfig', () => {
+    it('should update config values', () => {
+      service.updateConfig({ workItemTimeoutMs: 300_000 });
+      const status = service.getStatus();
+      expect(status.config.workItemTimeoutMs).toBe(300_000);
+    });
+
+    it('should restart loops when interval changes', () => {
+      service.start();
+      const stopSpy = jest.spyOn(service, 'stop');
+      const startSpy = jest.spyOn(service, 'start');
+
+      service.updateConfig({ fastLoopIntervalMs: 5_000 });
+
+      expect(stopSpy).toHaveBeenCalled();
+      expect(startSpy).toHaveBeenCalled();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Correction Application
+  // -----------------------------------------------------------------------
+  describe('correction application', () => {
+    it('should revoke claims via ClaimService when grace period exceeded', async () => {
+      const claim = createTaskClaim({ workItemId: 'wi-1', agentId: 'agent-1' });
+      const expiringClaim: TaskClaim = {
+        ...claim,
+        status: 'expiring',
+        leaseExpiresAt: new Date(Date.now() - 200_000).toISOString(),
+      };
+
+      provider = createMockProvider({
+        getActiveClaims: jest.fn().mockResolvedValue([expiringClaim]),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFast();
+      expect(provider.revokeClaimAndRelease).toHaveBeenCalledWith(
+        expiringClaim.id,
+        expect.stringContaining('Grace period exceeded'),
+      );
+      expect(result.claimsRevoked).toBe(1);
+    });
+
+    // #842: a worker that goes quiet holding a running WorkItem is reported
+    // to its lead once, on whichever loop revokes the claim.
+    it.each(['runFast', 'runFull'] as const)('%s reports a quiet holder whose session is up to its lead, once', async (loop) => {
+      const wi = makeWorkItem({ id: 'wi-quiet', status: 'running', target: 'agent-1' });
+      const claim = createTaskClaim({ workItemId: 'wi-quiet', agentId: 'agent-1' });
+      const expiringClaim: TaskClaim = {
+        ...claim,
+        status: 'expiring',
+        leaseExpiresAt: new Date(Date.now() - 200_000).toISOString(),
+      };
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getActiveClaims: jest.fn().mockResolvedValue([expiringClaim]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(new Map([['agent-1', {
+          sessionName: 'agent-1',
+          status: 'active',
+          lastActivityAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+        }]])),
+      });
+      service = new ReconcilerService(provider);
+      const addToPool = jest.fn().mockResolvedValue(undefined);
+      const stamp = jest.fn().mockResolvedValue(undefined);
+      service.setIdleHolderReporting({
+        loadTeams: async () => [{
+          id: 't1', name: 'T', members: [
+            { id: 'lead', sessionName: 'lead-1', canDelegate: true, hierarchyLevel: 1 },
+            { id: 'w', sessionName: 'agent-1' },
+          ],
+        } as never],
+        addToPool,
+        stamp,
+      });
+
+      await service[loop]();
+      await service[loop]();
+
+      expect(provider.revokeClaimAndRelease).toHaveBeenCalled();
+      expect(addToPool).toHaveBeenCalledTimes(1);
+      expect(addToPool.mock.calls[0][0]).toMatchObject({ type: 'review', target: 'lead-1', metadata: { reviewReason: 'idle_holder', sourceWorkItemId: 'wi-quiet' } });
+      expect(stamp).toHaveBeenCalledWith('wi-quiet', expect.objectContaining({ idleHolderSurfacedAt: expect.any(String) }));
+    });
+
+    // 2026-09-29, WI f34f09b0 / CE-19: the holder was working, yet the claim
+    // was revoked 13 minutes after it was taken.
+    it.each(['runFast', 'runFull'] as const)('%s renews instead of revoking when the holder is working', async (loop) => {
+      const claim = createTaskClaim({ workItemId: 'wi-1', agentId: 'agent-1' });
+      const expiringClaim: TaskClaim = {
+        ...claim,
+        status: 'expiring',
+        leaseExpiresAt: new Date(Date.now() - 200_000).toISOString(),
+      };
+      const renewClaim = jest.fn().mockResolvedValue(undefined);
+      provider = createMockProvider({
+        getActiveClaims: jest.fn().mockResolvedValue([expiringClaim]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(new Map([['agent-1', {
+          sessionName: 'agent-1',
+          status: 'active',
+          lastActivityAt: new Date(Date.now() - 20_000).toISOString(),
+        }]])),
+        renewClaim,
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service[loop]();
+      expect(renewClaim).toHaveBeenCalledWith(expiringClaim.id);
+      expect(provider.revokeClaimAndRelease).not.toHaveBeenCalled();
+      expect(result.claimsRevoked).toBe(0);
+    });
+
+    it('should mark claims as expiring when lease expired', async () => {
+      const claim = createTaskClaim({ workItemId: 'wi-1', agentId: 'agent-1' });
+      const expiredClaim: TaskClaim = {
+        ...claim,
+        status: 'active',
+        leaseExpiresAt: new Date(Date.now() - 1000).toISOString(),
+      };
+
+      provider = createMockProvider({
+        getActiveClaims: jest.fn().mockResolvedValue([expiredClaim]),
+      });
+      service = new ReconcilerService(provider);
+
+      await service.runFast();
+      expect(provider.markClaimExpiring).toHaveBeenCalledWith(expiredClaim.id);
+    });
+
+    it('should requeue recovered blocked WorkItems', async () => {
+      const wi = makeWorkItem({
+        status: 'blocked',
+        target: 'agent-1',
+        retryCount: 0,
+        maxRetries: 3,
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-1', { sessionName: 'agent-1', status: 'active', lastSeenAt: new Date().toISOString() }],
+      ]);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+      });
+      service = new ReconcilerService(provider);
+
+      await service.runFull();
+      // #820: allowWaitingOnHuman is false for this correction — it has no
+      // blockSource, so it did not come from the waiting_on_human rule.
+      expect(provider.requeueWorkItem).toHaveBeenCalledWith(wi.id, { allowWaitingOnHuman: false });
+      // Steve 2026-05-15 dogfood: applyCorrection MUST NOT also run for
+      // blocked→queued corrections, otherwise the WI is flipped to
+      // queued first and requeueWorkItem's call to `releaseBack` throws
+      // "Cannot release WorkItem: status must be 'running' or 'blocked',
+      // got 'queued'". requeueWorkItem owns the full lifecycle (claim
+      // release + status flip + retryCount bump + startedAt clear).
+      expect(provider.applyCorrection).not.toHaveBeenCalled();
+    });
+
+    it('#820: requeues a waiting_on_human WorkItem end-to-end when its agent is gone (whole path, not just the pure rule)', async () => {
+      // Regression for the bug found in the #815/#819 PR sweep:
+      // detectWaitingOnHumanWorkItems (the pure rule) correctly emits a
+      // blocked->queued correction when the agent holding a waiting_on_human
+      // item is gone, but the OLD requeueWorkItem refused ANY waiting_on_human
+      // item unconditionally — including this one, which is the rule's own
+      // intended requeue, not a stray other-rule requeue it must guard
+      // against. The item stayed blocked forever while workItemsRequeued
+      // still counted it. Exercising service.runFull() (not
+      // detectWaitingOnHumanWorkItems directly) is what catches this: the
+      // pure rule's corrections looked correct in isolation the whole time.
+      const wi = makeWorkItem({
+        status: 'blocked',
+        blockSource: WORK_ITEM_BLOCK_SOURCES.WAITING_ON_HUMAN,
+        target: 'agent-1',
+        retryCount: 0,
+        maxRetries: 3,
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-1', { sessionName: 'agent-1', status: 'inactive', lastSeenAt: new Date().toISOString() }],
+      ]);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+
+      // The fix: THIS requeue (blockSource waiting_on_human on the
+      // correction) is allowed through, unlike the plain agent-back-online
+      // path above.
+      expect(provider.requeueWorkItem).toHaveBeenCalledWith(wi.id, { allowWaitingOnHuman: true });
+      // The reported count must match a requeue that actually happened —
+      // not just a rule that emitted a correction nobody applied.
+      expect(result.workItemsRequeued).toBeGreaterThanOrEqual(1);
+    });
+
+    it('dedupes corrections sharing entity+newState in one tick (Steve 2026-05-15)', async () => {
+      // Repro: WI 5afef18f at 21:55:49 — both `detectRecoverableWorkItems`
+      // (agent back online) AND `detectDependencyResolvedWorkItems`
+      // (dependencies satisfied) emitted blocked→queued for the same
+      // WI in the same tick. First requeueWorkItem succeeded; second
+      // threw "Cannot release ... got 'queued'" because the WI was no
+      // longer in `blocked`. Dedup must skip the second.
+      provider = createMockProvider({});
+      service = new ReconcilerService(provider);
+
+      const correction = {
+        entityType: 'work_item' as const,
+        entityId: 'wi-1',
+        previousState: 'blocked',
+        newState: 'queued',
+        reason: 'agent back online',
+        evidence: '',
+        timestamp: new Date().toISOString(),
+        id: 'c1',
+      };
+      const duplicate = { ...correction, id: 'c2', reason: 'deps resolved' };
+
+      await (service as any).applyCorrections([correction, duplicate], {
+        corrections: [],
+        workItemsRequeued: 0,
+        claimsRevoked: 0,
+        errors: [],
+        staleItemsCleaned: 0,
+        workItemsTimedOut: 0,
+      });
+
+      // Only ONE requeueWorkItem call despite two corrections — dedup wins.
+      expect(provider.requeueWorkItem).toHaveBeenCalledTimes(1);
+      expect(provider.requeueWorkItem).toHaveBeenCalledWith('wi-1', { allowWaitingOnHuman: false });
+    });
+
+    it('should handle correction application errors gracefully', async () => {
+      const wi = makeWorkItem({
+        status: 'running',
+        target: 'agent-dead',
+        startedAt: new Date().toISOString(),
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-dead', { sessionName: 'agent-dead', status: 'inactive' }],
+      ]);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+        applyCorrection: jest.fn().mockRejectedValue(new Error('Write failed')),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+      expect(result.errors.length).toBeGreaterThan(0);
+      expect(result.errors[0]).toContain('Write failed');
+    });
+
+    // ---------------------------------------------------------------------
+    // Request 13548bd5 (2026-08-20) — full-loop-cycle guard.
+    //
+    // The unit tests in reconcile-rules.test.ts prove the TTL picker never
+    // NAMES an illegal target. This proves the assembled loop never ATTEMPTS
+    // one: the provider below enforces the real WORK_ITEM_TRANSITIONS matrix
+    // and throws the exact error string TaskPoolService.transitionStatus
+    // throws, so any illegal correction surfaces in `result.errors`.
+    //
+    // Before the fix, the `rejected` and `failed` items in this pool each
+    // produced `Invalid status transition ... → cancelled` on EVERY pass,
+    // forever.
+    // ---------------------------------------------------------------------
+    it('applies a full reconcile cycle with zero Invalid status transition errors', async () => {
+      const staleAt = new Date(Date.now() - 96 * 3600 * 1000).toISOString();
+      const pool = [
+        makeWorkItem({ id: 'wi-rejected', status: 'rejected', createdAt: staleAt }),
+        // Retry-EXHAUSTED: detectRetryableFailedWorkItems deliberately
+        // ignores it, so this item reaches the TTL rule — the exact case that
+        // used to throw on every pass and strand the item forever.
+        makeWorkItem({
+          id: 'wi-failed', status: 'failed', createdAt: staleAt,
+          retryCount: 3, maxRetries: 3,
+        }),
+        makeWorkItem({ id: 'wi-dbw', status: 'done_by_worker', createdAt: staleAt }),
+        makeWorkItem({ id: 'wi-queued', status: 'queued', createdAt: staleAt }),
+        makeWorkItem({ id: 'wi-running', status: 'running', createdAt: staleAt }),
+        makeWorkItem({ id: 'wi-blocked', status: 'blocked', createdAt: staleAt }),
+        makeWorkItem({ id: 'wi-escalated', status: 'escalated', createdAt: staleAt }),
+        makeWorkItem({ id: 'wi-proposed', status: 'proposed', createdAt: staleAt }),
+        makeWorkItem({ id: 'wi-accepted', status: 'accepted', createdAt: staleAt }),
+        makeWorkItem({ id: 'wi-scheduled', status: 'scheduled', createdAt: staleAt }),
+      ];
+      const byId = new Map(pool.map((wi) => [wi.id, wi]));
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue(pool),
+        // Enforce the real state machine, exactly as TaskPoolService does.
+        applyCorrection: jest.fn(async (correction: ReconcileCorrection) => {
+          if (correction.entityType !== 'work_item') return;
+          const item = byId.get(correction.entityId);
+          if (!item) return;
+          // `ReconcileCorrection.newState` is typed `string`, not
+          // `WorkItemStatus` — a weak spot that lets an illegal status reach
+          // the pool untyped. Narrow explicitly here so this fake enforces
+          // the same contract TaskPoolService.transitionStatus does.
+          const next = correction.newState as WorkItemStatus;
+          if (!isValidWorkItemTransition(item.status, next)) {
+            throw new Error(
+              `Invalid status transition for WorkItem ${correction.entityId}: ` +
+              `${item.status} → ${next}`,
+            );
+          }
+          item.status = next;
+        }),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+
+      expect(result.errors.filter((e) => e.includes('Invalid status transition')))
+        .toEqual([]);
+      expect(result.errors).toEqual([]);
+
+      // The two audit-record statuses are left untouched by the sweeper...
+      expect(byId.get('wi-rejected')!.status).toBe('rejected');
+      expect(byId.get('wi-failed')!.status).toBe('failed');
+      // (a retry-ELIGIBLE failed item is a different path — the retry rule
+      // legally requeues it; see the dedicated case below.)
+      // ...an unreviewed item is never passed by the sweeper (#813)...
+      expect(byId.get('wi-dbw')?.status).toBe('done_by_worker');
+      // ...while the genuinely stale in-flight work is still cleaned up.
+      expect(byId.get('wi-running')?.status).toBe('cancelled');
+    });
+
+    // ---------------------------------------------------------------------
+    // The `runFull` step-3d invariant, asserted rather than commented.
+    //
+    // reconciler.service.ts orders `enforceVerification` BEFORE the pruning
+    // pass so unverified work gets a real verdict opportunity and is never
+    // silently auto-accepted. That ordering was load-bearing but untested:
+    // commit 469a3a21 let the pruning pass auto-`verified` a `done_by_worker`
+    // item via the shared TTL picker, which bypassed the guard entirely and
+    // no test noticed.
+    // ---------------------------------------------------------------------
+    describe('unverified work is never silently auto-accepted (runFull step 3d)', () => {
+      /** Reads a WorkItem's current status without a non-null assertion. */
+      function statusOf(byId: Map<string, WorkItem>, id: string): WorkItemStatus | undefined {
+        return byId.get(id)?.status;
+      }
+
+      /** Builds a provider that enforces the real WORK_ITEM_TRANSITIONS matrix. */
+      function strictProvider(pool: WorkItem[], byId: Map<string, WorkItem>): ReconcilerDataProvider {
+        return createMockProvider({
+          getActiveWorkItems: jest.fn().mockResolvedValue(pool),
+          applyCorrection: jest.fn(async (correction: ReconcileCorrection) => {
+            if (correction.entityType !== 'work_item') return;
+            const item = byId.get(correction.entityId);
+            if (!item) return;
+            const next = correction.newState as WorkItemStatus;
+            if (!isValidWorkItemTransition(item.status, next)) {
+              throw new Error(
+                `Invalid status transition for WorkItem ${correction.entityId}: ` +
+                `${item.status} → ${next}`,
+              );
+            }
+            item.status = next;
+          }),
+        });
+      }
+
+      it('REGRESSION: a ~1s-old done_by_worker child under a permanently-failed parent is not verified', async () => {
+        const parent = makeWorkItem({
+          id: 'parent-dead', status: 'failed', retryCount: 3, maxRetries: 3,
+        });
+        const child = makeWorkItem({
+          id: 'child-unreviewed',
+          status: 'done_by_worker',
+          parentWorkItemId: 'parent-dead',
+          createdAt: new Date(Date.now() - 1000).toISOString(),
+        });
+        const pool = [parent, child];
+        const byId = new Map(pool.map((wi) => [wi.id, wi]));
+
+        provider = strictProvider(pool, byId);
+        service = new ReconcilerService(provider);
+
+        const result = await service.runFull();
+
+        expect(result.errors).toEqual([]);
+        // The whole point: TL-unreviewed output must survive the pass intact.
+        expect(statusOf(byId, 'child-unreviewed')).toBe('done_by_worker');
+        expect(result.corrections.filter((c) => c.entityId === 'child-unreviewed'))
+          .toEqual([]);
+        expect(result.corrections.map((c) => c.newState)).not.toContain('verified');
+      });
+
+      it('escalates for a verdict BEFORE the pruning pass can touch the item', async () => {
+        // 3h old: past DEFAULT_VERIFY_ESCALATE_MS (2h) so the guard fires,
+        // but nowhere near the 24h TTL, so nothing may legitimately expire it.
+        const child = makeWorkItem({
+          id: 'wi-awaiting',
+          status: 'done_by_worker',
+          createdAt: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
+        });
+        const pool = [child];
+        const byId = new Map(pool.map((wi) => [wi.id, wi]));
+
+        provider = strictProvider(pool, byId);
+        service = new ReconcilerService(provider);
+
+        const result = await service.runFull();
+
+        expect(result.errors).toEqual([]);
+        // Guard ran and asked for a real verdict...
+        expect(mockEscalateUnverified).toHaveBeenCalledTimes(1);
+        expect(mockEscalateUnverified.mock.calls[0][0]).toMatchObject({ id: 'wi-awaiting' });
+        // ...and the item is still awaiting one, not auto-accepted.
+        expect(statusOf(byId, 'wi-awaiting')).toBe('done_by_worker');
+        expect(provider.applyCorrection).not.toHaveBeenCalled();
+      });
+
+      it('the escalation guard runs before any correction is applied', async () => {
+        // Ordering is the invariant. Assert it on the call graph, not by
+        // reading the source.
+        const stale = new Date(Date.now() - 96 * 3600 * 1000).toISOString();
+        const pool = [
+          makeWorkItem({ id: 'wi-dbw', status: 'done_by_worker', createdAt: stale }),
+          makeWorkItem({ id: 'wi-running', status: 'running', createdAt: stale }),
+        ];
+        const byId = new Map(pool.map((wi) => [wi.id, wi]));
+
+        provider = strictProvider(pool, byId);
+        service = new ReconcilerService(provider);
+
+        await service.runFull();
+
+        // The 96h-old item goes to the orchestrator AND the owner, and the
+        // owner step must not stop the orchestrator step (#813).
+        expect(mockEscalateUnverified).toHaveBeenCalled();
+        expect(mockEscalateToOwner).toHaveBeenCalledWith(expect.objectContaining({ id: 'wi-dbw' }), expect.any(Number));
+        const applyMock = provider.applyCorrection as jest.Mock;
+        expect(applyMock).toHaveBeenCalled();
+        expect(mockEscalateUnverified.mock.invocationCallOrder[0])
+          .toBeLessThan(applyMock.mock.invocationCallOrder[0]);
+      });
+
+      it('no rule produces a `verified` correction — an ancient unreviewed item goes to the owner instead (#813)', async () => {
+        const stale = new Date(Date.now() - 96 * 3600 * 1000).toISOString();
+        const pool = [makeWorkItem({ id: 'wi-ancient', status: 'done_by_worker', createdAt: stale, completedAt: stale })];
+        const byId = new Map(pool.map((wi) => [wi.id, wi]));
+
+        provider = strictProvider(pool, byId);
+        service = new ReconcilerService(provider);
+
+        const result = await service.runFull();
+
+        expect(result.errors).toEqual([]);
+        expect(result.corrections.filter((c) => c.newState === 'verified')).toEqual([]);
+        expect(statusOf(byId, 'wi-ancient')).toBe('done_by_worker');
+        expect(mockStampReviewEscalation).toHaveBeenCalledWith('wi-ancient', 'reviewOwnerEscalatedAt');
+        expect(mockEscalateToOwner).toHaveBeenCalledTimes(1);
+        expect(mockEscalateToOwner.mock.calls[0][0]).toMatchObject({ id: 'wi-ancient' });
+      });
+
+      it('escalates to the owner once: an item already stamped is skipped', async () => {
+        const stale = new Date(Date.now() - 96 * 3600 * 1000).toISOString();
+        const pool = [makeWorkItem({
+          id: 'wi-stamped', status: 'done_by_worker', createdAt: stale, completedAt: stale,
+          metadata: { reviewOwnerEscalatedAt: stale },
+        })];
+        provider = strictProvider(pool, new Map(pool.map((wi) => [wi.id, wi])));
+        service = new ReconcilerService(provider);
+
+        await service.runFull();
+
+        expect(mockEscalateToOwner).not.toHaveBeenCalled();
+      });
+
+      it('does not notify the owner when the stamp could not be written (item moved on)', async () => {
+        mockStampReviewEscalation.mockResolvedValue(false);
+        const stale = new Date(Date.now() - 96 * 3600 * 1000).toISOString();
+        const pool = [makeWorkItem({ id: 'wi-gone', status: 'done_by_worker', createdAt: stale, completedAt: stale })];
+        provider = strictProvider(pool, new Map(pool.map((wi) => [wi.id, wi])));
+        service = new ReconcilerService(provider);
+
+        await service.runFull();
+
+        expect(mockEscalateToOwner).not.toHaveBeenCalled();
+        mockStampReviewEscalation.mockResolvedValue(true);
+      });
+    });
+
+    it('stays error-free across repeated passes (the bug recurred every pass)', async () => {
+      const staleAt = new Date(Date.now() - 96 * 3600 * 1000).toISOString();
+      const pool = [
+        makeWorkItem({ id: 'wi-rejected', status: 'rejected', createdAt: staleAt }),
+        makeWorkItem({
+          id: 'wi-failed', status: 'failed', createdAt: staleAt,
+          retryCount: 3, maxRetries: 3,
+        }),
+      ];
+      const byId = new Map(pool.map((wi) => [wi.id, wi]));
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue(pool),
+        applyCorrection: jest.fn(async (correction: ReconcileCorrection) => {
+          const item = byId.get(correction.entityId);
+          if (!item) return;
+          // `ReconcileCorrection.newState` is typed `string`, not
+          // `WorkItemStatus` — a weak spot that lets an illegal status reach
+          // the pool untyped. Narrow explicitly here so this fake enforces
+          // the same contract TaskPoolService.transitionStatus does.
+          const next = correction.newState as WorkItemStatus;
+          if (!isValidWorkItemTransition(item.status, next)) {
+            throw new Error(
+              `Invalid status transition for WorkItem ${correction.entityId}: ` +
+              `${item.status} → ${next}`,
+            );
+          }
+          item.status = next;
+        }),
+      });
+      service = new ReconcilerService(provider);
+
+      for (let pass = 0; pass < 3; pass++) {
+        const result = await service.runFull();
+        expect(result.errors).toEqual([]);
+      }
+      // Nothing to correct: both are terminal-for-practical-purposes audit
+      // records with no legal terminal edge. Previously each pass produced
+      // one doomed correction per item — 6 thrown errors across 3 passes.
+      expect(provider.applyCorrection).not.toHaveBeenCalled();
+    });
+
+    it('still auto-retries a retry-ELIGIBLE failed item (legal failed → queued)', async () => {
+      // Guard against over-correcting the fix: skipping `failed` in the TTL
+      // rule must not disable the genuine retry path.
+      const staleAt = new Date(Date.now() - 96 * 3600 * 1000).toISOString();
+      const wi = makeWorkItem({
+        id: 'wi-retryable', status: 'failed', createdAt: staleAt,
+        retryCount: 0, maxRetries: 3,
+      });
+      const byId = new Map([[wi.id, wi]]);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        applyCorrection: jest.fn(async (correction: ReconcileCorrection) => {
+          const item = byId.get(correction.entityId);
+          if (!item) return;
+          // `ReconcileCorrection.newState` is typed `string`, not
+          // `WorkItemStatus` — a weak spot that lets an illegal status reach
+          // the pool untyped. Narrow explicitly here so this fake enforces
+          // the same contract TaskPoolService.transitionStatus does.
+          const next = correction.newState as WorkItemStatus;
+          if (!isValidWorkItemTransition(item.status, next)) {
+            throw new Error(
+              `Invalid status transition for WorkItem ${correction.entityId}: ` +
+              `${item.status} → ${next}`,
+            );
+          }
+          item.status = next;
+        }),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFull();
+
+      expect(result.errors).toEqual([]);
+      expect(provider.applyCorrection).toHaveBeenCalledWith(
+        expect.objectContaining({
+          entityId: 'wi-retryable',
+          previousState: 'failed',
+          newState: 'queued',
+        }),
+      );
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Hybrid Wake (H3)
+  // -----------------------------------------------------------------------
+  describe('Hybrid Wake', () => {
+    const THREE_MIN_AGO = new Date(Date.now() - 3 * 60_000).toISOString();
+
+    it('should execute wake actions for unclaimed tasks with dormant agents', async () => {
+      // 2026-05-17 strict-target policy: wake only when wi.target matches a
+      // wakable agent. Override the makeWorkItem default ('agent-1') to
+      // point at the actual suspended agent in the map.
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: THREE_MIN_AGO,
+        type: 'delegate',
+        target: 'agent-suspended',
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-suspended', {
+          sessionName: 'agent-suspended',
+          status: 'suspended',
+          role: 'developer',
+        }],
+      ]);
+
+      const executeWakeAction = jest.fn().mockResolvedValue(true);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFast();
+      expect(executeWakeAction).toHaveBeenCalled();
+      expect(result.agentsWoken).toBe(1);
+      expect(result.wakeActions).toHaveLength(1);
+      expect(result.wakeActions[0].strategy).toBe('rehydrate');
+    });
+
+    it('crewly#1028: no redelivery storm while the input circuit is open — a probe per window, untraced skips', async () => {
+      resetInputCircuitsForTesting();
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: new Date(Date.now() - 30 * 60_000).toISOString(),
+        type: 'delegate',
+        target: 'agent-blocked',
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-blocked', { sessionName: 'agent-blocked', status: 'active', activeWorkItemCount: 0, lastSeenAt: new Date().toISOString() } as AgentHealth],
+      ]);
+      // Delivered each time: a failed one would add the wake backoff (CREW-304)
+      // on top of the circuit this test is about.
+      const executeWakeAction = jest.fn().mockResolvedValue(true);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      // This test is about the input circuit, not the success pacing.
+      service.setWakeTuning({ successBackoffBaseMs: 0, successBackoffMaxMs: 0 });
+
+      // Closed: redelivered every pass.
+      await service.runFast();
+      expect(executeWakeAction).toHaveBeenCalledTimes(1);
+      expect(executeWakeAction.mock.calls[0][0].strategy).toBe('redeliver');
+
+      // Refused for 6 min, just now: open, first probe a minute away.
+      const now = Date.now();
+      noteInputRefused('agent-blocked', { state: 'foreign', inputLength: 52 }, now - 6 * 60_000);
+      noteInputRefused('agent-blocked', { state: 'foreign', inputLength: 52 }, now);
+      for (let i = 0; i < 5; i++) {
+        const result = await service.runFast();
+        expect(result.errors.some((e) => e.includes('agent-blocked'))).toBe(false);
+      }
+      expect(executeWakeAction).toHaveBeenCalledTimes(1);
+      expect(inputCircuitStats().totals.suppressed).toBe(5);
+
+      // A probe is due when the window has passed.
+      resetInputCircuitsForTesting();
+      noteInputRefused('agent-blocked', { state: 'foreign', inputLength: 52 }, now - 20 * 60_000);
+      noteInputRefused('agent-blocked', { state: 'foreign', inputLength: 52 }, now - 10 * 60_000);
+      await service.runFast();
+      await service.runFast();
+      expect(executeWakeAction).toHaveBeenCalledTimes(2);
+      resetInputCircuitsForTesting();
+    });
+
+    it('should not run wake logic when provider lacks executeWakeAction', async () => {
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: THREE_MIN_AGO,
+        type: 'delegate',
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-suspended', {
+          sessionName: 'agent-suspended',
+          status: 'suspended',
+          role: 'developer',
+        }],
+      ]);
+
+      // Default provider has no executeWakeAction
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFast();
+      expect(result.agentsWoken).toBe(0);
+      expect(result.wakeActions).toHaveLength(0);
+    });
+
+    it('should use getAvailablePoolItems when provided', async () => {
+      // target-strict policy: WI must explicitly name the wakable agent.
+      const poolItem = makeWorkItem({
+        status: 'queued',
+        createdAt: THREE_MIN_AGO,
+        type: 'delegate',
+        target: 'agent-off',
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-off', {
+          sessionName: 'agent-off',
+          status: 'inactive',
+          role: 'developer',
+        }],
+      ]);
+
+      const getAvailablePoolItems = jest.fn().mockResolvedValue([poolItem]);
+      const executeWakeAction = jest.fn().mockResolvedValue(true);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+        getAvailablePoolItems,
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFast();
+      expect(getAvailablePoolItems).toHaveBeenCalled();
+      expect(result.agentsWoken).toBe(1);
+      expect(result.wakeActions[0].strategy).toBe('start');
+    });
+
+    it('should record error when wake action fails', async () => {
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: THREE_MIN_AGO,
+        type: 'delegate',
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-1', {
+          sessionName: 'agent-1',
+          status: 'suspended',
+          role: 'developer',
+        }],
+      ]);
+
+      const executeWakeAction = jest.fn().mockResolvedValue(false);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFast();
+      expect(result.agentsWoken).toBe(0);
+      expect(result.errors.some(e => e.includes('Wake action failed'))).toBe(true);
+    });
+
+    it('should handle wake action exceptions gracefully', async () => {
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: THREE_MIN_AGO,
+        type: 'delegate',
+      });
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-1', {
+          sessionName: 'agent-1',
+          status: 'suspended',
+          role: 'developer',
+        }],
+      ]);
+
+      const executeWakeAction = jest.fn().mockRejectedValue(new Error('Connection timeout'));
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFast();
+      expect(result.agentsWoken).toBe(0);
+      expect(result.errors.some(e => e.includes('Connection timeout'))).toBe(true);
+    });
+
+    it('wakes a named dormant target even when active agents >= maxConcurrentAgents', async () => {
+      // 2026-10-27: 11 agents up on a 10-agent setting; a trigger's WorkItem for a
+      // stopped agent sat queued 20 minutes because this pass used to end at the
+      // cap without a log line. The setting is enforced by nothing else, so the
+      // targeted wake goes through.
+      mockGetSettings.mockResolvedValue({
+        general: { maxConcurrentAgents: 2 },
+      });
+
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: new Date().toISOString(),
+        type: 'delegate',
+        target: 'agent-suspended',
+      });
+
+      // Two active agents already at the configured cap
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-1', { sessionName: 'agent-1', status: 'active', role: 'developer' } as AgentHealth],
+        ['agent-2', { sessionName: 'agent-2', status: 'active', role: 'developer' } as AgentHealth],
+        ['agent-suspended', {
+          sessionName: 'agent-suspended',
+          status: 'suspended',
+          role: 'developer',
+          teamId: 'team-1',
+          memberId: 'member-2',
+        } as AgentHealth],
+      ]);
+
+      const executeWakeAction = jest.fn().mockResolvedValue(true);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAvailablePoolItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFast();
+
+      expect(executeWakeAction).toHaveBeenCalledTimes(1);
+      expect(executeWakeAction.mock.calls[0][0]).toMatchObject({
+        agentSessionName: 'agent-suspended',
+        strategy: 'rehydrate',
+        workItemId: wi.id,
+      });
+      expect(result.agentsWoken).toBe(1);
+    });
+
+    it('redelivers to an idle named target when active agents >= maxConcurrentAgents', async () => {
+      // A redeliver creates no session; the cap never applied to it in spirit.
+      mockGetSettings.mockResolvedValue({
+        general: { maxConcurrentAgents: 1 },
+      });
+
+      const TEN_MIN_AGO = new Date(Date.now() - 10 * 60_000).toISOString();
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: TEN_MIN_AGO,
+        type: 'delegate',
+        target: 'agent-1',
+      });
+
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-1', {
+          sessionName: 'agent-1',
+          status: 'active',
+          role: 'developer',
+          teamId: 'team-1',
+          memberId: 'member-1',
+          activeWorkItemCount: 0,
+        } as AgentHealth],
+      ]);
+
+      const executeWakeAction = jest.fn().mockResolvedValue(true);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAvailablePoolItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFast();
+
+      expect(executeWakeAction).toHaveBeenCalledTimes(1);
+      expect(executeWakeAction.mock.calls[0][0]).toMatchObject({ agentSessionName: 'agent-1', strategy: 'redeliver' });
+      expect(result.agentsWoken).toBe(1);
+    });
+
+    it('should allow Hybrid Wake when active agents < maxConcurrentAgents', async () => {
+      // Set maxConcurrentAgents to 5 (plenty of room)
+      mockGetSettings.mockResolvedValue({
+        general: { maxConcurrentAgents: 5 },
+      });
+
+      // Item must be older than 5 min when active agents exist (effectiveThreshold)
+      const TEN_MIN_AGO = new Date(Date.now() - 10 * 60_000).toISOString();
+      const wi = makeWorkItem({
+        status: 'queued',
+        createdAt: TEN_MIN_AGO,
+        type: 'delegate',
+      });
+
+      // Only 1 active agent, well under the limit
+      const agentMap = new Map<string, AgentHealth>([
+        ['agent-1', {
+          sessionName: 'agent-1',
+          status: 'active',
+          role: 'developer',
+          teamId: 'team-1',
+          memberId: 'member-1',
+        } as AgentHealth],
+        ['agent-suspended', {
+          sessionName: 'agent-suspended',
+          status: 'suspended',
+          role: 'developer',
+          teamId: 'team-1',
+          memberId: 'member-2',
+        } as AgentHealth],
+      ]);
+
+      const executeWakeAction = jest.fn().mockResolvedValue(true);
+
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAvailablePoolItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agentMap),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+
+      const result = await service.runFast();
+
+      // executeWakeAction should be called because we have capacity
+      expect(executeWakeAction).toHaveBeenCalled();
+      expect(result.agentsWoken).toBe(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Self-heal fix #2 (2026-05-20): stale-queued WI broadcast
+  // ---------------------------------------------------------------------------
+  describe('stale-queued broadcast (task:queued_too_long)', () => {
+    it('invokes broadcastStaleQueuedWIs for each WI past the staleness threshold', async () => {
+      // Two stale WIs (>1h queued) and one fresh WI (just enqueued).
+      const stale1 = makeWorkItem({
+        id: 'wi-stale-1',
+        status: 'queued',
+        target: 'crewly-product-ella',
+        owner: 'orchestrator',
+        createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+      });
+      const stale2 = makeWorkItem({
+        id: 'wi-stale-2',
+        status: 'queued',
+        target: 'crewly-support-sora',
+        owner: 'orchestrator',
+        createdAt: new Date(Date.now() - 90 * 60 * 1000).toISOString(),
+      });
+      const fresh = makeWorkItem({
+        id: 'wi-fresh',
+        status: 'queued',
+        target: 'crewly-product-ella',
+        owner: 'orchestrator',
+        createdAt: new Date().toISOString(),
+      });
+
+      const broadcastStaleQueuedWIs = jest.fn();
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([stale1, stale2, fresh]),
+        broadcastStaleQueuedWIs,
+      });
+      service = new ReconcilerService(provider);
+
+      await service.runFull();
+
+      expect(broadcastStaleQueuedWIs).toHaveBeenCalledTimes(1);
+      const broadcastArg = broadcastStaleQueuedWIs.mock.calls[0]![0] as Array<{
+        id: string;
+        target?: string;
+        owner?: string;
+        createdAt: string;
+      }>;
+      // Both stale WIs are included; fresh is not.
+      const ids = broadcastArg.map((w) => w.id).sort();
+      expect(ids).toEqual(['wi-stale-1', 'wi-stale-2']);
+      // Target + owner are propagated so the subscriber can route.
+      const stale1Entry = broadcastArg.find((w) => w.id === 'wi-stale-1');
+      expect(stale1Entry?.target).toBe('crewly-product-ella');
+      expect(stale1Entry?.owner).toBe('orchestrator');
+    });
+
+    it('names a stale-queued WI in the warning once, then at most hourly — not on every pass', async () => {
+      const warn = jest.fn();
+      const realCreate = LoggerService.getInstance().createComponentLogger.bind(LoggerService.getInstance());
+      const spy = jest.spyOn(LoggerService.getInstance(), 'createComponentLogger').mockImplementation((name: string) => {
+        const real = realCreate(name);
+        return name === 'ReconcilerService' ? (Object.assign(Object.create(real), { warn }) as typeof real) : real;
+      });
+      try {
+        const stale = makeWorkItem({ id: 'wi-stuck', status: 'queued', target: 'a', createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString() });
+        const items = [stale];
+        provider = createMockProvider({ getActiveWorkItems: jest.fn().mockImplementation(async () => items) });
+        service = new ReconcilerService(provider);
+        const staleWarnings = (): unknown[][] => warn.mock.calls.filter((c) => String(c[0]).startsWith('WorkItems queued past staleness threshold'));
+
+        await service.runFull();
+        await service.runFull();
+        await service.runFull();
+        expect(staleWarnings()).toHaveLength(1);
+        expect(staleWarnings()[0]![1]).toMatchObject({ staleIds: ['wi-stuck'] });
+
+        // A newly stale item is named on its own.
+        items.push(makeWorkItem({ id: 'wi-stuck-2', status: 'queued', target: 'b', createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString() }));
+        await service.runFull();
+        expect(staleWarnings()).toHaveLength(2);
+        expect(staleWarnings()[1]![1]).toMatchObject({ staleIds: ['wi-stuck-2'], staleQueuedCount: 2 });
+
+        // An hour later both are named again.
+        const realNow = Date.now;
+        Date.now = () => realNow() + 61 * 60 * 1000;
+        try {
+          await service.runFull();
+        } finally {
+          Date.now = realNow;
+        }
+        expect(staleWarnings()).toHaveLength(3);
+        expect((staleWarnings()[2]![1] as { staleIds: string[] }).staleIds.sort()).toEqual(['wi-stuck', 'wi-stuck-2']);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('skips broadcast when no WIs are stale', async () => {
+      const fresh = makeWorkItem({
+        id: 'wi-fresh',
+        status: 'queued',
+        target: 'agent-1',
+        createdAt: new Date().toISOString(),
+      });
+
+      const broadcastStaleQueuedWIs = jest.fn();
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([fresh]),
+        broadcastStaleQueuedWIs,
+      });
+      service = new ReconcilerService(provider);
+
+      await service.runFull();
+
+      expect(broadcastStaleQueuedWIs).not.toHaveBeenCalled();
+    });
+
+    it('calls clearResolvedStuckWiDedup with the current queued-WI id set', async () => {
+      const stale = makeWorkItem({
+        id: 'wi-stale',
+        status: 'queued',
+        target: 'agent-1',
+        createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+      });
+      const running = makeWorkItem({
+        id: 'wi-running',
+        status: 'running',
+        target: 'agent-2',
+        createdAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+      });
+
+      const clearResolvedStuckWiDedup = jest.fn();
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([stale, running]),
+        broadcastStaleQueuedWIs: jest.fn(),
+        clearResolvedStuckWiDedup,
+      });
+      service = new ReconcilerService(provider);
+
+      await service.runFull();
+
+      expect(clearResolvedStuckWiDedup).toHaveBeenCalledTimes(1);
+      const queuedIds = clearResolvedStuckWiDedup.mock.calls[0]![0] as Set<string>;
+      expect(queuedIds.has('wi-stale')).toBe(true);
+      // Running WI is NOT in the queued set — its presence would falsely
+      // keep stuck-WI dedup state alive.
+      expect(queuedIds.has('wi-running')).toBe(false);
+    });
+
+    it('falls back gracefully when the provider does not implement broadcast hooks', async () => {
+      const stale = makeWorkItem({
+        id: 'wi-stale',
+        status: 'queued',
+        target: 'agent-1',
+        createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+      });
+
+      // No broadcastStaleQueuedWIs / clearResolvedStuckWiDedup on the provider.
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([stale]),
+      });
+      service = new ReconcilerService(provider);
+
+      // Must not throw.
+      await expect(service.runFull()).resolves.toBeDefined();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // EVAL 5 — full-cycle invariant
+  // -----------------------------------------------------------------------
+  /**
+   * One complete `runFull` over a pool holding every `WorkItemStatus` must
+   * produce zero illegal transitions AND must not leave a strand behind.
+   *
+   * The per-rule invariant tests in `reconcile-rules.test.ts` already derive
+   * their expectations from `WORK_ITEM_TRANSITIONS` and assert liveness plus
+   * soundness. This is the cycle-level counterpart: rules that are individually
+   * sound can still combine badly — #733 found exactly that, where the TTL rule
+   * legitimately emitted `done_by_worker → verified` and the pruning pass then
+   * treated the just-ACCEPTED parent as a dead ancestor.
+   *
+   * Both halves are asserted deliberately. Soundness alone passes just as
+   * happily if every rule is gutted to do nothing, and "do nothing" is exactly
+   * the state the reverted 469a3a21 rule left the codebase in.
+   */
+  describe('EVAL 5 — one full cycle produces no illegal transition and no surviving strand', () => {
+    const HOUR = 3600 * 1000;
+
+    /** One WorkItem in each status, all old enough to be actionable. */
+    function seedEveryStatus(): WorkItem[] {
+      const old = new Date(Date.now() - 48 * HOUR).toISOString();
+      return WORK_ITEM_STATUSES.map((status) =>
+        makeWorkItem({
+          status,
+          target: undefined, // no agent → no stuck-rule corrections to reason about
+          createdAt: old,
+          completedAt: old,
+        }),
+      );
+    }
+
+    it('soundness: every applied correction is a legal edge for the status it came from', async () => {
+      const workItems = seedEveryStatus();
+      const byId = new Map(workItems.map((wi) => [wi.id, wi]));
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue(workItems),
+      });
+      service = new ReconcilerService(provider, {
+        fastLoopIntervalMs: 10_000,
+        fullLoopIntervalMs: 60_000,
+      });
+
+      const result = await service.runFull();
+
+      const workItemCorrections = result.corrections.filter(
+        (c) => c.entityType === 'work_item',
+      );
+      for (const c of workItemCorrections) {
+        const source = byId.get(c.entityId);
+        if (!source) continue;
+        expect(
+          WORK_ITEM_TRANSITIONS[source.status].has(c.newState as WorkItemStatus),
+        ).toBe(true);
+      }
+    });
+
+    it('liveness: the stranding statuses are handed to the funnel, and only those', async () => {
+      const workItems = seedEveryStatus();
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue(workItems),
+      });
+      service = new ReconcilerService(provider, {
+        fastLoopIntervalMs: 10_000,
+        fullLoopIntervalMs: 60_000,
+      });
+
+      await service.runFull();
+
+      const disposedIds = mockDisposeFailedWorkItem.mock.calls.map(
+        (call) => call[0] as string,
+      );
+      const expected = workItems
+        .filter((wi) => wi.status === 'rejected' || wi.status === 'failed')
+        .map((wi) => wi.id);
+
+      expect(disposedIds.sort()).toEqual(expected.sort());
+      // Non-empty, so "the rule did nothing" cannot pass this.
+      expect(disposedIds).toHaveLength(2);
+    });
+
+    it('a strand that is already disposed is left alone on subsequent cycles', async () => {
+      // Re-entrancy at cycle level: the funnel is idempotent, but the rule must
+      // not keep handing the same item back to it every 60s either.
+      const disposed = makeWorkItem({
+        status: 'rejected',
+        target: undefined,
+        completedAt: new Date(Date.now() - 48 * HOUR).toISOString(),
+        metadata: {
+          [DISPOSITION_METADATA_KEY]: {
+            kind: 'terminal',
+            at: new Date().toISOString(),
+            by: 'system',
+            reason: 'already handled',
+          },
+        },
+      });
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([disposed]),
+      });
+      service = new ReconcilerService(provider, {
+        fastLoopIntervalMs: 10_000,
+        fullLoopIntervalMs: 60_000,
+      });
+
+      await service.runFull();
+      await service.runFull();
+
+      expect(mockDisposeFailedWorkItem).not.toHaveBeenCalled();
+    });
+
+    it('a disposition failure does not abort the rest of the cycle', async () => {
+      mockDisposeFailedWorkItem.mockRejectedValueOnce(new Error('pool down'));
+      const workItems = seedEveryStatus();
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue(workItems),
+      });
+      service = new ReconcilerService(provider, {
+        fastLoopIntervalMs: 10_000,
+        fullLoopIntervalMs: 60_000,
+      });
+
+      const result = await service.runFull();
+
+      // Both strands still attempted; the throw is contained.
+      expect(mockDisposeFailedWorkItem).toHaveBeenCalledTimes(2);
+      expect(result).toBeDefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // CREW-304: wake storm — outcomes, failure backoff, pending starts
+  // -------------------------------------------------------------------------
+  describe('failing redelivery is reported to the lead (CREW-577)', () => {
+    const MIN = 60_000;
+    const idleTarget = (): Map<string, AgentHealth> =>
+      new Map([['ce-nova', { sessionName: 'ce-nova', status: 'active', activeWorkItemCount: 0, lastSeenAt: new Date().toISOString() } as AgentHealth]]);
+    const queued = () => makeWorkItem({ id: 'wi-282', status: 'queued', type: 'delegate', target: 'ce-nova', createdAt: new Date(Date.now() - 30 * MIN).toISOString() });
+    const wire = (executeWakeAction: jest.Mock) => {
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([queued()]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(idleTarget()),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      service.setWakeTuning({ successBackoffBaseMs: 0, successBackoffMaxMs: 0 });
+      const addToPool = jest.fn().mockResolvedValue(undefined);
+      service.setIdleHolderReporting({
+        loadTeams: async () => [{
+          id: 'team-ce', name: 'CE', members: [
+            { id: 'owen', sessionName: 'ce-owen', canDelegate: true, hierarchyLevel: 1 },
+            { id: 'nova', sessionName: 'ce-nova' },
+          ],
+        } as never],
+        addToPool,
+        stamp: jest.fn().mockResolvedValue(undefined),
+        findWorkItem: async () => ({ id: 'wi-282', title: 'CE-282 brief' }) as never,
+      });
+      return addToPool;
+    };
+    const runPasses = async (n: number) => {
+      for (let i = 0; i < n; i++) {
+        await service.runFast();
+        jest.advanceTimersByTime(31 * MIN); // past the failure backoff
+      }
+      await Promise.resolve();
+      await Promise.resolve();
+    };
+
+    beforeEach(() => jest.setSystemTime(new Date('2026-10-26T13:10:00Z')));
+
+    it('the third failed redelivery in a row puts one review on the lead, with the reason', async () => {
+      const executeWakeAction = jest.fn().mockResolvedValue({ outcome: 'failed', reason: 'over its daily token cap' });
+      const addToPool = wire(executeWakeAction);
+
+      await runPasses(2);
+      expect(addToPool).not.toHaveBeenCalled();
+      await runPasses(1);
+
+      expect(executeWakeAction).toHaveBeenCalledTimes(3);
+      expect(addToPool).toHaveBeenCalledTimes(1);
+      expect(addToPool.mock.calls[0][0]).toMatchObject({
+        type: 'review',
+        target: 'ce-owen',
+        metadata: { reviewReason: 'redelivery_miss', sourceWorkItemId: 'wi-282' },
+      });
+      expect(addToPool.mock.calls[0][0].description).toContain('over its daily token cap');
+      expect(addToPool.mock.calls[0][0].title).toContain('CE-282 brief');
+    });
+
+    it('is told once however long it keeps failing', async () => {
+      const addToPool = wire(jest.fn().mockResolvedValue({ outcome: 'failed', reason: 'x' }));
+      await runPasses(7);
+      expect(addToPool).toHaveBeenCalledTimes(1);
+    });
+
+    it('a delivered redelivery in between resets the count (no report)', async () => {
+      const executeWakeAction = jest.fn()
+        .mockResolvedValueOnce({ outcome: 'failed', reason: 'x' })
+        .mockResolvedValueOnce({ outcome: 'failed', reason: 'x' })
+        .mockResolvedValueOnce({ outcome: 'ok' })
+        .mockResolvedValueOnce({ outcome: 'failed', reason: 'x' })
+        .mockResolvedValueOnce({ outcome: 'failed', reason: 'x' });
+      const addToPool = wire(executeWakeAction);
+      await runPasses(5);
+      expect(executeWakeAction).toHaveBeenCalledTimes(5);
+      expect(addToPool).not.toHaveBeenCalled();
+    });
+
+    it('another item\'s successful wake on the same agent does not reset the count (CE-282, 2026-10-12)', async () => {
+      const other = makeWorkItem({ id: 'wi-other', status: 'queued', type: 'delegate', target: 'ce-nova', createdAt: new Date(Date.now() - 30 * MIN).toISOString() });
+      const executeWakeAction = jest.fn().mockImplementation(async (action: { workItemId: string }) =>
+        action.workItemId === 'wi-282' ? { outcome: 'failed', reason: 'x' } : { outcome: 'ok' });
+      // Pass 1-2: only CE-282 is queued (fails twice); pass 3: another item's wake succeeds (clears the
+      // session's failure record); pass 4: CE-282 fails a third time.
+      const getActiveWorkItems = jest.fn()
+        .mockResolvedValueOnce([queued()])
+        .mockResolvedValueOnce([queued()])
+        .mockResolvedValueOnce([other])
+        .mockResolvedValue([queued()]);
+      provider = createMockProvider({
+        getActiveWorkItems,
+        getAgentHealthMap: jest.fn().mockResolvedValue(idleTarget()),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      service.setWakeTuning({ successBackoffBaseMs: 0, successBackoffMaxMs: 0 });
+      const addToPool = jest.fn().mockResolvedValue(undefined);
+      service.setIdleHolderReporting({ loadTeams: async () => [], addToPool, stamp: jest.fn() });
+      await runPasses(4);
+      expect(executeWakeAction.mock.calls.map((c) => c[0].workItemId)).toEqual(['wi-282', 'wi-282', 'wi-other', 'wi-282']);
+      expect(addToPool).toHaveBeenCalledTimes(1);
+      expect(addToPool.mock.calls[0][0].metadata.sourceWorkItemId).toBe('wi-282');
+    });
+
+    it('pending and skipped redeliveries (waiting on the queue, memory stop, offline) never count', async () => {
+      const addToPool = wire(jest.fn().mockResolvedValue({ outcome: 'pending', reason: "an earlier notice still waits on the agent's queue" }));
+      await runPasses(6);
+      expect(addToPool).not.toHaveBeenCalled();
+      const addToPool2 = wire(jest.fn().mockResolvedValue({ outcome: 'skipped', reason: 'target stopped for memory' }));
+      await runPasses(6);
+      expect(addToPool2).not.toHaveBeenCalled();
+    });
+
+    it('failures of a start (not a redelivery) are not reported by this path', async () => {
+      const wi = makeWorkItem({ id: 'wi-s', status: 'queued', target: 'ce-nova', createdAt: new Date(Date.now() - 30 * MIN).toISOString() });
+      const executeWakeAction = jest.fn().mockResolvedValue({ outcome: 'failed', reason: 'x' });
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(new Map([['ce-nova', { sessionName: 'ce-nova', status: 'inactive', teamId: 't1', memberId: 'm1', activeWorkItemCount: 0 } as AgentHealth]])),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      const addToPool = jest.fn().mockResolvedValue(undefined);
+      service.setIdleHolderReporting({ loadTeams: async () => [], addToPool, stamp: jest.fn() });
+      await runPasses(5);
+      expect(executeWakeAction.mock.calls.every((c) => c[0].strategy !== 'redeliver')).toBe(true);
+      expect(addToPool).not.toHaveBeenCalled();
+    });
+
+    it('without reporting wired, failing redeliveries only back off (no throw)', async () => {
+      const executeWakeAction = jest.fn().mockResolvedValue({ outcome: 'failed', reason: 'x' });
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([queued()]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(idleTarget()),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      service.setWakeTuning({ successBackoffBaseMs: 0, successBackoffMaxMs: 0 });
+      await expect(runPasses(4)).resolves.toBeUndefined();
+      expect(executeWakeAction).toHaveBeenCalledTimes(4);
+    });
+  });
+
+  describe('wake pacing (CREW-304)', () => {
+    const MIN = 60_000;
+    const stoppedAgent = (session = 'ce-vera'): Map<string, AgentHealth> =>
+      new Map([[session, { sessionName: session, status: 'inactive', teamId: 't1', memberId: 'm1', activeWorkItemCount: 0 } as AgentHealth]]);
+    const queuedFor = (session = 'ce-vera', id = 'wi-retry') =>
+      makeWorkItem({ id, status: 'queued', target: session, createdAt: new Date(Date.now() - 3 * MIN).toISOString() });
+    const wakeTraces = (outcome?: string) =>
+      mockTraceHarness.mock.calls.filter(
+        ([type, input]) => type === 'harness.wake' && (!outcome || (input as { outcome?: string }).outcome === outcome),
+      );
+
+    beforeEach(() => {
+      mockTraceHarness.mockClear();
+      jest.setSystemTime(new Date('2026-10-06T13:10:00Z'));
+    });
+
+    it('a failed start backs off (doubling) instead of retrying every 10s tick', async () => {
+      const wi = queuedFor();
+      const executeWakeAction = jest.fn().mockResolvedValue(false);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(stoppedAgent()),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+
+      // Six fast ticks in the first minute: one attempt.
+      for (let i = 0; i < 6; i++) {
+        await service.runFast();
+        jest.advanceTimersByTime(9_000);
+      }
+      expect(executeWakeAction).toHaveBeenCalledTimes(1);
+      expect(wakeTraces('failed')).toHaveLength(1);
+
+      // Past the first 60s backoff: the second attempt, then a 120s backoff.
+      jest.advanceTimersByTime(10_000);
+      await service.runFast();
+      expect(executeWakeAction).toHaveBeenCalledTimes(2);
+      jest.advanceTimersByTime(90_000);
+      await service.runFast();
+      expect(executeWakeAction).toHaveBeenCalledTimes(2);
+      jest.advanceTimersByTime(40_000);
+      await service.runFast();
+      expect(executeWakeAction).toHaveBeenCalledTimes(3);
+      const last = wakeTraces('failed').pop()![1] as { data: Record<string, unknown> };
+      expect(last.data).toMatchObject({ strategy: 'start', attempt: 3, retryInMs: 4 * MIN });
+    });
+
+    it('the backoff is capped at 30 min and a success resets it', async () => {
+      const wi = queuedFor();
+      const executeWakeAction = jest.fn().mockResolvedValue(false);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(stoppedAgent()),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      for (let i = 0; i < 8; i++) {
+        await service.runFast();
+        jest.advanceTimersByTime(31 * MIN);
+      }
+      expect(executeWakeAction).toHaveBeenCalledTimes(8);
+      const capped = wakeTraces('failed').pop()![1] as { data: Record<string, unknown> };
+      expect(capped.data.retryInMs).toBe(30 * MIN);
+
+      executeWakeAction.mockResolvedValueOnce(true).mockResolvedValue(false);
+      await service.runFast(); // ok → backoff cleared
+      jest.advanceTimersByTime(3 * MIN); // past the success pacing of the same item
+      await service.runFast(); // fails again → first step (60s)
+      const fresh = wakeTraces('failed').pop()![1] as { data: Record<string, unknown> };
+      expect(fresh.data).toMatchObject({ attempt: 1, retryInMs: MIN });
+    });
+
+    it('a successful wake is not repeated every tick while the item stays queued (doubling pacing)', async () => {
+      const wi = queuedFor();
+      const executeWakeAction = jest.fn().mockResolvedValue(true);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(stoppedAgent()),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+
+      // Ten ticks in the first 90s: one wake.
+      for (let i = 0; i < 10; i++) {
+        await service.runFast();
+        jest.advanceTimersByTime(9_000);
+      }
+      expect(executeWakeAction).toHaveBeenCalledTimes(1);
+
+      // Past the 2-minute base: second wake, then a 4-minute wait.
+      jest.advanceTimersByTime(40_000);
+      await service.runFast();
+      expect(executeWakeAction).toHaveBeenCalledTimes(2);
+      jest.advanceTimersByTime(3 * MIN);
+      await service.runFast();
+      expect(executeWakeAction).toHaveBeenCalledTimes(2);
+      jest.advanceTimersByTime(2 * MIN);
+      await service.runFast();
+      expect(executeWakeAction).toHaveBeenCalledTimes(3);
+    });
+
+    it('one session is woken at most N times per window, whatever the item pacing', async () => {
+      const cap = DEFAULT_WAKE_TUNING.maxWakesPerSessionPerWindow;
+      const executeWakeAction = jest.fn().mockResolvedValue(true);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([queuedFor()]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(stoppedAgent()),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      service.setWakeTuning({ successBackoffBaseMs: 1, successBackoffMaxMs: 1 });
+      // 15 ticks, 3 minutes apart (45 min, inside the 60 min window).
+      for (let i = 0; i < 15; i++) {
+        await service.runFast();
+        jest.advanceTimersByTime(3 * MIN);
+      }
+      expect(executeWakeAction).toHaveBeenCalledTimes(cap);
+      // The window passes: woken again.
+      jest.advanceTimersByTime(DEFAULT_WAKE_TUNING.sessionWakeWindowMs);
+      await service.runFast();
+      expect(executeWakeAction).toHaveBeenCalledTimes(cap + 1);
+    });
+
+    it('a skipped attempt (cooldown, item gone) is neither traced nor backed off', async () => {
+      const wi = queuedFor();
+      const executeWakeAction = jest.fn().mockResolvedValue({ outcome: 'skipped', reason: 'approval gate cooldown' });
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(stoppedAgent()),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      for (let i = 0; i < 5; i++) {
+        const result = await service.runFast();
+        expect(result.errors).toHaveLength(0);
+      }
+      expect(executeWakeAction).toHaveBeenCalledTimes(5);
+      expect(wakeTraces()).toHaveLength(0);
+    });
+
+    it('a start queued behind the cap is pending: traced once as queued, not re-requested while in flight', async () => {
+      const wi = queuedFor();
+      let finish: (v: boolean) => void = () => undefined;
+      const executeWakeAction = jest.fn().mockImplementation(
+        () => new Promise<boolean>((resolve) => { finish = resolve; }),
+      );
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(stoppedAgent()),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      service.setWakeTuning({ startAwaitMs: 1_000 });
+
+      const pass = service.runFast();
+      await jest.advanceTimersByTimeAsync(1_000);
+      const result = await pass;
+      expect(result.errors).toHaveLength(0);
+      expect(wakeTraces('queued')).toHaveLength(1);
+
+      for (let i = 0; i < 5; i++) {
+        await service.runFast();
+        jest.advanceTimersByTime(10_000);
+      }
+      expect(executeWakeAction).toHaveBeenCalledTimes(1);
+      expect(wakeTraces('queued')).toHaveLength(1);
+
+      // The slot opens: the start settles ok, and the pending episode ends.
+      finish(true);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(wakeTraces('ok')).toHaveLength(1);
+    });
+
+    it('a provider answer of pending is traced once per episode and never as failed', async () => {
+      const wi = queuedFor();
+      const executeWakeAction = jest.fn().mockResolvedValue({ outcome: 'pending', reason: 'running-agent cap reached' });
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([wi]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(stoppedAgent()),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      for (let i = 0; i < 4; i++) await service.runFast();
+      expect(wakeTraces('queued')).toHaveLength(1);
+      expect(wakeTraces('failed')).toHaveLength(0);
+    });
+
+    it('a WorkItem that leaves the queue drops its backoff', async () => {
+      const wi = queuedFor();
+      const items = [wi];
+      const executeWakeAction = jest.fn().mockResolvedValue(false);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockImplementation(async () => items),
+        getAgentHealthMap: jest.fn().mockResolvedValue(stoppedAgent()),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      await service.runFast();
+      items.length = 0;
+      await service.runFast(); // pruned
+      items.push(wi);
+      await service.runFast(); // no backoff left → attempted again at once
+      expect(executeWakeAction).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // CREW-303: stalled agents with queued work are recovered
+  // -------------------------------------------------------------------------
+  describe('stalled-agent recovery (CREW-303)', () => {
+    const MIN = 60_000;
+    const recoverTraces = () => mockTraceHarness.mock.calls.filter(([type]) => type === 'harness.recover');
+
+    beforeEach(() => {
+      mockTraceHarness.mockClear();
+      jest.setSystemTime(new Date('2026-10-06T13:40:00Z'));
+    });
+
+    const oldQueued = (session: string) =>
+      makeWorkItem({ id: `wi-${session}`, status: 'queued', target: session, createdAt: new Date(Date.now() - 30 * MIN).toISOString() });
+
+    it('restarts an idle agent that is not progressing its queued work: once per cooldown, one harness.recover', async () => {
+      const agents = new Map<string, AgentHealth>([
+        ['ce-owen', { sessionName: 'ce-owen', status: 'active', role: 'team-leader', activeWorkItemCount: 0, lastActivityAt: new Date(Date.now() - 40 * MIN).toISOString() } as AgentHealth],
+      ]);
+      const parkStalledAgent = jest.fn().mockResolvedValue(true);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([oldQueued('ce-owen')]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agents),
+        executeWakeAction: jest.fn().mockResolvedValue({ outcome: 'skipped' }),
+        parkStalledAgent,
+      });
+      service = new ReconcilerService(provider);
+
+      await service.runFull();
+      expect(parkStalledAgent).toHaveBeenCalledWith('ce-owen', 'team-leader');
+      expect(recoverTraces()).toHaveLength(1);
+      expect(recoverTraces()[0][1]).toMatchObject({ session: 'ce-owen', outcome: 'ok', data: { kind: 'idle', queuedCount: 1 } });
+
+      jest.advanceTimersByTime(10 * MIN);
+      await service.runFull();
+      expect(parkStalledAgent).toHaveBeenCalledTimes(1);
+      jest.advanceTimersByTime(25 * MIN);
+      await service.runFull();
+      expect(parkStalledAgent).toHaveBeenCalledTimes(2);
+    });
+
+    it('CREW-440: the follow-up WorkItem of a promise opened by a card tap starts the stopped agent', async () => {
+      const followUp = makeWorkItem({
+        id: 'wi-follow-up',
+        status: 'queued',
+        target: 'ce-owen',
+        createdAt: new Date(Date.now() - 3 * MIN).toISOString(),
+        metadata: { openItemFollowUp: true },
+      });
+      const agents = new Map<string, AgentHealth>([
+        ['ce-owen', { sessionName: 'ce-owen', status: 'inactive', teamId: 't1', memberId: 'm1', activeWorkItemCount: 0 } as AgentHealth],
+      ]);
+      const executeWakeAction = jest.fn().mockResolvedValue(true);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([followUp]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agents),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      await service.runFull();
+      expect(executeWakeAction).toHaveBeenCalledTimes(1);
+      expect(executeWakeAction.mock.calls[0][0]).toMatchObject({ agentSessionName: 'ce-owen', workItemId: 'wi-follow-up', strategy: 'start' });
+    });
+
+    it('a stopped agent in wake backoff gets one forced start (the backoff is cleared)', async () => {
+      const agents = new Map<string, AgentHealth>([
+        ['ce-owen', { sessionName: 'ce-owen', status: 'inactive', teamId: 't1', memberId: 'm1', activeWorkItemCount: 0 } as AgentHealth],
+      ]);
+      const executeWakeAction = jest.fn().mockResolvedValue(false);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([oldQueued('ce-owen')]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agents),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+      // Hybrid wake tries (and fails) on the first pass; recovery does not repeat it.
+      await service.runFull();
+      expect(executeWakeAction).toHaveBeenCalledTimes(1);
+      expect(recoverTraces()).toHaveLength(0);
+      // Next pass: hybrid wake is in backoff, so the recovery forces one start.
+      jest.advanceTimersByTime(20_000);
+      await service.runFull();
+      expect(executeWakeAction).toHaveBeenCalledTimes(2);
+      expect(executeWakeAction.mock.calls[1][0]).toMatchObject({ agentSessionName: 'ce-owen', strategy: 'start', teamId: 't1', memberId: 'm1' });
+      expect(recoverTraces()).toHaveLength(1);
+      expect(recoverTraces()[0][1]).toMatchObject({ outcome: 'failed', data: { kind: 'stopped' } });
+    });
+
+    it('restarts a stopped agent that still holds running work (Nova, CE-206, 2026-10-07)', async () => {
+      const agents = new Map<string, AgentHealth>([
+        ['ce-nova', { sessionName: 'ce-nova', status: 'inactive', teamId: 't1', memberId: 'm1', activeWorkItemCount: 0, lastSeenAt: new Date(Date.now() - 15 * MIN).toISOString() } as AgentHealth],
+      ]);
+      const executeWakeAction = jest.fn().mockResolvedValue({ outcome: 'pending', reason: 'running-agent cap reached' });
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([
+          makeWorkItem({ id: 'wi-ce-206', status: 'running', target: 'ce-nova', createdAt: new Date(Date.now() - 60 * MIN).toISOString() }),
+        ]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agents),
+        executeWakeAction,
+      });
+      service = new ReconcilerService(provider);
+
+      await service.runFull();
+      expect(executeWakeAction).toHaveBeenCalledTimes(1);
+      expect(executeWakeAction.mock.calls[0][0]).toMatchObject({ agentSessionName: 'ce-nova', workItemId: 'wi-ce-206', strategy: 'start', teamId: 't1', memberId: 'm1' });
+      expect(recoverTraces()).toHaveLength(1);
+      expect(recoverTraces()[0][1]).toMatchObject({ session: 'ce-nova', outcome: 'queued', data: { kind: 'stopped', heldCount: 1, queuedCount: 0 } });
+
+      // Per-session cooldown: no start storm on the next passes.
+      jest.advanceTimersByTime(5 * MIN);
+      await service.runFull();
+      expect(executeWakeAction).toHaveBeenCalledTimes(1);
+    });
+
+    it('restarts a hung agent', async () => {
+      const agents = new Map<string, AgentHealth>([
+        ['ce-vera', { sessionName: 'ce-vera', status: 'active', role: 'developer', activeWorkItemCount: 1, lastActivityAt: new Date().toISOString() } as AgentHealth],
+      ]);
+      const parkStalledAgent = jest.fn().mockResolvedValue(true);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue([oldQueued('ce-vera')]),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agents),
+        executeWakeAction: jest.fn().mockResolvedValue({ outcome: 'skipped' }),
+        parkStalledAgent,
+        getHungAgents: () => ['ce-vera'],
+      });
+      service = new ReconcilerService(provider);
+      await service.runFull();
+      expect(parkStalledAgent).toHaveBeenCalledWith('ce-vera', 'developer');
+      expect(recoverTraces()[0][1]).toMatchObject({ data: { kind: 'hung' } });
+    });
+
+    it('leaves alone an agent that is mid-turn, waiting on the owner, recently active, or holding a claim', async () => {
+      const longAgo = new Date(Date.now() - 40 * MIN).toISOString();
+      const agents = new Map<string, AgentHealth>([
+        ['a-midturn', { sessionName: 'a-midturn', status: 'active', activeWorkItemCount: 0, lastActivityAt: longAgo, midTurn: true } as AgentHealth],
+        ['a-prompt', { sessionName: 'a-prompt', status: 'active', activeWorkItemCount: 0, lastActivityAt: longAgo, waitingOnHumanSince: longAgo } as AgentHealth],
+        ['a-recent', { sessionName: 'a-recent', status: 'active', activeWorkItemCount: 0, lastActivityAt: new Date(Date.now() - 2 * MIN).toISOString() } as AgentHealth],
+        ['a-claim', { sessionName: 'a-claim', status: 'active', activeWorkItemCount: 1, lastActivityAt: longAgo } as AgentHealth],
+      ]);
+      const parkStalledAgent = jest.fn().mockResolvedValue(true);
+      provider = createMockProvider({
+        getActiveWorkItems: jest.fn().mockResolvedValue(['a-midturn', 'a-prompt', 'a-recent', 'a-claim'].map(oldQueued)),
+        getAgentHealthMap: jest.fn().mockResolvedValue(agents),
+        executeWakeAction: jest.fn().mockResolvedValue({ outcome: 'skipped' }),
+        parkStalledAgent,
+      });
+      service = new ReconcilerService(provider);
+      await service.runFull();
+      expect(parkStalledAgent).not.toHaveBeenCalled();
+      expect(recoverTraces()).toHaveLength(0);
+    });
+  });
+});

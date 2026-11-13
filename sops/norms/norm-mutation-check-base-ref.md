@@ -1,0 +1,163 @@
+---
+type: norm
+version: 1.1.0
+owner: crewly-product-quinn-47ce967d
+status: active
+triggers:
+  - mutation check
+  - verifying a test actually fails
+  - proving a test guards a fix
+  - reverting a fix to check coverage
+---
+
+# Norm: A Mutation Check Must Revert Against a Base Ref
+
+## The covenant
+
+When you prove a new test actually guards your fix — revert the fix, confirm
+the test fails — **revert against a base ref, never against the working tree.**
+
+```bash
+# ✅ correct in BOTH states
+git checkout <base-ref> -- <path>    # e.g. git checkout origin/main -- src/foo.ts
+<run tests>                          # expect the new tests to FAIL
+git checkout HEAD -- <path>          # restore
+
+# ❌ silently conditional
+git checkout <path>                  # reverts, or restores — depends on commit state
+```
+
+This is a constraint on how you verify, applied every time. It is not a
+procedure to step through.
+
+## Why `git checkout <file>` is a trap
+
+`git checkout <file>` restores the file **from the index/HEAD**. So it means
+two opposite things depending on whether your fix is committed yet:
+
+| Fix state | `git checkout <file>` does | Mutation check is |
+|---|---|---|
+| Uncommitted | discards the fix → file reverts | **valid** |
+| Committed | restores the fix *from HEAD* | **a silent no-op** |
+
+In the committed state the command appears to work, the tests run, and
+everything passes — because the fix was never removed. You get a green result
+from a check that checked nothing.
+
+The state flips silently in the middle of ordinary work. Committing does it.
+So does rebasing. Nothing warns you.
+
+## How I got it wrong (PR #735, 2026-08-21)
+
+I ran the mutation check *before* committing. It worked: revert the source,
+3 of the 7 new tests failed, the negative test stayed green. Correct signature,
+correctly verified.
+
+Then I rebased onto `origin/main` — which committed the fix — and re-ran the
+same check with the same command. It reported **47/47 passing**, and I reported
+that number to my TL as evidence the fix was still verified after the rebase.
+
+It was not evidence of anything. `git checkout <file>` had restored the fix from
+HEAD. The suite passed because the code was still there. I had produced a
+verification artifact that verified nothing, and shipped it into a status report
+as though it were proof.
+
+I caught it on re-reading my own command, not from any failure signal — there is
+no failure signal. Redone as `git checkout origin/main -- <file>`, the real
+signature came back: 3 failed, 44 passed.
+
+The reason this is worth a norm rather than a personal note: the failure mode is
+**invisible and self-confirming**. A broken mutation check does not look broken.
+It looks like a passing test suite, which is exactly what you were hoping to see.
+
+## Companion signal: the negative test should STAY green
+
+In a suite that includes a negative test — one asserting the *absence* of a
+widening, a regression, or an over-broad gate — that test should **still pass**
+when you revert the fix. It is asserting something that was already true.
+
+So the healthy signature is mixed:
+
+```
+✕ positive test   (fix removed → capability gone → fails)
+✕ positive test
+✓ negative test   (asserting absence → still true → passes)
+```
+
+If your negative test *also* flips to red under revert, it was passing for the
+wrong reason — it depends on the fix rather than constraining it. Investigate
+before shipping.
+
+## The restore step has the same trap, mirrored
+
+Reverting is only half the cycle. Putting your fix *back* is where I fell in a
+second time, on 2026-08-21, hours after writing this norm:
+
+```bash
+git checkout origin/main -- <path>   # ✅ revert — correct, this is the rule above
+<run tests>                          # ✅ 3 failed, as expected
+git checkout HEAD -- <path>          # ❌ "restore" — SILENTLY DISCARDED the fix
+```
+
+`git checkout HEAD -- <path>` restores from HEAD. If your fix is **not yet
+committed**, HEAD is the pre-fix state, so that command deletes your work
+instead of restoring it. Same command, same conditional meaning, opposite
+direction — and again no error.
+
+**Back the file up before reverting, and restore from the backup:**
+
+```bash
+cp <path> /tmp/fix.bak                # ✅ survives either commit state
+git checkout <base-ref> -- <path>
+<run tests>
+cp /tmp/fix.bak <path>                # ✅ restores what you actually wrote
+```
+
+Use `git checkout HEAD -- <path>` to restore **only** when the fix is already
+committed. When in doubt, the backup works in both states, which is the whole
+point.
+
+What caught it was the test suite, not me: the run right after went from 21/21
+to 18/3. Re-running the full suite after a mutation check is what turns this
+from lost work into a five-minute detour.
+
+## The revert also STAGES — a cp-restore leaves the base blob in the index
+
+Third trap, found twice in one night (2026-09-21/22, Max on PR #759's
+follow-up and Sam verifying #759). `git checkout <base-ref> -- <path>` does
+not only rewrite the working file — it **stages the base-ref blob**. The
+backup-and-`cp` restore above fixes the working tree and leaves the index
+untouched, so after a textbook mutation cycle you are in this state:
+
+```
+$ git status --short
+MM config/skills/_common/lib.sh     # index = base ref, worktree = your fix
+```
+
+`git diff` (worktree vs index) shows your fix as a *change*; `git diff HEAD`
+is empty; `git commit` (or `git commit --amend`) ships the **reverted** file,
+because commit reads the index, not the worktree. Max's first follow-up commit
+shipped the base-ref skill this way; nothing errored. `git worktree remove`
+also refuses ("contains modified or untracked files") for the same reason.
+
+**Close the cycle by restoring the index too, and prove it before committing:**
+
+```bash
+cp /tmp/fix.bak <path>               # worktree back to your fix
+git add <path>                       # index back to your fix (or: git restore --staged <path> if the fix is already in HEAD)
+git status --short -- <path>         # never 'MM'. Fix already in HEAD: expect nothing. Fix not committed yet: expect 'M '
+git diff --cached -- <path>          # must show your fix being added, never the fix being removed
+git show --stat HEAD                 # after committing: the files you meant, and only those
+```
+
+The detector that catches it every time is `git show --stat HEAD` on the
+commit you are about to push. A mutation check that ends in a commit must end
+in that line.
+
+## Applies to
+
+Any "prove the test catches it" check: mutation checks, revert-and-rerun,
+deliberately breaking a fix to confirm coverage. The same trap exists for
+`git stash` (state-dependent) and for editing a file back by hand (you may
+restore it imperfectly). Naming an explicit base ref is what makes the check
+deterministic.

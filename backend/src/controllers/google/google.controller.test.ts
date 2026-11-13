@@ -1,0 +1,652 @@
+/**
+ * Tests for the Google Workspace controller — response envelopes, the
+ * not_connected → 409 + connect-URL hint mapping, the other error codes,
+ * connect-url building and the send dry-run.
+ *
+ * @module controllers/google/google.controller.test
+ */
+
+import request from 'supertest';
+import express, { type Application } from 'express';
+import { createGoogleRouter } from './google.routes.js';
+import { setGoogleControllerDeps, setGmailSendApproval, setGmailReplyWatch, type GoogleControllerDeps } from './google.controller.js';
+import { GoogleWorkspaceError, type GoogleWorkspaceTokenService } from '../../services/google/google-workspace-token.service.js';
+import { base64UrlDecode, type GmailService } from '../../services/google/gmail.service.js';
+import type { CalendarService } from '../../services/google/calendar.service.js';
+import { resetGmailSendGate } from '../../services/google/gmail-send-gate.js';
+import { ownerUnlessAgentForTests } from '../../middleware/caller-identity.testing.js';
+import { ConnectorUseAuditService, setConnectorUseAuditForTesting } from '../../services/connector/connector-use-audit.service.js';
+import type { ActivityEntryInput } from '../../services/activity/activity-log.service.js';
+
+jest.mock('../../services/core/logger.service.js', () => ({
+  LoggerService: {
+    getInstance: () => ({
+      createComponentLogger: () => ({ info: jest.fn(), warn: jest.fn(), debug: jest.fn(), error: jest.fn() }),
+    }),
+  },
+}));
+
+const CONNECT_URL = 'https://api.crewlyai.com/api/cloud/google/workspace/start?token=cloud-jwt&returnUrl=x';
+
+let app: Application;
+let tokens: { status: jest.Mock; disconnect: jest.Mock; buildConnectUrl: jest.Mock };
+let gmail: { search: jest.Mock; read: jest.Mock; getAttachment: jest.Mock; send: jest.Mock; createDraft: jest.Mock; sendDraft: jest.Mock; deleteDraft: jest.Mock };
+let calendar: { listEvents: jest.Mock; createEvent: jest.Mock };
+let drive: { search: jest.Mock; get: jest.Mock; readContent: jest.Mock; upload: jest.Mock };
+let docs: { read: jest.Mock; create: jest.Mock; append: jest.Mock };
+let docComments: { list: jest.Mock; add: jest.Mock; reply: jest.Mock; resolve: jest.Mock };
+let sheets: { info: jest.Mock; read: jest.Mock; create: jest.Mock; append: jest.Mock; update: jest.Mock };
+let slides: { read: jest.Mock; create: jest.Mock };
+
+beforeEach(() => {
+  tokens = {
+    status: jest.fn().mockResolvedValue({ connected: true, cloudConnected: true, email: 'owner@example.com' }),
+    disconnect: jest.fn().mockResolvedValue({ removed: true }),
+    buildConnectUrl: jest.fn().mockReturnValue(CONNECT_URL),
+  };
+  gmail = { search: jest.fn(), read: jest.fn(), getAttachment: jest.fn(), send: jest.fn(), createDraft: jest.fn(), sendDraft: jest.fn(), deleteDraft: jest.fn().mockResolvedValue(undefined) };
+  resetGmailSendGate();
+  calendar = { listEvents: jest.fn(), createEvent: jest.fn() };
+  drive = { search: jest.fn(), get: jest.fn(), readContent: jest.fn(), upload: jest.fn() };
+  docs = { read: jest.fn(), create: jest.fn(), append: jest.fn() };
+  docComments = { list: jest.fn(), add: jest.fn(), reply: jest.fn(), resolve: jest.fn() };
+  sheets = { info: jest.fn(), read: jest.fn(), create: jest.fn(), append: jest.fn(), update: jest.fn() };
+  slides = { read: jest.fn(), create: jest.fn() };
+  setGoogleControllerDeps({
+    tokens: tokens as unknown as GoogleWorkspaceTokenService,
+    gmail: gmail as unknown as GmailService,
+    calendar: calendar as unknown as CalendarService,
+    drive, docs, docComments, sheets, slides,
+  } as unknown as GoogleControllerDeps);
+
+  app = express();
+  app.use(ownerUnlessAgentForTests);
+  app.use(express.json());
+  app.use('/api/google', createGoogleRouter());
+});
+
+afterEach(() => {
+  setGoogleControllerDeps(null);
+});
+
+describe('GET /status', () => {
+  it('returns the token service status', async () => {
+    const res = await request(app).get('/api/google/status');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true, data: { connected: true, cloudConnected: true, email: 'owner@example.com' } });
+  });
+
+  it('maps a Cloud not_configured to 503 with a distinct hint', async () => {
+    tokens.status.mockRejectedValueOnce(new GoogleWorkspaceError(503, 'not_configured', 'no client'));
+    const res = await request(app).get('/api/google/status');
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({ success: false, error: 'not_configured', hint: expect.stringContaining('not configured') });
+  });
+});
+
+describe('GET /connect-url', () => {
+  it('defaults the return URL to this API origin + the Connections page', async () => {
+    const res = await request(app).get('/api/google/connect-url').set('Host', 'localhost:8787');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true, data: { url: CONNECT_URL } });
+    expect(tokens.buildConnectUrl).toHaveBeenCalledWith('http://localhost:8787/connections?platform=google-workspace', { authorizedBy: 'owner' });
+  });
+
+  it('honours an explicit http(s) returnUrl and ignores a non-http one', async () => {
+    await request(app).get('/api/google/connect-url').query({ returnUrl: 'http://localhost:3000/connections?platform=google-workspace' }).set('Host', 'localhost:8787');
+    expect(tokens.buildConnectUrl).toHaveBeenLastCalledWith('http://localhost:3000/connections?platform=google-workspace', { authorizedBy: 'owner' });
+
+    await request(app).get('/api/google/connect-url').query({ returnUrl: 'javascript:alert(1)' }).set('Host', 'localhost:8787');
+    expect(tokens.buildConnectUrl).toHaveBeenLastCalledWith('http://localhost:8787/connections?platform=google-workspace', { authorizedBy: 'owner' });
+  });
+
+  it('answers 401 not_logged_in when there is no Cloud session', async () => {
+    tokens.buildConnectUrl.mockImplementation(() => { throw new GoogleWorkspaceError(401, 'not_logged_in', 'sign in'); });
+    const res = await request(app).get('/api/google/connect-url');
+    expect(res.status).toBe(401);
+    expect(res.body).toMatchObject({ success: false, error: 'not_logged_in', hint: expect.stringContaining('Sign in to Crewly Cloud') });
+  });
+});
+
+describe('DELETE /disconnect', () => {
+  it('revokes and reports removed', async () => {
+    const res = await request(app).delete('/api/google/disconnect');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true, data: { removed: true } });
+  });
+});
+
+describe('GET /gmail/search', () => {
+  it('passes q and max through and wraps the hits', async () => {
+    gmail.search.mockResolvedValueOnce([{ id: 'm1' }]);
+    const res = await request(app).get('/api/google/gmail/search').query({ q: 'is:unread', max: '5' });
+    expect(res.status).toBe(200);
+    expect(gmail.search).toHaveBeenCalledWith({ query: 'is:unread', max: 5 });
+    expect(res.body).toEqual({ success: true, data: { query: 'is:unread', count: 1, messages: [{ id: 'm1' }] } });
+  });
+
+  it('400s without q', async () => {
+    const res = await request(app).get('/api/google/gmail/search');
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ success: false, error: 'validation' });
+    expect(gmail.search).not.toHaveBeenCalled();
+  });
+
+  it('writes a connector.use.refused audit entry when Cloud says the grant is not shared (issue #969)', async () => {
+    const written: ActivityEntryInput[] = [];
+    setConnectorUseAuditForTesting(new ConnectorUseAuditService({ record: (e) => written.push(e) }));
+    try {
+      gmail.search.mockRejectedValueOnce(new GoogleWorkspaceError(403, 'not_permitted', 'not shared', { authorizedBy: 'Bob', product: 'gmail' }));
+      const res = await request(app).get('/api/google/gmail/search').query({ q: 'x' });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe('not_permitted');
+      // The role gate wrote the owner's allowed use first; the refusal follows.
+      const refused = written.filter((e) => e.action === 'connector.use.refused');
+      expect(refused).toHaveLength(1);
+      expect(refused[0]).toMatchObject({
+        target: { type: 'connector', id: 'google-workspace' },
+        after: { reason: 'grant_not_shared', authorizedBy: 'Bob', what: 'gmail' },
+      });
+      expect(refused[0].note).toContain('authorized by Bob');
+    } finally {
+      setConnectorUseAuditForTesting(null);
+    }
+  });
+
+  it('maps not_connected to 409 with the connect URL as the hint', async () => {
+    gmail.search.mockRejectedValueOnce(new GoogleWorkspaceError(409, 'not_connected', 'no grant'));
+    const res = await request(app).get('/api/google/gmail/search').query({ q: 'x' }).set('Host', 'localhost:8787');
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ success: false, error: 'not_connected', message: 'no grant', hint: CONNECT_URL });
+    expect(tokens.buildConnectUrl).toHaveBeenCalledWith('http://localhost:8787/connections?platform=google-workspace', { authorizedBy: 'owner' });
+  });
+
+  // The dashboard URL carries the owner's Cloud token and returns to localhost.
+  // An agent must get neither: it can paste what it is handed into Slack.
+  it('gives an agent the card skill and the portal page for not_connected, never the token URL or Settings', async () => {
+    gmail.search.mockRejectedValueOnce(new GoogleWorkspaceError(409, 'not_connected', 'no grant', { product: 'gmail' } as never));
+    tokens.buildConnectUrl.mockClear();
+    const res = await request(app).get('/api/google/gmail/search').query({ q: 'x' }).set('X-Agent-Session', 'ruth');
+    expect(res.status).toBe(409);
+    expect(res.body.hint).toContain('google-connect skill with --product gmail');
+    expect(res.body.hint).toContain('https://crewlyai.com/portal/integrations/google?products=gmail&auto=1');
+    expect(res.body.hint).not.toMatch(/token=|localhost|Settings →/);
+    expect(tokens.buildConnectUrl).not.toHaveBeenCalled();
+  });
+
+  it('GET /connect-url hands an agent the portal page, not the token URL', async () => {
+    tokens.buildConnectUrl.mockClear();
+    const res = await request(app).get('/api/google/connect-url').query({ products: 'drive' }).set('X-Agent-Session', 'ruth');
+    expect(res.body.data.url).toBe('https://crewlyai.com/portal/integrations/google?products=drive&auto=1');
+    expect(tokens.buildConnectUrl).not.toHaveBeenCalled();
+  });
+
+  it('falls back to a textual hint for not_connected when not even signed in to Cloud', async () => {
+    gmail.search.mockRejectedValueOnce(new GoogleWorkspaceError(409, 'not_connected', 'no grant'));
+    tokens.buildConnectUrl.mockImplementation(() => { throw new GoogleWorkspaceError(401, 'not_logged_in', 'sign in'); });
+    const res = await request(app).get('/api/google/gmail/search').query({ q: 'x' });
+    expect(res.status).toBe(409);
+    expect(res.body.hint).toContain('Sign in to Crewly Cloud');
+  });
+
+  it('passes Google 502/401 through with their status', async () => {
+    gmail.search.mockRejectedValueOnce(new GoogleWorkspaceError(502, 'google_error', 'boom'));
+    expect((await request(app).get('/api/google/gmail/search').query({ q: 'x' })).status).toBe(502);
+    gmail.search.mockRejectedValueOnce(new GoogleWorkspaceError(401, 'google_error', 'bad token'));
+    const res = await request(app).get('/api/google/gmail/search').query({ q: 'x' });
+    expect(res.status).toBe(401);
+    expect(res.body.hint).toContain('retry once');
+  });
+
+  it('turns an unexpected throw into a 500 internal', async () => {
+    gmail.search.mockRejectedValueOnce(new Error('kaboom'));
+    const res = await request(app).get('/api/google/gmail/search').query({ q: 'x' });
+    expect(res.status).toBe(500);
+    expect(res.body).toMatchObject({ success: false, error: 'internal', message: 'kaboom' });
+  });
+});
+
+describe('GET /gmail/messages/:id', () => {
+  it('reads by id', async () => {
+    gmail.read.mockResolvedValueOnce({ id: 'm1', body: 'hi' });
+    const res = await request(app).get('/api/google/gmail/messages/m1');
+    expect(res.status).toBe(200);
+    expect(gmail.read).toHaveBeenCalledWith('m1');
+    expect(res.body).toEqual({ success: true, data: { id: 'm1', body: 'hi' } });
+  });
+
+  it('passes a Gmail 404 through', async () => {
+    gmail.read.mockRejectedValueOnce(new GoogleWorkspaceError(404, 'google_error', 'not found'));
+    expect((await request(app).get('/api/google/gmail/messages/nope')).status).toBe(404);
+  });
+});
+
+describe('GET /gmail/messages/:id/attachments/:attachmentId', () => {
+  it('returns the attachment bytes for the message + attachment id', async () => {
+    gmail.getAttachment.mockResolvedValueOnce({ messageId: 'm1', attachmentId: 'A1', size: 3, dataBase64: 'YWJj' });
+    const res = await request(app).get('/api/google/gmail/messages/m1/attachments/A1');
+    expect(res.status).toBe(200);
+    expect(gmail.getAttachment).toHaveBeenCalledWith('m1', 'A1');
+    expect(res.body).toEqual({ success: true, data: { messageId: 'm1', attachmentId: 'A1', size: 3, dataBase64: 'YWJj' } });
+  });
+
+  it('answers 413 when the attachment is over the cap', async () => {
+    gmail.getAttachment.mockRejectedValueOnce(new GoogleWorkspaceError(413, 'validation', 'too big'));
+    expect((await request(app).get('/api/google/gmail/messages/m1/attachments/A1')).status).toBe(413);
+  });
+});
+
+describe('POST /gmail/send', () => {
+  it('sends with the normalised input', async () => {
+    gmail.send.mockResolvedValueOnce({ id: 's1', threadId: 't1', labelIds: ['SENT'] });
+    const res = await request(app).post('/api/google/gmail/send').send({
+      to: 'a@b.c', subject: 'Hi', text: 'x', cc: 'c@d.e', threadId: 't1', inReplyTo: '<m@x>',
+    });
+    expect(res.status).toBe(200);
+    expect(gmail.send).toHaveBeenCalledWith({ to: 'a@b.c', subject: 'Hi', text: 'x', cc: 'c@d.e', threadId: 't1', inReplyTo: '<m@x>' });
+    expect(res.body).toEqual({ success: true, data: { id: 's1', threadId: 't1', labelIds: ['SENT'] } });
+  });
+
+  it('drafts instead of sending when an agent asks, and says so plainly', async () => {
+    // The incident: an owner asked for a reply to be drafted and two emails
+    // went out. An agent gets a real draft it cannot send.
+    gmail.createDraft.mockResolvedValueOnce({ draftId: 'r-9', threadId: 't1' });
+
+    const res = await request(app)
+      .post('/api/google/gmail/send')
+      .set('X-Agent-Session', 'ella')
+      .send({ to: 'kpan@panlawoffice.com', subject: 'Re: closing', text: 'x' });
+
+    expect(res.status).toBe(202);
+    expect(res.body.data).toMatchObject({ drafted: true, draftId: 'r-9' });
+    expect(res.body.data.message).toMatch(/NOT been sent/);
+    expect(gmail.send).not.toHaveBeenCalled();
+  });
+
+  it('records the instruction the agent cited, in the language it was said in', async () => {
+    // Headers are Latin-1 and these citations quote the owner, who here
+    // speaks Chinese. Sent raw it is rejected by the HTTP layer and the
+    // citation is lost at exactly the moment it matters.
+    gmail.createDraft.mockResolvedValueOnce({ draftId: 'r-9' });
+    const claim = "owner 14:22 — 「你帮我填好 然后我来做剩下的」";
+
+    await request(app)
+      .post('/api/google/gmail/send')
+      .set('X-Agent-Session', 'ella')
+      .set('X-Agent-Authorization', `b64:${Buffer.from(claim, 'utf-8').toString('base64')}`)
+      .send({ to: 'a@b.c', subject: 'Hi', text: 'x' });
+
+    const { listHeldSends } = await import('../../services/google/gmail-send-gate.js');
+    expect(listHeldSends()[0].claim).toBe(claim);
+  });
+
+  it('accepts a plain ASCII citation too', async () => {
+    gmail.createDraft.mockResolvedValueOnce({ draftId: 'r-9' });
+    await request(app).post('/api/google/gmail/send')
+      .set('X-Agent-Session', 'ella')
+      .set('X-Agent-Authorization', 'owner 14:22 said send it')
+      .send({ to: 'a@b.c', subject: 'Hi', text: 'x' });
+
+    const { listHeldSends } = await import('../../services/google/gmail-send-gate.js');
+    expect(listHeldSends()[0].claim).toBe('owner 14:22 said send it');
+  });
+
+  it('still sends for the owner driving the API directly', async () => {
+    // No agent session — this is the owner, and the gate is not about them.
+    gmail.send.mockResolvedValueOnce({ id: 's1', threadId: 't1', labelIds: ['SENT'] });
+    const res = await request(app).post('/api/google/gmail/send').send({ to: 'a@b.c', subject: 'Hi', text: 'x' });
+    expect(res.status).toBe(200);
+    expect(gmail.send).toHaveBeenCalled();
+  });
+
+  it('sends the draft the owner reviewed, not a rebuilt copy', async () => {
+    // So any edit the owner made in Gmail is what goes out.
+    gmail.createDraft.mockResolvedValueOnce({ draftId: 'r-9' });
+    await request(app).post('/api/google/gmail/send').set('X-Agent-Session', 'ella')
+      .send({ to: 'a@b.c', subject: 'Hi', text: 'x' });
+
+    const { listHeldSends } = await import('../../services/google/gmail-send-gate.js');
+    const held = listHeldSends()[0];
+    gmail.sendDraft.mockResolvedValueOnce({ id: 's1', threadId: 't1', labelIds: ['SENT'] });
+
+    const res = await request(app).post(`/api/google/gmail/held/${encodeURIComponent(held.id)}`).send({ decision: 'send' });
+
+    expect(res.status).toBe(200);
+    expect(gmail.sendDraft).toHaveBeenCalledWith('r-9');
+    expect(gmail.send).not.toHaveBeenCalled();
+  });
+
+  it('does not let one owner approval pre-approve the next send (#882)', async () => {
+    gmail.createDraft.mockResolvedValueOnce({ draftId: 'r-9' });
+    await request(app).post('/api/google/gmail/send').set('X-Agent-Session', 'ella')
+      .send({ to: 'a@b.c', subject: 'Hi', text: 'x' });
+    const { listHeldSends } = await import('../../services/google/gmail-send-gate.js');
+    gmail.sendDraft.mockResolvedValueOnce({ id: 's1', threadId: 't1', labelIds: [] });
+    const resolved = await request(app).post(`/api/google/gmail/held/${encodeURIComponent(listHeldSends()[0].id)}`).send({ decision: 'send' });
+    expect(resolved.status).toBe(200);
+
+    // The agent's next send is a new message nobody reviewed: held again.
+    gmail.createDraft.mockResolvedValueOnce({ draftId: 'r-10' });
+    const again = await request(app).post('/api/google/gmail/send').set('X-Agent-Session', 'ella')
+      .send({ to: 'a@b.c', subject: 'Second', text: 'x' });
+
+    expect(again.status).toBe(202);
+    expect(again.body.data).toMatchObject({ drafted: true, draftId: 'r-10' });
+    expect(gmail.send).not.toHaveBeenCalled();
+    expect(listHeldSends()).toHaveLength(1);
+  });
+
+  it('an agent cannot send its own held draft: no agent route does it (CREW-257)', async () => {
+    gmail.createDraft.mockResolvedValueOnce({ draftId: 'r-9' });
+    await request(app).post('/api/google/gmail/send').set('X-Agent-Session', 'ella').send({ to: 'a@b.c', subject: 'Hi', text: 'x' });
+    const { listHeldSends } = await import('../../services/google/gmail-send-gate.js');
+
+    const res = await request(app)
+      .post(`/api/google/gmail/held/${encodeURIComponent(listHeldSends()[0].id)}`)
+      .set('X-Agent-Session', 'ella')
+      .send({ decision: 'send' });
+
+    expect(res.status).toBe(403);
+    expect(gmail.sendDraft).not.toHaveBeenCalled();
+    expect(gmail.send).not.toHaveBeenCalled();
+  });
+
+  it('raises the owner card for an agent\'s draft and says so', async () => {
+    const onHeld = jest.fn().mockResolvedValue(true);
+    setGmailSendApproval({ onHeld, answerFromOwner: jest.fn() } as never);
+    gmail.createDraft.mockResolvedValueOnce({ draftId: 'r-9', threadId: 't9' });
+
+    const res = await request(app).post('/api/google/gmail/send').set('X-Agent-Session', 'ella').send({ to: 'a@b.c', subject: 'Hi', text: 'x' });
+
+    expect(res.status).toBe(202);
+    expect(res.body.data.approvalCard).toBe(true);
+    expect(onHeld).toHaveBeenCalledWith(expect.objectContaining({ agentSession: 'ella', draftId: 'r-9' }));
+    expect(gmail.send).not.toHaveBeenCalled();
+    setGmailSendApproval(null);
+  });
+
+  it('the owner route answers through the card when there is one', async () => {
+    const answerFromOwner = jest.fn().mockResolvedValue(true);
+    setGmailSendApproval({ onHeld: jest.fn().mockResolvedValue(true), answerFromOwner } as never);
+    gmail.createDraft.mockResolvedValueOnce({ draftId: 'r-9' });
+    await request(app).post('/api/google/gmail/send').set('X-Agent-Session', 'ella').send({ to: 'a@b.c', subject: 'Hi', text: 'x' });
+    const { listHeldSends, updateHeldSend } = await import('../../services/google/gmail-send-gate.js');
+    const id = listHeldSends()[0].id;
+    updateHeldSend(id, { decisionId: 'D-1' });
+
+    const res = await request(app).post(`/api/google/gmail/held/${encodeURIComponent(id)}`).send({ decision: 'send' });
+
+    expect(answerFromOwner).toHaveBeenCalledWith(id, 'send');
+    expect(res.status).toBe(200);
+    expect(gmail.sendDraft).not.toHaveBeenCalled(); // the card's handler sends, after checking the draft
+    setGmailSendApproval(null);
+  });
+
+  it('POST /gmail/watch wakes the calling agent, and needs an agent session', async () => {
+    const watch = jest.fn().mockResolvedValue({ threadId: 't1', ownerSession: 'ella' });
+    setGmailReplyWatch({ watch } as never);
+
+    const anon = await request(app).post('/api/google/gmail/watch').send({ threadId: 't1' });
+    expect(anon.status).toBe(400);
+
+    const ok = await request(app).post('/api/google/gmail/watch').set('X-Agent-Session', 'ella').send({ threadId: 't1' });
+    expect(ok.status).toBe(200);
+    expect(watch).toHaveBeenCalledWith('t1', 'ella', undefined);
+    expect(ok.body.data.event).toBe('gmail:reply_received');
+    setGmailReplyWatch(null);
+  });
+
+  it('discards a held draft without sending it', async () => {
+    gmail.createDraft.mockResolvedValueOnce({ draftId: 'r-9' });
+    await request(app).post('/api/google/gmail/send').set('X-Agent-Session', 'ella')
+      .send({ to: 'a@b.c', subject: 'Hi', text: 'x' });
+    const { listHeldSends } = await import('../../services/google/gmail-send-gate.js');
+
+    const res = await request(app).post(`/api/google/gmail/held/${encodeURIComponent(listHeldSends()[0].id)}`).send({ decision: 'discard' });
+
+    expect(res.status).toBe(200);
+    expect(gmail.sendDraft).not.toHaveBeenCalled();
+    expect(gmail.deleteDraft).toHaveBeenCalledWith('r-9'); // the owner's explicit Discard is the one thing that deletes
+    expect(listHeldSends()).toHaveLength(0);
+  });
+
+  it('rejects a decision that is neither send nor discard', async () => {
+    const res = await request(app).post('/api/google/gmail/held/anything').send({ decision: 'maybe' });
+    expect(res.status).toBe(400);
+  });
+
+  it('dryRun returns the RFC 822 preview and never calls Gmail', async () => {
+    const res = await request(app).post('/api/google/gmail/send').send({ to: 'a@b.c', subject: 'Hi', text: 'hello', dryRun: true });
+    expect(res.status).toBe(200);
+    expect(res.body.data.dryRun).toBe(true);
+    expect(res.body.data.raw).toContain('To: a@b.c\r\nSubject: Hi\r\n');
+    expect(res.body.data.raw).toContain(Buffer.from('hello').toString('base64'));
+    expect(gmail.send).not.toHaveBeenCalled();
+    expect(base64UrlDecode(Buffer.from(res.body.data.raw).toString('base64url'))).toBe(res.body.data.raw);
+  });
+
+  it('400s a dry run without to/subject, without calling Gmail', async () => {
+    const res = await request(app).post('/api/google/gmail/send').send({ subject: 'Hi', text: 'x', dryRun: true });
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ success: false, error: 'validation' });
+    expect(gmail.send).not.toHaveBeenCalled();
+  });
+
+  it('propagates validation from the service as 400', async () => {
+    gmail.send.mockRejectedValueOnce(new GoogleWorkspaceError(400, 'validation', '"to" is required'));
+    const res = await request(app).post('/api/google/gmail/send').send({ subject: 'Hi', text: 'x' });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe('"to" is required');
+  });
+});
+
+describe('GET /calendar/events', () => {
+  it('maps from/to/calendarId/max onto the service', async () => {
+    calendar.listEvents.mockResolvedValueOnce([{ id: 'e1' }, { id: 'e2' }]);
+    const res = await request(app).get('/api/google/calendar/events').query({ from: '2026-09-18T00:00:00Z', to: '2026-09-19T00:00:00Z', calendarId: 'ops@x', max: '3' });
+    expect(res.status).toBe(200);
+    expect(calendar.listEvents).toHaveBeenCalledWith({ calendarId: 'ops@x', timeMin: '2026-09-18T00:00:00Z', timeMax: '2026-09-19T00:00:00Z', max: 3 });
+    expect(res.body).toEqual({ success: true, data: { count: 2, events: [{ id: 'e1' }, { id: 'e2' }] } });
+  });
+
+  it('sends undefined for absent filters', async () => {
+    calendar.listEvents.mockResolvedValueOnce([]);
+    await request(app).get('/api/google/calendar/events');
+    expect(calendar.listEvents).toHaveBeenCalledWith({ calendarId: undefined, timeMin: undefined, timeMax: undefined, max: undefined });
+  });
+
+  it('maps not_connected to 409 with the connect URL', async () => {
+    calendar.listEvents.mockRejectedValueOnce(new GoogleWorkspaceError(409, 'not_connected', 'no grant'));
+    const res = await request(app).get('/api/google/calendar/events');
+    expect(res.status).toBe(409);
+    expect(res.body.hint).toBe(CONNECT_URL);
+  });
+});
+
+describe('POST /calendar/events', () => {
+  it('creates with array attendees', async () => {
+    calendar.createEvent.mockResolvedValueOnce({ id: 'n1' });
+    const res = await request(app).post('/api/google/calendar/events').send({
+      summary: 'Review', start: '2026-09-20T14:00:00', end: '2026-09-20T15:00:00', timezone: 'Asia/Shanghai', description: 'd', attendees: ['a@b.c'],
+    });
+    expect(res.status).toBe(200);
+    expect(calendar.createEvent).toHaveBeenCalledWith({
+      calendarId: undefined, summary: 'Review', start: '2026-09-20T14:00:00', end: '2026-09-20T15:00:00', description: 'd', attendees: ['a@b.c'], timezone: 'Asia/Shanghai',
+    });
+    expect(res.body).toEqual({ success: true, data: { id: 'n1' } });
+  });
+
+  it('accepts comma-separated attendees and surfaces validation as 400', async () => {
+    calendar.createEvent.mockRejectedValueOnce(new GoogleWorkspaceError(400, 'validation', '"summary" is required'));
+    const res = await request(app).post('/api/google/calendar/events').send({ start: '2026-10-01', end: '2026-10-02', attendees: 'a@b.c, d@e.f' });
+    expect(calendar.createEvent).toHaveBeenCalledWith(expect.objectContaining({ summary: '', attendees: ['a@b.c', ' d@e.f'] }));
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('Drive / Docs / Sheets / Slides', () => {
+  it('drive: search passes q/mimeType/folderId/max, content and upload wrap the service', async () => {
+    drive.search.mockResolvedValue([{ id: '1' }]);
+    const res = await request(app).get('/api/google/drive/files?q=plan&mimeType=text%2Fplain&folderId=f&max=5');
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual({ count: 1, files: [{ id: '1' }] });
+    expect(drive.search).toHaveBeenCalledWith({ query: 'plan', mimeType: 'text/plain', folderId: 'f', max: 5 });
+
+    drive.readContent.mockResolvedValue({ content: 'x' });
+    expect((await request(app).get('/api/google/drive/files/abc/content')).body.data).toEqual({ content: 'x' });
+    expect(drive.readContent).toHaveBeenCalledWith('abc');
+
+    drive.upload.mockResolvedValue({ id: 'u' });
+    const up = await request(app).post('/api/google/drive/files').send({ name: 'n.txt', content: 'hi', folderId: 'f' });
+    expect(up.body.data).toEqual({ id: 'u' });
+    expect(drive.upload).toHaveBeenCalledWith({ name: 'n.txt', content: 'hi', encoding: 'utf8', mimeType: undefined, folderId: 'f', convertTo: undefined });
+  });
+
+  it('docs: read / create / append', async () => {
+    docs.read.mockResolvedValue({ id: 'd', text: 't' });
+    expect((await request(app).get('/api/google/docs/d')).body.data).toEqual({ id: 'd', text: 't' });
+    docs.create.mockResolvedValue({ id: 'n' });
+    await request(app).post('/api/google/docs').send({ title: 'T', text: 'body' });
+    expect(docs.create).toHaveBeenCalledWith({ title: 'T', text: 'body' });
+    docs.append.mockResolvedValue({ id: 'd' });
+    await request(app).post('/api/google/docs/d/append').send({ text: 'more' });
+    expect(docs.append).toHaveBeenCalledWith('d', 'more');
+  });
+
+  it('docs comments: list / add / reply / resolve', async () => {
+    docComments.list.mockResolvedValue({ docId: 'd', comments: [], truncated: false });
+    const list = await request(app).get('/api/google/docs/d/comments?includeResolved=1');
+    expect(list.body).toEqual({ success: true, data: { docId: 'd', comments: [], truncated: false } });
+    expect(docComments.list).toHaveBeenCalledWith('d', { includeResolved: true });
+    await request(app).get('/api/google/docs/d/comments');
+    expect(docComments.list).toHaveBeenLastCalledWith('d', { includeResolved: false });
+
+    docComments.add.mockResolvedValue({ docId: 'd', id: 'c1' });
+    await request(app).post('/api/google/docs/d/comments').send({ text: 'Why?', quote: 'this line' });
+    expect(docComments.add).toHaveBeenCalledWith('d', 'Why?', 'this line');
+
+    docComments.reply.mockResolvedValue({ docId: 'd', commentId: 'c1', id: 'r1' });
+    await request(app).post('/api/google/docs/d/comments/c1/replies').send({ text: 'Fixed' });
+    expect(docComments.reply).toHaveBeenCalledWith('d', 'c1', 'Fixed');
+
+    docComments.resolve.mockResolvedValue({ docId: 'd', commentId: 'c1', resolved: true });
+    await request(app).post('/api/google/docs/d/comments/c1/resolve').send({});
+    expect(docComments.resolve).toHaveBeenCalledWith('d', 'c1', undefined);
+  });
+
+  it('docs comments: reauth_required answers 403 with a one-tap reconnect hint', async () => {
+    docComments.reply.mockRejectedValue(new GoogleWorkspaceError(403, 'reauth_required', 'needs Google Drive edit access'));
+    const res = await request(app).post('/api/google/docs/d/comments/c1/replies').send({ text: 'x' });
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({
+      success: false,
+      error: 'reauth_required',
+      hint: expect.stringContaining('google-connect skill with --product drive'),
+    });
+  });
+
+  it('sheets: values read with range, write defaults to append and honours mode=update', async () => {
+    sheets.read.mockResolvedValue({ rows: [] });
+    await request(app).get('/api/google/sheets/s/values?range=A1%3AB2');
+    expect(sheets.read).toHaveBeenCalledWith('s', 'A1:B2');
+    sheets.append.mockResolvedValue({ updatedRows: 1 });
+    const a = await request(app).post('/api/google/sheets/s/values').send({ rows: [['x']] });
+    expect(a.body.data).toEqual({ mode: 'append', updatedRows: 1 });
+    sheets.update.mockResolvedValue({ updatedRows: 1 });
+    const u = await request(app).post('/api/google/sheets/s/values').send({ rows: [['x']], range: 'B2', mode: 'update' });
+    expect(u.body.data.mode).toBe('update');
+    expect(sheets.update).toHaveBeenCalledWith({ spreadsheetId: 's', range: 'B2', rows: [['x']] });
+  });
+
+  it('slides: create passes the outline and a service validation error maps to 400', async () => {
+    slides.create.mockResolvedValue({ id: 'p', slideCount: 1 });
+    await request(app).post('/api/google/slides').send({ title: 'Deck', slides: [{ title: 'a', bullets: ['b'] }] });
+    expect(slides.create).toHaveBeenCalledWith({ title: 'Deck', slides: [{ title: 'a', bullets: ['b'] }] });
+    slides.read.mockRejectedValue(new GoogleWorkspaceError(400, 'validation', '"id" is required'));
+    const res = await request(app).get('/api/google/slides/%20');
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('validation');
+  });
+});
+
+// 2026-10-08: drafts.create answered 403 "insufficient authentication
+// scopes" and the agent told the owner to open Connections — from a phone.
+// The harness now posts the owner a one-tap card and says so in the hint.
+describe('reconnect cards for failures only the owner can fix', () => {
+  let notify: jest.Mock;
+
+  beforeEach(async () => {
+    const { GoogleReauthNotifier } = await import('../../services/google/google-reauth-notifier.service.js');
+    notify = jest.fn().mockResolvedValue({ status: 'posted' });
+    GoogleReauthNotifier.setInstance({ notify, stop: jest.fn() } as never);
+  });
+
+  afterEach(async () => {
+    const { GoogleReauthNotifier } = await import('../../services/google/google-reauth-notifier.service.js');
+    GoogleReauthNotifier.setInstance(null);
+  });
+
+  const scopeRefusal = () =>
+    new GoogleWorkspaceError(403, 'reauth_required', 'Request had insufficient authentication scopes.', {
+      reason: 'insufficient_scope',
+      product: 'gmail',
+    });
+
+  it('posts the card for a missing draft scope and tells the agent it was sent', async () => {
+    gmail.createDraft.mockRejectedValueOnce(scopeRefusal());
+    const res = await request(app)
+      .post('/api/google/gmail/send')
+      .set('X-Agent-Session', 'ella')
+      .set('X-Google-Account', 'owner@gmail.com')
+      .send({ to: 'a@b.c', subject: 'Re: x', text: 'y' });
+
+    expect(res.status).toBe(403);
+    expect(notify).toHaveBeenCalledWith({ product: 'gmail', kind: 'missing_scope', agentSession: 'ella', account: 'owner@gmail.com' });
+    expect(res.body).toMatchObject({ error: 'reauth_required', reconnectLinkSent: true });
+    expect(res.body.hint).toMatch(/^A reconnect card was sent to the owner in Slack/);
+    expect(res.body.hint).not.toMatch(/Settings|open Connections/);
+    expect(res.body.hint).toContain('https://crewlyai.com/portal/integrations/google?products=gmail&account=owner%40gmail.com&auto=1');
+  });
+
+  it('posts the expiry card when Cloud says the grant was revoked', async () => {
+    gmail.search.mockRejectedValueOnce(
+      new GoogleWorkspaceError(409, 'not_connected', 'Google access expired or was revoked; the owner must reconnect it.', {
+        reason: 'grant_revoked',
+        product: 'gmail',
+        account: 'owner@gmail.com',
+      }),
+    );
+    const res = await request(app).get('/api/google/gmail/search').query({ q: 'x' }).set('X-Agent-Session', 'ella');
+
+    expect(res.status).toBe(409);
+    expect(notify).toHaveBeenCalledWith({ product: 'gmail', kind: 'expired', agentSession: 'ella', account: 'owner@gmail.com' });
+    expect(res.body.hint).toMatch(/^A reconnect card was sent to the owner in Slack/);
+  });
+
+  it('says a card already went out instead of asking for another', async () => {
+    notify.mockResolvedValueOnce({ status: 'already_sent', sentAt: '2026-10-08T14:00:00.000Z', nextCardAfter: '2026-10-08T14:10:00.000Z' });
+    gmail.createDraft.mockRejectedValueOnce(scopeRefusal());
+    const res = await request(app).post('/api/google/gmail/send').set('X-Agent-Session', 'ella').send({ to: 'a@b.c', subject: 'x', text: 'y' });
+    expect(res.body.reconnectLinkSent).toBe(true);
+    expect(res.body.hint).toMatch(/already sent to the owner in Slack at 2026-10-08T14:00:00.000Z/);
+  });
+
+  it('falls back to the google-connect hint when no card could be posted', async () => {
+    notify.mockResolvedValueOnce({ status: 'unavailable', why: 'no Slack' });
+    gmail.createDraft.mockRejectedValueOnce(scopeRefusal());
+    const res = await request(app).post('/api/google/gmail/send').set('X-Agent-Session', 'ella').send({ to: 'a@b.c', subject: 'x', text: 'y' });
+    expect(res.body.reconnectLinkSent).toBeUndefined();
+    expect(res.body.hint).toContain('google-connect skill with --product gmail');
+  });
+
+  it('posts nothing for the owner at the dashboard, or for an unrelated failure', async () => {
+    gmail.send.mockRejectedValueOnce(scopeRefusal());
+    await request(app).post('/api/google/gmail/send').send({ to: 'a@b.c', subject: 'x', text: 'y' });
+    gmail.search.mockRejectedValueOnce(new GoogleWorkspaceError(404, 'google_error', 'Not Found'));
+    await request(app).get('/api/google/gmail/search').query({ q: 'x' }).set('X-Agent-Session', 'ella');
+    // Never connected at all is a first-time setup, not a reconnect.
+    gmail.search.mockRejectedValueOnce(new GoogleWorkspaceError(409, 'not_connected', 'not connected'));
+    await request(app).get('/api/google/gmail/search').query({ q: 'x' }).set('X-Agent-Session', 'ella');
+    expect(notify).not.toHaveBeenCalled();
+  });
+});

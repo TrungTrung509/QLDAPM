@@ -1,0 +1,935 @@
+/**
+ * Memory Data Models for Crewly Two-Level Memory System
+ *
+ * This module defines the data structures for the structured memory system:
+ * - Agent-level memory: Role knowledge, preferences, and performance metrics
+ * - Project-level memory: Patterns, decisions, gotchas, and relationships
+ *
+ * @module memory.types
+ */
+
+// ========================= AGENT-LEVEL MEMORY =========================
+
+/**
+ * Categories for role knowledge entries
+ */
+export type RoleKnowledgeCategory = 'best-practice' | 'anti-pattern' | 'tool-usage' | 'workflow';
+
+/**
+ * Memory type classification — determines how a memory entry is used.
+ *
+ * Different memory types serve different purposes and should be injected
+ * differently (or not at all) into agent prompts:
+ *
+ * - **procedural**: How to do things — injected into worker prompts to guide execution
+ * - **risk**: What to avoid — injected early in prompts as warnings
+ * - **preference**: Style/approach preferences — injected with low weight, may be overridden
+ * - **domain**: Business/architecture facts — injected but flagged for freshness verification
+ * - **performance**: Agent strengths/weaknesses — injected into TL/orchestrator prompts for scheduling, NOT into worker prompts
+ */
+export type MemoryType =
+  | 'procedural'    // Steps, workflows, how-to knowledge
+  | 'risk'          // Failures, anti-patterns, prohibitions
+  | 'preference'    // Style, approach, team convention preferences
+  | 'domain'        // Business facts, architecture knowledge
+  | 'performance'   // Agent capability assessment (for scheduling, not self-use)
+  | 'task-history'; // Record of completed tasks — who did what, which capabilities
+
+/**
+ * A single piece of role-specific knowledge learned by an agent
+ *
+ * @example
+ * ```typescript
+ * const entry: RoleKnowledgeEntry = {
+ *   id: 'rk-001',
+ *   category: 'best-practice',
+ *   content: 'Always run tests before committing code changes',
+ *   learnedFrom: 'TICKET-123',
+ *   confidence: 0.85,
+ *   createdAt: '2026-01-29T10:00:00Z',
+ *   lastUsed: '2026-01-29T14:30:00Z'
+ * };
+ * ```
+ */
+export interface RoleKnowledgeEntry {
+  /** Unique identifier for this knowledge entry */
+  id: string;
+  /** Category of knowledge */
+  category: RoleKnowledgeCategory;
+  /**
+   * Memory type — determines injection strategy.
+   * Risk memories are injected as early warnings. Performance memories go to TL/orchestrator only.
+   * Defaults to 'procedural' for backward compatibility with existing entries.
+   */
+  memoryType?: MemoryType;
+  /** The actual knowledge content */
+  content: string;
+  /** Task/Ticket ID where this was learned (optional) */
+  learnedFrom?: string;
+  /** Confidence score 0-1, increases with reinforcement */
+  confidence: number;
+  /** ISO timestamp when this entry was created */
+  createdAt: string;
+  /** ISO timestamp when this entry was last used/referenced */
+  lastUsed?: string;
+  /** Tags for additional categorization */
+  tags?: string[];
+
+  // === v2: Task-linked provenance ===
+
+  /** Task ID where this knowledge was learned */
+  sourceTaskId?: string;
+  /** Objective/goal ID this knowledge relates to */
+  sourceObjectiveId?: string;
+  /** Outcome of the task where this was learned */
+  sourceOutcome?: 'success' | 'failed' | 'partial';
+  /** What contexts/domains this knowledge applies to */
+  appliesTo?: string[];
+  /** ISO timestamp when this knowledge was last verified as still valid */
+  lastVerifiedAt?: string;
+  /** Whether this entry has been superseded by newer knowledge */
+  superseded?: boolean;
+  /** ID of the entry that supersedes this one */
+  supersededBy?: string;
+
+  // === v3 (M3): Importance + evidence + lifecycle ===
+  // Per spec 2026-05-03-memory-codebase-improvement-plan.md §158-197:
+  // separates "Steve's strategic preference (high importance, persistent)"
+  // from "agent's tactical guess yesterday (low confidence, expires)" so
+  // recall can stop drowning agents in stale low-signal entries.
+
+  /**
+   * Strategic importance score 0-1.
+   *
+   * Distinct from {@link confidence}:
+   * - importance = how much this should weight in injection decisions
+   *   (a strategic preference is high-importance even when only 0.6
+   *   confident);
+   * - confidence = how reliably true this entry is.
+   *
+   * Default for legacy entries (lazy-migrated on read): 0.5.
+   *
+   * Recall-eligibility (per spec §183-187):
+   * - importance >= 0.85 AND confidence >= 0.7 → eligible for auto-inject
+   *   into context.
+   */
+  importance?: number;
+
+  /**
+   * Provenance refs that back this entry — requestId, workItemId,
+   * slackMessageTs, file paths, etc. Distinct from the legacy
+   * {@link learnedFrom} single-string field which is preserved for
+   * backward compatibility (lazy-migration: when evidence is absent and
+   * learnedFrom is present, evidence resolves to [learnedFrom]).
+   *
+   * Default for legacy entries: [] (or [learnedFrom] when available).
+   */
+  evidence?: string[];
+
+  /**
+   * Optional ISO8601 timestamp at which this entry expires.
+   *
+   * Recall behavior (per spec §187): when {@link ttl} < now, the entry
+   * is hidden from default recall (kept in raw store for audit). Used
+   * for tactical / time-bound facts (e.g., "the staging API key
+   * rotates Friday").
+   */
+  ttl?: string;
+
+  /**
+   * Should this entry be auto-injected into the agent's context by
+   * default?
+   *
+   * Allows the writer to override the derived default. The derivation
+   * (used when this field is undefined) is:
+   *
+   *   importance >= 0.85
+   *   AND confidence >= 0.7
+   *   AND !superseded
+   *   AND (!ttl || ttl > now)
+   *
+   * Setting `false` explicitly forces "show only on explicit recall"
+   * even when the derivation would auto-inject. Setting `true`
+   * explicitly forces auto-inject even if importance/confidence fall
+   * below the gate.
+   */
+  shouldInjectByDefault?: boolean;
+}
+
+/**
+ * Verbosity level for agent communication
+ */
+export type VerbosityLevel = 'concise' | 'detailed';
+
+/**
+ * Task breakdown size preference
+ */
+export type BreakdownSize = 'small' | 'medium' | 'large';
+
+/**
+ * Agent coding style preferences
+ */
+export interface CodingStylePreferences {
+  /** Preferred programming language */
+  language?: string;
+  /** Preferred testing framework (e.g., 'jest', 'vitest', 'pytest') */
+  testingFramework?: string;
+  /** Linting rules preference (e.g., 'eslint-recommended', 'strict') */
+  lintingRules?: string;
+  /** Code formatting preferences */
+  formatting?: {
+    /** Indentation style ('tabs' or 'spaces') */
+    indentStyle?: 'tabs' | 'spaces';
+    /** Number of spaces for indentation */
+    indentSize?: number;
+    /** Maximum line length */
+    maxLineLength?: number;
+  };
+}
+
+/**
+ * Agent communication style preferences
+ */
+export interface CommunicationStylePreferences {
+  /** How verbose the agent should be in responses */
+  verbosity: VerbosityLevel;
+  /** Whether to ask for confirmation before taking actions */
+  askBeforeAction: boolean;
+  /** Whether to include explanations with code changes */
+  includeExplanations?: boolean;
+}
+
+/**
+ * Agent work pattern preferences
+ */
+export interface WorkPatternPreferences {
+  /** How often to commit changes (e.g., 'after-each-task', 'at-milestones') */
+  commitFrequency?: string;
+  /** Preferred size for task breakdown */
+  breakdownSize?: BreakdownSize;
+  /** Preferred working hours (for scheduling) */
+  preferredHours?: {
+    start: string; // HH:MM format
+    end: string;
+  };
+}
+
+/**
+ * Combined agent preferences
+ */
+export interface AgentPreferences {
+  /** Coding style preferences */
+  codingStyle?: CodingStylePreferences;
+  /** Communication style preferences */
+  communicationStyle?: CommunicationStylePreferences;
+  /** Work pattern preferences */
+  workPatterns?: WorkPatternPreferences;
+  /** Custom preferences (key-value pairs) */
+  custom?: Record<string, unknown>;
+}
+
+/**
+ * A pattern of errors encountered by the agent
+ */
+export interface ErrorPattern {
+  /** Identifier or description of the error pattern */
+  pattern: string;
+  /** Number of times this error has occurred */
+  occurrences: number;
+  /** ISO timestamp of the last occurrence */
+  lastOccurred: string;
+  /** Known resolution for this error (if any) */
+  resolution?: string;
+  /** Related file paths where this error commonly occurs */
+  relatedFiles?: string[];
+}
+
+/**
+ * Agent performance metrics over time
+ */
+export interface PerformanceMetrics {
+  /** Total number of tasks completed */
+  tasksCompleted: number;
+  /** Average number of iterations per task */
+  averageIterations: number;
+  /** Percentage of quality gates passed on first try (0-100) */
+  qualityGatePassRate: number;
+  /** Common error patterns encountered */
+  commonErrors: ErrorPattern[];
+  /** Average time to complete a task (in minutes) */
+  averageCompletionTime?: number;
+  /** Success rate for different task types */
+  taskTypeSuccessRates?: Record<string, number>;
+}
+
+/**
+ * Complete agent-level memory structure
+ *
+ * Stored at: ~/.crewly/agents/{agentId}/memory.json
+ *
+ * @example
+ * ```typescript
+ * const agentMemory: AgentMemory = {
+ *   agentId: 'frontend-dev-001',
+ *   role: 'frontend-developer',
+ *   createdAt: '2026-01-01T00:00:00Z',
+ *   updatedAt: '2026-01-29T15:00:00Z',
+ *   roleKnowledge: [...],
+ *   preferences: { ... },
+ *   performance: { ... }
+ * };
+ * ```
+ */
+export interface AgentMemory {
+  /** Unique agent identifier */
+  agentId: string;
+  /** Agent's role (e.g., 'developer', 'qa', 'pm') */
+  role: string;
+  /** ISO timestamp when this memory was created */
+  createdAt: string;
+  /** ISO timestamp of last update */
+  updatedAt: string;
+  /** Role-specific knowledge entries */
+  roleKnowledge: RoleKnowledgeEntry[];
+  /** Agent preferences */
+  preferences: AgentPreferences;
+  /** Performance metrics */
+  performance: PerformanceMetrics;
+  /** Schema version for migration support */
+  schemaVersion?: number;
+}
+
+// ========================= PROJECT-LEVEL MEMORY =========================
+
+/**
+ * Categories for project code patterns
+ */
+export type PatternCategory =
+  | 'api'
+  | 'component'
+  | 'service'
+  | 'testing'
+  | 'styling'
+  | 'database'
+  | 'config'
+  | 'user_preference'
+  | 'other';
+
+/**
+ * A code pattern discovered in the project
+ *
+ * @example
+ * ```typescript
+ * const pattern: PatternEntry = {
+ *   id: 'pat-001',
+ *   category: 'api',
+ *   title: 'Error Handling Wrapper',
+ *   description: 'All API endpoints use handleApiError() wrapper',
+ *   example: 'app.get("/api/users", handleApiError(async (req, res) => {...}))',
+ *   files: ['backend/src/utils/api-errors.ts'],
+ *   discoveredBy: 'backend-dev-001',
+ *   createdAt: '2026-01-15T10:00:00Z'
+ * };
+ * ```
+ */
+export interface PatternEntry {
+  /** Unique identifier for this pattern */
+  id: string;
+  /** Category of the pattern */
+  category: PatternCategory;
+  /** Short title describing the pattern */
+  title: string;
+  /** Detailed description of the pattern */
+  description: string;
+  /** Code example demonstrating the pattern */
+  example?: string;
+  /** Related file paths */
+  files?: string[];
+  /** Agent ID that discovered this pattern */
+  discoveredBy: string;
+  /** ISO timestamp when discovered */
+  createdAt: string;
+  /** Tags for searchability */
+  tags?: string[];
+
+  // === v2: Task-linked provenance ===
+
+  /** Task ID where this pattern was discovered */
+  sourceTaskId?: string;
+  /** Outcome of the task where this was learned */
+  sourceOutcome?: 'success' | 'failed' | 'partial';
+  /** ISO timestamp when this pattern was last verified */
+  lastVerifiedAt?: string;
+  /**
+   * People allowed to read this entry (#969). Set when the writer had read a
+   * person's connector grant shortly before; absent means everyone.
+   */
+  visibleToPeople?: string[];
+}
+
+/**
+ * An architecture or design decision made for the project
+ *
+ * @example
+ * ```typescript
+ * const decision: DecisionEntry = {
+ *   id: 'dec-001',
+ *   title: 'State Management Choice',
+ *   decision: 'Use React Context API instead of Redux',
+ *   rationale: 'Project scope is small, Redux would add unnecessary complexity',
+ *   alternatives: ['Redux', 'MobX', 'Zustand'],
+ *   decidedBy: 'tech-lead',
+ *   decidedAt: '2026-01-10T14:00:00Z',
+ *   affectedAreas: ['frontend/src/contexts/', 'frontend/src/components/']
+ * };
+ * ```
+ */
+export interface DecisionEntry {
+  /** Unique identifier for this decision */
+  id: string;
+  /** Short title of the decision */
+  title: string;
+  /** The actual decision made */
+  decision: string;
+  /** Why this decision was made */
+  rationale: string;
+  /** Other options that were considered */
+  alternatives?: string[];
+  /** Who made this decision (agent ID or 'user') */
+  decidedBy: string;
+  /** ISO timestamp when decided */
+  decidedAt: string;
+  /** Areas of the codebase affected by this decision */
+  affectedAreas?: string[];
+  /** Current status of the decision */
+  status?: 'active' | 'superseded' | 'deprecated';
+  /** ID of the decision that supersedes this one */
+  supersededBy?: string;
+  /** What actually happened (filled retrospectively) */
+  actualOutcome?: string;
+  /** What was learned from this decision */
+  learnings?: string;
+  /** ISO timestamp when the outcome was recorded */
+  outcomeRecordedAt?: string;
+  /**
+   * People allowed to read this entry (#969). Set when the writer had read a
+   * person's connector grant shortly before; absent means everyone.
+   */
+  visibleToPeople?: string[];
+}
+
+/**
+ * Severity levels for gotcha entries
+ */
+export type GotchaSeverity = 'low' | 'medium' | 'high' | 'critical';
+
+/**
+ * A known issue or workaround in the project
+ *
+ * @example
+ * ```typescript
+ * const gotcha: GotchaEntry = {
+ *   id: 'got-001',
+ *   title: 'PostgreSQL connection pool exhaustion',
+ *   problem: 'Database connections leak when using transactions without proper cleanup',
+ *   solution: 'Always use try/finally with client.release() or use pool.query() for single queries',
+ *   severity: 'high',
+ *   discoveredBy: 'backend-dev-001',
+ *   createdAt: '2026-01-20T09:00:00Z'
+ * };
+ * ```
+ */
+export interface GotchaEntry {
+  /** Unique identifier for this gotcha */
+  id: string;
+  /** Short title of the issue */
+  title: string;
+  /** Description of the problem */
+  problem: string;
+  /** Known solution or workaround */
+  solution: string;
+  /** How severe is this issue */
+  severity: GotchaSeverity;
+  /** Agent ID that discovered this */
+  discoveredBy: string;
+  /** ISO timestamp when discovered */
+  createdAt: string;
+  /** Related file paths */
+  relatedFiles?: string[];
+  /** Whether this gotcha is still relevant */
+  resolved?: boolean;
+  /** ISO timestamp when resolved */
+  resolvedAt?: string;
+
+  // === v2: Task-linked provenance ===
+
+  /** Task ID where this gotcha was discovered */
+  sourceTaskId?: string;
+  /** Outcome of the task where this was learned */
+  sourceOutcome?: 'success' | 'failed' | 'partial';
+  /** ISO timestamp when this gotcha was last verified */
+  lastVerifiedAt?: string;
+  /**
+   * People allowed to read this entry (#969). Set when the writer had read a
+   * person's connector grant shortly before; absent means everyone.
+   */
+  visibleToPeople?: string[];
+}
+
+/**
+ * Types of relationships between components
+ */
+export type RelationshipType = 'depends-on' | 'uses' | 'extends' | 'implements' | 'calls' | 'imported-by';
+
+/**
+ * A relationship between two components/services in the project
+ *
+ * @example
+ * ```typescript
+ * const relationship: RelationshipEntry = {
+ *   id: 'rel-001',
+ *   from: 'UserController',
+ *   to: 'AuthService',
+ *   relationshipType: 'depends-on',
+ *   description: 'UserController requires AuthService for authentication checks'
+ * };
+ * ```
+ */
+export interface RelationshipEntry {
+  /** Unique identifier for this relationship */
+  id: string;
+  /** Source component/service name */
+  from: string;
+  /** Target component/service name */
+  to: string;
+  /** Type of relationship */
+  relationshipType: RelationshipType;
+  /** Optional description of the relationship */
+  description?: string;
+  /** File path of the source component */
+  fromFile?: string;
+  /** File path of the target component */
+  toFile?: string;
+}
+
+/**
+ * Complete project-level memory structure
+ *
+ * Stored at: project/.crewly/knowledge/index.json
+ *
+ * @example
+ * ```typescript
+ * const projectMemory: ProjectMemory = {
+ *   projectId: 'proj-001',
+ *   projectPath: '/home/user/projects/my-app',
+ *   createdAt: '2026-01-01T00:00:00Z',
+ *   updatedAt: '2026-01-29T15:00:00Z',
+ *   patterns: [...],
+ *   decisions: [...],
+ *   gotchas: [...],
+ *   relationships: [...]
+ * };
+ * ```
+ */
+export interface ProjectMemory {
+  /** Unique project identifier */
+  projectId: string;
+  /** Absolute path to the project directory */
+  projectPath: string;
+  /** ISO timestamp when this memory was created */
+  createdAt: string;
+  /** ISO timestamp of last update */
+  updatedAt: string;
+  /** Code patterns discovered in the project */
+  patterns: PatternEntry[];
+  /** Architecture and design decisions */
+  decisions: DecisionEntry[];
+  /** Known issues and workarounds */
+  gotchas: GotchaEntry[];
+  /** Component/service relationships */
+  relationships: RelationshipEntry[];
+  /**
+   * Completed-task ledger keyed by capability. Append-only at the
+   * subscriber level; the orchestrator queries this via
+   * `recall_memory({ capability: 'gmail:read' })` before delegating
+   * external-access work, so "who in my team has done X" is a fact
+   * rather than a guess. See {@link TaskHistoryEntry}.
+   */
+  taskHistory?: TaskHistoryEntry[];
+  /** Schema version for migration support */
+  schemaVersion?: number;
+}
+
+// ========================= TASK HISTORY =========================
+
+/**
+ * Outcome of a recorded task — used by recall queries to weight
+ * "this member can do X" against "they tried and failed."
+ *
+ * - `success`: task completed cleanly (reported via complete_task)
+ * - `failure`: task failed with an error the agent surfaced
+ * - `partial`: task ended in a partially-completed state (blocked /
+ *   handed off / abandoned with progress)
+ * - `declared`: synthetic entry — agent self-declared capability at
+ *   `register_self` time, no real task ran. Treated as low-weight
+ *   evidence; real entries supersede it.
+ */
+export type TaskOutcome = 'success' | 'failure' | 'partial' | 'declared';
+
+/**
+ * A single completed-task record. Written by TaskHistorySubscriber
+ * when the eventBus emits `v3:task_completed` / `v3:task_failed`, or
+ * synthetically at `register_self` time as a cold-start seed.
+ *
+ * The load-bearing field for routing decisions is `capabilities` —
+ * canonical strings of the form `<category>:<resource>` (e.g.
+ * `gmail:read`, `slack:post`, `oauth:gmail`). The orchestrator's
+ * delegation-first prompt queries by these strings.
+ *
+ * @example
+ * ```typescript
+ * const entry: TaskHistoryEntry = {
+ *   id: 'th-7f3a2b',
+ *   completedAt: '2026-05-18T14:32:11Z',
+ *   agent: { sessionName: 'crewly-product-ella', role: 'fullstack-dev' },
+ *   task: { description: 'Read MIT Role email from inbox', outcome: 'success', durationSec: 12 },
+ *   capabilities: ['gmail:read', 'oauth:gmail'],
+ *   toolsUsed: ['read_email_oauth'],
+ *   taskId: 'task-1747575131-742',
+ * };
+ * ```
+ */
+export interface TaskHistoryEntry {
+  /** Stable identifier for dedup and back-references */
+  id: string;
+  /** ISO timestamp of completion (or declaration time, for synthetic seeds) */
+  completedAt: string;
+  /** Agent that did the work */
+  agent: {
+    /** Session name, e.g. `crewly-product-ella` */
+    sessionName: string;
+    /** Role name from the team template, e.g. `fullstack-dev` */
+    role: string;
+    /** Optional team association — present when invoked through a team */
+    teamId?: string;
+  };
+  /** Task metadata */
+  task: {
+    /** Human-readable summary. Should be brief — full body lives in chat history. */
+    description: string;
+    /** Outcome — see {@link TaskOutcome} */
+    outcome: TaskOutcome;
+    /** Wall-clock duration in seconds, if known */
+    durationSec?: number;
+  };
+  /**
+   * Canonical capability strings derived from the tool trace. Format:
+   * `<category>:<resource>`. Mapping table lives in CapabilityInferenceService.
+   *
+   * Examples:
+   *   gmail:read, gmail:send
+   *   slack:post, slack:dm
+   *   github:pr-create, github:issue-comment
+   *   oauth:gmail, oauth:slack, oauth:github
+   *   chrome:scrape (web-search via browser)
+   *   code:edit, code:read
+   */
+  capabilities: string[];
+  /** Tool names called during the task — raw audit trace, drives inference */
+  toolsUsed: string[];
+  /** Optional link to the originating WorkItem id */
+  taskId?: string;
+  /** Optional link to the chat-v2 conversation id */
+  conversationId?: string;
+  /**
+   * Optional redacted version of `task.description` for privacy-sensitive
+   * contexts. If set, recall results SHOULD surface this instead of the raw
+   * description when leaving the originating agent's trust boundary.
+   */
+  redactedDescription?: string;
+}
+
+// ========================= SHARED USER PROFILE =========================
+
+/**
+ * Shared user profile — preferences that apply across ALL agents.
+ * Stored once at ~/.crewly/user-profile.json, readable by all agents.
+ * Any agent can update it, but orchestrator is the primary writer.
+ */
+export interface SharedUserProfile {
+  /** Display language preference (e.g., 'zh-CN', 'en') */
+  language?: string;
+  /** Communication style: concise vs detailed */
+  reportingStyle?: 'concise' | 'detailed' | 'structured';
+  /** Risk tolerance for autonomous decisions */
+  riskTolerance?: 'conservative' | 'moderate' | 'aggressive';
+  /** Timezone for scheduling and reporting (e.g., 'Asia/Shanghai') */
+  timezone?: string;
+  /** Domain knowledge context (e.g., "fintech startup, Series A") */
+  domainContext?: string;
+  /** Things the user explicitly does NOT want */
+  prohibitions?: string[];
+  /** Preferred tools, frameworks, or approaches */
+  preferences?: Record<string, string>;
+  /** Free-form notes about working with this user */
+  notes?: string[];
+  /** ISO timestamp of last update */
+  updatedAt?: string;
+  /** Who last updated this profile (agentId or 'user') */
+  updatedBy?: string;
+}
+
+// ========================= LEARNING LOG TYPES =========================
+
+/**
+ * Categories for learning entries
+ */
+export type LearningCategory = 'pattern' | 'decision' | 'gotcha' | 'insight' | 'improvement';
+
+/**
+ * A single learning entry for the append-only log
+ *
+ * This is used for the human-readable learnings.md file
+ */
+export interface LearningEntry {
+  /** ISO timestamp of the learning */
+  timestamp: string;
+  /** Agent ID that recorded this learning */
+  agentId: string;
+  /** Agent's role */
+  agentRole: string;
+  /** Category of learning */
+  category: LearningCategory;
+  /** Title of the learning */
+  title: string;
+  /** Content of the learning */
+  content: string;
+  /** Related file paths */
+  relatedFiles?: string[];
+  /** Related task/ticket ID */
+  relatedTask?: string;
+}
+
+// ========================= SESSION & LIFECYCLE TYPES =========================
+
+/**
+ * Summary of an agent's work session, captured on session end
+ */
+export interface SessionSummary {
+  /** Agent identifier */
+  agentId: string;
+  /** ISO timestamp when the session started */
+  sessionStart: string;
+  /** ISO timestamp when the session ended */
+  sessionEnd: string;
+  /** Human-readable summary of what was accomplished */
+  summary: string;
+  /** Description of unfinished work to pick up next session */
+  unfinishedWork?: string;
+  /** Agent's role during this session */
+  role?: string;
+  /** Project path for this session */
+  projectPath?: string;
+}
+
+/**
+ * Briefing assembled for an agent at session startup
+ */
+export interface StartupBriefing {
+  /** Summary from the agent's most recent session (if any) */
+  lastSessionSummary: string | null;
+  /** Agent-level context (knowledge, preferences, performance) */
+  agentContext: string;
+  /** Project-level context (patterns, decisions, gotchas) */
+  projectContext: string;
+  /** Today's daily log entries (if any) */
+  todaysDailyLog: string | null;
+  /** Active goals for the project (if any) */
+  activeGoals: string | null;
+  /** Recent failures to avoid repeating */
+  recentFailures: string | null;
+  /** Recent successes to replicate */
+  recentSuccesses: string | null;
+}
+
+/**
+ * Entry in the project agents index, tracking which agents have worked on a project
+ */
+export interface AgentIndexEntry {
+  /** Agent identifier */
+  agentId: string;
+  /** Agent's role */
+  role: string;
+  /** ISO timestamp of last activity */
+  lastActive: string;
+}
+
+/**
+ * Project agents index file structure
+ */
+export interface ProjectAgentsIndex {
+  /** List of agents that have worked on this project */
+  agents: AgentIndexEntry[];
+}
+
+/**
+ * Entry in the daily log
+ */
+export interface DailyLogEntry {
+  /** ISO timestamp */
+  timestamp: string;
+  /** Agent identifier */
+  agentId: string;
+  /** Agent's role */
+  role: string;
+  /** Log entry content */
+  entry: string;
+}
+
+/**
+ * A learning entry categorized as success or failure
+ */
+export interface LearningAccumulationEntry {
+  /** ISO timestamp when recorded */
+  timestamp: string;
+  /** Agent that recorded this */
+  agentId: string;
+  /** Agent's role */
+  role: string;
+  /** Description of what worked or failed */
+  description: string;
+  /** Related context (file paths, task IDs, etc.) */
+  context?: string;
+}
+
+// ========================= MEMORY OPERATION TYPES =========================
+
+/**
+ * Scope for memory operations
+ */
+export type MemoryScope = 'agent' | 'project';
+
+/**
+ * Options for querying memory
+ */
+export interface MemoryQueryOptions {
+  /** Scope of the query */
+  scope: MemoryScope;
+  /** Category filter */
+  category?: string;
+  /** Tag filter */
+  tags?: string[];
+  /** Minimum confidence threshold (for agent memory) */
+  minConfidence?: number;
+  /** Maximum number of results */
+  limit?: number;
+  /** Search text for content matching */
+  searchText?: string;
+  /** Only return entries after this date */
+  since?: string;
+}
+
+/**
+ * Result of a memory query
+ */
+export interface MemoryQueryResult<T> {
+  /** The matching entries */
+  entries: T[];
+  /** Total count (may be more than entries if limited) */
+  totalCount: number;
+  /** Whether there are more results */
+  hasMore: boolean;
+}
+
+/**
+ * Options for storing memory
+ */
+export interface MemoryStoreOptions {
+  /** Scope for storage */
+  scope: MemoryScope;
+  /** Whether to merge with existing entry if ID exists */
+  merge?: boolean;
+  /** Whether to update the 'updatedAt' timestamp */
+  updateTimestamp?: boolean;
+}
+
+// ========================= FILE STRUCTURE TYPES =========================
+
+/**
+ * Agent memory file structure
+ *
+ * Location: ~/.crewly/agents/{agentId}/
+ */
+export interface AgentMemoryFileStructure {
+  /** Main memory file containing AgentMemory */
+  memoryFile: 'memory.json';
+  /** Detailed role knowledge entries */
+  roleKnowledgeFile: 'role-knowledge.json';
+  /** Agent preferences */
+  preferencesFile: 'preferences.json';
+  /** Performance metrics */
+  performanceFile: 'performance.json';
+  /** Custom SOPs directory */
+  sopCustomDir: 'sop-custom';
+}
+
+/**
+ * Project memory file structure
+ *
+ * Location: project/.crewly/knowledge/
+ */
+export interface ProjectMemoryFileStructure {
+  /** Main index file containing ProjectMemory summary */
+  indexFile: 'index.json';
+  /** All pattern entries */
+  patternsFile: 'patterns.json';
+  /** All decision entries */
+  decisionsFile: 'decisions.json';
+  /** All gotcha entries */
+  gotchasFile: 'gotchas.json';
+  /** All relationship entries */
+  relationshipsFile: 'relationships.json';
+  /** Append-only human-readable log */
+  learningsFile: 'learnings.md';
+}
+
+// ========================= VALIDATION AND DEFAULTS =========================
+
+/**
+ * Default values for new agent memory
+ */
+export const DEFAULT_AGENT_MEMORY: Omit<AgentMemory, 'agentId' | 'role' | 'createdAt' | 'updatedAt'> = {
+  roleKnowledge: [],
+  preferences: {
+    communicationStyle: {
+      verbosity: 'detailed',
+      askBeforeAction: true,
+    },
+    workPatterns: {
+      breakdownSize: 'medium',
+    },
+  },
+  performance: {
+    tasksCompleted: 0,
+    averageIterations: 0,
+    qualityGatePassRate: 0,
+    commonErrors: [],
+  },
+  schemaVersion: 1,
+};
+
+/**
+ * Default values for new project memory
+ */
+export const DEFAULT_PROJECT_MEMORY: Omit<ProjectMemory, 'projectId' | 'projectPath' | 'createdAt' | 'updatedAt'> = {
+  patterns: [],
+  decisions: [],
+  gotchas: [],
+  relationships: [],
+  schemaVersion: 1,
+};
+
+/**
+ * Current schema version for memory files
+ */
+export const MEMORY_SCHEMA_VERSION = 1;

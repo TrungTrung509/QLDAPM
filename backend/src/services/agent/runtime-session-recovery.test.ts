@@ -1,0 +1,543 @@
+/**
+ * Tests for runtime session recovery: preset/resume flags, Codex rollout
+ * discovery, nested-session env stripping.
+ *
+ * @module services/agent/runtime-session-recovery.test
+ */
+
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import {
+  buildHandoverSummary,
+  claudeTranscriptPath,
+  copyClaudeConversation,
+  lastTurnContextTokens,
+  orcFreshContextTokens,
+  memberFreshContextTokens,
+  conversationExists,
+  findClaudeTranscript,
+  discoverAntigravityConversationId,
+  discoverCodexSessionId,
+  planRuntimeSessionFlags,
+  stripNestedClaudeSessionEnv,
+  toAntigravityResumeFlag,
+  toCodexResumeCommand,
+  waitForAntigravityConversationId,
+  waitForCodexSessionId,
+} from './runtime-session-recovery.js';
+
+describe('planRuntimeSessionFlags', () => {
+  it('launches a fresh Claude Code agent with a preset --session-id that must be persisted', () => {
+    const plan = planRuntimeSessionFlags({ runtimeType: 'claude-code', isRestored: false, storedSessionId: null, autoResume: true, newId: () => 'uuid-1' });
+    expect(plan.flags).toEqual(['--session-id', 'uuid-1']);
+    expect(plan.presetSessionId).toBe('uuid-1');
+    expect(plan.resumeSessionId).toBeNull();
+  });
+
+  it('resumes a Claude Code agent with its stored id (restored flag or not); a fresh id when auto-resume is off or the transcript is gone', () => {
+    const on = planRuntimeSessionFlags({ runtimeType: 'claude-code', isRestored: true, storedSessionId: 'old', autoResume: true, newId: () => 'x' });
+    expect(on.flags).toEqual(['--resume', 'old']);
+    expect(on.resumeSessionId).toBe('old');
+    // The persistence "restored" flag is not required — a stored id is.
+    expect(planRuntimeSessionFlags({ runtimeType: 'claude-code', isRestored: false, storedSessionId: 'old', autoResume: true, newId: () => 'x' }).flags).toEqual(['--resume', 'old']);
+    const gone = planRuntimeSessionFlags({ runtimeType: 'claude-code', isRestored: false, storedSessionId: 'old', autoResume: true, conversationExists: false, newId: () => 'fresh' });
+    expect(gone.flags).toEqual(['--session-id', 'fresh']);
+    expect(gone.note).toContain('no longer exists');
+    const off = planRuntimeSessionFlags({ runtimeType: 'claude-code', isRestored: true, storedSessionId: 'old', autoResume: false, newId: () => 'new' });
+    expect(off.flags).toEqual(['--session-id', 'new']);
+    expect(off.note).toContain('disabled');
+  });
+
+  it('Codex: resume id on restore, nothing to inject on a fresh launch; other runtimes get nothing', () => {
+    expect(planRuntimeSessionFlags({ runtimeType: 'codex-cli', isRestored: true, storedSessionId: 'c1', autoResume: true })).toMatchObject({ flags: [], resumeSessionId: 'c1' });
+    expect(planRuntimeSessionFlags({ runtimeType: 'codex-cli', isRestored: false, storedSessionId: null, autoResume: true })).toMatchObject({ flags: [], resumeSessionId: null, presetSessionId: null });
+    expect(planRuntimeSessionFlags({ runtimeType: 'gemini-cli', isRestored: true, storedSessionId: 'g', autoResume: true })).toMatchObject({ flags: [], resumeSessionId: null });
+  });
+});
+
+describe('Antigravity CLI conversations', () => {
+  const ID_A = '75e715be-ea13-400e-8e4a-0358e87d170c';
+  const ID_B = '537e402c-83b8-4f69-9bf1-04729ba3ea7f';
+  let configDir: string;
+  let cwd: string;
+
+  beforeEach(() => {
+    configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-conv-'));
+    cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-ws-'));
+    fs.mkdirSync(path.join(configDir, 'conversations'));
+    fs.mkdirSync(path.join(configDir, 'cache'));
+  });
+  afterEach(() => {
+    fs.rmSync(configDir, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  /** Create a conversation the way agy 1.2.11 lays it out (db + brain dir). */
+  function conversation(id: string, log?: string): void {
+    fs.writeFileSync(path.join(configDir, 'conversations', `${id}.db`), '');
+    const logs = path.join(configDir, 'brain', id, '.system_generated', 'logs');
+    fs.mkdirSync(logs, { recursive: true });
+    if (log) fs.writeFileSync(path.join(logs, 'transcript.jsonl'), log);
+  }
+
+  /** Write cache/last_conversations.json. */
+  function lastConversation(map: Record<string, string>): void {
+    fs.writeFileSync(path.join(configDir, 'cache', 'last_conversations.json'), JSON.stringify(map, null, 2));
+  }
+
+  it('plans a fresh start (id discovered later) and a resume with --conversation=<id>', () => {
+    const fresh = planRuntimeSessionFlags({ runtimeType: 'antigravity-cli', isRestored: false, storedSessionId: null, autoResume: true });
+    expect(fresh).toMatchObject({ flags: [], resumeSessionId: null, presetSessionId: null });
+    const resumed = planRuntimeSessionFlags({ runtimeType: 'antigravity-cli', isRestored: true, storedSessionId: ID_A, autoResume: true, conversationExists: true });
+    expect(resumed).toMatchObject({ flags: [`--conversation=${ID_A}`], resumeSessionId: ID_A });
+    const gone = planRuntimeSessionFlags({ runtimeType: 'antigravity-cli', isRestored: true, storedSessionId: ID_A, autoResume: true, conversationExists: false });
+    expect(gone.flags).toEqual([]);
+  });
+
+  it('builds the resume flag agy prints on exit, stripping anything unsafe', () => {
+    expect(toAntigravityResumeFlag(ID_A)).toBe(`--conversation=${ID_A}`);
+    expect(toAntigravityResumeFlag(`${ID_A}; rm -rf ~`)).toBe(`--conversation=${ID_A}rm-rf`);
+  });
+
+  it('knows whether a conversation still exists', () => {
+    conversation(ID_A);
+    expect(conversationExists({ runtimeType: 'antigravity-cli', sessionId: ID_A, cwd, antigravityConfigDir: configDir })).toBe(true);
+    expect(conversationExists({ runtimeType: 'antigravity-cli', sessionId: ID_B, cwd, antigravityConfigDir: configDir })).toBe(false);
+  });
+
+  it('finds nothing before the first prompt creates a conversation', () => {
+    expect(discoverAntigravityConversationId({ configDir, cwd, notBeforeMs: Date.now() })).toBeNull();
+    fs.rmSync(path.join(configDir, 'conversations'), { recursive: true });
+    expect(discoverAntigravityConversationId({ configDir, cwd, notBeforeMs: Date.now() })).toBeNull();
+  });
+
+  it('takes the workspace\'s latest conversation from last_conversations.json (realpath or as given)', () => {
+    const launchedAt = Date.now();
+    conversation(ID_A);
+    lastConversation({ [fs.realpathSync(cwd)]: ID_A });
+    expect(discoverAntigravityConversationId({ configDir, cwd, notBeforeMs: launchedAt })).toBe(ID_A);
+  });
+
+  it('ignores conversations from before the launch and ones another agent claimed', () => {
+    conversation(ID_A);
+    lastConversation({ [fs.realpathSync(cwd)]: ID_A });
+    expect(discoverAntigravityConversationId({ configDir, cwd, notBeforeMs: Date.now() + 60_000 })).toBeNull();
+    expect(discoverAntigravityConversationId({ configDir, cwd, notBeforeMs: 0, claimed: new Set([ID_A]) })).toBeNull();
+  });
+
+  it('prefers the conversation whose logs mention this agent\'s prompt file, even when another agent in the same folder started later', () => {
+    conversation(ID_A, '{"type":"user","text":"Read the file at /home/me/.crewly/prompts/team-dev-1-init.md and follow all instructions in it."}\n');
+    conversation(ID_B, '{"type":"user","text":"Read the file at /home/me/.crewly/prompts/team-dev-2-init.md"}\n');
+    lastConversation({ [fs.realpathSync(cwd)]: ID_B });
+    expect(discoverAntigravityConversationId({ configDir, cwd, notBeforeMs: 0, marker: 'team-dev-1-init.md' })).toBe(ID_A);
+    expect(discoverAntigravityConversationId({ configDir, cwd, notBeforeMs: 0, marker: 'team-dev-2-init.md' })).toBe(ID_B);
+    // No log mentions the marker yet: fall back to the workspace cache.
+    expect(discoverAntigravityConversationId({ configDir, cwd, notBeforeMs: 0, marker: 'team-dev-3-init.md' })).toBe(ID_B);
+  });
+
+  it('polls until the conversation appears', async () => {
+    let polls = 0;
+    const found = await waitForAntigravityConversationId({
+      configDir,
+      cwd,
+      notBeforeMs: 0,
+      timeoutMs: 60_000,
+      intervalMs: 1,
+      sleep: async () => {
+        polls++;
+        if (polls === 2) {
+          conversation(ID_A);
+          lastConversation({ [path.resolve(cwd)]: ID_A });
+        }
+      },
+    });
+    expect(found).toBe(ID_A);
+    // Timing out: the only conversation belongs to another agent.
+    expect(
+      await waitForAntigravityConversationId({ configDir, cwd, notBeforeMs: 0, claimed: new Set([ID_A]), timeoutMs: 0, intervalMs: 1, sleep: async () => undefined }),
+    ).toBeNull();
+  });
+});
+
+describe('toCodexResumeCommand', () => {
+  it('turns the configured launch into a resume with the id last, keeping approval/sandbox flags', () => {
+    expect(toCodexResumeCommand('codex -a never -s danger-full-access', '01a0-b5a6')).toBe('codex resume -a never -s danger-full-access 01a0-b5a6');
+    expect(toCodexResumeCommand('cd /x && codex --full-auto', 'id;rm -rf')).toBe('cd /x && codex resume --full-auto idrm-rf');
+    expect(toCodexResumeCommand('codex resume --last', 'id')).toBe('codex resume --last');
+    expect(toCodexResumeCommand('claude --dangerously-skip-permissions', 'id')).toBe('claude --dangerously-skip-permissions');
+  });
+});
+
+describe('stripNestedClaudeSessionEnv', () => {
+  it('drops the parent-session markers and keeps user configuration', () => {
+    const out = stripNestedClaudeSessionEnv({
+      CLAUDECODE: '1',
+      CLAUDE_CODE_CHILD_SESSION: '1',
+      CLAUDE_CODE_SESSION_ID: 'abc',
+      CLAUDE_CODE_ENTRYPOINT: 'cli',
+      CLAUDE_CODE_ENABLE_TELEMETRY: '1',
+      CLAUDE_CODE_USE_BEDROCK: '1',
+      PATH: '/bin',
+    });
+    expect(out).toEqual({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', CLAUDE_CODE_USE_BEDROCK: '1', PATH: '/bin' });
+  });
+});
+
+describe('discoverCodexSessionId', () => {
+  let home: string;
+  const T0 = Date.UTC(2026, 8, 18, 17, 53, 34); // 2026-09-18T17:53:34Z
+
+  // Birth time cannot be set from userland, and whether the filesystem reports
+  // one at all varies by host (statx on Linux, APFS on macOS, 0 elsewhere).
+  // Report the birth time each test declares so results are host-independent.
+  const birthTimes = new Map<string, number>();
+  let statSpy: jest.SpyInstance;
+
+  /**
+   * Write a Codex rollout file with the given creation and last-write times.
+   *
+   * @param day - `YYYY/MM/DD` sessions sub-directory
+   * @param id - Codex session id
+   * @param cwd - The session's working directory
+   * @param mtimeMs - Last write time
+   * @param extra - Extra JSONL content after the session_meta line
+   * @param bornAtMs - Birth time to report (defaults to mtimeMs; 0 = filesystem records none)
+   * @returns Path of the rollout file
+   */
+  function rollout(day: string, id: string, cwd: string, mtimeMs: number, extra = '', bornAtMs = mtimeMs): string {
+    const dir = path.join(home, 'sessions', day);
+    fs.mkdirSync(dir, { recursive: true });
+    const p = path.join(dir, `rollout-${day.replace(/\//g, '-')}T00-00-00-${id}.jsonl`);
+    const meta = { timestamp: 'x', type: 'session_meta', payload: { session_id: id, id, cwd, originator: 'codex-tui' } };
+    fs.writeFileSync(p, `${JSON.stringify(meta)}\n${extra}`);
+    fs.utimesSync(p, mtimeMs / 1000, mtimeMs / 1000);
+    birthTimes.set(p, bornAtMs);
+    return p;
+  }
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
+    birthTimes.clear();
+    // Spy on the CommonJS module object: the `import * as fs` namespace is
+    // non-configurable, but its getters (here and in the source) read through to it.
+    const fsModule = jest.requireActual<typeof fs>('fs');
+    const realStatSync = fsModule.statSync;
+    statSpy = jest.spyOn(fsModule, 'statSync').mockImplementation(((p: fs.PathLike, o?: fs.StatSyncOptions) => {
+      const st = realStatSync(p, o) as fs.Stats;
+      const born = birthTimes.get(String(p));
+      if (born !== undefined) st.birthtimeMs = born;
+      return st;
+    }) as typeof fs.statSync);
+  });
+  afterEach(() => {
+    statSpy.mockRestore();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('returns the earliest unclaimed rollout for the cwd written after launch', () => {
+    rollout('2026/09/18', 'old-one', '/opt/app', T0 - 60_000); // before launch
+    rollout('2026/09/18', 'other-cwd', '/elsewhere', T0 + 1_000);
+    rollout('2026/09/18', 'ours', '/opt/app', T0 + 2_000);
+    rollout('2026/09/18', 'next-agent', '/opt/app', T0 + 9_000);
+    const found = discoverCodexSessionId({ codexHome: home, cwd: '/opt/app', notBeforeMs: T0 });
+    expect(found?.sessionId).toBe('ours');
+    const second = discoverCodexSessionId({ codexHome: home, cwd: '/opt/app', notBeforeMs: T0, claimed: new Set(['ours']) });
+    expect(second?.sessionId).toBe('next-agent');
+    expect(discoverCodexSessionId({ codexHome: home, cwd: '/nope', notBeforeMs: T0 })).toBeNull();
+  });
+
+  it('ignores an older conversation in the same cwd that is still being written after launch', () => {
+    // Created a minute before launch, but still running: its last write is after launch.
+    rollout('2026/09/18', 'still-running', '/opt/app', T0 + 1_000, '', T0 - 60_000);
+    rollout('2026/09/18', 'ours', '/opt/app', T0 + 3_000, '', T0 + 2_000);
+    expect(discoverCodexSessionId({ codexHome: home, cwd: '/opt/app', notBeforeMs: T0 })?.sessionId).toBe('ours');
+  });
+
+  it('picks the earliest-created rollout even when a later one was written to first', () => {
+    rollout('2026/09/18', 'ours', '/opt/app', T0 + 8_000, '', T0 + 1_000);
+    rollout('2026/09/18', 'next-agent', '/opt/app', T0 + 4_000, '', T0 + 3_000);
+    expect(discoverCodexSessionId({ codexHome: home, cwd: '/opt/app', notBeforeMs: T0 })?.sessionId).toBe('ours');
+  });
+
+  it('falls back to the last write time where the filesystem records no birth time', () => {
+    rollout('2026/09/18', 'old-one', '/opt/app', T0 - 60_000, '', 0);
+    rollout('2026/09/18', 'ours', '/opt/app', T0 + 2_000, '', 0);
+    expect(discoverCodexSessionId({ codexHome: home, cwd: '/opt/app', notBeforeMs: T0 })?.sessionId).toBe('ours');
+  });
+
+  it('reads a session_meta line longer than 8 KB (Codex embeds its base instructions)', () => {
+    const dir = path.join(home, 'sessions', '2026/09/18');
+    fs.mkdirSync(dir, { recursive: true });
+    const meta = { type: 'session_meta', payload: { session_id: 'big-one', id: 'big-one', cwd: '/opt/app', base_instructions: { text: 'x'.repeat(40_000) } } };
+    const p = path.join(dir, 'rollout-2026-09-18T00-00-00-big-one.jsonl');
+    fs.writeFileSync(p, `${JSON.stringify(meta)}\n{"type":"turn"}\n`);
+    fs.utimesSync(p, (T0 + 3_000) / 1000, (T0 + 3_000) / 1000);
+    birthTimes.set(p, T0 + 3_000);
+    expect(discoverCodexSessionId({ codexHome: home, cwd: '/opt/app', notBeforeMs: T0 })?.sessionId).toBe('big-one');
+  });
+
+  it('conversationExists finds a Codex rollout by id anywhere under sessions/, and a Claude transcript by cwd slug', () => {
+    rollout('2026/08/01', 'old-codex', '/opt/app', T0 - 86_400_000 * 40);
+    expect(conversationExists({ runtimeType: 'codex-cli', sessionId: 'old-codex', cwd: '/opt/app', codexHome: home })).toBe(true);
+    expect(conversationExists({ runtimeType: 'codex-cli', sessionId: 'nope', cwd: '/opt/app', codexHome: home })).toBe(false);
+    const claudeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-home-'));
+    try {
+      const slugDir = path.join(claudeHome, 'projects', '-Users-me-proj-crewly');
+      fs.mkdirSync(slugDir, { recursive: true });
+      fs.writeFileSync(path.join(slugDir, 'abc.jsonl'), '{}');
+      expect(conversationExists({ runtimeType: 'claude-code', sessionId: 'abc', cwd: '/Users/me/proj/crewly', claudeHome })).toBe(true);
+      expect(conversationExists({ runtimeType: 'claude-code', sessionId: 'zzz', cwd: '/Users/me/proj/crewly', claudeHome })).toBe(false);
+      expect(conversationExists({ runtimeType: 'gemini-cli', sessionId: 'any', cwd: '/x' })).toBe(true);
+    } finally {
+      fs.rmSync(claudeHome, { recursive: true, force: true });
+    }
+  });
+
+  it('tolerates a missing home, malformed first lines and non-rollout files', () => {
+    expect(discoverCodexSessionId({ codexHome: path.join(home, 'missing'), cwd: '/x', notBeforeMs: T0 })).toBeNull();
+    const dir = path.join(home, 'sessions', '2026/09/18');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'rollout-bad.jsonl'), 'not json\n');
+    fs.writeFileSync(path.join(dir, 'notes.txt'), 'x');
+    expect(discoverCodexSessionId({ codexHome: home, cwd: '/x', notBeforeMs: T0 })).toBeNull();
+  });
+
+  it('waitForCodexSessionId polls until the file appears, and gives up on timeout', async () => {
+    let ticks = 0;
+    const sleep = async () => {
+      ticks += 1;
+      if (ticks === 2) rollout('2026/09/18', 'late', '/opt/app', T0 + 3_000);
+    };
+    const found = await waitForCodexSessionId({ codexHome: home, cwd: '/opt/app', notBeforeMs: T0, timeoutMs: 10_000, intervalMs: 1, sleep });
+    expect(found?.sessionId).toBe('late');
+    const none = await waitForCodexSessionId({ codexHome: home, cwd: '/never', notBeforeMs: T0, timeoutMs: 0, intervalMs: 1, sleep: async () => undefined });
+    expect(none).toBeNull();
+  });
+});
+
+describe('an orchestrator conversation too big to carry on', () => {
+  // One machine's orc re-read 612k tokens every turn, 0.1% of it new, and the
+  // history grew ~64k a day because it was resumed across every restart.
+  let dir: string;
+  const line = (o: unknown) => JSON.stringify(o);
+  const turn = (id: string, read: number, write = 0) =>
+    line({ type: 'assistant', timestamp: 't', message: { id, content: [{ type: 'text', text: `answer ${id}` }], usage: { input_tokens: 5, output_tokens: 10, cache_read_input_tokens: read, cache_creation_input_tokens: write } } });
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orc-convo-'));
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('reads the size of the last real turn, skipping zero-usage bookkeeping', () => {
+    const file = path.join(dir, 'c.jsonl');
+    fs.writeFileSync(file, [
+      turn('m1', 100_000),
+      turn('m2', 611_575, 730),
+      line({ type: 'assistant', message: { model: '<synthetic>', usage: { input_tokens: 0, output_tokens: 0 } } }),
+      '',
+    ].join('\n'));
+    expect(lastTurnContextTokens(file)).toBe(5 + 611_575 + 730);
+  });
+
+  it('knows nothing about a missing or empty transcript', () => {
+    expect(lastTurnContextTokens(path.join(dir, 'missing.jsonl'))).toBeNull();
+    fs.writeFileSync(path.join(dir, 'empty.jsonl'), '');
+    expect(lastTurnContextTokens(path.join(dir, 'empty.jsonl'))).toBeNull();
+  });
+
+  it('hands over what was said and one clipped line per tool call and result, never system reminders (crewly#1344)', () => {
+    const file = path.join(dir, 'c.jsonl');
+    fs.writeFileSync(file, [
+      line({ type: 'user', timestamp: 't1', message: { content: 'Slack: please draft the Sunrun email' } }),
+      line({ type: 'user', timestamp: 't1', message: { content: '<system-reminder>ignore me</system-reminder>' } }),
+      line({ type: 'assistant', timestamp: 't2', message: { content: [{ type: 'tool_use', id: 'tu-1', name: 'Bash', input: { command: 'cat big' } }] } }),
+      line({ type: 'user', timestamp: 't2', message: { content: [{ type: 'tool_result', tool_use_id: 'tu-1', content: 'x'.repeat(5000) }] } }),
+      line({ type: 'user', timestamp: 't2', message: { content: [{ type: 'tool_result', tool_use_id: 'tu-9', content: [{ type: 'image', source: {} }] }] } }),
+      line({ type: 'assistant', timestamp: 't3', message: { content: [{ type: 'text', text: 'Drafted, not sent.' }] } }),
+      '',
+    ].join('\n'));
+
+    const summary = buildHandoverSummary(file);
+
+    expect(summary).toContain('please draft the Sunrun email');
+    expect(summary).toContain('Drafted, not sent.');
+    expect(summary).not.toContain('ignore me');
+    // The tool call and its result are one line each: name + the first 200 characters.
+    expect(summary).toContain('↳ Bash: {"command":"cat big"}');
+    expect(summary).toContain(`↳ Bash result: ${'x'.repeat(200)}…`);
+    expect(summary).not.toContain('x'.repeat(201));
+    // An image is described, never copied.
+    expect(summary).toContain('↳ tool result: [1 image returned]');
+  });
+
+  it('lists the sub-agent and background command the restart cut off, not the finished ones (crewly#1361)', () => {
+    const file = path.join(dir, 'c.jsonl');
+    fs.writeFileSync(file, [
+      line({ type: 'user', timestamp: 't1', message: { content: 'Ella: plan approved, go ahead with v4' } }),
+      line({ type: 'assistant', timestamp: 't2', message: { content: [{ type: 'tool_use', id: 'tu-done', name: 'Task', input: { description: 'Review v3', prompt: 'Review the v3 cut.' } }] } }),
+      line({ type: 'user', timestamp: 't2', message: { content: [{ type: 'tool_result', tool_use_id: 'tu-done', content: 'Review done: 3 notes.' }] } }),
+      line({ type: 'assistant', timestamp: 't3', message: { content: [
+        { type: 'text', text: 'W41 full version v4 is still being cut by the sub-agent.' },
+        { type: 'tool_use', id: 'tu-open', name: 'Task', input: { description: 'Make W41 v4', prompt: 'Cut v4, then run a fresh review agent twice and re-cut 9:16.' } },
+        { type: 'tool_use', id: 'tu-bg', name: 'Bash', input: { command: 'npx remotion render W41 out/v4.mp4', run_in_background: true } },
+        { type: 'tool_use', id: 'tu-short', name: 'Bash', input: { command: 'ls out' } },
+      ] } }),
+      '',
+    ].join('\n'));
+
+    const summary = buildHandoverSummary(file);
+
+    expect(summary.startsWith('## Interrupted by the restart')).toBe(true);
+    expect(summary).toContain('- A sub-agent was running: Make W41 v4: Cut v4, then run a fresh review agent twice and re-cut 9:16. It did not finish and is not running now. Restart it or report that it was lost.');
+    expect(summary).toContain('- A background command was running: npx remotion render W41 out/v4.mp4. It is not running now.');
+    expect(summary).not.toContain('A sub-agent was running: Review v3');
+    expect(summary).not.toContain('A background command was running: ls out');
+    // The section comes before the transcript tail, which still carries the agent's words.
+    expect(summary.indexOf('## Interrupted by the restart')).toBeLessThan(summary.indexOf('still being cut'));
+  });
+
+  it('writes no interrupted section when every call got its result', () => {
+    const file = path.join(dir, 'c.jsonl');
+    fs.writeFileSync(file, [
+      line({ type: 'assistant', timestamp: 't2', message: { content: [{ type: 'tool_use', id: 'tu-1', name: 'Task', input: { description: 'Review', prompt: 'x' } }] } }),
+      line({ type: 'user', timestamp: 't2', message: { content: [{ type: 'tool_result', tool_use_id: 'tu-1', content: 'done' }] } }),
+      '',
+    ].join('\n'));
+    expect(buildHandoverSummary(file)).not.toContain('Interrupted by the restart');
+  });
+
+  it('keeps the handover short however long the conversation was', () => {
+    const file = path.join(dir, 'c.jsonl');
+    const lines: string[] = [];
+    for (let i = 0; i < 500; i++) lines.push(line({ type: 'user', timestamp: `t${i}`, message: { content: `message ${i} ` + 'y'.repeat(2000) } }));
+    fs.writeFileSync(file, lines.join('\n'));
+
+    const summary = buildHandoverSummary(file);
+
+    expect(summary.length).toBeLessThanOrEqual(40_000 + 200);
+    // Newest last: the end of the conversation is what survives.
+    expect(summary).toContain('message 499');
+    expect(summary).not.toContain('message 0 ');
+  });
+
+  it('finds the transcript where Claude Code keeps it', () => {
+    expect(claudeTranscriptPath({ sessionId: 'abc', cwd: '/Users/me/proj.x', claudeHome: '/h/.claude' })).toBe(
+      '/h/.claude/projects/-Users-me-proj-x/abc.jsonl',
+    );
+  });
+
+  describe('a cwd reached through a symlink', () => {
+    // Claude Code files the transcript under the realpath slug (macOS: /tmp →
+    // /private/tmp); path.resolve alone gave the raw slug and resume said
+    // "conversation missing" for an agent under /tmp.
+    let root: string;
+    let linkedCwd: string;
+    let realCwd: string;
+    let claudeHome: string;
+
+    beforeEach(() => {
+      root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'resume-link-')));
+      realCwd = path.join(root, 'private', 'proj');
+      fs.mkdirSync(realCwd, { recursive: true });
+      fs.symlinkSync(path.join(root, 'private'), path.join(root, 'tmp'), 'dir');
+      linkedCwd = path.join(root, 'tmp', 'proj');
+      claudeHome = path.join(root, 'claude');
+    });
+
+    afterEach(() => {
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    const slug = (p: string) => p.replace(/[/.]/g, '-');
+
+    it('conversationExists and claudeTranscriptPath find the transcript under the realpath slug', () => {
+      const dir = path.join(claudeHome, 'projects', slug(realCwd));
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'abc.jsonl'), '{}\n');
+
+      expect(conversationExists({ runtimeType: 'claude-code', sessionId: 'abc', cwd: linkedCwd, claudeHome })).toBe(true);
+      expect(claudeTranscriptPath({ sessionId: 'abc', cwd: linkedCwd, claudeHome })).toBe(path.join(dir, 'abc.jsonl'));
+    });
+
+    it('still finds a transcript left under the raw slug', () => {
+      const dir = path.join(claudeHome, 'projects', slug(linkedCwd));
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'abc.jsonl'), '{}\n');
+
+      expect(conversationExists({ runtimeType: 'claude-code', sessionId: 'abc', cwd: linkedCwd, claudeHome })).toBe(true);
+      expect(claudeTranscriptPath({ sessionId: 'abc', cwd: linkedCwd, claudeHome })).toBe(path.join(dir, 'abc.jsonl'));
+    });
+
+    it('a missing transcript points where Claude Code would write it (the realpath slug)', () => {
+      expect(conversationExists({ runtimeType: 'claude-code', sessionId: 'abc', cwd: linkedCwd, claudeHome })).toBe(false);
+      expect(claudeTranscriptPath({ sessionId: 'abc', cwd: linkedCwd, claudeHome })).toBe(
+        path.join(claudeHome, 'projects', slug(realCwd), 'abc.jsonl'),
+      );
+    });
+
+    it('findClaudeTranscript searches several Claude homes in order', () => {
+      const accountHome = path.join(root, 'account');
+      const inDefault = path.join(claudeHome, 'projects', slug(realCwd), 'abc.jsonl');
+      fs.mkdirSync(path.dirname(inDefault), { recursive: true });
+      fs.writeFileSync(inDefault, '{}\n');
+      expect(findClaudeTranscript({ sessionId: 'abc', cwd: linkedCwd, claudeHomes: [accountHome, claudeHome] })).toBe(inDefault);
+      expect(findClaudeTranscript({ sessionId: 'abc', cwd: linkedCwd, claudeHomes: [accountHome] })).toBeNull();
+    });
+  });
+
+  it('starts fresh above 300k unless the environment says otherwise', () => {
+    expect(orcFreshContextTokens({})).toBe(300_000);
+    expect(orcFreshContextTokens({ CREWLY_ORC_FRESH_CONTEXT_TOKENS: '500000' })).toBe(500_000);
+    expect(orcFreshContextTokens({ CREWLY_ORC_FRESH_CONTEXT_TOKENS: 'nope' })).toBe(300_000);
+  });
+
+  it('members start fresh above 400k (over Claude Code\'s 350k auto-compact) unless the environment says otherwise', () => {
+    expect(memberFreshContextTokens({})).toBe(400_000);
+    expect(memberFreshContextTokens({ CREWLY_MEMBER_FRESH_CONTEXT_TOKENS: '200000' })).toBe(200_000);
+    expect(memberFreshContextTokens({ CREWLY_MEMBER_FRESH_CONTEXT_TOKENS: '-1' })).toBe(400_000);
+  });
+});
+
+describe('copyClaudeConversation (account switch keeps the conversation, crewly#1344)', () => {
+  let root: string;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-copy-'));
+  });
+  afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  it('copies the transcript and its sidecar folder under the same cwd slug, so the target home resumes it', () => {
+    const cwd = path.join(root, 'proj');
+    fs.mkdirSync(cwd);
+    const fromHome = path.join(root, 'default-claude');
+    const toHome = path.join(root, 'account-b');
+    const source = claudeTranscriptPath({ sessionId: 'conv-1', cwd, claudeHome: fromHome });
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    fs.writeFileSync(source, '{"type":"user","message":{"content":"hi"}}\n');
+    fs.mkdirSync(path.join(path.dirname(source), 'conv-1', 'subagents'), { recursive: true });
+    fs.writeFileSync(path.join(path.dirname(source), 'conv-1', 'subagents', 'agent-1.jsonl'), '{}\n');
+
+    expect(conversationExists({ runtimeType: 'claude-code', sessionId: 'conv-1', cwd, claudeHome: toHome })).toBe(false);
+    const result = copyClaudeConversation({ sessionId: 'conv-1', cwd, fromHomes: [toHome, fromHome], toHome });
+
+    expect(result?.source).toBe(source);
+    expect(result?.target).toBe(claudeTranscriptPath({ sessionId: 'conv-1', cwd, claudeHome: toHome }));
+    expect(fs.readFileSync(result!.target, 'utf8')).toContain('"hi"');
+    expect(fs.existsSync(path.join(path.dirname(result!.target), 'conv-1', 'subagents', 'agent-1.jsonl'))).toBe(true);
+    // What the launch checks before `--resume`: the target home now has it.
+    expect(conversationExists({ runtimeType: 'claude-code', sessionId: 'conv-1', cwd, claudeHome: toHome })).toBe(true);
+    // Nothing else of the account is touched.
+    expect(fs.readdirSync(toHome)).toEqual(['projects']);
+  });
+
+  it('is a no-op when both homes are the same, and null when the transcript is nowhere', () => {
+    const cwd = path.join(root, 'proj');
+    fs.mkdirSync(cwd);
+    const home = path.join(root, 'claude');
+    const source = claudeTranscriptPath({ sessionId: 'conv-2', cwd, claudeHome: home });
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    fs.writeFileSync(source, '{}\n');
+    expect(copyClaudeConversation({ sessionId: 'conv-2', cwd, fromHomes: [home], toHome: home })).toEqual({ source, target: source, copied: [] });
+    expect(copyClaudeConversation({ sessionId: 'missing', cwd, fromHomes: [home], toHome: path.join(root, 'other') })).toBeNull();
+  });
+});

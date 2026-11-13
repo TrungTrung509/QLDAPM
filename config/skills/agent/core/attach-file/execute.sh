@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# attach-file — put a real file into the Slack channel you are replying in.
+#
+# Backed by POST /api/slack/attach. Takes the CHAT channel id (the one in your
+# prompt), not a Slack channel id: the backend resolves the Slack channel, the
+# thread and your bot identity from it.
+#
+# Usage: execute.sh --channel <chatChannelId> --path <file> [--name <n>]
+#                   [--title <t>] [--comment <c>] [--thread <messageId>]
+#                   [--work-item <id>] [--ticket <id>] [--to <messageId>]
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/../../../_common/lib.sh"
+
+CHANNEL=""; FILE_PATH=""; NAME=""; TITLE=""; COMMENT=""; THREAD=""; TICKET=""; TO=""; WORK_ITEM=""
+
+usage() {
+  cat <<'USAGE'
+attach-file — send a file into your Slack channel
+
+  --channel <id>   Chat channel id from your prompt ([CHAT:<id>])   (required)
+  --path <file>    Absolute path of the file to send                (required)
+  --name <name>    Filename to show in Slack
+  --title <title>  Title shown above the file
+  --comment <text> A line of text posted with the file
+  --thread <id>    The thread the file belongs to ([SLACK-THREAD:<key>] key, or a chat thread id)
+  --ticket <id>    The ticket the file is for (TKT-187 / CE-7) — Crewly finds its thread (no --channel needed)
+  --to <id>        The message the file answers (from your prompt) — no --channel needed
+  --work-item <id> The work item the file delivers ([CREWLY-DISPATCH] id) — Crewly posts it in that work's thread (no --channel needed)
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --channel|-c) CHANNEL="${2:-}"; shift 2 ;;
+    --path|-p)    FILE_PATH="${2:-}"; shift 2 ;;
+    --name)       NAME="${2:-}"; shift 2 ;;
+    --title)      TITLE="${2:-}"; shift 2 ;;
+    --comment|-m) COMMENT="${2:-}"; shift 2 ;;
+    --thread|-t)  THREAD="${2:-}"; shift 2 ;;
+    --ticket)     TICKET="${2:-}"; shift 2 ;;
+    --to)         TO="${2:-}"; shift 2 ;;
+    --work-item|--workitem) WORK_ITEM="${2:-}"; shift 2 ;;
+    -h|--help)    usage; exit 0 ;;
+    *) unknown_arg_exit "$1" ;;
+  esac
+done
+
+if { [ -z "$CHANNEL" ] && [ -z "$TICKET" ] && [ -z "$TO" ] && [ -z "$WORK_ITEM" ]; } || [ -z "$FILE_PATH" ]; then
+  echo '{"error":"Missing required parameter: --path, and --channel (or --work-item / --ticket / --to)"}' >&2
+  usage >&2
+  exit 1
+fi
+
+if [ ! -f "$FILE_PATH" ]; then
+  echo "{\"error\":\"No such file: $FILE_PATH\"}" >&2
+  exit 1
+fi
+
+BODY=$(jq -cn \
+  --arg channelId "$CHANNEL" \
+  --arg filePath "$FILE_PATH" \
+  --arg filename "$NAME" \
+  --arg title "$TITLE" \
+  --arg comment "$COMMENT" \
+  --arg threadId "$THREAD" \
+  --arg ticket "$TICKET" \
+  --arg to "$TO" \
+  --arg workItemId "$WORK_ITEM" \
+  '{filePath: $filePath}
+   + (if $channelId != "" then {channelId: $channelId} else {} end)
+   + (if $ticket   != "" then {ticket: $ticket}     else {} end)
+   + (if $to       != "" then {to: $to}             else {} end)
+   + (if $workItemId != "" then {workItemId: $workItemId} else {} end)
+   + (if $filename != "" then {filename: $filename} else {} end)
+   + (if $title    != "" then {title: $title}       else {} end)
+   + (if $comment  != "" then {comment: $comment}   else {} end)
+   + (if $threadId != "" then {threadId: $threadId} else {} end)')
+
+if RESPONSE=$(api_call POST "/slack/attach" "$BODY" 2>&1); then
+  echo "$RESPONSE"
+else
+  echo "$RESPONSE" >&2
+  exit 1
+fi

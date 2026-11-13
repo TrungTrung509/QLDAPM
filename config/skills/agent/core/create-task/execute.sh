@@ -1,0 +1,257 @@
+#!/bin/bash
+# Create a new task as a V3 WorkItem in the task-pool.
+#
+# V3-only as of spec 2026-05-06-task-management-v1-deprecation.md. Replaces
+# the v1 `POST /task-management/create` endpoint, which wrote a `.md` file
+# to the project's `.crewly/tasks/` filesystem. The V3 task-pool's
+# `POST /task-pool/add` endpoint is now the sole way to create new tasks.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../_common/lib.sh"
+
+print_usage() {
+  cat <<'EOF_USAGE'
+Usage:
+  # CLI flags (preferred)
+  bash execute.sh --project-path /path/to/project --task "Implement login API" \
+    --priority high --milestone sprint-1 --session dev-1
+
+  # Legacy JSON (backward compatible)
+  bash execute.sh '{"projectPath":"/path/to/project","task":"Implement login API","priority":"high"}'
+
+Options:
+  --project-path | -p   Absolute path to the project root (required)
+  --task         | -t   Task description (required)
+  --priority            Priority level: low, medium, high, critical (default: medium)
+  --milestone    | -m   Milestone/sprint name (default: delegated)
+  --session      | -s   Session to assign the task to (optional; if omitted, task is open)
+  --output-schema       JSON string defining expected output schema (optional)
+  --owner               Responsible role: orchestrator, team_lead, agent, system (default: agent)
+  --description  | -d   Short summary of the task (optional)
+  --brief               Long-form brief in markdown: inline text, or @/path/to/file.md
+                        Should carry Goal + Expected Outcome + Eval Criteria. Max 16384 bytes.
+  --request-id   | -R   Ticket this task is for: the id (or TKT-123) from the
+                        [TICKET:TKT-123 <id>] line of the message you are working on
+  --thread             Owner thread the task answers (Slack thread key from your
+                        prompt). A task you assign to yourself inherits no owner
+                        thread: name it here, or its result goes nowhere public
+  --conversation       Owner conversation the task answers (chat-v2 id)
+  --json         | -j   Raw JSON payload (same as legacy)
+  --help         | -h   Show this help
+EOF_USAGE
+}
+
+INPUT_JSON=""
+PROJECT_PATH=""
+TASK=""
+PRIORITY=""
+MILESTONE=""
+SESSION_NAME=""
+OUTPUT_SCHEMA=""
+OWNER=""
+DESCRIPTION=""
+BRIEF=""
+REQUEST_ID=""
+OWNER_THREAD=""
+OWNER_CONVERSATION=""
+
+# Detect legacy JSON argument
+if [[ $# -gt 0 && ${1:0:1} == '{' ]]; then
+  INPUT_JSON="$1"
+  shift || true
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project-path|-p)
+      PROJECT_PATH="$2"
+      shift 2
+      ;;
+    --task|-t)
+      TASK="$2"
+      shift 2
+      ;;
+    --priority)
+      PRIORITY="$2"
+      shift 2
+      ;;
+    --milestone|-m)
+      MILESTONE="$2"
+      shift 2
+      ;;
+    --session|-s)
+      SESSION_NAME="$2"
+      shift 2
+      ;;
+    --output-schema)
+      OUTPUT_SCHEMA="$2"
+      shift 2
+      ;;
+    --owner)
+      OWNER="$2"
+      shift 2
+      ;;
+    --description|-d)
+      DESCRIPTION="$2"
+      shift 2
+      ;;
+    --brief)
+      BRIEF="$2"
+      shift 2
+      ;;
+    --request-id|-R)
+      REQUEST_ID="$2"
+      shift 2
+      ;;
+    --thread)
+      OWNER_THREAD="$2"
+      shift 2
+      ;;
+    --conversation)
+      OWNER_CONVERSATION="$2"
+      shift 2
+      ;;
+    --json|-j)
+      INPUT_JSON="$2"
+      shift 2
+      ;;
+    --help|-h)
+      print_usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      if [[ -z "$INPUT_JSON" && ${1:0:1} == '{' ]]; then
+        INPUT_JSON="$1"
+        shift
+      else
+        unknown_arg_exit "$1"
+      fi
+      ;;
+  esac
+done
+
+# Read from stdin if no input yet
+if [ -z "$INPUT_JSON" ] && [ -z "$TASK" ] && [ ! -t 0 ]; then
+  STDIN_DATA="$(cat)"
+  if [[ ${STDIN_DATA:0:1} == '{' ]]; then
+    INPUT_JSON="$STDIN_DATA"
+  fi
+fi
+
+# Parse JSON if provided
+if [ -n "$INPUT_JSON" ]; then
+  INPUT=$(read_json_input "$INPUT_JSON")
+  [ -z "$PROJECT_PATH" ] && PROJECT_PATH=$(printf '%s' "$INPUT" | jq -r '.projectPath // empty')
+  [ -z "$TASK" ] && TASK=$(printf '%s' "$INPUT" | jq -r '.task // empty')
+  [ -z "$PRIORITY" ] && PRIORITY=$(printf '%s' "$INPUT" | jq -r '.priority // empty')
+  [ -z "$MILESTONE" ] && MILESTONE=$(printf '%s' "$INPUT" | jq -r '.milestone // empty')
+  [ -z "$SESSION_NAME" ] && SESSION_NAME=$(printf '%s' "$INPUT" | jq -r '.sessionName // empty')
+  [ -z "$OUTPUT_SCHEMA" ] && OUTPUT_SCHEMA=$(printf '%s' "$INPUT" | jq -c '.outputSchema // empty')
+  [ -z "$OWNER" ] && OWNER=$(printf '%s' "$INPUT" | jq -r '.owner // empty')
+  [ -z "$DESCRIPTION" ] && DESCRIPTION=$(printf '%s' "$INPUT" | jq -r '.description // empty')
+  [ -z "$BRIEF" ] && BRIEF=$(printf '%s' "$INPUT" | jq -r '.briefMarkdown // .brief // empty')
+  [ -z "$REQUEST_ID" ] && REQUEST_ID=$(printf '%s' "$INPUT" | jq -r '.requestId // empty')
+  [ -z "$OWNER_THREAD" ] && OWNER_THREAD=$(printf '%s' "$INPUT" | jq -r '.thread // .ownerThread // empty')
+  [ -z "$OWNER_CONVERSATION" ] && OWNER_CONVERSATION=$(printf '%s' "$INPUT" | jq -r '.conversation // .conversationId // .ownerConversation // empty')
+fi
+
+# Apply defaults
+PRIORITY="${PRIORITY:-medium}"
+MILESTONE="${MILESTONE:-delegated}"
+OWNER="${OWNER:-agent}"
+
+require_param "projectPath (--project-path)" "$PROJECT_PATH"
+require_param "task (--task)" "$TASK"
+
+# `--brief @/path/to/file.md` reads the brief from a file. A real brief is
+# usually too long and too full of quotes/backticks to pass safely as a shell
+# argument, so the file form is the one callers should reach for.
+if [ -n "$BRIEF" ] && [ "${BRIEF:0:1}" = "@" ]; then
+  BRIEF_PATH="${BRIEF:1}"
+  [ -f "$BRIEF_PATH" ] || error_exit "brief file not found: ${BRIEF_PATH}"
+  BRIEF="$(cat "$BRIEF_PATH")"
+fi
+
+# Enforce MAX_BRIEF_MARKDOWN_BYTES (16 * 1024) HERE rather than letting the
+# server reject it, so the caller gets the limit and their actual size instead
+# of a bare 400. Deliberately NOT truncated: silently shipping a half-brief is
+# the same class of bug this field was added to fix — trimming is the caller's
+# decision, not ours.
+if [ -n "$BRIEF" ]; then
+  BRIEF_BYTES=$(printf '%s' "$BRIEF" | wc -c | tr -d ' ')
+  if [ "$BRIEF_BYTES" -gt 16384 ]; then
+    error_exit "briefMarkdown is ${BRIEF_BYTES} bytes, over the 16384-byte limit (MAX_BRIEF_MARKDOWN_BYTES). Trim it, or attach the long form as a file and reference it from the brief. Not truncating automatically — what to cut is your call."
+  fi
+fi
+
+# Validate `owner` against the WorkItemOwner enum the endpoint accepts.
+# This is the field, not the session name — `owner` answers "which role is
+# responsible for execution", and `target` answers "which session runs it".
+# Sending a session name here fails validation with
+# "owner must be one of: orchestrator, team_lead, agent, system".
+case "$OWNER" in
+  orchestrator|team_lead|agent|system) ;;
+  *) error_exit "owner must be one of: orchestrator, team_lead, agent, system (got: '$OWNER'). This is a role, not a session name — use --session/target for the session." ;;
+esac
+
+# Build a minimal `CreateWorkItemInput` for `POST /task-pool/add`.
+#
+# The endpoint reads `req.body` DIRECTLY as the input — there is no
+# `{workItem: ...}` envelope. It accepts two shapes: this minimal input
+# (server fills id/status/createdAt/retryCount/...), or a legacy full
+# WorkItem carrying id AND status AND createdAt. We send the minimal shape,
+# matching `team-leader/delegate-task`.
+#
+# Deliberately NOT sent:
+#   - `id`     — this skill has no idempotency key worth preserving, so the
+#                server-generated uuid wins. (`CreateWorkItemInput.id` IS
+#                honoured when supplied; we simply have nothing stable to
+#                supply.)
+#   - `status` — derived server-side from dependsOn/scheduledAt.
+#   - empty `description`/`briefMarkdown` — omitted rather than sent as "",
+#                so a task filed without a brief stays a clean minimal WorkItem
+#   - top-level `priority` — NOT a WorkItem field; it is silently dropped by
+#                both body shapes. Priority travels in `metadata.priority`,
+#                which is what real pool items carry and what
+#                work-item-projection reads.
+WORK_ITEM=$(jq -n \
+  --arg title "$TASK" \
+  --arg target "$SESSION_NAME" \
+  --arg owner "$OWNER" \
+  --arg projectPath "$PROJECT_PATH" \
+  --arg milestone "$MILESTONE" \
+  --arg priority "$PRIORITY" \
+  --arg description "$DESCRIPTION" \
+  --arg briefMarkdown "$BRIEF" \
+  --arg requestId "$REQUEST_ID" \
+  --arg ownerThread "$OWNER_THREAD" \
+  --arg ownerConversation "$OWNER_CONVERSATION" \
+  '{
+    title: $title,
+    type: "delegate",
+    owner: $owner,
+    target: (if $target == "" then null else $target end),
+    metadata: ({ projectPath: $projectPath, milestone: $milestone, priority: $priority }
+      + (if $ownerThread != "" then {ownerThread: $ownerThread} else {} end)
+      + (if $ownerConversation != "" then {ownerConversation: $ownerConversation} else {} end))
+  }
+  + (if $description != "" then {description: $description} else {} end)
+  + (if $briefMarkdown != "" then {briefMarkdown: $briefMarkdown} else {} end)
+  + (if $requestId != "" then {requestId: $requestId} else {} end)
+  | with_entries(select(.value != null))')
+
+if [ -n "$OUTPUT_SCHEMA" ] && [ "$OUTPUT_SCHEMA" != "" ]; then
+  WORK_ITEM=$(printf '%s' "$WORK_ITEM" | jq --argjson schema "$OUTPUT_SCHEMA" '.metadata += {outputSchema: $schema}')
+fi
+
+# A task with no owner place answers no owner thread: say so (message-routing
+# audit 2026-10-18: a self-assigned task no longer borrows your last one).
+if [ -z "$OWNER_THREAD" ] && [ -z "$OWNER_CONVERSATION" ] && [ -z "$REQUEST_ID" ]; then
+  echo "Note: no --thread / --conversation given — this task answers no owner thread unless it is delegated from your current work. Pass --thread <key> to tie it to the owner's request." >&2
+fi
+
+api_call POST "/task-pool/add" "$WORK_ITEM"

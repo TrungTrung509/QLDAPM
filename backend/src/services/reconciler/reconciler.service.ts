@@ -1,0 +1,1444 @@
+/**
+ * ReconcilerService — The "CPU" of Crewly V3
+ *
+ * The Reconciler periodically and on-demand recomputes system truth from
+ * durable state. It does NOT trust event delivery — it reads state and
+ * determines what should be true.
+ *
+ * Two-level loop:
+ * - Fast loop (10s): Lease expiry + agent health only
+ * - Full loop (60s): Complete scan of all Requests, WorkItems, Claims
+ *
+ * Performance budget: single reconcile < 3s (CEO requirement).
+ *
+ * @module services/reconciler/reconciler.service
+ */
+
+import { isSessionPaused } from '../team/team-pause.registry.js';
+import { shouldAttemptDelivery } from '../session/input-circuit-breaker.js';
+import type {
+  ReconcileResult,
+  ReconcileType,
+  ReconcileCorrection,
+  ReconcilerConfig,
+  ReconcilerStatus,
+  WakeAction,
+  WakeActionResult,
+  WorkItem,
+  Request,
+  TaskClaim,
+} from '../../types/v2/index.js';
+import {
+  createEmptyReconcileResult,
+  DEFAULT_RECONCILER_CONFIG,
+} from '../../types/v2/index.js';
+import {
+  detectStuckWorkItems,
+  detectExpiredClaims,
+  reconcileRequestStatus,
+  detectRecoverableWorkItems,
+  detectWaitingOnHumanWorkItems,
+  detectRetryableFailedWorkItems,
+  detectUndisposedStrandedWorkItems,
+  detectDependencyResolvedWorkItems,
+  detectDueBlockedWorkItems,
+  detectUnclaimedTasks,
+  detectUnverifiedWorkItems,
+  detectUnreviewedPastTTL,
+  detectIdleHoldersOfRunningWork,
+  VERIFY_ESCALATED_AT_KEY,
+  REVIEW_OWNER_ESCALATED_AT_KEY,
+  runPruningPass,
+  decisionHoldPredicate,
+} from './reconcile-rules.js';
+import type { AgentHealth, DecisionHoldLink } from './reconcile-rules.js';
+import { surfaceIdleHolders, type IdleHolderSurfacerDeps } from './idle-holder-surfacer.js';
+import { surfaceRedeliveryMiss } from './redelivery-escalation.js';
+import { WORK_ITEM_BLOCK_SOURCES } from '../../types/v2/work-item.types.js';
+import { getSettingsService } from '../settings/index.js';
+import { LoggerService } from '../core/logger.service.js';
+import { traceHarness } from '../trace/trace-recorder.js';
+import { RestartDrainService } from '../restart/restart-drain.service.js';
+import { detectStalledAgents, type StalledAgent } from './stalled-agent-recovery.js';
+import { RECONCILER_WAKE_CONSTANTS, STALLED_AGENT_RECOVERY_CONSTANTS } from '../../constants.js';
+
+/** Wake pacing and stalled-agent thresholds (overridable in tests). */
+export interface WakeTuning {
+  /** First wait after a failed wake for one session + WorkItem (ms) */
+  failureBackoffBaseMs: number;
+  /** Ceiling of the doubling failure backoff (ms) */
+  failureBackoffMaxMs: number;
+  /** How long a pass waits on a start / rehydrate before treating it as pending (ms) */
+  startAwaitMs: number;
+  /** Queued work this old marks its target as stalled (ms) */
+  stalledQueuedAgeMs: number;
+  /** A stopped agent still holding work counts as stalled after this long down (ms) */
+  stalledHeldMs: number;
+  /** An awake agent counts as idle-not-progressing after this long without activity (ms) */
+  stalledIdleMs: number;
+  /** One stalled-agent recovery per session at most this often (ms) */
+  recoveryCooldownMs: number;
+  /** First wait after a successful wake for one session + WorkItem (ms) */
+  successBackoffBaseMs: number;
+  /** Ceiling of the doubling success backoff (ms) */
+  successBackoffMaxMs: number;
+  /** Max successful wakes per session inside the window */
+  maxWakesPerSessionPerWindow: number;
+  /** Window of the per-session wake cap (ms) */
+  sessionWakeWindowMs: number;
+}
+
+/** Defaults from the backend constants. */
+export const DEFAULT_WAKE_TUNING: Readonly<WakeTuning> = {
+  failureBackoffBaseMs: RECONCILER_WAKE_CONSTANTS.FAILURE_BACKOFF_BASE_MS,
+  failureBackoffMaxMs: RECONCILER_WAKE_CONSTANTS.FAILURE_BACKOFF_MAX_MS,
+  startAwaitMs: RECONCILER_WAKE_CONSTANTS.START_AWAIT_MS,
+  stalledQueuedAgeMs: STALLED_AGENT_RECOVERY_CONSTANTS.QUEUED_WORK_AGE_MS,
+  stalledHeldMs: STALLED_AGENT_RECOVERY_CONSTANTS.HELD_WORK_STOPPED_MS,
+  stalledIdleMs: STALLED_AGENT_RECOVERY_CONSTANTS.IDLE_NO_PROGRESS_MS,
+  recoveryCooldownMs: STALLED_AGENT_RECOVERY_CONSTANTS.RECOVERY_COOLDOWN_MS,
+  successBackoffBaseMs: RECONCILER_WAKE_CONSTANTS.SUCCESS_BACKOFF_BASE_MS,
+  successBackoffMaxMs: RECONCILER_WAKE_CONSTANTS.SUCCESS_BACKOFF_MAX_MS,
+  maxWakesPerSessionPerWindow: RECONCILER_WAKE_CONSTANTS.MAX_WAKES_PER_SESSION_PER_WINDOW,
+  sessionWakeWindowMs: RECONCILER_WAKE_CONSTANTS.SESSION_WAKE_WINDOW_MS,
+};
+
+/**
+ * Normalize a provider's wake answer: `true` / `false` (older providers and
+ * tests) or a {@link WakeActionResult}.
+ *
+ * @param value - What `executeWakeAction` resolved to
+ * @returns The outcome with its reason
+ */
+export function normalizeWakeResult(value: boolean | WakeActionResult | undefined | null): WakeActionResult {
+  if (value === true) return { outcome: 'ok' };
+  if (value === false || value === undefined || value === null) return { outcome: 'failed' };
+  return value;
+}
+
+/**
+ * Backoff after the n-th consecutive failed wake: base doubled per failure,
+ * capped.
+ *
+ * @param failures - Consecutive failures so far (>= 1)
+ * @param tuning - Base and ceiling
+ * @returns Milliseconds before the next attempt
+ */
+export function wakeFailureBackoffMs(failures: number, tuning: Pick<WakeTuning, 'failureBackoffBaseMs' | 'failureBackoffMaxMs'>): number {
+  const steps = Math.max(0, Math.min(failures - 1, 30));
+  return Math.min(tuning.failureBackoffBaseMs * 2 ** steps, tuning.failureBackoffMaxMs);
+}
+
+// ---------------------------------------------------------------------------
+// Data Provider Interface (dependency injection)
+// ---------------------------------------------------------------------------
+
+/**
+ * Interface for providing data to the Reconciler.
+ * Abstracts over the actual storage/service layer so the Reconciler
+ * can be tested independently.
+ */
+export interface ReconcilerDataProvider {
+  /** Get all non-terminal WorkItems */
+  getActiveWorkItems(): Promise<WorkItem[]>;
+  /** Get all WorkItems for a specific Request */
+  getWorkItemsForRequest(requestId: string): Promise<WorkItem[]>;
+  /** Get all non-terminal Requests */
+  getActiveRequests(): Promise<Request[]>;
+  /** Get all active TaskClaims */
+  getActiveClaims(): Promise<TaskClaim[]>;
+  /** Get health info for all known agents */
+  getAgentHealthMap(): Promise<Map<string, AgentHealth>>;
+  /** Apply a correction — update an entity's status */
+  applyCorrection(correction: ReconcileCorrection): Promise<void>;
+  /** Release a WorkItem back to the task pool */
+  releaseToPool(workItemId: string, reason: string): Promise<void>;
+  /**
+   * Re-queue a WorkItem (increment retryCount, set status to queued).
+   * `allowWaitingOnHuman` must be passed true only for the waiting_on_human
+   * rule's own requeue (see the call site below and the provider's JSDoc).
+   */
+  requeueWorkItem(workItemId: string, opts?: { allowWaitingOnHuman?: boolean; allowExplicitWhenDue?: boolean }): Promise<void>;
+  /** Mark a claim as 'expiring' (lease expired, within grace period) */
+  markClaimExpiring(claimId: string): Promise<void>;
+  /** Revoke a claim and release its work item back to the pool */
+  revokeClaimAndRelease(claimId: string, reason: string): Promise<void>;
+  /**
+   * Renew a claim's lease because its holder is visibly working (see
+   * `detectExpiredClaims`). Optional: a provider without it simply never
+   * renews, and claims expire as before.
+   */
+  renewClaim?(claimId: string): Promise<void>;
+  /** Get all available (queued, unclaimed) WorkItems from the task pool */
+  getAvailablePoolItems?(): Promise<WorkItem[]>;
+  /**
+   * Open owner decision cards (their work item / ticket): WorkItems waiting
+   * on one are not TTL-cancelled (crewly#1369 §5). Optional.
+   */
+  getOpenDecisionHolds?(): Promise<DecisionHoldLink[]>;
+  /**
+   * Execute a wake action — rehydrate a suspended agent, start an inactive
+   * one, or re-push a brief. `true` / `false` are read as ok / failed; a
+   * {@link WakeActionResult} also says pending (queued behind the cap) or
+   * skipped (nothing attempted) — see CREW-304.
+   */
+  executeWakeAction?(action: WakeAction): Promise<boolean | WakeActionResult>;
+  /**
+   * Stop a stalled agent's session so the next wake starts it fresh
+   * (CREW-303). Optional: without it, idle / hung agents are only reported.
+   */
+  parkStalledAgent?(sessionName: string, role: string): Promise<boolean>;
+  /** Sessions the claim service reports as hung (optional). */
+  getHungAgents?(): string[];
+  /** Backfill token usage data on completed WorkItems that have 0 tokens */
+  backfillTokenUsage?(): Promise<number>;
+  /**
+   * Emit `task:queued_too_long` events for WIs that have crossed the
+   * staleness threshold. Per-WI dedup is the provider's responsibility.
+   * Self-heal fix #2 (2026-05-20).
+   */
+  broadcastStaleQueuedWIs?(
+    staleWorkItems: ReadonlyArray<{
+      id: string;
+      target?: string;
+      owner?: string;
+      createdAt: string;
+    }>,
+  ): void;
+  /**
+   * Release the dedup entry for any WI in the provider's internal map
+   * that is no longer in the currently-queued set. Called by the
+   * reconciler each pass so a WI that became un-stuck (claimed,
+   * completed, cancelled) and later re-becomes stuck gets a fresh
+   * first-fire instead of being silenced by stale dedup state.
+   */
+  clearResolvedStuckWiDedup?(currentlyQueuedIds: ReadonlySet<string>): void;
+}
+
+// ---------------------------------------------------------------------------
+// ReconcilerService
+// ---------------------------------------------------------------------------
+
+export class ReconcilerService {
+  private config: ReconcilerConfig;
+  private dataProvider: ReconcilerDataProvider;
+  private fastLoopTimer: ReturnType<typeof setInterval> | null = null;
+  private fullLoopTimer: ReturnType<typeof setInterval> | null = null;
+  private history: ReconcileResult[] = [];
+  /**
+   * In-memory dedup of WorkItems already escalated for overdue TL verification
+   * (P1). Fires the verify-escalation once per item within the process; pruned
+   * each pass of ids that have left `done_by_worker` so a future cycle can
+   * re-escalate. Mirrors the existing stuck-WI dedup pattern.
+   */
+  private readonly escalatedVerifyIds = new Set<string>();
+  /** WorkItems whose idle holder was reported this process (the metadata stamp covers restarts). */
+  private readonly reportedIdleHolderIds = new Set<string>();
+  /** Where idle-holder reports go; unset = not reported (see {@link setIdleHolderReporting}). */
+  private idleHolderDeps: IdleHolderSurfacerDeps | null = null;
+  private isRunning = false;
+  /** Wake pacing and stalled-agent thresholds */
+  private wakeTuning: WakeTuning = { ...DEFAULT_WAKE_TUNING };
+  /**
+   * Failed wakes per `session + WorkItem` (CREW-304): the next attempt waits
+   * a doubling backoff; cleared when the session wakes or the item leaves
+   * the queue.
+   */
+  private readonly wakeFailures = new Map<string, { failures: number; nextAt: number; session: string; workItemId: string }>();
+  /**
+   * Consecutive failed redeliveries per WorkItem (CREW-577). Separate from {@link wakeFailures}, which is
+   * cleared for the whole session when any other wake of it succeeds (CE-282, 2026-10-12: the count restarted
+   * at 1 after attempt 3 and the lead was never told). Cleared when that item's own redelivery succeeds.
+   */
+  private readonly redeliveryMisses = new Map<string, number>();
+  /** WorkItems whose failing redelivery was already reported to a lead (once per item, CREW-577) */
+  private readonly escalatedRedeliveries = new Set<string>();
+  /**
+   * Successful wakes per `session + WorkItem`: the next wake of the same pair waits a doubling
+   * backoff while the item stays queued (the wake "worked" but the agent did not take the item).
+   */
+  private readonly wakeSuccesses = new Map<string, { count: number; nextAt: number; workItemId: string }>();
+  /** Times of recent successful wakes per session (rolling window of the per-session cap) */
+  private readonly sessionWakeTimes = new Map<string, number[]>();
+  /** Starts still in flight (pending) per session: not requested again meanwhile */
+  private readonly pendingStarts = new Map<string, { workItemId: string; since: number }>();
+  /** Sessions whose current pending wake was already traced (one trace per episode) */
+  private readonly pendingTraced = new Set<string>();
+  /** Last stalled-agent recovery per session (epoch ms) */
+  private readonly recoveredAt = new Map<string, number>();
+  /** Sessions the last hybrid-wake pass already tried (recovery does not repeat them) */
+  private wokenThisPass = new Set<string>();
+  /**
+   * When each stale-queued WorkItem was last named in the stale-queued
+   * warning (epoch ms). The pass runs every minute; an item stuck for hours
+   * was logged on every pass. Now it is named when it first goes stale and
+   * then at most once per {@link STALE_QUEUED_LOG_REPEAT_MS}.
+   */
+  private readonly staleQueuedLoggedAt = new Map<string, number>();
+  private static readonly STALE_QUEUED_LOG_REPEAT_MS = 60 * 60 * 1000;
+  private totalPasses = 0;
+  private totalCorrections = 0;
+
+  /**
+   * Creates a new ReconcilerService.
+   *
+   * @param dataProvider - Provides data access and mutation capabilities
+   * @param config - Optional configuration override
+   */
+  constructor(
+    dataProvider: ReconcilerDataProvider,
+    config?: Partial<ReconcilerConfig>,
+  ) {
+    this.dataProvider = dataProvider;
+    this.config = { ...DEFAULT_RECONCILER_CONFIG, ...config };
+  }
+
+  // -------------------------------------------------------------------------
+  // Public API
+  // -------------------------------------------------------------------------
+
+  /**
+   * Start the reconciliation loops (fast + full).
+   * Called during backend startup.
+   */
+  start(): void {
+    if (this.fastLoopTimer || this.fullLoopTimer) {
+      this.stop();
+    }
+
+    this.fastLoopTimer = setInterval(
+      () => void this.runFast(),
+      this.config.fastLoopIntervalMs,
+    );
+
+    this.fullLoopTimer = setInterval(
+      () => void this.runFull(),
+      this.config.fullLoopIntervalMs,
+    );
+  }
+
+  /**
+   * Stop the reconciliation loops. Called during graceful shutdown.
+   */
+  stop(): void {
+    if (this.fastLoopTimer) {
+      clearInterval(this.fastLoopTimer);
+      this.fastLoopTimer = null;
+    }
+    if (this.fullLoopTimer) {
+      clearInterval(this.fullLoopTimer);
+      this.fullLoopTimer = null;
+    }
+  }
+
+  /**
+   * Full reconciliation pass — scans all entities.
+   * Called on startup, periodically (60s), and manually via API.
+   *
+   * @returns The reconciliation result
+   */
+  async runFull(): Promise<ReconcileResult> {
+    return this.executeReconcile('full', async (result) => {
+      const [workItems, requests, claims, agentHealthMap] = await Promise.all([
+        this.dataProvider.getActiveWorkItems(),
+        this.dataProvider.getActiveRequests(),
+        this.dataProvider.getActiveClaims(),
+        this.dataProvider.getAgentHealthMap(),
+      ]);
+
+      // 1. Detect stuck WorkItems (agent dead or timed out)
+      const stuck = detectStuckWorkItems(
+        workItems,
+        agentHealthMap,
+        this.config.workItemTimeoutMs,
+        undefined,
+        claims,
+      );
+      result.corrections.push(...stuck.corrections);
+      result.workItemsTimedOut += stuck.stuckIds.length;
+
+      // 2. Detect expired claims (a holder that is visibly working is renewed)
+      const expired = detectExpiredClaims(claims, undefined, agentHealthMap);
+      result.corrections.push(...expired.corrections);
+      // 2a. A quiet holder whose session is up stopped without reporting: tell its lead (#842).
+      await this.reportIdleHolders(claims, expired.revokedIds, workItems, agentHealthMap);
+
+      // 3. Detect recoverable blocked WorkItems (agent back online)
+      const recoverable = detectRecoverableWorkItems(workItems, agentHealthMap);
+      result.corrections.push(...recoverable.corrections);
+      result.workItemsRequeued += recoverable.recoverableIds.length;
+
+      // 3a. waiting_on_human (#815): park running work whose agent sits on a
+      // prompt, resume it when the prompt is gone.
+      const waiting = detectWaitingOnHumanWorkItems(workItems, agentHealthMap);
+      result.corrections.push(...waiting.corrections);
+      result.workItemsRequeued += waiting.requeuedIds.length;
+
+      // 3b. Auto-retry failed WorkItems with remaining retries
+      const retryable = detectRetryableFailedWorkItems(workItems);
+      result.corrections.push(...retryable.corrections);
+      result.workItemsRequeued += retryable.retriedIds.length;
+
+      // 3c. Unblock WorkItems whose dependencies are all resolved
+      const workItemMap = new Map(workItems.map(wi => [wi.id, wi]));
+      const unblocked = detectDependencyResolvedWorkItems(workItems, workItemMap);
+      result.corrections.push(...unblocked.corrections);
+      result.workItemsRequeued += unblocked.unblockedIds.length;
+
+      // 3c-ii. Lift explicit blocks whose `until` time has passed (block-task
+      // `until`): the item returns to `queued` for the same target, who takes
+      // it before new work. The only explicit-block requeue the reconciler
+      // performs — the agent asked for it when it set the time.
+      const dueBlocks = detectDueBlockedWorkItems(workItems);
+      result.corrections.push(...dueBlocks.corrections);
+      result.workItemsRequeued += dueBlocks.releasedIds.length;
+
+      // 3d. Verification enforcement (P1): a worker reported done but the TL
+      // never verified within the deadline. Escalate to the orchestrator for an
+      // explicit verdict so unverified work is never silently auto-accepted by
+      // the 24h TTL fallback (pickTTLExpiryTarget('done_by_worker') → verified).
+      await this.enforceVerification(workItems);
+
+      // 3e. Successor model safety net: `rejected`/`failed` items that nobody
+      // disposed of. Runs BEFORE the pruning pass for the same reason
+      // enforceVerification does — the pruning rules deliberately skip these
+      // statuses (no legal terminal edge), so if this pass does not deal with
+      // them nothing downstream will, and the strand is silent.
+      await this.disposeStrandedWorkItems(workItems);
+
+      // 4. Pruning pass (F4): TTL expiry + orphan cascade + deep cascade + stale queue detection
+      const holds = (await this.dataProvider.getOpenDecisionHolds?.().catch(() => [] as DecisionHoldLink[])) ?? [];
+      const pruning = runPruningPass(workItems, undefined, undefined, decisionHoldPredicate(holds));
+      result.corrections.push(...pruning.totalCorrections);
+      // `staleItemsCleaned` means "work that was DISCARDED", so only the
+      // cancel-shaped counters may be summed here. The TTL rule also emits
+      // `done_by_worker → verified` (24h implicit acceptance); that item was
+      // ACCEPTED, not cleaned up, and folding it in made the metric report
+      // two opposite outcomes as one number. See `PruningResult`.
+      result.staleItemsCleaned +=
+        pruning.ttlCancelledCount + pruning.orphanCancelledCount + pruning.cascadeCancelledCount;
+
+      // 4-bis. Auto-acceptance visibility: excluded from `staleItemsCleaned`
+      // above, so surface it explicitly rather than letting it vanish — a
+      // silent metric is worse than a wrong one. The per-item audit trail is
+      // already in `result.corrections` (newState `verified`); this log makes
+      // the aggregate visible to an operator watching the reconciler.
+      if (pruning.ttlAutoVerifiedCount > 0) {
+        LoggerService.getInstance()
+          .createComponentLogger('ReconcilerService')
+          .warn('TTL rule accepted WorkItems instead of cancelling them — should be 0 since #813 (NOT counted as staleItemsCleaned)', {
+            ttlAutoVerifiedCount: pruning.ttlAutoVerifiedCount,
+          });
+      }
+
+      // 4a. Stale-queued visibility (2026-05-16): the pruning rule no
+      // longer auto-cancels these WIs (was destroying user work — Atlas
+      // X-article task on 2026-05-16). Log them so the stuck condition
+      // is observable without destroying the work; the wake / eviction-
+      // under-pressure path (PR #585) is responsible for actually
+      // making progress on them.
+      const staleNow = new Set(pruning.staleQueuedIds);
+      for (const id of [...this.staleQueuedLoggedAt.keys()]) {
+        if (!staleNow.has(id)) this.staleQueuedLoggedAt.delete(id);
+      }
+      if (pruning.staleQueuedCount > 0) {
+        const logNow = Date.now();
+        const due = pruning.staleQueuedIds.filter(
+          (id) => logNow - (this.staleQueuedLoggedAt.get(id) ?? 0) >= ReconcilerService.STALE_QUEUED_LOG_REPEAT_MS,
+        );
+        // ReconcilerService has no injected logger field (the rest of
+        // the service surfaces failures via result.errors); use the
+        // shared LoggerService directly. Stale-queued isn't a failure
+        // — it's an observability signal, so it lives in the log
+        // stream rather than the result envelope.
+        if (due.length > 0) {
+          for (const id of due) this.staleQueuedLoggedAt.set(id, logNow);
+          LoggerService.getInstance()
+            .createComponentLogger('ReconcilerService')
+            .warn('WorkItems queued past staleness threshold (NOT cancelling — eviction path will retry wake)', {
+              staleQueuedCount: pruning.staleQueuedCount,
+              // Only the items not named in the last hour; cap the list to
+              // avoid huge log lines if dozens accumulate.
+              staleIds: due.slice(0, 20),
+              truncated: due.length > 20,
+              repeatEveryMin: ReconcilerService.STALE_QUEUED_LOG_REPEAT_MS / 60_000,
+            });
+        }
+
+        // Self-heal fix #2 (2026-05-20): emit an actionable
+        // `task:queued_too_long` event so the owner (typically ORC)
+        // can re-deliver / re-target / fail-fast. Resolves the
+        // 2026-05-20 ESTestNode incident pattern where the WI sat
+        // queued for 53min because the recovery chain quietly
+        // skipped active-but-idle agents.
+        if (this.dataProvider.broadcastStaleQueuedWIs) {
+          const staleWithMeta: Array<{
+            id: string;
+            target?: string;
+            owner?: string;
+            createdAt: string;
+          }> = [];
+          for (const wiId of pruning.staleQueuedIds) {
+            const wi = workItems.find((w) => w.id === wiId);
+            if (!wi) continue;
+            staleWithMeta.push({
+              id: wi.id,
+              target: wi.target,
+              owner: wi.owner,
+              createdAt: wi.createdAt,
+            });
+          }
+          this.dataProvider.broadcastStaleQueuedWIs(staleWithMeta);
+        }
+      }
+
+      // Clear dedup entries for WIs that are no longer queued — a WI
+      // that was claimed/completed/cancelled since the last reconcile
+      // should get a fresh first-fire if it ever re-enters stuck state.
+      if (this.dataProvider.clearResolvedStuckWiDedup) {
+        const currentlyQueued = new Set(
+          workItems.filter((w) => w.status === 'queued').map((w) => w.id),
+        );
+        this.dataProvider.clearResolvedStuckWiDedup(currentlyQueued);
+      }
+
+      // 5. Reconcile Request statuses
+      for (const request of requests) {
+        const requestWorkItems = await this.dataProvider.getWorkItemsForRequest(request.id);
+        const correction = reconcileRequestStatus(request, requestWorkItems);
+        if (correction) {
+          result.corrections.push(correction);
+          result.requestsUpdated++;
+        }
+      }
+
+      // 6. Apply all corrections
+      await this.applyCorrections(result.corrections, result);
+
+      // 7. Backfill token usage on completed WorkItems with 0 tokens
+      if (this.dataProvider.backfillTokenUsage) {
+        try {
+          await this.dataProvider.backfillTokenUsage();
+        } catch {
+          // Token backfill is non-fatal
+        }
+      }
+
+      // 8. Hybrid Wake: detect unclaimed tasks and wake dormant agents (H3)
+      // Call after status corrections to ensure we have current pool state.
+      await this.runHybridWake(workItems, agentHealthMap, result);
+
+      // 9. Stalled agents (CREW-303): queued work waiting on a session that is
+      // stopped, hung or idle past the threshold — or work a stopped agent still
+      // holds — is recovered, once per cooldown.
+      await this.recoverStalledAgents(workItems, agentHealthMap, result);
+    });
+  }
+
+  /**
+   * Fast reconciliation pass — checks leases, agent health, and Hybrid Wake.
+   * Called frequently (every 10s) with minimal overhead.
+   *
+   * @returns The reconciliation result
+   */
+  async runFast(): Promise<ReconcileResult> {
+    return this.executeReconcile('fast', async (result) => {
+      const [claims, agentHealthMap, workItems] = await Promise.all([
+        this.dataProvider.getActiveClaims(),
+        this.dataProvider.getAgentHealthMap(),
+        this.dataProvider.getActiveWorkItems(),
+      ]);
+
+      // 1. Check lease expiry (a holder that is visibly working is renewed)
+      const expired = detectExpiredClaims(claims, undefined, agentHealthMap);
+      result.corrections.push(...expired.corrections);
+      // 1a. A quiet holder whose session is up stopped without reporting: tell its lead (#842).
+      await this.reportIdleHolders(claims, expired.revokedIds, workItems, agentHealthMap);
+
+      // 2. Quick stuck check on running items
+      const runningItems = workItems.filter(wi => wi.status === 'running');
+      const stuck = detectStuckWorkItems(
+        runningItems,
+        agentHealthMap,
+        this.config.workItemTimeoutMs,
+        undefined,
+        claims,
+      );
+      result.corrections.push(...stuck.corrections);
+      result.workItemsTimedOut += stuck.stuckIds.length;
+
+      // 3. Apply corrections
+      await this.applyCorrections(result.corrections, result);
+
+      // 4. Hybrid Wake: detect unclaimed tasks and wake dormant agents
+      await this.runHybridWake(workItems, agentHealthMap, result);
+    });
+  }
+
+  /**
+   * Targeted reconciliation for a single Request.
+   * Called when a specific Request's state may have changed.
+   *
+   * @param requestId - The Request ID to reconcile
+   */
+  async reconcileRequest(requestId: string): Promise<ReconcileResult> {
+    return this.executeReconcile('targeted_request', async (result) => {
+      const requests = await this.dataProvider.getActiveRequests();
+      const request = requests.find(r => r.id === requestId);
+      if (!request) return;
+
+      const workItems = await this.dataProvider.getWorkItemsForRequest(requestId);
+      const correction = reconcileRequestStatus(request, workItems);
+      if (correction) {
+        result.corrections.push(correction);
+        result.requestsUpdated++;
+        await this.applyCorrections(result.corrections, result);
+      }
+    });
+  }
+
+  /**
+   * Returns current Reconciler status for API exposure.
+   *
+   * @returns Current status including last result, config, and counters
+   */
+  getStatus(): ReconcilerStatus {
+    const now = new Date();
+    return {
+      isRunning: this.isRunning,
+      lastResult: this.history[0],
+      nextFullReconcileAt: this.fullLoopTimer
+        ? new Date(now.getTime() + this.config.fullLoopIntervalMs).toISOString()
+        : undefined,
+      nextFastReconcileAt: this.fastLoopTimer
+        ? new Date(now.getTime() + this.config.fastLoopIntervalMs).toISOString()
+        : undefined,
+      totalPasses: this.totalPasses,
+      totalCorrections: this.totalCorrections,
+      config: { ...this.config },
+    };
+  }
+
+  /**
+   * Returns recent reconciliation history.
+   *
+   * @param limit - Maximum number of results to return
+   * @returns Array of recent ReconcileResults (newest first)
+   */
+  getHistory(limit: number = 20): ReconcileResult[] {
+    return this.history.slice(0, Math.min(limit, this.config.maxHistorySize));
+  }
+
+  /**
+   * Updates the Reconciler configuration at runtime.
+   *
+   * @param updates - Partial configuration to merge
+   */
+  updateConfig(updates: Partial<ReconcilerConfig>): void {
+    this.config = { ...this.config, ...updates };
+
+    // Restart loops if timing changed
+    if (updates.fastLoopIntervalMs || updates.fullLoopIntervalMs) {
+      const wasRunning = !!(this.fastLoopTimer || this.fullLoopTimer);
+      if (wasRunning) {
+        this.stop();
+        this.start();
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Private
+  // -------------------------------------------------------------------------
+
+  /**
+   * Executes a reconciliation pass with timing, error handling, and history tracking.
+   *
+   * @param type - The type of reconciliation
+   * @param logic - The reconciliation logic to execute
+   * @returns The completed ReconcileResult
+   */
+  private async executeReconcile(
+    type: ReconcileType,
+    logic: (result: ReconcileResult) => Promise<void>,
+  ): Promise<ReconcileResult> {
+    if (this.isRunning) {
+      return createEmptyReconcileResult(type);
+    }
+    // Winding down for a shutdown / restart: no redelivery, wake or escalation.
+    if (RestartDrainService.getInstance().isWindingDown()) {
+      return createEmptyReconcileResult(type);
+    }
+
+    this.isRunning = true;
+    const result = createEmptyReconcileResult(type);
+    const startTime = Date.now();
+
+    try {
+      await logic(result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      result.errors.push(`Reconcile error: ${message}`);
+    } finally {
+      result.durationMs = Date.now() - startTime;
+      result.reconciledAt = new Date().toISOString();
+      this.isRunning = false;
+      this.totalPasses++;
+      this.totalCorrections += result.corrections.length;
+
+      // Add to history (newest first)
+      this.history.unshift(result);
+      if (this.history.length > this.config.maxHistorySize) {
+        this.history = this.history.slice(0, this.config.maxHistorySize);
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Applies corrections by calling the data provider.
+   * Handles errors gracefully — a failed correction doesn't stop the pass.
+   *
+   * @param corrections - Corrections to apply
+   * @param result - The ReconcileResult to accumulate errors into
+   */
+  private async applyCorrections(
+    corrections: ReconcileCorrection[],
+    result: ReconcileResult,
+  ): Promise<void> {
+    // Steve 2026-05-15 dogfood (WI 5afef18f, 21:55:49): TWO rules can
+    // both emit blocked→queued for the same WI in a single tick —
+    // `detectRecoverableWorkItems` (agent back online) and
+    // `detectDependencyResolvedWorkItems` (dependencies satisfied). The
+    // first requeueWorkItem call succeeds; the second throws "Cannot
+    // release WorkItem: status must be 'running' or 'blocked', got
+    // 'queued'" because the WI is already past blocked. Dedup before
+    // iterating so each entity gets at most one terminal-state
+    // correction per tick — first writer wins. Key by entity+newState
+    // to keep room for legitimate distinct corrections on the same
+    // entity (e.g. a separate cancelled correction after a queued
+    // one, which the matrix rejects anyway but we surface explicitly).
+    const seen = new Set<string>();
+    const deduped: ReconcileCorrection[] = [];
+    let dupCount = 0;
+    for (const c of corrections) {
+      const key = `${c.entityType}:${c.entityId}:${c.newState}`;
+      if (seen.has(key)) {
+        dupCount++;
+        continue;
+      }
+      seen.add(key);
+      deduped.push(c);
+    }
+    if (dupCount > 0) {
+      // ReconcilerService has no injected logger; the result.errors
+      // array is the surface here. A duplicate-correction skip is not
+      // an error per se, but we want it observable in the tick result
+      // so a `runFull()` caller can see it in returned diagnostics.
+      // No error pushed — duplicates are expected when rules overlap
+      // (Steve 2026-05-15: detectRecoverable + detectDependencyResolved
+      // both produced blocked→queued for the same WI).
+    }
+
+    for (const correction of deduped) {
+      if (correction.entityType === 'work_item') {
+        traceHarness('harness.correction', {
+          workItemId: correction.entityId,
+          summary: `Reconciler moved work item ${correction.previousState} → ${correction.newState}: ${correction.reason}`,
+          data: { from: correction.previousState, to: correction.newState },
+        });
+      }
+      try {
+        // Handle claim-specific corrections via ClaimService
+        if (correction.entityType === 'claim') {
+          if (correction.newState === 'active') {
+            // Liveness renewal — the holder is working (detectExpiredClaims).
+            await this.dataProvider.renewClaim?.(correction.entityId);
+          } else if (correction.newState === 'expiring') {
+            await this.dataProvider.markClaimExpiring(correction.entityId);
+          } else if (correction.newState === 'revoked') {
+            await this.dataProvider.revokeClaimAndRelease(
+              correction.entityId,
+              correction.reason,
+            );
+            result.claimsRevoked++;
+          }
+          continue;
+        }
+
+        // blocked → queued (agent-back-online recovery) is special: it
+        // needs the full lifecycle — release the dangling claim, clear
+        // startedAt, record the release — which `releaseBack` owns.
+        // NOTE: this path deliberately does NOT charge a retry. An agent
+        // coming back online is a recovery, not a failure; `retryCount`
+        // means failures only. `releaseBack` records it in `releaseCount`.
+        // The earlier code called `applyCorrection` (which flips status
+        // to queued via updateItemStatus) AND `requeueWorkItem` (which
+        // calls `releaseBack`, which expects status running|blocked).
+        // The second call always threw "Cannot release WorkItem: status
+        // must be 'running' or 'blocked', got 'queued'" — see Steve's
+        // 2026-05-15 17:58:18 dogfood log for WI e61e16e9. Skip
+        // applyCorrection for this case so releaseBack sees the
+        // original blocked status and the full recovery side-effects run.
+        if (
+          correction.entityType === 'work_item' &&
+          correction.newState === 'queued' &&
+          correction.previousState === 'blocked'
+        ) {
+          // #820: only the waiting_on_human rule's OWN requeue (its
+          // correction carries blockSource 'waiting_on_human' — see
+          // detectWaitingOnHumanWorkItems) is allowed through the
+          // provider's waiting_on_human guard. Any other blocked->queued
+          // correction on a waiting_on_human item (e.g. agent-back-online
+          // recovery matching it too) must still be refused.
+          //
+          // Likewise only the due-block rule's own requeue (its correction
+          // carries blockSource 'explicit' — see detectDueBlockedWorkItems)
+          // may lift an explicit block, and the provider still checks that
+          // the block's `until` time has in fact passed.
+          const requeueOptions: { allowWaitingOnHuman: boolean; allowExplicitWhenDue?: boolean } = {
+            allowWaitingOnHuman: correction.blockSource === WORK_ITEM_BLOCK_SOURCES.WAITING_ON_HUMAN,
+          };
+          if (correction.blockSource === WORK_ITEM_BLOCK_SOURCES.EXPLICIT) requeueOptions.allowExplicitWhenDue = true;
+          await this.dataProvider.requeueWorkItem(correction.entityId, requeueOptions);
+          continue;
+        }
+
+        await this.dataProvider.applyCorrection(correction);
+
+        // If a WorkItem was revoked (from claim expiry), release it back to pool
+        if (
+          correction.entityType === 'work_item' &&
+          correction.newState === 'revoked'
+        ) {
+          await this.dataProvider.releaseToPool(correction.entityId, correction.reason);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        result.errors.push(`Failed to apply correction for ${correction.entityType}:${correction.entityId}: ${message}`);
+      }
+    }
+  }
+
+  /**
+   * Wire where idle-holder reports go: the teams to find each worker's lead,
+   * and the pool to queue the review in (#842). Wired at boot; unset in
+   * tests that do not exercise it.
+   *
+   * @param deps - Teams, pool and metadata writer, or null to stop reporting
+   */
+  setIdleHolderReporting(deps: IdleHolderSurfacerDeps | null): void {
+    this.idleHolderDeps = deps;
+  }
+
+  /**
+   * Report workers that went quiet holding a running WorkItem to their team
+   * lead, once per item (#842). Best-effort: never throws.
+   *
+   * @param claims - The pass's active claims
+   * @param revokedClaimIds - Claims this pass revokes
+   * @param workItems - The pass's WorkItems
+   * @param agentHealthMap - Agent health by session
+   */
+  private async reportIdleHolders(
+    claims: TaskClaim[],
+    revokedClaimIds: string[],
+    workItems: WorkItem[],
+    agentHealthMap: Map<string, AgentHealth>,
+  ): Promise<void> {
+    if (!this.idleHolderDeps) return;
+    const log = LoggerService.getInstance().createComponentLogger('ReconcilerService');
+    try {
+      const holders = detectIdleHoldersOfRunningWork(claims, revokedClaimIds, workItems, agentHealthMap)
+        .filter((h) => !this.reportedIdleHolderIds.has(h.workItem.id));
+      if (holders.length === 0) return;
+      for (const h of holders) this.reportedIdleHolderIds.add(h.workItem.id);
+
+      const reviews = await surfaceIdleHolders(holders, this.idleHolderDeps);
+      for (const review of reviews) {
+        log.info('Worker went quiet holding a running WorkItem — reported to its lead', {
+          workItemId: review.metadata?.['sourceWorkItemId'],
+          reviewWorkItemId: review.id,
+          lead: review.target,
+        });
+      }
+    } catch (err) {
+      log.warn('Reporting idle holders failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Dispose of `rejected`/`failed` WorkItems that no writer dealt with.
+   *
+   * The writers dispose their own items eagerly; this catches the ones that
+   * fell through — a writer that threw, a bridge successor that never
+   * materialised. Runs the same funnel the writers use, so the outcome and the
+   * audit record are identical regardless of who noticed.
+   *
+   * Non-fatal throughout: a stranded item is already the failure case, and
+   * throwing here would take down the rest of the reconcile pass with it.
+   *
+   * @param workItems - The pass's WorkItem snapshot.
+   */
+  private async disposeStrandedWorkItems(workItems: WorkItem[]): Promise<void> {
+    const log = LoggerService.getInstance().createComponentLogger('ReconcilerService');
+    try {
+      const { items } = detectUndisposedStrandedWorkItems(workItems);
+      if (items.length === 0) return;
+
+      const { TaskPoolService } = await import('../task-pool/task-pool.service.js');
+      const pool = TaskPoolService.getInstance();
+
+      for (const wi of items) {
+        try {
+          const disposition = await pool.disposeFailedWorkItem(wi.id, {
+            reason:
+              `Stranded in '${wi.status}' with no successor ` +
+              `(retryCount=${wi.retryCount}/${wi.maxRetries})`,
+          });
+          log.warn('Disposed a stranded WorkItem the writers missed', {
+            workItemId: wi.id,
+            status: wi.status,
+            kind: disposition?.kind ?? 'none',
+          });
+        } catch (err) {
+          log.warn('Disposition of a stranded WorkItem failed (non-fatal)', {
+            workItemId: wi.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    } catch (err) {
+      log.warn('disposeStrandedWorkItems pass failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Review escalation (P1, #813): lead → orchestrator → owner.
+   *
+   * 1. A `done_by_worker` item its reviewer has not judged within
+   *    {@link DEFAULT_VERIFY_ESCALATE_MS} goes to the orchestrator, and the
+   *    item is stamped so the orchestrator may now render the verdict.
+   * 2. One still unreviewed past the WorkItem TTL goes to the owner
+   *    ({@link detectUnreviewedPastTTL}); this replaced the old TTL
+   *    auto-verify. The item is never moved by either step.
+   *
+   * Each step fires once per item: the in-memory set covers a pass, the
+   * metadata stamp covers restarts. Best-effort; failures are logged, never
+   * thrown.
+   *
+   * @param workItems - All active WorkItems for this pass.
+   */
+  private async enforceVerification(workItems: WorkItem[]): Promise<void> {
+    const log = LoggerService.getInstance().createComponentLogger('ReconcilerService');
+    try {
+      const { items } = detectUnverifiedWorkItems(workItems);
+
+      // Prune the dedup set: allow re-escalation for ids that have since left
+      // done_by_worker (verdict rendered, or cycled back through rework).
+      const stillAwaiting = new Set(
+        workItems.filter((w) => w.status === 'done_by_worker').map((w) => w.id),
+      );
+      for (const id of this.escalatedVerifyIds) {
+        if (!stillAwaiting.has(id)) this.escalatedVerifyIds.delete(id);
+      }
+
+      const fresh = items.filter((wi) => !this.escalatedVerifyIds.has(wi.id));
+      const { items: ownerDue, examined } = detectUnreviewedPastTTL(workItems);
+      if (fresh.length === 0 && ownerDue.length === 0) return;
+
+      const { EscalationRouterService } = await import('../v3/escalation-router.service.js');
+      const router = EscalationRouterService.getInstance();
+      const { TaskPoolService } = await import('../task-pool/task-pool.service.js');
+      const pool = TaskPoolService.getInstance();
+      const now = Date.now();
+
+      /** Best-effort metadata stamp; a failure never stops the pass. */
+      const stamp = async (id: string, key: string): Promise<boolean> => {
+        try {
+          return await pool.stampReviewEscalation(id, key);
+        } catch {
+          return false;
+        }
+      };
+      /** The router's view of a WorkItem plus how long it has awaited review. */
+      const forEscalation = (wi: WorkItem) => {
+        const awaitingSince = new Date(wi.completedAt ?? wi.startedAt ?? wi.createdAt).getTime();
+        return {
+          view: {
+            id: wi.id,
+            title: wi.title,
+            type: wi.type,
+            target: wi.target ?? null,
+            retryCount: wi.retryCount,
+            maxRetries: wi.maxRetries,
+            requestId: wi.requestId ?? null,
+            missionId: wi.missionId ?? null,
+            parentWorkItemId: wi.parentWorkItemId ?? null,
+          },
+          awaitingMs: Number.isFinite(awaitingSince) ? now - awaitingSince : 0,
+        };
+      };
+
+      // Step 1 — orchestrator.
+      for (const wi of fresh) {
+        const { view, awaitingMs } = forEscalation(wi);
+        try {
+          await router.escalateUnverifiedWorkItem(view, awaitingMs);
+          this.escalatedVerifyIds.add(wi.id);
+          // Lets the orchestrator render the verdict (#813) and survives restarts.
+          await stamp(wi.id, VERIFY_ESCALATED_AT_KEY);
+          log.info('Escalated unverified WorkItem to orchestrator for a verdict', {
+            workItemId: wi.id,
+            awaitingMs,
+          });
+        } catch (err) {
+          log.warn('Verify-escalation failed (non-fatal)', {
+            workItemId: wi.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      // Step 2 — owner (replaces the TTL auto-verify). Stamp first so a
+      // failed notify is not re-sent every pass; the pending escalation
+      // record is the durable signal.
+      let ownerEscalated = 0;
+      for (const wi of ownerDue) {
+        const { view, awaitingMs } = forEscalation(wi);
+        try {
+          if (!(await stamp(wi.id, REVIEW_OWNER_ESCALATED_AT_KEY))) continue;
+          await router.escalateUnreviewedToOwner(view, awaitingMs);
+          ownerEscalated += 1;
+        } catch (err) {
+          log.warn('Owner review escalation failed (non-fatal)', {
+            workItemId: wi.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      if (ownerDue.length > 0) {
+        log.info('Unreviewed WorkItems escalated to the owner', {
+          escalated: ownerEscalated,
+          due: ownerDue.length,
+          examined,
+        });
+      }
+    } catch (err) {
+      log.warn('enforceVerification pass failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Runs Hybrid Wake logic: detects unclaimed tasks in the pool and
+   * wakes dormant agents (suspended → rehydrate, inactive → start).
+   *
+   * Only runs if the data provider supports pool item retrieval and wake execution.
+   *
+   * @param workItems - All active WorkItems (used as fallback if no pool provider)
+   * @param agentHealthMap - Map of agent session → health info
+   * @param result - The ReconcileResult to accumulate wake actions into
+   */
+  private async runHybridWake(
+    workItems: WorkItem[],
+    agentHealthMap: Map<string, AgentHealth>,
+    result: ReconcileResult,
+  ): Promise<void> {
+    this.wokenThisPass = new Set();
+    // Only run if the provider supports wake actions
+    if (!this.dataProvider.executeWakeAction) return;
+
+    // `maxConcurrentAgents` (Settings › General) used to end this pass here
+    // whenever that many agents were active. It was the only place that read
+    // the setting: a DM, a stall recovery, a restore and the start API all
+    // start agents regardless, and under memory pressure the start path has its
+    // own running-agent cap that queues a start and frees a slot (CREW-304).
+    // So the early return only delayed work: 2026-10-27, 11 agents up on a
+    // 10-agent setting, a trigger's WorkItem for the stopped Owen sat queued
+    // for 20 minutes — the fast wake was dropped every pass without a log line
+    // and the stall recovery (which never checked the setting) started him.
+    // Redelivers (a re-push to an agent already running) were dropped too.
+    // Now a wake to a named target goes through; the count is logged so an
+    // exceeded setting is visible.
+    let maxConcurrent = 50; // matches ConfigService default (MAX_CONCURRENT_AGENTS)
+    try {
+      const settings = await getSettingsService().getSettings();
+      maxConcurrent = settings.general.maxConcurrentAgents;
+    } catch {
+      // Use default if settings unavailable
+    }
+
+    let activeAgentCount = 0;
+    for (const agent of agentHealthMap.values()) {
+      if (agent.status === 'active') {
+        activeAgentCount++;
+      }
+    }
+    const overConfiguredMax = activeAgentCount >= maxConcurrent;
+
+    // Use pool items if available, otherwise fall back to active work items
+    const poolItems = this.dataProvider.getAvailablePoolItems
+      ? await this.dataProvider.getAvailablePoolItems()
+      : workItems.filter(wi => wi.status === 'queued');
+
+    const { wakeActions } = detectUnclaimedTasks(poolItems, agentHealthMap);
+
+    // A WorkItem that left the queue drops its failure backoff.
+    const queuedIds = new Set(poolItems.filter((wi) => wi.status === 'queued').map((wi) => wi.id));
+    for (const [key, entry] of this.wakeFailures) {
+      if (!queuedIds.has(entry.workItemId)) this.wakeFailures.delete(key);
+    }
+
+    // A WorkItem that left the queue drops its success pacing too.
+    for (const [key, entry] of this.wakeSuccesses) {
+      if (!queuedIds.has(entry.workItemId)) this.wakeSuccesses.delete(key);
+    }
+
+    // One wake per session per pass, whatever the number of items (CREW-304).
+    const actedOn = new Set<string>();
+    this.wokenThisPass = actedOn;
+    const now = Date.now();
+    for (const action of wakeActions) {
+      const session = action.agentSessionName;
+      if (actedOn.has(session)) continue;
+      // Belt and braces: a paused team is never woken (specs/2026-10-04-team-pause.md).
+      if (isSessionPaused(session)) continue;
+      // An agent whose input box the guard keeps refusing gets a probe now and
+      // then, not a redelivery every pass (crewly#1028: ~1,100 failed
+      // redeliveries + wakes in 2h45m). Skipped attempts are counted by the
+      // breaker, not traced as failed wakes.
+      if (action.strategy === 'redeliver' && !shouldAttemptDelivery(session)) continue;
+      // A start still in flight (queued behind the cap) is not asked again.
+      if (this.pendingStarts.has(session)) continue;
+      // A failed wake waits its backoff before the next attempt.
+      const backoff = this.wakeFailures.get(this.wakeKey(session, action.workItemId));
+      if (backoff && now < backoff.nextAt) continue;
+      // A wake that worked is not repeated every pass while the item stays queued, and one agent
+      // is woken only so often whatever the items.
+      const paced = this.wakeSuccesses.get(this.wakeKey(session, action.workItemId));
+      if (paced && now < paced.nextAt) continue;
+      if (this.sessionWakeCapReached(session, now)) continue;
+      actedOn.add(session);
+      if (overConfiguredMax && action.strategy !== 'redeliver') {
+        LoggerService.getInstance().createComponentLogger('ReconcilerService').info('Waking the named target although the configured max concurrent agents is reached', {
+          agent: session,
+          workItemId: action.workItemId,
+          strategy: action.strategy,
+          activeAgents: activeAgentCount,
+          maxConcurrentAgents: maxConcurrent,
+        });
+      }
+      try {
+        const outcome = await this.attemptWake(action);
+        this.recordWakeOutcome(action, outcome, result);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.recordWakeOutcome(action, { outcome: 'failed', reason: message }, result);
+        result.errors.push(
+          `Wake action error for agent ${session}: ${message}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Override wake pacing and stalled-agent thresholds (tests, tuning).
+   *
+   * @param tuning - Fields to change
+   */
+  setWakeTuning(tuning: Partial<WakeTuning>): void {
+    this.wakeTuning = { ...this.wakeTuning, ...tuning };
+  }
+
+  /**
+   * Whether the session already had its fill of successful wakes in the window.
+   *
+   * @param session - Agent session
+   * @param now - Epoch ms
+   * @returns True when the cap is reached
+   */
+  private sessionWakeCapReached(session: string, now: number): boolean {
+    const recent = (this.sessionWakeTimes.get(session) ?? []).filter((t) => now - t < this.wakeTuning.sessionWakeWindowMs);
+    if (recent.length === 0) this.sessionWakeTimes.delete(session);
+    else this.sessionWakeTimes.set(session, recent);
+    return recent.length >= this.wakeTuning.maxWakesPerSessionPerWindow;
+  }
+
+  /** Map key of a session + WorkItem failure backoff. */
+  private wakeKey(session: string, workItemId: string): string {
+    return `${session}\u0000${workItemId}`;
+  }
+
+  /**
+   * Run one wake. A start / rehydrate that has not finished within
+   * `startAwaitMs` (typically queued behind the running-agent cap) is
+   * reported pending and settles in the background, so the pass neither
+   * stalls nor asks again (CREW-304).
+   *
+   * @param action - The wake
+   * @returns Its outcome now (pending when still in flight)
+   */
+  private async attemptWake(action: WakeAction): Promise<WakeActionResult> {
+    const call = this.dataProvider.executeWakeAction!(action).then(normalizeWakeResult);
+    if (action.strategy === 'redeliver') return call;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), this.wakeTuning.startAwaitMs);
+      (timer as { unref?: () => void }).unref?.();
+    });
+    const first = await Promise.race([call, timeout]);
+    if (timer) clearTimeout(timer);
+    if (first) return first;
+
+    const session = action.agentSessionName;
+    this.pendingStarts.set(session, { workItemId: action.workItemId, since: Date.now() });
+    call
+      .then((late) => {
+        this.pendingStarts.delete(session);
+        this.recordWakeOutcome(action, late, null);
+      })
+      .catch((err: unknown) => {
+        this.pendingStarts.delete(session);
+        this.recordWakeOutcome(action, { outcome: 'failed', reason: err instanceof Error ? err.message : String(err) }, null);
+      });
+    return { outcome: 'pending', reason: 'start still in progress' };
+  }
+
+  /**
+   * Trace and pace one wake outcome: ok clears the session's backoffs; a
+   * failure backs that session + WorkItem off (doubling, capped); pending is
+   * traced once per episode; skipped is neither traced nor backed off.
+   *
+   * @param action - The wake
+   * @param res - Its outcome
+   * @param result - The pass result to count into (null when it settled after the pass)
+   */
+  private recordWakeOutcome(action: WakeAction, res: WakeActionResult, result: ReconcileResult | null): void {
+    const session = action.agentSessionName;
+    const summary = `Reconciler woke ${session} (${action.strategy}) for queued work`;
+    if (res.outcome === 'skipped') return;
+
+    if (res.outcome === 'pending') {
+      if (this.pendingTraced.has(session)) return;
+      this.pendingTraced.add(session);
+      traceHarness('harness.wake', {
+        workItemId: action.workItemId,
+        session,
+        summary: `${summary}: pending (${res.reason ?? 'start queued'})`,
+        outcome: 'queued',
+        data: { strategy: action.strategy, ...(res.reason ? { reason: res.reason } : {}) },
+      });
+      return;
+    }
+
+    this.pendingTraced.delete(session);
+    if (res.outcome === 'ok') {
+      this.redeliveryMisses.delete(action.workItemId);
+      for (const [key, entry] of this.wakeFailures) {
+        if (entry.session === session) this.wakeFailures.delete(key);
+      }
+      const nowMs = Date.now();
+      const successKey = this.wakeKey(session, action.workItemId);
+      const count = (this.wakeSuccesses.get(successKey)?.count ?? 0) + 1;
+      const waitMs = Math.min(this.wakeTuning.successBackoffBaseMs * 2 ** Math.min(count - 1, 30), this.wakeTuning.successBackoffMaxMs);
+      this.wakeSuccesses.set(successKey, { count, nextAt: nowMs + waitMs, workItemId: action.workItemId });
+      this.sessionWakeTimes.set(session, [...(this.sessionWakeTimes.get(session) ?? []), nowMs]);
+      traceHarness('harness.wake', {
+        workItemId: action.workItemId,
+        session,
+        summary,
+        outcome: 'ok',
+        data: { strategy: action.strategy },
+      });
+      if (result) {
+        result.wakeActions.push(action);
+        result.agentsWoken++;
+      }
+      return;
+    }
+
+    const key = this.wakeKey(session, action.workItemId);
+    const failures = (this.wakeFailures.get(key)?.failures ?? 0) + 1;
+    const retryInMs = wakeFailureBackoffMs(failures, this.wakeTuning);
+    this.wakeFailures.set(key, { failures, nextAt: Date.now() + retryInMs, session, workItemId: action.workItemId });
+    traceHarness('harness.wake', {
+      workItemId: action.workItemId,
+      session,
+      summary: `${summary}: failed${res.reason ? ` (${res.reason})` : ''}; next try in ${Math.round(retryInMs / 1000)}s`,
+      outcome: 'failed',
+      data: { strategy: action.strategy, attempt: failures, retryInMs, ...(res.reason ? { reason: res.reason } : {}) },
+    });
+    if (result) {
+      result.errors.push(
+        `Wake action failed for agent ${session} (strategy: ${action.strategy})`,
+      );
+    }
+    if (action.strategy === 'redeliver') {
+      const misses = (this.redeliveryMisses.get(action.workItemId) ?? 0) + 1;
+      this.redeliveryMisses.set(action.workItemId, misses);
+      if (this.redeliveryMisses.size > RECONCILER_WAKE_CONSTANTS.REDELIVERY_ESCALATED_KEPT) {
+        const oldest = this.redeliveryMisses.keys().next().value;
+        if (oldest !== undefined && oldest !== action.workItemId) this.redeliveryMisses.delete(oldest);
+      }
+      if (misses >= RECONCILER_WAKE_CONSTANTS.REDELIVERY_ESCALATE_AFTER) {
+        void this.escalateRedeliveryMiss(action.workItemId, session, misses, res.reason);
+      }
+    }
+  }
+
+  /**
+   * Tell the target's lead, once per WorkItem, that its brief keeps failing
+   * to reach the agent (CREW-577). Best-effort: never throws, and does
+   * nothing when idle-holder reporting is not wired.
+   *
+   * @param workItemId - The queued WorkItem
+   * @param session - Its target
+   * @param attempts - Consecutive failed redeliveries
+   * @param reason - Why the last one failed
+   */
+  private async escalateRedeliveryMiss(workItemId: string, session: string, attempts: number, reason?: string): Promise<void> {
+    if (!this.idleHolderDeps || this.escalatedRedeliveries.has(workItemId)) return;
+    this.escalatedRedeliveries.add(workItemId);
+    if (this.escalatedRedeliveries.size > RECONCILER_WAKE_CONSTANTS.REDELIVERY_ESCALATED_KEPT) {
+      const oldest = this.escalatedRedeliveries.values().next().value;
+      if (oldest !== undefined && oldest !== workItemId) this.escalatedRedeliveries.delete(oldest);
+    }
+    const log = LoggerService.getInstance().createComponentLogger('ReconcilerService');
+    try {
+      const review = await surfaceRedeliveryMiss({ workItemId, session, attempts, ...(reason ? { reason } : {}) }, this.idleHolderDeps);
+      log.warn('Brief keeps failing to reach its target — reported to its lead', { workItemId, session, attempts, reason, lead: review.target, reviewWorkItemId: review.id });
+    } catch (err) {
+      this.escalatedRedeliveries.delete(workItemId);
+      log.warn('Reporting a failing redelivery failed (non-fatal)', { workItemId, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /**
+   * Recover agents whose queued work has waited past the threshold while
+   * their session is stopped, hung or idle (CREW-303), and stopped agents
+   * that still hold work (running / blocked by their outage). Once per
+   * session per cooldown, with one `harness.recover` trace:
+   * - stopped → its failure backoff is cleared and one start is asked for
+   *   now (through the normal start path: running-agent cap, team gates);
+   * - hung / idle → the session is stopped as a harness park, so the next
+   *   pass's wake starts it fresh with its queued work in the briefing.
+   *
+   * Best-effort: never throws.
+   *
+   * @param workItems - The pass's WorkItems
+   * @param agentHealthMap - Agent health by session
+   * @param result - The pass result
+   */
+  private async recoverStalledAgents(
+    workItems: WorkItem[],
+    agentHealthMap: Map<string, AgentHealth>,
+    result: ReconcileResult,
+  ): Promise<void> {
+    if (!this.dataProvider.executeWakeAction) return;
+    const log = LoggerService.getInstance().createComponentLogger('ReconcilerService');
+    try {
+      const now = Date.now();
+      const hung = new Set(this.dataProvider.getHungAgents?.() ?? []);
+      const stalled = detectStalledAgents(workItems, agentHealthMap, {
+        now,
+        queuedAgeMs: this.wakeTuning.stalledQueuedAgeMs,
+        heldStoppedMs: this.wakeTuning.stalledHeldMs,
+        idleNoProgressMs: this.wakeTuning.stalledIdleMs,
+        hungSessions: hung,
+      });
+      for (const agent of stalled) {
+        const last = this.recoveredAt.get(agent.sessionName);
+        if (last !== undefined && now - last < this.wakeTuning.recoveryCooldownMs) continue;
+        if (this.pendingStarts.has(agent.sessionName)) continue;
+        // Hybrid wake just tried to start it: that is the recovery for this pass.
+        if (agent.kind === 'stopped' && this.wokenThisPass.has(agent.sessionName)) continue;
+        if (agent.kind !== 'stopped' && !this.dataProvider.parkStalledAgent) continue;
+        this.recoveredAt.set(agent.sessionName, now);
+        await this.recoverOne(agent, result, log);
+      }
+      // Forget sessions that are no longer stalled, so a later stall recovers at once.
+      const still = new Set(stalled.map((a) => a.sessionName));
+      for (const [session, at] of this.recoveredAt) {
+        if (!still.has(session) && now - at >= this.wakeTuning.recoveryCooldownMs) this.recoveredAt.delete(session);
+      }
+    } catch (err) {
+      log.warn('Stalled-agent recovery pass failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Recover one stalled agent (see {@link recoverStalledAgents}).
+   *
+   * @param agent - The stalled agent
+   * @param result - The pass result
+   * @param log - Logger
+   */
+  private async recoverOne(
+    agent: StalledAgent,
+    result: ReconcileResult,
+    log: ReturnType<ReturnType<typeof LoggerService.getInstance>['createComponentLogger']>,
+  ): Promise<void> {
+    const minutes = Math.round(agent.queuedForMs / 60_000);
+    const work = [
+      agent.queuedCount > 0 ? `${agent.queuedCount} queued` : '',
+      agent.heldCount > 0 ? `${agent.heldCount} held (claimed but not progressed)` : '',
+    ].filter(Boolean).join(' and ');
+    const base = `${agent.sessionName} is ${agent.kind} with ${work} work item(s), oldest waiting ${minutes} min`;
+    let outcome: 'ok' | 'failed' | 'queued' = 'failed';
+    let action = '';
+
+    if (agent.kind === 'stopped') {
+      for (const [key, entry] of this.wakeFailures) {
+        if (entry.session === agent.sessionName) this.wakeFailures.delete(key);
+      }
+      const wake: WakeAction = {
+        workItemId: agent.workItem.id,
+        agentSessionName: agent.sessionName,
+        strategy: 'start',
+        score: 0,
+        scoreBreakdown: { skillMatch: 0, urgency: 0, contextFamiliarity: 0, loadPenalty: 0 },
+        triggeredAt: new Date().toISOString(),
+        ...(agent.teamId ? { teamId: agent.teamId } : {}),
+        ...(agent.memberId ? { memberId: agent.memberId } : {}),
+      };
+      const res = await this.attemptWake(wake).catch((err: unknown): WakeActionResult => ({
+        outcome: 'failed',
+        reason: err instanceof Error ? err.message : String(err),
+      }));
+      this.recordWakeOutcome(wake, res, result);
+      outcome = res.outcome === 'ok' ? 'ok' : res.outcome === 'pending' ? 'queued' : res.outcome === 'skipped' ? 'queued' : 'failed';
+      action = `start requested (${res.outcome}${res.reason ? `: ${res.reason}` : ''})`;
+    } else {
+      const parked = await this.dataProvider.parkStalledAgent!(agent.sessionName, agent.role ?? '').catch(() => false);
+      outcome = parked ? 'ok' : 'failed';
+      action = parked ? 'session stopped; the next wake starts it fresh' : 'could not stop the session';
+    }
+
+    traceHarness('harness.recover', {
+      workItemId: agent.workItem.id,
+      session: agent.sessionName,
+      summary: `Recovered stalled agent: ${base}; ${action}`,
+      outcome,
+      data: { kind: agent.kind, queuedMinutes: minutes, queuedCount: agent.queuedCount, heldCount: agent.heldCount },
+    });
+    log.warn('Recovered a stalled agent with waiting work', {
+      sessionName: agent.sessionName,
+      kind: agent.kind,
+      workItemId: agent.workItem.id,
+      queuedMinutes: minutes,
+      queuedCount: agent.queuedCount,
+      heldCount: agent.heldCount,
+      outcome,
+    });
+  }
+}
