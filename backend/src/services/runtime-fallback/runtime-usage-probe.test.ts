@@ -3,7 +3,15 @@
  */
 
 import * as os from 'os';
-import { classifyClaudeUsageProbe, classifyProviderProbe, createRuntimeUsageProbe, type ProbeFetch } from './runtime-usage-probe.js';
+import { classifyClaudeUsageProbe, classifyCodexUsageProbe, classifyProviderProbe, createRuntimeUsageProbe, type ProbeFetch } from './runtime-usage-probe.js';
+
+describe('classifyCodexUsageProbe', () => {
+	it('clears a stale mark only after a successful model turn', () => {
+		expect(classifyCodexUsageProbe({ code: 0, stdout: 'OK', stderr: '' })).toBe('available');
+		expect(classifyCodexUsageProbe({ code: 1, stdout: 'Out of usage', stderr: '' })).toBe('limited');
+		expect(classifyCodexUsageProbe({ code: 1, stdout: 'Login expired', stderr: '' })).toBe('unknown');
+	});
+});
 
 describe('classifyClaudeUsageProbe', () => {
 	it('reads a usage limit, a normal answer and anything else', () => {
@@ -48,7 +56,7 @@ describe('createRuntimeUsageProbe', () => {
 		const run = jest.fn(async () => {
 			throw new Error('boom');
 		});
-		expect(await createRuntimeUsageProbe({ run, credentials, resolveCommand: () => '/x' })('codex-cli')).toBe('unsupported');
+		expect(await createRuntimeUsageProbe({ run, credentials, resolveCommand: () => '/x' })('codex-cli')).toBe('unknown');
 		expect(await createRuntimeUsageProbe({ run, credentials, resolveCommand: () => null })('claude-code')).toBe('unknown');
 		expect(await createRuntimeUsageProbe({ run, credentials, resolveCommand: () => '/x', scratchDir: os.tmpdir() })('claude-code')).toBe('unknown');
 	});

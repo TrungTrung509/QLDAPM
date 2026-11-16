@@ -310,6 +310,7 @@ export class TicketReviewService {
           continue;
         }
         if (t.status !== 'waiting_confirmation' || !ticketNeedsReview(t) || !t.submittedAt) continue;
+        if (/PLAN_STANDALONE\.md/.test(t.description ?? '')) continue;
         // Silence accepts: a hard deadline from the answer, whatever the nudges
         // did — or sooner, once the owner has moved on in the thread without
         // an objection (no ticket mechanics are ever shown to the owner).

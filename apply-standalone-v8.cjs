@@ -1,0 +1,11 @@
+const fs=require('node:fs'),path=require('node:path');
+const apply=require('./seed-crewly/upgrade-atelierx-v8.cjs');
+const team='af30c001-2789-4f20-b917-000000000010',file='/home/node/.crewly/teams/'+team+'/config.json';
+apply.build();
+const config=JSON.parse(fs.readFileSync(file));
+if(config.members.length!==6)throw Error('Expected six agents');
+const backup=file+'.before-standalone-v8';if(!fs.existsSync(backup))fs.copyFileSync(file,backup);
+apply(config);
+for(const id of new Set(config.members.flatMap(m=>m.skillOverrides).filter(id=>id.endsWith('-v8'))))fs.cpSync(path.join(__dirname,'seed-crewly/skills',id),path.join('/home/node/.crewly/skills',id),{recursive:true});
+fs.writeFileSync(file+'.tmp',JSON.stringify(config,null,2));fs.renameSync(file+'.tmp',file);
+console.log(JSON.stringify(config.members.map(m=>({session:m.sessionName,skills:m.skillOverrides.filter(s=>s.endsWith('-v8'))})),null,2));

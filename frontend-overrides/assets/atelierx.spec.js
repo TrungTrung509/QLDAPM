@@ -28,6 +28,22 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '../..');
 
+test('Sàn trưng bày serves a local catalog and CSP-compatible viewer', () => {
+  const showcase = path.resolve(repoRoot, '../AtelierX/showcase');
+  const catalog = JSON.parse(fs.readFileSync(path.join(showcase, 'catalog.json'), 'utf8'));
+  assert.ok(catalog.products.length > 0);
+  const product = catalog.products[0];
+  assert.ok(['preview', 'complete'].includes(product.status));
+  assert.ok(fs.existsSync(path.join(showcase, product.model)));
+  const viewer = fs.readFileSync(path.join(showcase, product.viewer), 'utf8');
+  assert.match(viewer, /\/atelierx-products\/assets\/model-viewer\.min\.js/);
+  assert.match(viewer, /\/atelierx-products\/assets\/viewer\.js/);
+  assert.doesNotMatch(viewer, /<script(?![^>]*\bsrc=)[^>]*>/i);
+  const studio = fs.readFileSync(path.join(repoRoot, 'frontend-overrides/atelierx.html'), 'utf8');
+  assert.match(studio, /id="showcase-list"/);
+  assert.match(studio, /id="showcase-frame"/);
+});
+
 function parseMarkdownTicket(filePath) {
   const raw = fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n');
   const fmMatch = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
@@ -641,6 +657,9 @@ test('REGRESSION Bug 1 & Bug 2: parent ATEL-1 never steals child WorkItems menti
       taskName: 'Write blog post',
       status: 'active',
     },
+    { id: 'wi-barber', projectId: 'other-project-999', teamId: 'other-team-999', assignedSessionName: 'atelierx-designer-0003', taskName: 'BBS-5 booking', status: 'pending_assignment' },
+    { id: 'wi-qa:review:blocked', projectId: '', teamId: team.id, taskName: 'Blocked: ATEL-1 QA', status: 'pending_assignment' },
+    { id: 'wi-miss:review:redelivery_miss', projectId: '', teamId: team.id, taskName: 'Brief not reaching atelierx-designer-0003', status: 'pending_assignment' },
   ];
 
   const studioTasks = filterStudioTasks(rawPool, {
@@ -1048,7 +1067,7 @@ test('REGRESSION Bug 5 + CSP, DOM ID contract, font asset existence, LF bundle c
 
   const scriptTags = html.match(/<script\b[^>]*>[\s\S]*?<\/script>/gi) || [];
   assert.equal(scriptTags.length, 1, 'Exactly one external module script tag');
-  assert.match(scriptTags[0], /src="\/assets\/atelierx\.js\?v=20261113v4"/);
+  assert.match(scriptTags[0], /src="\/assets\/atelierx\.js\?v=20261114v8"/);
   assert.doesNotMatch(html, /\son[a-z]+\s*=/i, 'No inline event handlers in HTML');
 
   // Verify every ID queried by atelierx.js exists in atelierx.html

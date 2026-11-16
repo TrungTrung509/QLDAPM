@@ -14,7 +14,7 @@ for (const id of ids) {
   const src = path.join(seed, 'skills', id);
   const dest = path.join(home, 'skills', id);
   fs.accessSync(path.join(src, 'SKILL.md'));
-  fs.cpSync(src, dest, {recursive: true, force: false});
+  if (!fs.existsSync(dest)) fs.cpSync(src, dest, {recursive: true});
 }
 const dest = path.join(home, 'teams', team);
 fs.mkdirSync(dest, {recursive: true});
@@ -27,6 +27,7 @@ for (const member of current.members) {
   if (!seedMember) continue;
   member.systemPrompt = seedMember.systemPrompt;
   member.skillOverrides = seedMember.skillOverrides;
+  member.excludedRoleSkills = seedMember.excludedRoleSkills;
 }
 const liveTmp = liveConfig + '.flow-' + process.pid;
 fs.writeFileSync(liveTmp, JSON.stringify(current, null, 2) + '\n');
@@ -39,3 +40,4 @@ if (!projects.some(p => p.id === project.id)) {
   fs.renameSync(tmp, file);
 }
 console.log('AtelierX installed:', config.members.length, 'members,', ids.size, 'studio skills');
+require('./install-atelierx-v9.cjs')(home);

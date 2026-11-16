@@ -1528,6 +1528,15 @@
         transition: none !important;
       }
     }
+    .showcase-overlay{position:fixed;inset:0;z-index:1200;background:#273444a8;display:none;padding:clamp(12px,3vw,40px)}
+    .showcase-overlay.open{display:grid;place-items:center}
+    .showcase-shell{width:min(1400px,100%);height:min(900px,100%);background:#e8edf0;color:#18212b;border:1px solid #ffffffb0;border-radius:24px;display:grid;grid-template-rows:auto 1fr;overflow:hidden;box-shadow:0 28px 100px #18212b66}
+    .showcase-head{display:flex;justify-content:space-between;align-items:center;padding:16px 22px;border-bottom:1px solid #26374630}
+    .showcase-head h2{margin:0;font-size:20px}.showcase-close{background:#ffffffb8;color:#18212b;border:1px solid #26374630;border-radius:10px;padding:8px 12px;cursor:pointer}
+    .showcase-body{min-height:0;display:grid;grid-template-columns:minmax(220px,290px) 1fr}.showcase-list{overflow:auto;padding:16px;border-right:1px solid #26374630;display:grid;align-content:start;gap:10px}
+    .showcase-product{width:100%;text-align:left;background:#fff;color:#18212b;border:1px solid #aab4be;border-radius:14px;padding:14px;cursor:pointer}.showcase-product.active{border-color:#27779b;background:#d8edf4}.showcase-product strong,.showcase-product span{display:block}.showcase-product span{font-size:12px;color:#52616e;margin-top:5px}
+    .showcase-view{min-width:0;min-height:0;display:grid;grid-template-rows:auto 1fr}.showcase-meta{padding:12px 18px;font-size:13px;color:#334454;border-bottom:1px solid #26374630}.showcase-frame{width:100%;height:100%;border:0;background:#cbd2d8}.showcase-empty{padding:24px;color:#52616e}
+    @media(max-width:700px){.showcase-body{grid-template-columns:1fr;grid-template-rows:auto 1fr}.showcase-list{display:flex;overflow-x:auto;overflow-y:hidden;border-right:0;border-bottom:1px solid #ffffff24}.showcase-product{min-width:210px}.showcase-shell{border-radius:14px}}
   </style>
 </head>
 <body>
@@ -1694,6 +1703,13 @@
     </aside>
   </main>
 
+  <section id="showcase-overlay" class="showcase-overlay" role="dialog" aria-modal="true" aria-labelledby="showcase-title" aria-hidden="true">
+    <div class="showcase-shell">
+      <header class="showcase-head"><h2 id="showcase-title">✦ Sàn trưng bày AtelierX</h2><button id="showcase-close" class="showcase-close" type="button">Đóng ×</button></header>
+      <div class="showcase-body"><nav id="showcase-list" class="showcase-list" aria-label="Danh sách sản phẩm"></nav><div class="showcase-view"><div id="showcase-meta" class="showcase-meta">Chọn một sản phẩm để xem 3D.</div><iframe id="showcase-frame" class="showcase-frame" title="Sản phẩm AtelierX 3D" loading="lazy" allow="fullscreen"></iframe></div></div>
+    </div>
+  </section>
+
   <!-- Modal Quota & Task Telemetry 6 Agents -->
   <div id="token-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <div class="modal-box">
@@ -1726,6 +1742,6 @@
     </div>
   </div>
 
-  <script type="module" src="/assets/atelierx.js?v=20261113v4"></script>
+  <script type="module" src="/assets/atelierx.js?v=20261116v4"></script>
 </body>
 </html>

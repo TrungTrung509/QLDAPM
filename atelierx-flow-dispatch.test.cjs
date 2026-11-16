@@ -1,0 +1,20 @@
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+const {pathToFileURL}=require('node:url');
+const {dispatchArtifacts}=require('./atelierx-flow-dispatch.cjs');
+test('artifact wakes existing QA once, releases only dependency block, never creates work',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'atel-dispatch-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const home=path.join(dir,'home'),root=path.join(dir,'project');fs.mkdirSync(home);fs.mkdirSync(path.join(root,'quality'),{recursive:true});fs.mkdirSync(path.join(root,'orders/ATEL-99'),{recursive:true});
+  const base=await import(pathToFileURL(path.resolve(__dirname,'../AtelierX/tools/studio-base.mjs')).href);
+  const flow=await import(pathToFileURL(path.resolve(__dirname,'../AtelierX/tools/studio-flow.mjs')).href);
+  const routing={...base,...flow};
+  fs.writeFileSync(path.join(root,'quality/studio-control.json'),JSON.stringify({awaitingBrief:false}));
+  const file='orders/ATEL-99/shape.json';fs.writeFileSync(path.join(root,file),JSON.stringify({orderId:'ATEL-99',revision:'v1'}));
+  const event={id:'shape:v1:'+base.sha(path.join(root,file)),stage:'shape',revision:'v1',file};
+  fs.writeFileSync(path.join(root,'orders/ATEL-99/studio-flow.json'),JSON.stringify({tasks:{qa:{workItemId:'qa-one',target:'atelierx-qa-0004',title:'Kiểm áo'}},events:[event]}));
+  const calls=[];let blockedReason='usage_limit';
+  const api=async(route,body)=>{calls.push({route,body});return route.startsWith('task-pool/items/')?{id:'qa-one',status:'blocked',blockedReason}:{}};
+  await dispatchArtifacts({home,root,api,routing});assert(!calls.some(c=>c.route.startsWith('terminal/')));
+  blockedReason='studio-wait: shape';await dispatchArtifacts({home,root,api,routing});await dispatchArtifacts({home,root,api,routing});
+  assert.equal(calls.filter(c=>c.route.startsWith('terminal/')).length,1);assert.equal(calls.filter(c=>c.route.startsWith('task-pool/release/')).length,1);
+  assert(!calls.some(c=>c.route.includes('/add')));
+});

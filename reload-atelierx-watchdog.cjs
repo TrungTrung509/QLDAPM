@@ -1,0 +1,1 @@
+const fs=require('node:fs');const file='/home/node/.crewly/atelierx-watchdog.json.pid';const pid=Number(fs.readFileSync(file,'utf8'));const cmd=fs.readFileSync('/proc/'+pid+'/cmdline','utf8');if(!cmd.includes('atelierx-watchdog.cjs'))throw Error('Unexpected process');process.kill(pid,'SIGTERM');console.log('Restarting watchdog',pid);

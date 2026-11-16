@@ -2008,6 +2008,9 @@ export class TaskPoolService {
    * @returns true when the verification path should fire
    */
   private requiresVerification(wi: WorkItem): boolean {
+    // AtelierX uses one independent QA of the assembled product. Reviewing
+    // every intermediate material/artwork/scene handoff stalls production.
+    if (wi.target?.startsWith('atelierx-') || wi.metadata?.['teamId'] === 'af30c001-2789-4f20-b917-000000000010') return false;
     const metaFlag = (wi.metadata as { requiresVerification?: boolean } | undefined)?.requiresVerification;
     if (metaFlag === true) return true;
     if (metaFlag === false) return false;

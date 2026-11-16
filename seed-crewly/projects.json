@@ -1,21 +1,5 @@
 [
   {
-    "id": "f0c67446-db1b-4209-b12b-d45e577b1d97",
-    "name": "Barbershop-Booking-System",
-    "path": "/home/node/project/Barbershop-Booking-System",
-    "teams": {
-      "orchestrator": [
-        "orchestrator"
-      ],
-      "core": [
-        "62132154-1530-4fc7-b0bc-54999a9c7fa8"
-      ]
-    },
-    "status": "active",
-    "createdAt": "2026-11-05T02:49:05.760Z",
-    "updatedAt": "2026-11-05T03:04:20.970Z"
-  },
-  {
     "id": "af30c001-2789-4f20-b917-000000000020",
     "name": "AtelierX",
     "path": "/home/node/project/AtelierX",

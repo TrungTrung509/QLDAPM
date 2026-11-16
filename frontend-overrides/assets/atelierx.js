@@ -322,9 +322,7 @@ export function classifyWorkBucket(ticketStatus, liveTaskStatus) {
   if (s === 'in_progress' || ['active', 'running', 'in_progress', 'working', 'assigned'].includes(ls)) {
     return 'active';
   }
-  if (['blocked', 'failed', 'input_required'].includes(ls)) {
-    return 'review';
-  }
+  if (['blocked', 'failed', 'input_required'].includes(ls)) return 'review';
   if (!s && ['done', 'completed', 'verified'].includes(ls)) {
     return 'done';
   }
@@ -390,9 +388,25 @@ export function filterStudioTasks(allTasks = [], { activeProjectId = DEFAULT_PRO
   const knownTicketIds = (Array.isArray(tickets) ? tickets : [])
     .map((tk) => (tk && tk.id ? String(tk.id).toUpperCase() : ''))
     .filter(Boolean);
+  const completedTickets = (Array.isArray(tickets) ? tickets : []).filter(
+    (tk) => tk && ['done', 'completed', 'verified', 'cancelled'].includes(String(tk.status || '').toLowerCase()),
+  );
 
   return allTasks.filter((t) => {
     if (!t) return false;
+    if (/^(?:Refresh standing answer|Cleanup \d+ of \d+ low-quality wiki page|Migrate \d+ legacy wiki item)/i.test(String(t.taskName || ''))) return false;
+    // Review/redelivery WorkItems are internal orchestration diagnostics, not studio tasks.
+    if (String(t.id || '').includes(':review:')) return false;
+    if (/^(?:Brief not reaching|Went quiet on a running task|Blocked:|Mission review)/i.test(String(t.taskName || ''))) return false;
+    // Completed ticket history must not return as a live error/queue card.
+    if (completedTickets.some((tk) => {
+      if (tk.workItemId && (t.id === tk.workItemId || String(t.id || '').startsWith(`${tk.workItemId}:`))) return true;
+      const prefix = new RegExp(`^\\s*(?:Retry\\s+\\d+\/\\d+:\\s*)?(?:Verify:\\s*)?${String(tk.id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=[:\\s.-]|$)`, 'i');
+      return prefix.test(String(t.taskName || ''));
+    })) return false;
+    // An explicit foreign project always wins over a matching session or title.
+    if (t.projectId && activeProjectId && t.projectId !== activeProjectId) return false;
+    if (t.teamId && teamId && t.teamId !== teamId && !t.projectId) return false;
     if (activeProjectId && t.projectId === activeProjectId) return true;
     if (teamId && t.teamId === teamId) return true;
     if (t.id && ticketWorkItemIds.has(t.id)) return true;
@@ -462,7 +476,8 @@ export function resolveTicketDepartment(ticket, members = []) {
 
 export function buildDepartmentWorkloads(tickets = [], tasks = [], members = []) {
   const validTickets = Array.isArray(tickets) ? tickets.filter((t) => t && t.status !== 'cancelled') : [];
-  const validTasks = Array.isArray(tasks) ? tasks.filter((t) => t && t.status !== 'cancelled') : [];
+  const validTasks = Array.isArray(tasks) ? tasks.filter((t) => t && t.status !== 'cancelled' &&
+    !['standing-refresh', 'wiki_quality_cleanup', 'wiki_legacy_migrate'].includes(t.metadata?.kind)) : [];
 
   const matchedTaskIds = new Set();
   const ticketMeta = validTickets.map((ticket) => ({
@@ -570,17 +585,17 @@ export function buildDepartmentWorkloads(tickets = [], tasks = [], members = [])
       bucket !== 'done' && latestLog?.rawNote
         ? latestLog.rawNote.match(/(?:\bBLOCKED\b[^.;\n]*[:—-]?\s*[^]*|Blocker\s*cuối\s*:\s*[^]*)$/i)
         : null;
-    const logIndicatesBlocked = Boolean(blockerClauseMatch);
+    const logIndicatesBlocked = Boolean(blockerClauseMatch) && (!linkedTask ? ticket.status === 'blocked' : linkedTask.status === 'blocked');
 
     const hasBlocker =
-      linkedTask?.status === 'blocked' ||
-      Boolean(linkedTask?.blockReason) ||
+      (bucket !== 'done' && linkedTask?.status === 'blocked') ||
+      (linkedTask?.status === 'blocked' && Boolean(linkedTask?.blockedReason || linkedTask?.blockReason)) ||
       ticket.status === 'blocked' ||
       logIndicatesBlocked;
 
-    const blockerNote = linkedTask?.blockReason
-      ? cleanOneLine(linkedTask.blockReason, 175)
-      : blockerClauseMatch
+    const blockerNote = linkedTask?.status === 'blocked' && (linkedTask?.blockedReason || linkedTask?.blockReason)
+      ? cleanOneLine(linkedTask.blockedReason || linkedTask.blockReason, 300)
+      : linkedTask?.status === 'blocked' && blockerClauseMatch
         ? cleanOneLine(blockerClauseMatch[0], 175)
         : '';
 
@@ -592,6 +607,8 @@ export function buildDepartmentWorkloads(tickets = [], tasks = [], members = [])
       priority: ticket.priority || null,
       bucket,
       statusLabel:
+        linkedTask?.status === 'blocked' ? flowLabel('blocked') :
+        linkedTask?.status === 'queued' ? flowLabel('queued') :
         assignmentSource !== 'direct' && !ticket.assignee && bucket === 'queued'
           ? `${flowLabel(ticket.status)} · Chờ giao`
           : flowLabel(ticket.status),
@@ -633,8 +650,8 @@ export function buildDepartmentWorkloads(tickets = [], tasks = [], members = [])
       bucket,
       statusLabel: flowLabel(task.status),
       liveStatusLabel: null,
-      hasBlocker: task.status === 'blocked' || Boolean(task.blockReason),
-      blockerNote: task.blockReason ? cleanOneLine(task.blockReason, 175) : '',
+      hasBlocker: task.status === 'blocked',
+      blockerNote: task.status === 'blocked' && (task.blockedReason || task.blockReason) ? cleanOneLine(task.blockedReason || task.blockReason, 300) : '',
       brief,
       criteriaDone: 0,
       criteriaTotal: 0,
@@ -1864,6 +1881,7 @@ export function initAtelierXStudio() {
   let studioTasks = [];
   let liveTokenUsage = null;
   let liveRuntimeFallback = null;
+  let codexIdentity = null;
   let activeProjectId = DEFAULT_PROJECT_ID;
   let online = false;
   let activeModalFilter = 'all';
@@ -2354,6 +2372,13 @@ export function initAtelierXStudio() {
           pipeGrid.append(step);
         }
         runwayCard.append(pipeGrid);
+        const galleryButton = document.createElement('button');
+        galleryButton.type = 'button';
+        galleryButton.className = 'tiny-btn';
+        galleryButton.textContent = '✦ Xem danh sách sản phẩm 3D';
+        galleryButton.style.margin = '10px 16px 16px';
+        galleryButton.addEventListener('click', () => selectDepartment(6, true));
+        runwayCard.append(galleryButton);
         nav.append(runwayCard);
         continue;
       }
@@ -2536,9 +2561,23 @@ export function initAtelierXStudio() {
   function renderTokenModalTable(workloads) {
     const banner = document.getElementById('modal-runtime-banner');
     if (banner) {
+      if (codexIdentity?.email) {
+        banner.removeAttribute?.('hidden'); banner.hidden = false;
+        const quota = codexIdentity.quota;
+        const measuredAt = quota?.measuredAt ? Date.parse(quota.measuredAt) : NaN;
+        const checkedAt = codexIdentity.checkedAt ? Date.parse(codexIdentity.checkedAt) : NaN;
+        const quotaFresh = Number.isFinite(measuredAt) && Date.now() - measuredAt < 5 * 60 * 1000;
+        const updaterFresh = Number.isFinite(checkedAt) && Date.now() - checkedAt < 2 * 60 * 1000;
+        const quotaLabel = quotaFresh
+          ? `Còn ${quota.fiveHourRemaining}% (5 giờ), ${quota.weeklyRemaining ?? '?'}% (tuần)`
+          : quota ? `Quota chưa cập nhật (số đo cuối: ${quota.fiveHourRemaining}% / ${quota.weeklyRemaining ?? '?'}%)` : 'Đang chờ số đo quota mới';
+        const syncLabel = updaterFresh ? 'Đồng bộ đang chạy' : 'Đồng bộ đã dừng hoặc mất kết nối';
+        const timeLabel = Number.isFinite(measuredAt) ? new Date(measuredAt).toLocaleTimeString('vi-VN') : 'chưa có';
+        banner.textContent = `Codex: ${codexIdentity.email} · ${quotaLabel} · ${codexIdentity.sessionsFresh ? 'Phiên agent đã làm mới' : 'Đang chờ làm mới phiên agent'} · ${syncLabel} · đo ${timeLabel}`;
+      }
       const exhausted = Array.isArray(liveRuntimeFallback?.exhausted) ? liveRuntimeFallback.exhausted : [];
       const overrides = Array.isArray(liveRuntimeFallback?.overrides) ? liveRuntimeFallback.overrides : [];
-      if (exhausted.length > 0 || overrides.length > 0) {
+      if (!codexIdentity?.email && (exhausted.length > 0 || overrides.length > 0)) {
         const exNames = exhausted.map((e) => shortRuntimeName(e.runtime)).filter(Boolean);
         banner.removeAttribute?.('hidden');
         banner.hidden = false;
@@ -2546,7 +2585,7 @@ export function initAtelierXStudio() {
           exNames.length > 0
             ? `⚠️ Cảnh báo Runtime Crewly: ${exNames.join(', ')} đã chạm giới hạn quota${overrides.length > 0 ? ` · ${overrides.length} Agent đã chuyển sang Runtime dự phòng.` : '.'}`
             : `ℹ️ Có ${overrides.length} Agent đang chạy trên Runtime dự phòng.`;
-      } else {
+      } else if (!codexIdentity?.email) {
         banner.setAttribute('hidden', '');
         banner.hidden = true;
         banner.textContent = '';
@@ -2623,6 +2662,65 @@ export function initAtelierXStudio() {
     }
   }
 
+  async function openShowcase() {
+    const overlay = document.getElementById('showcase-overlay');
+    const list = document.getElementById('showcase-list');
+    const frame = document.getElementById('showcase-frame');
+    const meta = document.getElementById('showcase-meta');
+    if (!overlay || !list || !frame || !meta) return;
+    overlay.classList.add('open');
+    overlay.setAttribute('aria-hidden', 'false');
+    list.replaceChildren();
+    meta.textContent = 'Đang tải danh sách sản phẩm…';
+    try {
+      const response = await fetch('/atelierx-products/catalog.json', { cache: 'no-store' });
+      if (!response.ok) throw new Error('catalog unavailable');
+      const catalog = await response.json();
+      const products = Array.isArray(catalog.products) ? [...catalog.products].sort((a, b) => {
+        const rank = product => product?.status === 'complete' ? 0 : 1;
+        return rank(a) - rank(b) || (Number(String(b?.id || '').match(/ATEL-(\d+)/)?.[1] || 0) - Number(String(a?.id || '').match(/ATEL-(\d+)/)?.[1] || 0));
+      }) : [];
+      if (!products.length) { meta.textContent = 'Chưa có sản phẩm trong Sàn trưng bày.'; frame.removeAttribute('src'); return; }
+      let first = null;
+      for (const product of products) {
+        const viewerPath = String(product?.viewer || '');
+        if (!/^products\/ATEL-\d+\/[a-zA-Z0-9._-]+\/index\.html$/.test(viewerPath) || viewerPath.includes('..')) continue;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'showcase-product';
+        const name = document.createElement('strong');
+        name.textContent = String(product.name || product.id || 'Sản phẩm');
+        const info = document.createElement('span');
+        info.textContent = `${product.id || ''} · ${product.revision || ''} · ${product.statusLabel || product.status || ''}`;
+        button.append(name, info);
+        button.addEventListener('click', () => {
+          list.querySelectorAll('.showcase-product').forEach((el) => el.classList.remove('active'));
+          button.classList.add('active');
+          meta.textContent = `${product.name || product.id} · ${product.statusLabel || product.status || ''}. ${product.description || ''}`;
+          frame.src = `/atelierx-products/${product.viewer}?revision=${encodeURIComponent(product.revision || '')}&theme=light`;
+        });
+        list.append(button);
+        if (!first) first = button;
+      }
+      if (first) first.click();
+      else meta.textContent = 'Catalog chưa có sản phẩm xem được.';
+    } catch {
+      meta.textContent = 'Chưa tải được catalog sản phẩm. Kiểm tra thư mục AtelierX/showcase.';
+    }
+  }
+
+  const showcaseOverlay = document.getElementById('showcase-overlay');
+  const showcaseClose = document.getElementById('showcase-close');
+  function closeShowcase() {
+    if (!showcaseOverlay) return;
+    showcaseOverlay.classList.remove('open');
+    showcaseOverlay.setAttribute('aria-hidden', 'true');
+    const frame = document.getElementById('showcase-frame');
+    if (frame) frame.removeAttribute('src');
+  }
+  if (showcaseClose) showcaseClose.addEventListener('click', closeShowcase);
+  if (showcaseOverlay) showcaseOverlay.addEventListener('click', (e) => { if (e.target === showcaseOverlay) closeShowcase(); });
+
   function selectDepartment(index, focusCamera = false) {
     if (index < 0 || index > 6) return;
     hasAutoSelected = true;
@@ -2646,6 +2744,7 @@ export function initAtelierXStudio() {
       camera();
     }
     renderAll();
+    if (index === 6) openShowcase();
 
     const targetCard = nav.querySelector(`[data-dept-index="${index}"]`);
     if (targetCard && typeof targetCard.scrollIntoView === 'function') {
@@ -2749,10 +2848,12 @@ export function initAtelierXStudio() {
         }
       }
 
-      const [usageResult, fallbackResult] = await Promise.allSettled([
+      const [usageResult, fallbackResult, identityResult] = await Promise.allSettled([
         fetch('/api/system/usage/caps?days=1', { cache: 'no-store', headers }),
         fetch('/api/system/runtime-fallback', { cache: 'no-store', headers }),
+        fetch('/atelierx-products/codex-account.json', { cache: 'no-store' }),
       ]);
+      if (identityResult.status === 'fulfilled' && identityResult.value?.ok) codexIdentity = await identityResult.value.json();
 
       if (usageResult.status === 'fulfilled' && usageResult.value?.ok) {
         const usageData = await usageResult.value.json();

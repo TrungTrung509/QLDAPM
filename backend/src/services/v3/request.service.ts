@@ -444,6 +444,22 @@ export class RequestService {
       throw new Error(`Request not found: ${id}`);
     }
     const previousStatus = request.status;
+    // AtelierX product requests require a delivered viewer and independent QA.
+    // A routing/acknowledgement update from the orchestrator is not submission.
+    if (/PLAN_STANDALONE\.md/.test(request.description ?? '') &&
+        (updates.status === 'waiting_confirmation' || updates.status === 'done')) {
+      const id = String(updates.result ?? '').match(/ATEL-\d+/)?.[0];
+      let published = false;
+      if (id) {
+        try {
+          const catalog = JSON.parse(await fs.readFile('/home/node/project/AtelierX/showcase/catalog.json', 'utf8'));
+          published = catalog.products?.some((p: { id: string; status: string }) => p.id === id && p.status === 'complete') === true;
+        } catch { /* No valid delivery yet. */ }
+      }
+      if (!published || !/ATELIERX_DELIVERY_VERIFIED/.test(String(updates.result ?? ''))) {
+        updates = { ...updates, status: 'running', accepted: false };
+      }
+    }
 
     // Ticket review gate (specs/ticket-loop.md Phase 2): a ticket that needs
     // the owner never becomes `done` on its own. Every close path (cascade,

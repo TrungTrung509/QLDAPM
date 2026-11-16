@@ -235,6 +235,12 @@ export const Teams: React.FC<TeamsProps> = ({ createOpen, onCreateOpenChange, on
    */
   const handleStartTeam = async (teamId: string) => {
     try {
+      if (teamId === 'orchestrator') {
+        const result = await apiService.setupOrchestrator();
+        if (!result.success) throw new Error(result.error || 'Failed to start orchestrator');
+        await fetchTeams();
+        return;
+      }
       await apiService.startTeam(teamId);
     } catch (error) {
       logSilentError(error, { context: 'handleStartTeam' });

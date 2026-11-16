@@ -428,6 +428,22 @@ export class RuntimeFallbackService implements RuntimeFallbackHooks {
 		this.availability = null;
 		try {
 			await this.recheckAfterLogin(runtime);
+			// A new account can answer while WorkItems released by the old account
+			// remain queued. Wake their assigned agents after quota is confirmed.
+			if (runtime === RUNTIME_TYPES.CODEX_CLI && !this.state.exhausted[runtime]
+				&& await this.deps.probe(runtime) === 'available') {
+				const { TaskPoolService } = await import('../task-pool/task-pool.service.js');
+				const { WorkItemDispatchSubscriber } = await import('../v3/workitem-dispatch.subscriber.js');
+				const pool = TaskPoolService.getInstance();
+				for (const item of await pool.getAllItems()) {
+					if (item.status === 'blocked' && item.target && /usage_limit|quota/i.test(item.blockedReason ?? '')) {
+						await pool.releaseBack(item.id, 'Codex account signed in and quota probe passed');
+					}
+				}
+				const items = await pool.getAvailableItems();
+				const queued = items.filter((item) => item.status === 'queued' && item.target);
+				for (const item of queued) await WorkItemDispatchSubscriber.getInstance().redispatch(item);
+			}
 		} catch (err) {
 			this.logger.warn('Re-checking a runtime after a sign-in failed', { runtime, error: err instanceof Error ? err.message : String(err) });
 		}

@@ -6,13 +6,16 @@ services:
     container_name: crewly
     restart: unless-stopped
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
     volumes:
       - crewly_data:/home/node/.crewly
       - ${HOST_PROJECT_PATH:-..}:/home/node/project
+      # Crewly signs in independently, avoiding refresh-token races with Windows.
+      - crewly_codex_data:/home/node/.codex
     environment:
-      - NODE_ENV=production
+      - NODE_ENV=development
       - WEB_PORT=8787
+      - WIKI_BRIDGE_ENABLED=false
       - DEFAULT_RUNTIME=antigravity-cli
       - CREWLY_FORCE_EMPTY_BOOT=1
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
@@ -27,4 +30,6 @@ services:
 
 volumes:
   crewly_data:
+    driver: local
+  crewly_codex_data:
     driver: local

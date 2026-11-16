@@ -1,0 +1,1 @@
+const fs=require('node:fs');const file='/home/node/.codex/sessions/2026/11/15/rollout-2026-11-15T08-14-20-01a1de45-7f3c-7372-bf5f-c461d1c9fa69.jsonl';for(const line of fs.readFileSync(file,'utf8').trim().split('\n')){try{const o=JSON.parse(line);const rate=o.payload?.info?.rate_limits||o.payload?.rate_limits;if(rate)console.log(JSON.stringify(rate))}catch{}}

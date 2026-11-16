@@ -87,6 +87,13 @@ export function classifyClaudeUsageProbe(result: { code: number | null; stdout: 
 	return 'unknown';
 }
 
+/** A Codex login is usable only when an actual model turn succeeds. */
+export function classifyCodexUsageProbe(result: { code: number | null; stdout: string; stderr: string }): ProbeResult {
+	const match = detectUsageLimit(`${result.stdout}\n${result.stderr}`, RUNTIME_TYPES.CODEX_CLI);
+	if (match && isExhaustingKind(match.kind)) return 'limited';
+	return result.code === 0 ? 'available' : 'unknown';
+}
+
 /**
  * Classify a provider's answer to a one-token request.
  *
@@ -205,6 +212,16 @@ export function createRuntimeUsageProbe(deps: UsageProbeDeps = {}): (runtime: st
 				const targets = deps.crewlyAgentTargets ? await deps.crewlyAgentTargets() : [];
 				const fetchFn = deps.fetch ?? (globalThis.fetch as unknown as ProbeFetch);
 				return await probeCrewlyAgent(targets, fetchFn, timeoutMs);
+			}
+			if (runtime === RUNTIME_TYPES.CODEX_CLI) {
+				const binary = resolve('codex');
+				if (!binary) return 'unknown';
+				const scratch = deps.scratchDir ?? path.join(os.tmpdir(), 'crewly-usage-probe');
+				fs.mkdirSync(scratch, { recursive: true });
+				const env = { ...baseEnv };
+				for (const name of STRIPPED_ENV) delete env[name];
+				const result = await run(binary, ['exec', '--model', 'gpt-6-luna', '--skip-git-repo-check', '--sandbox', 'read-only', 'Reply exactly OK'], { env, timeoutMs, cwd: scratch });
+				return classifyCodexUsageProbe(result);
 			}
 			if (runtime !== RUNTIME_TYPES.CLAUDE_CODE) return 'unsupported';
 			const binary = resolve('claude');
