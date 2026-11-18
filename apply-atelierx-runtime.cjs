@@ -3,7 +3,7 @@ function apply(root='/usr/local/lib/node_modules/crewly/dist/backend/backend/src
 function patch(relative,marker,replacement){const file=path.join(root,relative),s=fs.readFileSync(file,'utf8');if(s.includes(replacement))return;if(!s.includes(marker))throw Error('Runtime patch target changed: '+relative);fs.writeFileSync(file,s.replace(marker,replacement));}
 const verify='requiresVerification(wi) {',verifyReplacement=verify+"\n        if (wi.target?.startsWith('atelierx-') || wi.metadata?.teamId === 'af30c001-2789-4f20-b917-000000000010') return false;";
 patch('services/task-pool/task-pool.service.js',verify,verifyReplacement);
-const body='const body = req.body;',replacement=body+"\n        if (body && typeof body === 'object') Object.assign(body, (await import('file:///home/node/project/crewly-docker/atelierx-task-title.cjs')).default.normalize(body));";
+const body='const body = req.body;',replacement=body+"\n        if (body && typeof body === 'object') Object.assign(body, (await import('file:///home/node/crewly-runtime/atelierx-task-title.cjs')).default.normalize(body));";
 // Scope insertion to addItem; other controllers may use the same local name.
 const controller=path.join(root,'controllers/task-pool/task-pool.controller.js'),s=fs.readFileSync(controller,'utf8');
 if(!s.includes(replacement)){const index=s.indexOf('export async function addItem(');if(index<0||!s.slice(index).includes(body))throw Error('addItem runtime target changed');fs.writeFileSync(controller,s.slice(0,index)+s.slice(index).replace(body,replacement));}

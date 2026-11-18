@@ -50,20 +50,30 @@ async function main(){
   let busy=false;
   let lastIdentityAt=0;
   async function publishCodexIdentity(){try{
-    const authFile='/home/node/.codex/auth.json',auth=JSON.parse(fs.readFileSync(authFile,'utf8'));
-    const claims=JSON.parse(Buffer.from(auth.tokens.id_token.split('.')[1],'base64url'));
-    const rotationFile=path.join(home,'atelierx-codex-account-rotation.json');
-    const rotation=fs.existsSync(rotationFile)?JSON.parse(fs.readFileSync(rotationFile,'utf8')):{};
-    const sessionsFresh=rotation.accountId===auth.tokens.account_id;
-    let quota=null,quotaError=null;
-    try {
-      const limits=await require('./codex-rate-limits.cjs').readCodexRateLimits();
-      if(limits.accountId&&limits.accountId!==auth.tokens.account_id)throw Error('Codex quota account does not match signed-in account');
-      const rate=limits.rateLimitsByLimitId?.codex||limits.rateLimits;
-      if(!rate?.primary||!Number.isFinite(rate.primary.usedPercent))throw Error('Codex quota response has no primary window');
-      quota={fiveHourRemaining:Math.max(0,Math.round(100-rate.primary.usedPercent)),weeklyRemaining:Number.isFinite(rate.secondary?.usedPercent)?Math.max(0,Math.round(100-rate.secondary.usedPercent)):null,measuredAt:new Date().toISOString(),source:'codex-app-server',ordinaryUsageAllowed:limits.ordinaryUsageAllowed};
-    } catch(e) {quotaError=e.message;}
-    const value={email:claims.email||null,authMode:auth.auth_mode,checkedAt:new Date().toISOString(),sessionsFresh,quota,quotaError};
+    const poolDir=path.join(home,'codex-accounts');
+    const poolEmails=[];
+    try{for(const d of fs.readdirSync(poolDir,{withFileTypes:true})){if(!d.isDirectory())continue;const af=path.join(poolDir,d.name,'auth.json');if(!fs.existsSync(af))continue;try{const a=JSON.parse(fs.readFileSync(af,'utf8'));const c=a.tokens?.id_token?JSON.parse(Buffer.from(a.tokens.id_token.split('.')[1],'base64url')):null;poolEmails.push({name:d.name,email:c?.email||(a.OPENAI_API_KEY?'API key':'ChatGPT')});}catch{}}}catch{}
+    const authFile='/home/node/.codex/auth.json';
+    let email=null,authMode=null,sessionsFresh=false,quota=null,quotaError=null;
+    if(fs.existsSync(authFile)){
+      const auth=JSON.parse(fs.readFileSync(authFile,'utf8'));
+      const claims=auth.tokens?.id_token?JSON.parse(Buffer.from(auth.tokens.id_token.split('.')[1],'base64url')):null;
+      const rotationFile=path.join(home,'atelierx-codex-account-rotation.json');
+      const rotation=fs.existsSync(rotationFile)?JSON.parse(fs.readFileSync(rotationFile,'utf8')):{};
+      sessionsFresh=rotation.accountId===auth.tokens?.account_id;
+      email=claims?.email||null;authMode=auth.auth_mode||null;
+      try {
+        const limits=await require('./codex-rate-limits.cjs').readCodexRateLimits();
+        if(limits.accountId&&auth.tokens?.account_id&&limits.accountId!==auth.tokens.account_id)throw Error('Codex quota account does not match signed-in account');
+        const rate=limits.rateLimitsByLimitId?.codex||limits.rateLimits;
+        if(!rate?.primary||!Number.isFinite(rate.primary.usedPercent))throw Error('Codex quota response has no primary window');
+        quota={fiveHourRemaining:Math.max(0,Math.round(100-rate.primary.usedPercent)),weeklyRemaining:Number.isFinite(rate.secondary?.usedPercent)?Math.max(0,Math.round(100-rate.secondary.usedPercent)):null,measuredAt:new Date().toISOString(),source:'codex-app-server',ordinaryUsageAllowed:limits.ordinaryUsageAllowed};
+      } catch(e) {quotaError=e.message;}
+    } else if (poolEmails.length > 0) {
+      email=poolEmails.map(p=>`${p.name}: ${p.email}`).join(' · ');
+      authMode='pool';sessionsFresh=true;
+    } else { return; }
+    const value={email,authMode,checkedAt:new Date().toISOString(),sessionsFresh,quota,quotaError,poolAccounts:poolEmails,poolCount:poolEmails.length+(fs.existsSync(authFile)?1:0)};
     const file=path.join(root,'showcase/codex-account.json');fs.writeFileSync(file+'.tmp',JSON.stringify(value));fs.renameSync(file+'.tmp',file);
   }catch(e){console.error('[AtelierX watchdog] Codex identity unavailable:',e.message)}}
   async function rotateCodexSessions(items){

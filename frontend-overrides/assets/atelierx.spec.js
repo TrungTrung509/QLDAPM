@@ -31,17 +31,44 @@ const repoRoot = path.resolve(__dirname, '../..');
 test('Sàn trưng bày serves a local catalog and CSP-compatible viewer', () => {
   const showcase = path.resolve(repoRoot, '../AtelierX/showcase');
   const catalog = JSON.parse(fs.readFileSync(path.join(showcase, 'catalog.json'), 'utf8'));
-  assert.ok(catalog.products.length > 0);
-  const product = catalog.products[0];
-  assert.ok(['preview', 'complete'].includes(product.status));
-  assert.ok(fs.existsSync(path.join(showcase, product.model)));
-  const viewer = fs.readFileSync(path.join(showcase, product.viewer), 'utf8');
-  assert.match(viewer, /\/atelierx-products\/assets\/model-viewer\.min\.js/);
-  assert.match(viewer, /\/atelierx-products\/assets\/viewer\.js/);
-  assert.doesNotMatch(viewer, /<script(?![^>]*\bsrc=)[^>]*>/i);
+  assert.ok(catalog.products.length >= 6);
+  assert.ok(fs.existsSync(path.join(showcase, 'assets/viewer.css')));
+
+  for (const product of catalog.products) {
+    assert.ok(['preview', 'complete'].includes(product.status), `Valid status on ${product.id}`);
+    assert.doesNotMatch(
+      `${product.name || ''} ${product.statusLabel || ''} ${product.description || ''} ${product.tagline || ''}`,
+      /\?[a-zA-ZÀ-ỹ]/,
+      `No ?-mojibake in catalog entry ${product.id}`,
+    );
+    assert.ok(fs.existsSync(path.join(showcase, product.model)), `Model exists for ${product.id}`);
+
+    const viewer = fs.readFileSync(path.join(showcase, product.viewer), 'utf8');
+    assert.match(viewer, /\/atelierx-products\/assets\/viewer\.css/, `viewer.css linked in ${product.id}`);
+    assert.match(viewer, /\/atelierx-products\/assets\/model-viewer\.min\.js/, `model-viewer linked in ${product.id}`);
+    assert.match(viewer, /\/atelierx-products\/assets\/viewer\.js/, `viewer.js linked in ${product.id}`);
+    assert.doesNotMatch(viewer, /<script(?![^>]*\bsrc=)[^>]*>/i, `No inline script in ${product.id}`);
+    assert.doesNotMatch(viewer, /\son[a-z]+\s*=/i, `No inline handler in ${product.id}`);
+
+    assert.ok(product.content, `Content file declared for ${product.id}`);
+    const content = JSON.parse(fs.readFileSync(path.join(showcase, product.content), 'utf8'));
+    assert.equal(content.orderId, product.id);
+    assert.equal(content.revision, product.revision);
+    assert.ok(content.title?.trim(), `Title present for ${product.id}`);
+    assert.ok(content.summary?.trim(), `Summary present for ${product.id}`);
+    assert.ok(content.style?.trim(), `Style present for ${product.id}`);
+    assert.ok(content.material?.name?.trim(), `Material name present for ${product.id}`);
+    assert.ok(Array.isArray(content.details) && content.details.length >= 3, `Details >= 3 for ${product.id}`);
+    assert.ok(Array.isArray(content.specifications) && content.specifications.length >= 3, `Specs >= 3 for ${product.id}`);
+    assert.ok(Array.isArray(content.credits) && content.credits.length >= 1, `Credits >= 1 for ${product.id}`);
+  }
+
   const studio = fs.readFileSync(path.join(repoRoot, 'frontend-overrides/atelierx.html'), 'utf8');
   assert.match(studio, /id="showcase-list"/);
   assert.match(studio, /id="showcase-frame"/);
+  assert.match(studio, /id="showcase-filters"/);
+  assert.match(studio, /id="showcase-open-tab"/);
+  assert.match(studio, /id="showcase-count"/);
 });
 
 function parseMarkdownTicket(filePath) {
@@ -381,7 +408,7 @@ function createStudioDomHarness() {
 
   // Construct the exact DOM tree matching atelierx.html
   const documentElement = new MockElement('html');
-  documentElement.setAttribute('data-studio-theme', 'day');
+  documentElement.setAttribute('data-studio-theme', 'night');
   const body = new MockElement('body');
   documentElement.append(body);
 
@@ -394,19 +421,22 @@ function createStudioDomHarness() {
   };
 
   body.append(
-    mk('div', 'kpi-active-work', 'kpi-chip kpi-active'),
-    mk('div', 'kpi-queued-work', 'kpi-chip'),
-    mk('div', 'kpi-done-work', 'kpi-chip'),
+    mk('button', 'kpi-active-work', 'kpi-chip kpi-active'),
+    mk('button', 'kpi-queued-work', 'kpi-chip'),
+    mk('button', 'kpi-done-work', 'kpi-chip'),
   );
   const tokBtn = mk('button', 'token-summary-btn');
   tokBtn.append(mk('span', 'token-summary-indicator'));
   body.append(
     tokBtn,
+    mk('button', 'btn-back-tickets', 'icon-pill-btn'),
     mk('div', 'status'),
     mk('button', 'btn-theme-toggle'),
     mk('button', 'btn-sync-now'),
+    mk('button', 'btn-fullscreen-studio', 'icon-pill-btn'),
     mk('button', 'btn-toggle-links', 'hud-pill active'),
     mk('button', 'btn-toggle-callouts', 'hud-pill active'),
+    mk('button', 'btn-showcase-hud', 'hud-pill hud-showcase'),
     mk('span', 'zoom-indicator', 'hud-pill'),
   );
 
@@ -421,6 +451,7 @@ function createStudioDomHarness() {
     mk('button', 'reset'),
     mk('button', 'plus'),
     mk('button', 'btn-wide-sidebar'),
+    mk('button', 'btn-collapse-sidebar'),
     mk('span', 'sync-badge'),
     mk('button', 'btn-sort-mode', 'tiny-btn is-active'),
     mk('button', 'btn-expand-all', 'tiny-btn'),
@@ -439,6 +470,25 @@ function createStudioDomHarness() {
     mk('section', 'info'),
     mk('section', 'task-flow'),
   );
+
+  const showcaseOverlay = mk('section', 'showcase-overlay', 'showcase-overlay', { 'aria-hidden': 'true' });
+  const showcaseFilters = mk('div', 'showcase-filters', 'showcase-filters');
+  showcaseFilters.append(
+    mk('button', '', 'showcase-filter-btn active', { 'data-showcase-filter': 'all' }),
+    mk('button', '', 'showcase-filter-btn', { 'data-showcase-filter': 'complete' }),
+    mk('button', '', 'showcase-filter-btn', { 'data-showcase-filter': 'preview' }),
+  );
+  showcaseOverlay.append(
+    mk('h2', 'showcase-title'),
+    mk('span', 'showcase-count', 'showcase-count-pill'),
+    showcaseFilters,
+    mk('button', 'showcase-open-tab', 'showcase-action-btn'),
+    mk('button', 'showcase-close', 'showcase-close'),
+    mk('nav', 'showcase-list', 'showcase-list'),
+    mk('div', 'showcase-meta', 'showcase-meta'),
+    mk('iframe', 'showcase-frame', 'showcase-frame'),
+  );
+  body.append(showcaseOverlay);
 
   const modal = mk('div', 'token-modal', 'modal-overlay');
   modal.append(
@@ -785,6 +835,22 @@ test('REGRESSION Bug 3: computeAgentTokenInfo integrates SpendCap + RuntimeFallb
   assert.match(onFallbackTok.shortBadge, /Dự phòng Codex/);
   assert.match(onFallbackTok.model, /Antigravity → Codex/);
 
+  // Case C2: Pool load-balancing displays exact secondary account suffix (`Codex (acc2)`) without warning badge
+  const pooledHealthy = {
+    overrides: [],
+    exhausted: [],
+    poolAssignments: { 'atelierx-designer-0003': 'codex-cli@acc2' },
+    runtimeAccounts: [
+      { runtime: 'codex-cli', name: 'acc2', target: 'codex-cli@acc2', signedIn: true },
+    ],
+  };
+  const pooledTok = computeAgentTokenInfo(3, members, { agents: [], teams: [] }, pooledHealthy);
+  assert.equal(pooledTok.status, 'unlimited');
+  assert.equal(pooledTok.isRunningOnFallback, false);
+  assert.equal(pooledTok.pillClass, 'tok-unlimited');
+  assert.match(pooledTok.model, /Codex \(acc2\)/);
+  assert.match(pooledTok.noteText, /Chia tải pool: Codex \(acc2\)/);
+
   // Case D: SpendCap 15% remaining -> low warning (`🟠 Còn 15%`)
   const lowTok = computeAgentTokenInfo(3, members, {
     agents: [{ session: 'atelierx-designer-0003', todayTokens: 85000, capTokens: 100000, stopped: false }],
@@ -936,6 +1002,12 @@ test('initAtelierXStudio end-to-end DOM controller: priority sorting, z-order, r
         }),
       };
     }
+    if (u.startsWith('/atelierx-products/catalog.json')) {
+      const realCatalog = JSON.parse(
+        fs.readFileSync(path.resolve(repoRoot, '../AtelierX/showcase/catalog.json'), 'utf8'),
+      );
+      return { ok: true, json: async () => realCatalog };
+    }
     return { ok: false, json: async () => ({}) };
   };
 
@@ -954,6 +1026,19 @@ test('initAtelierXStudio end-to-end DOM controller: priority sorting, z-order, r
       (worldMarkup.match(/class="room staff"/g) || []).length,
       6,
       'All 6 specialist staff figures rendered inside pavilions',
+    );
+    assert.match(worldMarkup, /class="char-facing"/, 'Articulated human facing wrapper present');
+    assert.match(worldMarkup, /class="char-leg-f"/, 'Articulated human front leg present');
+    assert.match(worldMarkup, /class="char-arm-f"/, 'Articulated human front arm present');
+    assert.equal(
+      world.querySelectorAll('.staff').length,
+      6,
+      'Strictly 6 unique specialist characters inside pavilions',
+    );
+    assert.equal(
+      world.querySelectorAll('.courier').length,
+      0,
+      'Zero duplicate skybridge clone characters rendered',
     );
     const lastStaffIdx = worldMarkup.lastIndexOf('class="room staff"');
     const hudIdx = worldMarkup.indexOf('class="hud-overlays"');
@@ -979,11 +1064,11 @@ test('initAtelierXStudio end-to-end DOM controller: priority sorting, z-order, r
     assert.doesNotMatch(roomsHtml, /<img\b/i, 'XSS payload must be escaped, never parsed as raw HTML tag');
     assert.match(roomsHtml, /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/);
 
-    // 5. Verify "+ Xem thêm 1 việc đã hoàn thành" button on Dept 3
+    // 5. Verify "+1 việc xong" compact button on Dept 3
     const dept3Card = doc.querySelector('[data-dept-index="3"]');
     const moreBtn = dept3Card.querySelector('.more-done-btn');
-    assert.ok(moreBtn, 'Unselected department with 3 done tasks shows "+ Xem thêm" button');
-    assert.match(moreBtn.textContent, /Xem thêm 1 việc/);
+    assert.ok(moreBtn, 'Unselected department with 3 done tasks shows "+N việc xong" button');
+    assert.match(moreBtn.textContent, /\+1 việc xong/);
     moreBtn.click();
     const dept3AfterExpand = doc.querySelector('[data-dept-index="3"]');
     assert.equal(dept3AfterExpand.querySelectorAll('.dept-task-card').length, 3);
@@ -1004,7 +1089,7 @@ test('initAtelierXStudio end-to-end DOM controller: priority sorting, z-order, r
     spotlightBtn.click();
     assert.equal(doc.querySelector('.is-selected').dataset.deptIndex, '4');
 
-    // 8. Verify Department Filter tabs (`active`, `queued`, `done`, `all`)
+    // 8. Verify Department Filter tabs (`active`, `queued`, `done`, `all`) & clickable KPI chips
     const filterButtons = doc.querySelectorAll('[data-dept-filter]');
     filterButtons.find((b) => b.dataset.deptFilter === 'active').click();
     assert.equal(doc.getElementById('rooms').children.length, 1);
@@ -1013,22 +1098,50 @@ test('initAtelierXStudio end-to-end DOM controller: priority sorting, z-order, r
     filterButtons.find((b) => b.dataset.deptFilter === 'all').click();
     assert.equal(doc.getElementById('rooms').children.length, 7);
 
-    // 9. Verify Day <-> Night Runway Theme toggle & Wide Sidebar toggle & Zoom controls
+    doc.getElementById('kpi-active-work').click();
+    assert.equal(doc.getElementById('rooms').children.length, 1, 'KPI active chip filters rooms to active dept');
+    doc.getElementById('kpi-active-work').click();
+    assert.equal(doc.getElementById('rooms').children.length, 7, 'Clicking KPI active chip again resets filter');
+
+    // 9. Verify Night (default) <-> Day toggle, Sidebar collapse/wide, Showcase HUD & Reset guard
+    assert.equal(doc.documentElement.getAttribute('data-studio-theme'), 'night', 'Default theme is cyber-neon night');
+    doc.getElementById('btn-theme-toggle').click();
+    assert.equal(doc.documentElement.getAttribute('data-studio-theme'), 'day');
+    assert.equal(localStorageMock.getItem('atelierx_studio_theme'), 'day');
     doc.getElementById('btn-theme-toggle').click();
     assert.equal(doc.documentElement.getAttribute('data-studio-theme'), 'night');
-    assert.equal(localStorageMock.getItem('atelierx_studio_theme'), 'night');
     assert.doesNotMatch(world.innerHTML, /\bNaN\b/);
 
+    doc.getElementById('btn-collapse-sidebar').click();
+    assert.equal(doc.body.classList.contains('sidebar-collapsed'), true);
     doc.getElementById('btn-wide-sidebar').click();
+    assert.equal(doc.body.classList.contains('sidebar-collapsed'), false, 'Wide button uncollapses sidebar');
     assert.equal(doc.body.classList.contains('sidebar-wide'), true);
 
-    doc.getElementById('plus').click();
-    assert.notEqual(svg.getAttribute('viewBox'), '-660 -450 1320 880');
-    doc.getElementById('reset').click();
-    assert.equal(svg.getAttribute('viewBox'), '-660 -450 1320 880');
-    assert.match(doc.getElementById('zoom-indicator').textContent, /100%/);
+    doc.getElementById('btn-showcase-hud').click();
+    assert.equal(doc.getElementById('showcase-overlay').classList.contains('open'), true);
+    await new Promise((r) => setTimeout(r, 20));
+    const showcaseCards = doc.getElementById('showcase-list').querySelectorAll('.showcase-product');
+    assert.equal(showcaseCards.length, 6, 'Sàn trưng bày renders all 6 catalog products');
+    assert.match(doc.getElementById('showcase-count').textContent, /4 hoàn thiện/);
+    assert.match(doc.getElementById('showcase-frame').src, /theme=night/);
+    doc.querySelector('[data-showcase-filter="complete"]').click();
+    assert.equal(doc.getElementById('showcase-list').querySelectorAll('.showcase-product').length, 4);
+    doc.querySelector('[data-showcase-filter="preview"]').click();
+    assert.equal(doc.getElementById('showcase-list').querySelectorAll('.showcase-product').length, 2);
+    doc.querySelector('[data-showcase-filter="all"]').click();
+    assert.equal(doc.getElementById('showcase-list').querySelectorAll('.showcase-product').length, 6);
+    doc.dispatchKeyDown('Escape');
+    assert.equal(doc.getElementById('showcase-overlay').classList.contains('open'), false);
 
-    // 10. Verify Token Quota Modal + Runtime Fallback Banner (`antigravity-cli` exhausted -> Nhi marked `out`)
+    doc.getElementById('plus').click();
+    assert.notEqual(svg.getAttribute('viewBox'), '-660 -470 1320 884');
+    doc.getElementById('reset').click();
+    assert.equal(svg.getAttribute('viewBox'), '-660 -470 1320 884');
+    assert.match(doc.getElementById('zoom-indicator').textContent, /100%/);
+    assert.equal(doc.getElementById('showcase-overlay').classList.contains('open'), false, 'Reset must NOT open showcase modal');
+
+    // 10. Verify Token Quota Modal + Runtime Fallback Banner (`antigravity-cli` exhausted -> Visual Studio marked `out`)
     doc.getElementById('token-summary-btn').click();
     const modal = doc.getElementById('token-modal');
     assert.equal(modal.classList.contains('open'), true);
@@ -1038,9 +1151,32 @@ test('initAtelierXStudio end-to-end DOM controller: priority sorting, z-order, r
 
     const tbody = doc.getElementById('token-table-body');
     assert.equal(tbody.children.length, 6);
+    const tbodyText = tbody.children.map((tr) => tr.children.map((td) => td.textContent).join(' ')).join('\n');
+    const roleNames = [
+      'Studio Lead',
+      'Trend Researcher',
+      'Material Specialist',
+      'Fashion Designer',
+      'Technical QA',
+      'Visual Studio',
+    ];
+    for (const role of roleNames) {
+      assert.ok(tbodyText.includes(role), `Token modal table must display role "${role}"`);
+    }
+    const humanNameRe = /\b(Minh|An|Linh|Vy|Khoa|Nhi)\b/;
+    const sidebarRoomsHtml = doc.getElementById('rooms').innerHTML;
+    const spotlightHtml = doc.getElementById('active-spotlight').innerHTML;
+    assert.doesNotMatch(world.innerHTML, humanNameRe, 'SVG #world must not display human persona names');
+    assert.doesNotMatch(sidebarRoomsHtml, humanNameRe, 'Sidebar #rooms must not display human persona names');
+    assert.doesNotMatch(spotlightHtml, humanNameRe, '#active-spotlight must not display human persona names');
+    assert.doesNotMatch(tbodyText, humanNameRe, '#token-table-body must not display human persona names');
+    for (const role of roleNames) {
+      assert.ok(world.innerHTML.includes(role), `SVG #world must display role "${role}"`);
+    }
+
     const modalTabs = doc.querySelectorAll('.modal-tab-btn');
     modalTabs.find((b) => b.dataset.filter === 'out').click();
-    assert.equal(tbody.children.length, 1, 'Nhi running on exhausted Antigravity override appears under out filter');
+    assert.equal(tbody.children.length, 1, 'Visual Studio running on exhausted Antigravity override appears under out filter');
     modalTabs.find((b) => b.dataset.filter === 'ok').click();
     assert.equal(tbody.children.length, 5);
 
@@ -1067,16 +1203,24 @@ test('REGRESSION Bug 5 + CSP, DOM ID contract, font asset existence, LF bundle c
 
   const scriptTags = html.match(/<script\b[^>]*>[\s\S]*?<\/script>/gi) || [];
   assert.equal(scriptTags.length, 1, 'Exactly one external module script tag');
-  assert.match(scriptTags[0], /src="\/assets\/atelierx\.js\?v=20261114v8"/);
+  assert.match(scriptTags[0], /src="\/assets\/atelierx\.js\?v=20261117v7"/);
   assert.doesNotMatch(html, /\son[a-z]+\s*=/i, 'No inline event handlers in HTML');
+  assert.doesNotMatch(
+    html,
+    /\.token-badge-svg[\s\S]*?transform\s*:/i,
+    'Hover CSS must never apply transform: on SVG pills (would overwrite SVG translate)',
+  );
 
   // Verify every ID queried by atelierx.js exists in atelierx.html
   const htmlIds = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
+  assert.ok(htmlIds.has('btn-manage-accounts'), 'Quota modal header exposes + Thêm / Quản lý Account button');
+  assert.ok(htmlIds.has('btn-back-tickets'), 'Topbar exposes ← Tickets button for full-screen mode');
+  assert.ok(htmlIds.has('btn-fullscreen-studio'), 'Topbar exposes ⛶ Thu nhỏ / Toàn màn button');
   const jsQueriedIds = [
     ...[...jsSource.matchAll(/getElementById\('([^']+)'\)/g)].map((m) => m[1]),
     ...[...jsSource.matchAll(/querySelector\('#([a-zA-Z0-9_-]+)'\)/g)].map((m) => m[1]),
   ];
-  assert.ok(jsQueriedIds.length >= 26, 'Expected >=26 queried DOM IDs');
+  assert.ok(jsQueriedIds.length >= 28, 'Expected >=28 queried DOM IDs');
   for (const id of jsQueriedIds) {
     assert.ok(htmlIds.has(id), `atelierx.html must contain id="${id}" queried by atelierx.js`);
   }
@@ -1089,9 +1233,9 @@ test('REGRESSION Bug 5 + CSP, DOM ID contract, font asset existence, LF bundle c
     assert.ok(fs.existsSync(fullPath), `Font file missing: ${fontFile}`);
   }
 
-  // Verify index.html points to ?v=20261113v4, both index-05f23a33.js copies match byte-for-byte, have ZERO \r, and guard ganttView!==2
+  // Verify index.html points to ?v=20261118v8, both index-05f23a33.js copies match byte-for-byte, have ZERO \r, and include Multi-Account Pool UI + Edit Team dynamic runtime selector
   const indexHtml = fs.readFileSync(path.join(repoRoot, 'frontend-overrides/index.html'), 'utf8');
-  assert.match(indexHtml, /\/assets\/index-05f23a33\.js\?v=20261113v4/);
+  assert.match(indexHtml, /\/assets\/index-05f23a33\.js\?v=20261118v8/);
 
   const rootBundle = fs.readFileSync(path.join(repoRoot, 'frontend-overrides/index-05f23a33.js'), 'utf8');
   const assetsBundle = fs.readFileSync(path.join(repoRoot, 'frontend-overrides/assets/index-05f23a33.js'), 'utf8');
@@ -1099,6 +1243,86 @@ test('REGRESSION Bug 5 + CSP, DOM ID contract, font asset existence, LF bundle c
   assert.equal(assetsBundle.includes('\r'), false, 'Bundle must preserve pure LF line endings (zero CRLF noise)');
   assert.match(assetsBundle, /J\?pe&&ganttView!==2\?/, 'AtelierX Studio tab must render even when project has 0 tickets');
   assert.match(assetsBundle, /ce&&ke\.length===0&&ganttView!==2&&/, 'Empty ticket filter must not hide AtelierX Studio tab');
-  assert.match(assetsBundle, /height:"calc\(100dvh - 190px\)",minHeight:"520px"/, 'Responsive iframe height avoids laptop double scrollbars');
-  assert.match(assetsBundle, /\/atelierx\.html\?v=20261113v4/);
+  assert.match(assetsBundle, /position:"fixed",inset:0,zIndex:90,width:"100vw",height:"100dvh"/, 'Studio opens in full-screen fixed overlay by default');
+  assert.match(assetsBundle, /atelierx-close-studio/);
+  assert.match(assetsBundle, /\/atelierx\.html\?v=20261117v7/);
+  assert.match(assetsBundle, /Multi-Account Token Pool/);
+  assert.match(assetsBundle, /\/api\/system\/runtime-fallback\/accounts/);
+  assert.match(assetsBundle, /function bRt\(/);
+  assert.match(assetsBundle, /function cRtOpts\(/);
+  assert.match(assetsBundle, /function firstCfgRt\(/);
+  assert.match(assetsBundle, /Áp dụng cả team/);
+  assert.match(assetsBundle, /href:"\/settings\?tab=runtimes"/);
+
+  // Evaluate extracted helper functions (bRt, pw, cRtOpts, firstCfgRt) from the compiled bundle
+  const startHelpers = assetsBundle.indexOf('n2={"claude-code"');
+  const endMarker = 'function firstCfgRt(snap){return cRtOpts(snap,"").find(o=>o.configured&&!o.disabled)||null}';
+  const endHelpers = assetsBundle.indexOf(endMarker, startHelpers);
+  assert.ok(startHelpers > 0 && endHelpers > startHelpers, 'Runtime option helpers found cleanly in bundle');
+  const helperSlice = assetsBundle.slice(startHelpers, endHelpers + endMarker.length);
+  const { bRt, pw, cRtOpts, firstCfgRt } = new Function(
+    `const fue=["gemini-cli"],pue=" (retired)",xue=[],${helperSlice};return{bRt,pw,cRtOpts,firstCfgRt};`,
+  )();
+
+  assert.equal(bRt('antigravity-cli@test1'), 'antigravity-cli');
+  assert.equal(pw('antigravity-cli@test1'), 'Antigravity CLI (@test1)');
+
+  const liveLikeSnap = {
+    runtimes: [
+      { runtime: 'claude-code', selectable: false },
+      { runtime: 'codex-cli', selectable: false },
+      { runtime: 'antigravity-cli', selectable: false },
+      { runtime: 'crewly-agent', selectable: false },
+      { runtime: 'antigravity-cli@test1', selectable: true },
+    ],
+    runtimeAccounts: [
+      { runtime: 'antigravity-cli', name: 'test1', target: 'antigravity-cli@test1', identity: '••••Vr_g (Google Gemini)', signedIn: true },
+    ],
+  };
+  const liveOpts = cRtOpts(liveLikeSnap, 'claude-code');
+  assert.equal(liveOpts[0].value, 'claude-code');
+  assert.match(liveOpts[0].label, /Chưa thêm trong Settings\/Runtimes/);
+  assert.equal(liveOpts[1].value, 'antigravity-cli@test1');
+  assert.match(liveOpts[1].label, /Antigravity CLI · @test1 · ••••Vr_g/);
+  assert.equal(liveOpts.length, 2, 'Only configured account + legacy current runtime shown');
+  assert.equal(firstCfgRt(liveLikeSnap)?.value, 'antigravity-cli@test1');
+
+  const pooledSnap = {
+    runtimes: [
+      { runtime: 'codex-cli', selectable: false },
+      { runtime: 'codex-cli@acc1', selectable: true },
+      { runtime: 'codex-cli@acc2', selectable: true },
+    ],
+    runtimeAccounts: [
+      { runtime: 'codex-cli', name: 'acc1', target: 'codex-cli@acc1', identity: 'a@x.com', signedIn: true },
+      { runtime: 'codex-cli', name: 'acc2', target: 'codex-cli@acc2', identity: 'b@x.com', signedIn: true },
+      { runtime: 'codex-cli', name: 'pending', target: 'codex-cli@pending', signedIn: false },
+    ],
+  };
+  const pooledOpts = cRtOpts(pooledSnap, 'codex-cli@acc1');
+  assert.deepEqual(
+    pooledOpts.map((o) => [o.value, Boolean(o.disabled)]),
+    [
+      ['codex-cli@acc1', false],
+      ['codex-cli@acc2', false],
+      ['codex-cli', false],
+      ['codex-cli@pending', true],
+    ],
+  );
+  assert.match(pooledOpts[2].label, /Tự động chia tải \(2 account\)/);
+
+  // Verify useChannelMessages (bK) restores agentThinking across channel switches and z2 expires stale pending prompts
+  assert.ok(
+    assetsBundle.includes('const S=lU(y.messages);a(S),x(z2(S))'),
+    'useChannelMessages must recompute agentThinking on listMessages load',
+  );
+  const z2Match = assetsBundle.match(/function z2\(t\)\{if\(t\.length===0\)return!1;[^}]+\}/);
+  assert.ok(z2Match, 'Found z2 helper in bundle');
+  const z2Fn = new Function(`${z2Match[0]};return z2;`)();
+  const nowIso = new Date().toISOString();
+  const staleIso = new Date(Date.now() - 22 * 60 * 1000).toISOString();
+  assert.equal(z2Fn([{ author: { role: 'user' }, clientMessageId: 'cm-1', createdAt: nowIso }]), true);
+  assert.equal(z2Fn([{ author: { role: 'agent' }, clientMessageId: 'cm-1', createdAt: nowIso }]), false);
+  assert.equal(z2Fn([{ author: { role: 'system' }, createdAt: nowIso }]), false);
+  assert.equal(z2Fn([{ author: { role: 'user' }, clientMessageId: 'cm-2', createdAt: staleIso }]), false);
 });

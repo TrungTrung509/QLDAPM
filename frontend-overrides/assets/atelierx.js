@@ -1,106 +1,121 @@
-// AtelierX Grand Citadel 3D — Monumental Isometric Studio & Department-Centric Task Engine
+// AtelierX Cyber-Couture Neon 3D — Expanded Isometric Studio & Minimalist Department Engine
+
+export const PAVILION_SCALE = 1.25;
 
 export const STUDIO_ZONES = [
   {
     index: 0,
     label: 'Điều phối',
-    staffName: 'Minh',
+    staffName: 'Studio Lead',
+    roleShort: 'Lead',
     memberName: 'Studio Lead',
     agentId: 'atelierx-team-leader-0001',
     memberId: 'af30c001-2789-4f20-b917-000000000001',
     roleKey: 'team-leader',
     icon: '👑',
     duty: 'Điều phối đơn hàng, phân việc song song & duyệt bàn giao cuối',
-    x: -240,
-    y: -240,
-    h: 46,
+    x: -232,
+    y: -232,
+    h: 34,
     color: '#C98A4B',
+    neon: '#fbbf24',
     kind: 'desk',
   },
   {
     index: 1,
     label: 'Nghiên cứu',
-    staffName: 'An',
+    staffName: 'Trend Researcher',
+    roleShort: 'Researcher',
     memberName: 'Market & Trend Researcher',
     agentId: 'atelierx-tpm-0002',
     memberId: 'af30c001-2789-4f20-b917-000000000002',
     roleKey: 'tpm',
     icon: '🔍',
     duty: 'Nghiên cứu thị trường, chủ thể minh họa, bố cục & bảng màu',
-    x: -290,
-    y: 20,
-    h: 32,
-    color: '#3E9BA9',
+    x: -378,
+    y: 62,
+    h: 26,
+    color: '#1E8FA5',
+    neon: '#22d3ee',
     kind: 'board',
   },
   {
     index: 2,
     label: 'Vật liệu',
-    staffName: 'Linh',
+    staffName: 'Material Specialist',
+    roleShort: 'Material',
     memberName: 'Merchandiser / Material Specialist',
     agentId: 'atelierx-backend-developer-0005',
     memberId: 'af30c001-2789-4f20-b917-000000000005',
     roleKey: 'backend-developer',
     icon: '🧵',
     duty: 'Đặc tả chất liệu số PBR, màu vải, độ nhám & vùng in',
-    x: 20,
-    y: -290,
-    h: 32,
-    color: '#6E9A63',
+    x: 62,
+    y: -378,
+    h: 26,
+    color: '#2F8F6B',
+    neon: '#34d399',
     kind: 'fabric',
   },
   {
     index: 3,
     label: 'Thiết kế',
-    staffName: 'Vy',
+    staffName: 'Fashion Designer',
+    roleShort: 'Designer',
     memberName: 'Fashion Designer',
     agentId: 'atelierx-designer-0003',
     memberId: 'af30c001-2789-4f20-b917-000000000003',
     roleKey: 'designer',
     icon: '🎨',
     duty: 'Dựng phom áo 3D, thiết kế artwork, UV placement & xuất GLB',
-    x: -20,
-    y: 290,
-    h: 20,
-    color: '#CA7279',
+    x: -62,
+    y: 378,
+    h: 18,
+    color: '#C84B73',
+    neon: '#f472b6',
     kind: 'sketch',
   },
   {
     index: 4,
     label: 'Kỹ thuật',
-    staffName: 'Khoa',
+    staffName: 'Technical QA',
+    roleShort: 'Tech QA',
     memberName: 'Technical Designer / QA',
     agentId: 'atelierx-qa-0004',
     memberId: 'af30c001-2789-4f20-b917-000000000004',
     roleKey: 'qa',
     icon: '📐',
     duty: 'Kiểm định hình học GLB, mặt in, hướng artwork & QA Viewer thực tế',
-    x: 290,
-    y: -20,
-    h: 20,
-    color: '#5C7EB8',
+    x: 378,
+    y: -62,
+    h: 18,
+    color: '#4368C9',
+    neon: '#60a5fa',
     kind: 'cut',
   },
   {
     index: 5,
     label: 'Studio hình ảnh',
-    staffName: 'Nhi',
+    staffName: 'Visual Studio',
+    roleShort: 'Visual',
     memberName: 'Brand & Commerce / Visual Studio',
     agentId: 'atelierx-frontend-developer-0006',
     memberId: 'af30c001-2789-4f20-b917-000000000006',
     roleKey: 'frontend-developer',
     icon: '📸',
     duty: 'Tích hợp Web Viewer xoay 360°, camera orbit, ánh sáng & trình diễn',
-    x: 255,
-    y: 255,
-    h: 14,
-    color: '#8D70B5',
+    x: 264,
+    y: 264,
+    h: 12,
+    color: '#7C5CE0',
+    neon: '#c084fc',
     kind: 'photo',
   },
   {
     index: 6,
     label: 'Sàn trưng bày',
     staffName: 'Runway',
+    roleShort: 'Runway',
     memberName: '',
     agentId: null,
     memberId: null,
@@ -109,8 +124,9 @@ export const STUDIO_ZONES = [
     duty: 'Sàn Catwalk trung tâm trưng bày mẫu 3D & theo dõi dây chuyền 6 chặng',
     x: 0,
     y: 0,
-    h: 24,
-    color: '#3D8F7D',
+    h: 20,
+    color: '#1F8A82',
+    neon: '#22d3ee',
     kind: 'runway',
   },
 ];
@@ -118,19 +134,28 @@ export const STUDIO_ZONES = [
 const DEFAULT_TEAM_ID = 'af30c001-2789-4f20-b917-000000000010';
 const DEFAULT_PROJECT_ID = 'af30c001-2789-4f20-b917-000000000020';
 const DEFAULT_VIEW_W = 1320;
-const DEFAULT_VIEW_H = 880;
+const DEFAULT_VIEW_H = 884;
 const DEFAULT_CX = 0;
-const DEFAULT_CY = -10;
+const DEFAULT_CY = -28;
 const DYES = ['#d96b62', '#efc66b', '#4d9299', '#8a82b5', '#f3ede0', '#63a375'];
 
-// Dedicated open-floor standing coordinates per specialist pavilion (never colliding with furniture)
+// Dedicated open-floor standing & patrol waypoints per specialist pavilion (clear of all furniture)
 const STAFF_AISLE_OFFSETS = [
-  [-8, 22],  // 0 Điều phối: open carpet in front of executive desk, left of holo-table
-  [-48, 24], // 1 Nghiên cứu: open aisle left of round collaboration table
-  [-4, 34],  // 2 Vật liệu: open inspection aisle between PBR scanner and fabric rolls
-  [26, 28],  // 3 Thiết kế: open studio floor beside prototype hoodie mannequin
-  [26, 26],  // 4 Kỹ thuật: open QA floor beside laser turntable
-  [-28, 26], // 5 Studio hình ảnh: open director aisle beside camera tripod
+  [-8, 22],  // 0 Điều phối: open carpet in front of executive desk, clear of stools & holo-table
+  [-46, 22], // 1 Nghiên cứu: open left aisle clear of desk (y<=8) and collaboration stools (x>=-22)
+  [-6, 38],  // 2 Vật liệu: open front promenade in front of PBR scanner (y<=27) & fabric rolls
+  [24, 26],  // 3 Thiết kế: open studio floor between front table, hoodie turntable, and dress form
+  [24, 24],  // 4 Kỹ thuật: open QA floor between workstations and laser turntable
+  [-28, 26], // 5 Studio hình ảnh: open director aisle left of camera tripod (-2,14) & monitor desk
+];
+
+const STAFF_PATROL_WAYPOINTS = [
+  [[-8, 22], [10, 32], [-14, 38]],    // 0 Điều phối
+  [[-46, 22], [-48, 38], [-34, 20]],  // 1 Nghiên cứu
+  [[-6, 38], [-30, 40], [22, 38]],    // 2 Vật liệu
+  [[24, 26], [16, 12], [36, 36]],     // 3 Thiết kế
+  [[24, 24], [14, 10], [38, 34]],     // 4 Kỹ thuật
+  [[-28, 26], [-40, 36], [-20, 16]],  // 5 Studio hình ảnh
 ];
 
 export function esc(value) {
@@ -350,6 +375,7 @@ export function resolveDepartmentForIdentifier(identifier, members = []) {
       zone.roleKey,
       zone.label,
       zone.staffName,
+      zone.roleShort,
       mem?.id,
       mem?.agentId,
       mem?.sessionName,
@@ -764,12 +790,17 @@ function selectBestLogEntry(logs) {
 export function shortRuntimeName(runtimeType) {
   const raw = String(runtimeType || '').trim();
   if (!raw) return '';
-  const lower = raw.toLowerCase();
-  if (lower.includes('antigravity')) return 'Antigravity';
-  if (lower.includes('codex')) return 'Codex';
-  if (lower.includes('claude')) return 'Claude';
-  if (lower.includes('gemini')) return 'Gemini';
-  return raw.replace(/-cli$/i, '');
+  const at = raw.indexOf('@');
+  const base = at > 0 ? raw.slice(0, at) : raw;
+  const account = at > 0 ? raw.slice(at + 1) : '';
+  const lower = base.toLowerCase();
+  let label = base.replace(/-cli$/i, '');
+  if (lower.includes('antigravity')) label = 'Antigravity';
+  else if (lower.includes('codex')) label = 'Codex';
+  else if (lower.includes('claude')) label = 'Claude';
+  else if (lower.includes('gemini')) label = 'Gemini';
+  else if (lower.includes('crewly-agent')) label = 'Crewly Agent';
+  return account ? `${label} (${account})` : label;
 }
 
 export function computeAgentTokenInfo(deptIndex, members = [], liveTokenUsage = null, liveRuntimeFallback = null) {
@@ -799,15 +830,20 @@ export function computeAgentTokenInfo(deptIndex, members = [], liveTokenUsage = 
   const remaining = limits.length ? Math.max(0, Math.min(...limits.map(([cap, used]) => cap - used))) : null;
   const budget = limits.length ? Math.min(...limits.map(([cap]) => cap)) : null;
 
-  // Inspect RuntimeFallbackService state (`/api/system/runtime-fallback`) for provider quota exhaustion!
+  // Inspect RuntimeFallbackService state (`/api/system/runtime-fallback`) for provider quota exhaustion & account pool!
   const overrides = Array.isArray(liveRuntimeFallback?.overrides) ? liveRuntimeFallback.overrides : [];
   const exhaustedArr = Array.isArray(liveRuntimeFallback?.exhausted) ? liveRuntimeFallback.exhausted : [];
   const exhaustedSet = new Set(exhaustedArr.map((e) => String(e?.runtime || '').toLowerCase()).filter(Boolean));
+  const poolAssignments =
+    liveRuntimeFallback?.poolAssignments && typeof liveRuntimeFallback.poolAssignments === 'object'
+      ? liveRuntimeFallback.poolAssignments
+      : {};
 
   const sessionCandidates = [mem?.sessionName, mem?.agentId, zone.agentId].filter(Boolean);
   const activeOverride = overrides.find((o) => sessionCandidates.includes(o?.sessionName)) || null;
+  const pooledTarget = sessionCandidates.map((s) => poolAssignments[s]).find(Boolean) || null;
   const baseRuntime = String(mem?.runtimeType || '');
-  const effectiveRuntime = String(activeOverride?.runtime || baseRuntime || '');
+  const effectiveRuntime = String(activeOverride?.runtime || pooledTarget || baseRuntime || '');
   const effRuntimeShort = shortRuntimeName(effectiveRuntime);
   const baseRuntimeShort = shortRuntimeName(baseRuntime);
 
@@ -816,6 +852,9 @@ export function computeAgentTokenInfo(deptIndex, members = [], liveTokenUsage = 
   );
   const isRunningOnFallback = Boolean(
     activeOverride && effectiveRuntime && effectiveRuntime.toLowerCase() !== baseRuntime.toLowerCase(),
+  );
+  const isPooledAccount = Boolean(
+    !isRunningOnFallback && pooledTarget && String(pooledTarget).includes('@'),
   );
 
   const isSpendCapStopped = Boolean(
@@ -892,9 +931,11 @@ export function computeAgentTokenInfo(deptIndex, members = [], liveTokenUsage = 
     ? `Runtime ${effRuntimeShort} hết quota`
     : isRunningOnFallback
       ? `Chuyển dự phòng từ ${baseRuntimeShort || 'runtime gốc'}`
-      : remaining == null
-        ? 'Không giới hạn'
-        : remaining.toLocaleString('vi-VN');
+      : isPooledAccount
+        ? `Chia tải pool: ${effRuntimeShort}`
+        : remaining == null
+          ? 'Không giới hạn'
+          : remaining.toLocaleString('vi-VN');
 
   return {
     deptIndex,
@@ -1108,127 +1149,170 @@ const props = {
       oval(x + 3.2, y + 3.2, z + 14, 1.8, 0.9, '#78624c')
     );
   },
-  softboxLight(x, y, z) {
+  cyberMonolith(x, y, z, accent = '#22d3ee', isNight = true) {
+    const body = isNight ? '#111936' : '#334155';
+    return (
+      oval(x, y, z + 0.5, 13, 6, accent, isNight ? 'opacity="0.24" filter="url(#neon-halo)"' : 'opacity="0.14"') +
+      box(x - 6, y - 6, z, 12, 12, 5, isNight ? '#1e293b' : '#cbd5e1', accent) +
+      box(x - 4, y - 4, z + 5, 8, 8, 30, body, accent) +
+      box(x - 2.2, y - 2.2, z + 35, 4.4, 4.4, 9, accent, '#ffffff') +
+      oval(x, y, z + 46, 5.5, 3, '#ffffff', `stroke="${accent}" stroke-width="1.2" opacity="${isNight ? 0.95 : 0.78}"`)
+    );
+  },
+  stool(x, y, z, cushion = '#334e68') {
+    return (
+      oval(x + 1, y + 1, z + 0.5, 5, 2.3, '#0f172a', 'opacity="0.18"') +
+      box(x, y, z, 2.2, 2.2, 10, '#64748b') +
+      box(x - 3.2, y - 3.2, z + 10, 8.6, 8.6, 2.6, cushion)
+    );
+  },
+  execDesk(x, y, z, accent = '#22d3ee') {
+    return (
+      box(x, y, z, 5, 5, 15, '#334155') +
+      box(x + 47, y + 20, z, 5, 5, 15, '#334155') +
+      box(x, y + 20, z, 5, 5, 15, '#334155') +
+      box(x - 2, y - 2, z + 15, 56, 28, 3.2, '#1e293b', accent) +
+      box(x + 12, y + 3, z + 18, 2.5, 2.5, 4, '#475569') +
+      box(x + 4, y + 2, z + 22, 20, 2, 13, '#0f172a', accent) +
+      box(x + 6, y + 4.1, z + 25, 15, 0.5, 8, accent) +
+      box(x + 33, y + 5, z + 18, 2.5, 2.5, 4, '#475569') +
+      box(x + 26, y + 4, z + 22, 18, 2, 12, '#0f172a', '#a855f7') +
+      box(x + 28, y + 6.1, z + 25, 13, 0.5, 7, '#a7f3d0') +
+      box(x + 14, y + 12, z + 18.2, 14, 6, 0.8, '#94a3b8') +
+      box(x + 44, y + 15, z + 18.2, 3.2, 3.2, 4.2, '#fef08a')
+    );
+  },
+  fabricRoll(x, y, z, k) {
+    const c = DYES[k % DYES.length];
+    return (
+      box(x, y, z, 6.5, 6.5, 14, c) +
+      oval(x + 3.2, y + 3.2, z + 14, 5.2, 2.6, shade(c, 1.08)) +
+      oval(x + 3.2, y + 3.2, z + 14, 1.8, 0.9, '#78624c')
+    );
+  },
+  softboxLight(x, y, z, glow = '#fef9c3') {
     return (
       oval(x, y, z + 0.5, 7, 3.4, '#1e293b', 'opacity="0.32"') +
       box(x - 1, y - 1, z, 2.2, 2.2, 32, '#475569') +
-      box(x - 7, y - 3, z + 30, 15, 6, 12, '#1e293b') +
-      box(x - 5.8, y + 3.1, z + 31.2, 12.6, 0.8, 9.6, '#fef9c3')
+      box(x - 7, y - 3, z + 30, 15, 6, 12, '#1e293b', '#c084fc') +
+      box(x - 5.8, y + 3.1, z + 31.2, 12.6, 0.8, 9.6, glow)
     );
   },
 };
 
+function extrudedPolygonDeck(pts3d, depthZ, topFill, sideTint, strokeCol = '') {
+  const top = pts3d.map(([x, y, z]) => iso(x, y, z));
+  const bot = pts3d.map(([x, y, z]) => iso(x, y, z - depthZ));
+  let svg = '';
+  for (let i = 0; i < pts3d.length; i++) {
+    const n = (i + 1) % pts3d.length;
+    const isVisibleFront = top[i][1] + top[n][1] > -40 || Math.abs(top[i][0] - top[n][0]) > 15;
+    if (!isVisibleFront) continue;
+    const factor = i % 2 === 0 ? 0.72 : 0.56;
+    const st = strokeCol ? `stroke="${strokeCol}" stroke-width="0.7" stroke-opacity="0.45"` : '';
+    svg += poly([top[i], top[n], bot[n], bot[i]], shade(sideTint, factor), st);
+  }
+  const topStroke = strokeCol ? `stroke="${strokeCol}" stroke-width="2"` : '';
+  svg += poly(top, topFill, topStroke);
+  return svg;
+}
+
 function renderCampusPlaza(isNight) {
   let svg = '';
-  const foundation = isNight ? '#101935' : '#bccde4';
-  const moatRim = isNight ? '#1a2850' : '#d5e3f4';
   const upperFill = isNight ? 'url(#plazaTopNight)' : 'url(#plazaTopDay)';
-  const rimAccent = isNight ? '#38bdf8' : '#8fb1da';
+  const neonCyan = isNight ? '#22d3ee' : '#3b82f6';
+  const neonPink = isNight ? '#f472b6' : '#8b5cf6';
+  const sideAlloy = isNight ? '#111a3a' : '#94a3b8';
 
-  // Monumental Three-Tier Grand Citadel Terrace (fits cleanly inside 1320x860 viewBox)
-  svg += oval(0, 0, -30, 595, 282, '#0f172a', 'opacity="0.18" filter="url(#shadow)"');
-  svg += box(-346, -346, -26, 692, 692, 10, foundation);
+  // Extruded Octagonal Cyber-Couture Citadel Terrace (fits strictly within [-636..636, -380..354])
+  svg += oval(0, 0, -26, 628, 336, '#020617', `opacity="${isNight ? 0.58 : 0.22}" filter="url(#shadow)"`);
 
-  // Perimeter Reflecting Water Moat framing the Citadel
-  svg += box(-336, -336, -16, 672, 672, 4, moatRim, rimAccent);
-  svg += face(
-    [
-      [-332, -332, -11.8],
-      [332, -332, -11.8],
-      [332, 332, -11.8],
-      [-332, 332, -11.8],
-    ],
-    'url(#waterPool)',
-  );
+  const outerOctagon = [
+    [-255, -505, -8],
+    [169, -505, -8],
+    [505, -169, -8],
+    [505, 255, -8],
+    [255, 505, -8],
+    [-169, 505, -8],
+    [-505, 169, -8],
+    [-505, -255, -8],
+  ];
+  svg += extrudedPolygonDeck(outerOctagon, 14, isNight ? '#0d1530' : '#cad9ee', sideAlloy, neonCyan);
 
-  // Raised Travertine Grand Courtyard Deck
-  svg += box(-320, -320, -12, 640, 640, 8, isNight ? '#182447' : '#e6effa', rimAccent);
-  svg += face(
-    [
-      [-319, -319, -3.9],
-      [319, -319, -3.9],
-      [319, 319, -3.9],
-      [-319, 319, -3.9],
-    ],
-    upperFill,
-  );
+  const innerOctagon = [
+    [-245, -488, -2],
+    [162, -488, -2],
+    [488, -162, -2],
+    [488, 245, -2],
+    [245, 488, -2],
+    [-162, 488, -2],
+    [-488, 162, -2],
+    [-488, -245, -2],
+  ];
+  svg += extrudedPolygonDeck(innerOctagon, 6, upperFill, isNight ? '#17234d' : '#dbe7f7', neonPink);
 
-  // Architectural stone grid & golden diagonal boulevards
-  const gridStroke = isNight ? 'rgba(148,163,218,0.12)' : 'rgba(95,120,162,0.15)';
-  for (let g = -280; g <= 280; g += 70) {
-    const [x1, y1] = iso(g, -312, -3.7);
-    const [x2, y2] = iso(g, 312, -3.7);
-    const [x3, y3] = iso(-312, g, -3.7);
-    const [x4, y4] = iso(312, g, -3.7);
+  // Perspective Cyber Laser Grid clipped smoothly inside inner deck
+  const gridStroke = isNight ? 'rgba(56, 189, 248, 0.14)' : 'rgba(59, 130, 246, 0.14)';
+  for (let g = -360; g <= 360; g += 90) {
+    const maxSpan = Math.min(480, 725 - Math.abs(g));
+    const [x1, y1] = iso(g, -maxSpan, -1.8);
+    const [x2, y2] = iso(g, maxSpan, -1.8);
+    const [x3, y3] = iso(-maxSpan, g, -1.8);
+    const [x4, y4] = iso(maxSpan, g, -1.8);
     svg += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${gridStroke}" stroke-width="1"/>`;
     svg += `<line x1="${x3}" y1="${y3}" x2="${x4}" y2="${y4}" stroke="${gridStroke}" stroke-width="1"/>`;
   }
 
-  // Grand Central Compass-Rose Medallion beneath the Catwalk Hub
-  svg += oval(0, 0, -3.6, 156, 72, 'none', `stroke="${isNight ? '#d99b43' : '#cfa054'}" stroke-width="1.6" opacity="0.55"`);
-  svg += oval(0, 0, -3.6, 134, 62, 'none', `stroke="${isNight ? '#38bdf8' : '#60a5fa'}" stroke-width="1.1" stroke-dasharray="6 4" opacity="0.5"`);
+  // Three Concentric Glowing Neon Orbital Rings centered on Catwalk Hub
+  svg += oval(0, 0, -1.6, 536, 256, 'none', `stroke="${neonCyan}" stroke-width="1.3" opacity="${isNight ? 0.34 : 0.24}" class="orbital-ring"`);
+  svg += oval(0, 0, -1.6, 404, 192, 'none', `stroke="${neonPink}" stroke-width="1.2" opacity="${isNight ? 0.32 : 0.2}" stroke-dasharray="10 8"`);
+  svg += oval(0, 0, -1.5, 184, 88, 'none', `stroke="${neonCyan}" stroke-width="2.1" opacity="${isNight ? 0.72 : 0.45}" filter="url(#neon-bloom)"`);
+  svg += oval(0, 0, -1.5, 152, 72, 'none', `stroke="#fbbf24" stroke-width="1.2" stroke-dasharray="6 4" opacity="0.65"`);
 
-  // 4 Courtyard Reflecting Light Pools with Illuminated Fountain Jets
+  // Twin East/West Bioluminescent Reflecting Pools in open courtyard wings
   const poolCoords = [
-    [-162, -142, 66, 52],
-    [-142, 92, 52, 66],
-    [92, -162, 66, 52],
-    [102, 102, 58, 58],
+    [-254, 196, 62, 54],
+    [192, -250, 62, 54],
   ];
   for (const [px, py, pw, pd] of poolCoords) {
-    svg += box(px, py, -4.4, pw, pd, 1.8, isNight ? '#0c4a6e' : '#bae6fd', '#38bdf8');
+    svg += box(px, py, -2.5, pw, pd, 2.2, isNight ? '#0e7490' : '#93c5fd', neonCyan);
     svg += face(
       [
-        [px + 3, py + 3, -2.5],
-        [px + pw - 3, py + 3, -2.5],
-        [px + pw - 3, py + pd - 3, -2.5],
-        [px + 3, py + pd - 3, -2.5],
+        [px + 3, py + 3, -0.2],
+        [px + pw - 3, py + 3, -0.2],
+        [px + pw - 3, py + pd - 3, -0.2],
+        [px + 3, py + pd - 3, -0.2],
       ],
       'url(#waterPool)',
     );
     const cx = px + pw / 2;
     const cy = py + pd / 2;
-    svg += oval(cx, cy, -2.2, 8.5, 4, '#e0f2fe', 'opacity="0.78"');
-    svg += oval(cx, cy, 2.5, 3.2, 5.5, '#bae6fd', 'opacity="0.72"');
+    svg += oval(cx, cy, 0.2, 10, 4.8, '#a5f3fc', 'opacity="0.82"');
+    svg += oval(cx, cy, 8, 3.6, 9, neonCyan, 'opacity="0.65" filter="url(#neon-bloom)"');
   }
 
-  // Grand Ceremonial Front Staircase + Twin Illuminated Citadel Obelisk Pylons
-  for (let s = 0; s < 5; s++) {
-    svg += box(
-      284 + s * 9,
-      284 + s * 9,
-      -25 + (4 - s) * 3.4,
-      54 - s * 4,
-      54 - s * 4,
-      3.4,
-      isNight ? '#263766' : '#dce7f5',
-      rimAccent,
-    );
-  }
-  svg += props.obeliskPylon(268, 314, -12, isNight);
-  svg += props.obeliskPylon(314, 268, -12, isNight);
+  // Four Cyber-Crystal Neon Monolith Pylons framing open diagonals
+  svg += props.cyberMonolith(-265, -48, -2, '#22d3ee', isNight);
+  svg += props.cyberMonolith(-48, -265, -2, '#34d399', isNight);
+  svg += props.cyberMonolith(265, 48, -2, '#f472b6', isNight);
+  svg += props.cyberMonolith(48, 265, -2, '#a855f7', isNight);
 
-  // Depth-sorted Cypress Colonnade & Boulevard Lamps along the Citadel Perimeter
+  // Depth-sorted Neon Garden Cypress & Cyber Street Lamps on Outer Promenade
   const plazaProps = [
-    { kind: 'tree', x: -306, y: -306 },
-    { kind: 'tree', x: -306, y: -128 },
-    { kind: 'tree', x: -128, y: -306 },
-    { kind: 'lamp', x: -195, y: -304 },
-    { kind: 'lamp', x: -304, y: -195 },
-    { kind: 'tree', x: -306, y: 158 },
-    { kind: 'tree', x: 158, y: -306 },
-    { kind: 'lamp', x: -304, y: 112 },
-    { kind: 'lamp', x: 112, y: -304 },
-    { kind: 'tree', x: -162, y: 304 },
-    { kind: 'tree', x: 304, y: -162 },
-    { kind: 'lamp', x: -112, y: 302 },
-    { kind: 'lamp', x: 302, y: -112 },
-    { kind: 'tree', x: 304, y: 222 },
-    { kind: 'tree', x: 222, y: 304 },
+    { kind: 'lamp', x: -395, y: -195 },
+    { kind: 'lamp', x: -195, y: -395 },
+    { kind: 'tree', x: -455, y: -155 },
+    { kind: 'tree', x: -155, y: -455 },
+    { kind: 'lamp', x: 395, y: -195 },
+    { kind: 'lamp', x: -195, y: 395 },
+    { kind: 'tree', x: -455, y: 120 },
+    { kind: 'tree', x: 120, y: -455 },
+    { kind: 'lamp', x: 395, y: 195 },
+    { kind: 'lamp', x: 195, y: 395 },
   ].sort((a, b) => a.x + a.y - (b.x + b.y));
 
   for (const item of plazaProps) {
-    svg += item.kind === 'tree' ? props.cypressTree(item.x, item.y, -4) : props.streetLamp(item.x, item.y, -4, isNight);
+    svg += item.kind === 'tree' ? props.cypressTree(item.x, item.y, -2) : props.streetLamp(item.x, item.y, -2, isNight);
   }
 
   return svg;
@@ -1238,26 +1322,27 @@ function renderSkybridge(fromZone, toZone, statusMode, showLinks, isOuterRing = 
   const dx = toZone.x - fromZone.x;
   const dy = toZone.y - fromZone.y;
   const length = Math.hypot(dx, dy) || 1;
-  const halfW = 86;
-  const halfD = 70;
-  const edgeStart = Math.min(halfW / Math.abs(dx || 0.001), halfD / Math.abs(dy || 0.001)) * 0.96;
+  const halfW = 86 * PAVILION_SCALE;
+  const halfD = 70 * PAVILION_SCALE;
+  const tBox = 1 / Math.max(Math.abs(dx || 0.001) / halfW, Math.abs(dy || 0.001) / halfD);
+  const edgeStart = tBox * 0.94;
   const edgeEnd = 1 - edgeStart;
   if (edgeEnd <= edgeStart) return '';
 
-  const widthHalf = isOuterRing ? 8.2 : 12;
+  const widthHalf = isOuterRing ? 9 : 13.5;
   const nx = (-dy / length) * widthHalf;
   const ny = (dx / length) * widthHalf;
 
   let parts = '';
-  const steps = isOuterRing ? 10 : 13;
-  const zStart = fromZone.h + 10;
-  const zEnd = toZone.h + 10;
+  const steps = isOuterRing ? 9 : 12;
+  const zStart = (fromZone.h + 10) * PAVILION_SCALE;
+  const zEnd = (toZone.h + 10) * PAVILION_SCALE;
 
-  // Mid-span architectural support pier rising from Courtyard Plaza
+  // Mid-span architectural support pier
   const midX = fromZone.x + dx * 0.5;
   const midY = fromZone.y + dy * 0.5;
   const midZ = (zStart + zEnd) * 0.5;
-  parts += box(midX - 4.5, midY - 4.5, -4, 9, 9, Math.max(8, midZ + 2), isNight ? '#26355c' : '#94a3b8');
+  parts += box(midX - 5, midY - 5, -2, 10, 10, Math.max(8, midZ + 1), isNight ? '#1e293b' : '#94a3b8', fromZone.neon || '#22d3ee');
 
   for (let k = 0; k < steps; k++) {
     const t0 = edgeStart + ((edgeEnd - edgeStart) * k) / steps;
@@ -1270,11 +1355,11 @@ function renderSkybridge(fromZone, toZone, statusMode, showLinks, isOuterRing = 
     const deckColor = isNight
       ? isOuterRing
         ? k % 2
-          ? '#1e2b4d'
-          : '#263761'
+          ? '#162144'
+          : '#1e2d59'
         : k % 2
-          ? '#24345c'
-          : '#304578'
+          ? '#1a274f'
+          : '#25386e'
       : isOuterRing
         ? k % 2
           ? '#cbd5e1'
@@ -1293,28 +1378,38 @@ function renderSkybridge(fromZone, toZone, statusMode, showLinks, isOuterRing = 
     );
   }
 
-  // Tempered glass balustrades + brushed steel handrails
+  // Tempered glass balustrades + glowing neon laser handrails
+  const railColor = isNight
+    ? statusMode === 'active'
+      ? '#22d3ee'
+      : isOuterRing
+        ? '#818cf8'
+        : '#38bdf8'
+    : '#3b82f6';
   for (const side of [-1, 1]) {
     const aBot = iso(fromZone.x + dx * edgeStart + side * nx, fromZone.y + dy * edgeStart + side * ny, zStart);
     const bBot = iso(fromZone.x + dx * edgeEnd + side * nx, fromZone.y + dy * edgeEnd + side * ny, zEnd);
-    const aTop = iso(fromZone.x + dx * edgeStart + side * nx, fromZone.y + dy * edgeStart + side * ny, zStart + 10.5);
-    const bTop = iso(fromZone.x + dx * edgeEnd + side * nx, fromZone.y + dy * edgeEnd + side * ny, zEnd + 10.5);
+    const aTop = iso(fromZone.x + dx * edgeStart + side * nx, fromZone.y + dy * edgeStart + side * ny, zStart + 11);
+    const bTop = iso(fromZone.x + dx * edgeEnd + side * nx, fromZone.y + dy * edgeEnd + side * ny, zEnd + 11);
 
-    parts += poly([aBot, bBot, bTop, aTop], '#93c5fd', 'fill-opacity="0.24"');
-    parts += `<path d="M${aTop.join(' ')} L${bTop.join(' ')}" stroke="#64748b" stroke-width="1.6" fill="none"/>`;
+    parts += poly([aBot, bBot, bTop, aTop], '#38bdf8', isNight ? 'fill-opacity="0.16"' : 'fill-opacity="0.22"');
+    parts += `<path d="M${aTop.join(' ')} L${bTop.join(' ')}" stroke="${railColor}" stroke-width="1.8" stroke-opacity="${isNight ? 0.85 : 0.72}" fill="none"/>`;
   }
 
-  // Animated workflow energy stream along skybridge
-  if (showLinks && statusMode !== 'idle') {
+  // Animated workflow neon plasma stream along skybridge
+  if (showLinks) {
     const pStart = iso(fromZone.x + dx * edgeStart, fromZone.y + dy * edgeStart, zStart + 2.5);
     const pEnd = iso(fromZone.x + dx * edgeEnd, fromZone.y + dy * edgeEnd, zEnd + 2.5);
     if (statusMode === 'active') {
-      parts += `<path d="M${pStart.join(' ')} L${pEnd.join(' ')}" stroke="#3b82f6" stroke-width="5" stroke-opacity="0.28" fill="none"/>`;
-      parts += `<path d="M${pStart.join(' ')} L${pEnd.join(' ')}" stroke="#2563eb" stroke-width="2.6" fill="none" class="bridge-energy-active"/>`;
+      const pulseCol = fromZone.neon || '#22d3ee';
+      parts += `<path d="M${pStart.join(' ')} L${pEnd.join(' ')}" stroke="${pulseCol}" stroke-width="6" stroke-opacity="0.32" fill="none" filter="url(#neon-bloom)"/>`;
+      parts += `<path d="M${pStart.join(' ')} L${pEnd.join(' ')}" stroke="#ffffff" stroke-width="2.4" fill="none" class="bridge-energy-active"/>`;
     } else if (statusMode === 'queued') {
-      parts += `<path d="M${pStart.join(' ')} L${pEnd.join(' ')}" stroke="#f59e0b" stroke-width="2.2" fill="none" class="bridge-energy-queued"/>`;
+      parts += `<path d="M${pStart.join(' ')} L${pEnd.join(' ')}" stroke="#f59e0b" stroke-width="2.4" fill="none" class="bridge-energy-queued"/>`;
     } else if (statusMode === 'done') {
-      parts += `<path d="M${pStart.join(' ')} L${pEnd.join(' ')}" stroke="#10b981" stroke-width="1.6" stroke-opacity="0.58" fill="none"/>`;
+      parts += `<path d="M${pStart.join(' ')} L${pEnd.join(' ')}" stroke="#10b981" stroke-width="1.8" stroke-opacity="0.65" fill="none"/>`;
+    } else if (isNight) {
+      parts += `<path d="M${pStart.join(' ')} L${pEnd.join(' ')}" stroke="#38bdf8" stroke-width="1.2" stroke-opacity="0.26" stroke-dasharray="4 6" fill="none"/>`;
     }
   }
 
@@ -1324,156 +1419,158 @@ function renderSkybridge(fromZone, toZone, statusMode, showLinks, isOuterRing = 
 function buildPavilionInterior(zone, z, isNight) {
   let art = '';
   const i = zone.index;
+  const neon = zone.neon || '#22d3ee';
+  const mullionCol = isNight ? '#334155' : '#475569';
 
-  // Architectural rear glass curtain wall & side gallery partition
-  art += box(-84, -69, z, 168, 3.8, 4.5, '#64748b');
-  art += glassPanel(-82, -68.5, z + 4.5, 164, 2.5, 42, '#bae6fd', isNight ? 0.22 : 0.36);
+  // Architectural rear glass curtain wall & neon mullions
+  art += box(-84, -69, z, 168, 3.8, 4.5, '#334155', neon);
+  art += glassPanel(-82, -68.5, z + 4.5, 164, 2.5, 42, neon, isNight ? 0.18 : 0.28);
   for (let m = 0; m <= 4; m++) {
-    art += box(-82 + m * 40.5, -69, z + 4.5, 2.2, 3.2, 43, '#475569');
+    art += box(-82 + m * 40.5, -69, z + 4.5, 2.2, 3.2, 43, mullionCol, neon);
   }
 
-  // Cantilevered Architectural Skylight Pergola Ribs (gives true multi-story building volume without occluding interior!)
-  art += box(-83, -69.5, z + 46.5, 166, 4, 3, '#334155');
+  // Cantilevered Neon Skylight Pergola Ribs
+  art += box(-83, -69.5, z + 46.5, 166, 4, 3, '#1e293b', neon);
   for (let rib = 0; rib < 4; rib++) {
-    art += box(-72 + rib * 46, -68, z + 47, 3.2, 34, 2, isNight ? '#475569' : '#64748b');
+    art += box(-72 + rib * 46, -68, z + 47, 3.2, 34, 2, isNight ? '#334155' : '#64748b', neon);
   }
   art += glassPanel(-76, -67, z + 48.5, 152, 30, 1, '#e0f2fe', isNight ? 0.14 : 0.24);
 
   // Left glass gallery wall
-  art += box(-84, -69, z, 3.8, 122, 4.5, '#64748b');
-  art += glassPanel(-83.5, -66, z + 4.5, 2.5, 112, 36, '#bae6fd', isNight ? 0.16 : 0.26);
+  art += box(-84, -69, z, 3.8, 122, 4.5, '#334155', neon);
+  art += glassPanel(-83.5, -66, z + 4.5, 2.5, 112, 36, '#bae6fd', isNight ? 0.15 : 0.24);
 
-  // Decorative woven floor trim along front edge
+  // Neon Light-Strip Floor Trim along front edge
   for (let k = 0; k < 15; k++) {
-    art += box(-78 + k * 10.8, 62, z, 7.6, 2.5, 0.6, k % 2 ? '#f6e7c8' : '#ffffff');
+    art += box(-78 + k * 10.8, 62, z, 7.6, 2.4, 0.8, k % 2 ? neon : '#e2e8f0');
   }
 
-  // Bespoke Equipment per Department
+  // Bespoke Cyber-Couture Equipment per Department
   if (i === 0) {
-    // 👑 Điều phối — Executive Command Penthouse
-    art += box(-60, -54, z, 120, 52, 3, shade(zone.color, 0.92));
-    art += box(-54, -63, z + 8, 102, 2.5, 31, '#f8fafc');
+    // 👑 Điều phối — Executive Cyber Command Penthouse
+    art += box(-60, -54, z, 120, 52, 3, shade(zone.color, 0.72), neon);
+    art += box(-54, -63, z + 8, 102, 2.5, 31, '#0f172a', neon);
     for (let col = 0; col < 4; col++) {
       art += box(-49 + col * 24, -60.2, z + 32, 19, 0.8, 4.2, DYES[col]);
       for (let row = 0; row < 2; row++) {
-        art += box(-49 + col * 24, -60.2, z + 13 + row * 8.5, 18, 0.8, 6.2, '#e2e8f0');
+        art += box(-49 + col * 24, -60.2, z + 13 + row * 8.5, 18, 0.8, 6.2, col === 0 ? neon : '#38bdf8');
       }
     }
-    art += props.execDesk(-44, -30, z + 3, '#38bdf8');
-    // Central Holographic Collection Table projecting mini 3D Hoodie!
-    art += box(24, 14, z, 38, 28, 12, '#1e293b', '#38bdf8');
-    art += oval(43, 28, z + 12.5, 14, 6.8, '#38bdf8', 'opacity="0.48"');
+    art += props.execDesk(-44, -30, z + 3, neon);
+    art += box(24, 14, z, 38, 28, 12, '#0f172a', '#22d3ee');
+    art += oval(43, 28, z + 12.5, 15, 7.2, '#22d3ee', 'opacity="0.56"');
     const [hx, hy] = iso(43, 28, z + 13);
-    art += `<polygon points="${hx - 12},${hy} ${hx + 12},${hy} ${hx + 20},${hy - 29} ${hx - 20},${hy - 29}" fill="url(#holoCone)"/>`;
+    art += `<polygon points="${hx - 13},${hy} ${hx + 13},${hy} ${hx + 22},${hy - 32} ${hx - 22},${hy - 32}" fill="url(#holoCone)"/>`;
     art += hoodieShowcase(43, 28, z + 12, '#0f172a', '#67e8f9', false);
     art += props.stool(-54, 28, z, '#92400e') + props.stool(-36, 36, z, '#92400e');
     art += props.lushPlant(62, -52, z) + props.lushPlant(-74, 46, z);
   } else if (i === 1) {
-    // 🔍 Nghiên cứu — Trend & Moodboard Intelligence Lab
+    // 🔍 Nghiên cứu — Neon Trend & Holographic Moodboard Lab
     for (let p = 0; p < 3; p++) {
-      art += box(-66 + p * 44, -63, z + 7, 38, 2.5, 31, '#fffbeb');
+      art += box(-66 + p * 44, -63, z + 7, 38, 2.5, 31, '#0f172a', neon);
       for (let sw = 0; sw < 4; sw++) {
         art += box(-62 + p * 44 + sw * 8.2, -60.2, z + 12 + (sw % 2) * 7, 6.8, 0.8, 12, DYES[(p + sw) % DYES.length]);
       }
     }
-    art += props.execDesk(-44, -18, z, '#2dd4bf');
-    art += box(22, -32, z, 42, 20, 14, '#e2e8f0');
+    art += props.execDesk(-44, -18, z, '#22d3ee');
+    art += box(22, -32, z, 42, 20, 14, '#1e293b', neon);
     for (let b = 0; b < 6; b++) {
       art += box(26 + b * 6, -28, z + 14, 4.2, 12, 6, DYES[b % DYES.length]);
     }
-    art += box(2, 32, z, 4, 4, 12, '#64748b') + oval(4, 34, z + 13, 20, 9.5, '#f8fafc', 'stroke="#94a3b8" stroke-width="1"');
-    art += props.stool(-18, 32, z, '#0f766e') + props.stool(24, 34, z, '#0f766e');
+    art += box(2, 32, z, 4, 4, 12, '#475569') + oval(4, 34, z + 13, 20, 9.5, '#0f172a', `stroke="${neon}" stroke-width="1.3"`);
+    art += props.stool(-18, 32, z, '#0e7490') + props.stool(24, 34, z, '#0e7490');
     art += props.lushPlant(62, 42, z) + props.lushPlant(-74, 44, z);
   } else if (i === 2) {
-    // 🧵 Vật liệu — Digital Textile Vault & PBR Scanner Lab
+    // 🧵 Vật liệu — Digital Textile Vault & Laser PBR Scanner
     for (let bay = 0; bay < 3; bay++) {
       const bx = -64 + bay * 42;
-      art += box(bx, -61, z, 36, 14, 36, '#7c5e42');
+      art += box(bx, -61, z, 36, 14, 36, '#334155', neon);
       for (let shelf = 0; shelf < 2; shelf++) {
         for (let r = 0; r < 4; r++) {
           art += box(bx + 3 + r * 8, -58, z + 4 + shelf * 16, 6.2, 10, 11, DYES[(bay + shelf + r) % DYES.length]);
         }
       }
     }
-    art += box(-58, 2, z, 50, 25, 15, '#e2e8f0');
-    art += box(-52, 6, z + 15, 25, 17, 2.2, '#0f172a');
-    art += face([[-50, 8, z + 17.4], [-29, 8, z + 17.4], [-29, 21, z + 17.4], [-50, 21, z + 17.4]], '#38bdf8', 'fill-opacity="0.55"');
-    art += box(-21, 5, z + 15, 11, 2, 11, '#1e293b') + box(-19, 7.2, z + 17, 7.5, 0.5, 7, '#6ee7b7');
+    art += box(-58, 2, z, 50, 25, 15, '#1e293b', neon);
+    art += box(-52, 6, z + 15, 25, 17, 2.2, '#020617');
+    art += face([[-50, 8, z + 17.4], [-29, 8, z + 17.4], [-29, 21, z + 17.4], [-50, 21, z + 17.4]], '#34d399', 'fill-opacity="0.68"');
+    art += box(-21, 5, z + 15, 11, 2, 11, '#0f172a') + box(-19, 7.2, z + 17, 7.5, 0.5, 7, '#6ee7b7');
     for (let k = 0; k < 6; k++) {
       art += props.fabricRoll(18 + (k % 3) * 14, 4 + Math.floor(k / 3) * 16, z, k);
     }
     art += props.lushPlant(62, 44, z) + props.lushPlant(-74, 44, z);
   } else if (i === 3) {
-    // 🎨 Thiết kế — 3D Couture & CAD Sculpting Atelier
-    art += box(-60, -63, z + 8, 116, 2.5, 30, '#fff7ed');
+    // 🎨 Thiết kế — 3D Neon Couture & CAD Sculpting Atelier
+    art += box(-60, -63, z + 8, 116, 2.5, 30, '#0f172a', neon);
     for (let k = 0; k < 5; k++) {
-      art += box(-54 + k * 22, -60.2, z + 13, 17, 0.8, 20, k === 2 ? '#1e293b' : DYES[k]);
+      art += box(-54 + k * 22, -60.2, z + 13, 17, 0.8, 20, k === 2 ? '#f472b6' : DYES[k]);
     }
     art += props.execDesk(-54, -18, z, '#f472b6');
-    art += hoodieShowcase(36, -22, z, '#181c24', '#f8fafc', true);
-    art += dressForm(58, 4, z, '#e11d48');
-    art += box(-42, 24, z, 46, 24, 14, '#f5ebe0', '#b08968');
-    art += box(-34, 28, z + 14.2, 24, 15, 1.4, '#1e293b');
+    art += hoodieShowcase(36, -22, z, '#181c24', '#f472b6', true);
+    art += dressForm(58, 4, z, '#ec4899');
+    art += box(-42, 24, z, 46, 24, 14, '#1e293b', neon);
+    art += box(-34, 28, z + 14.2, 24, 15, 1.4, '#22d3ee');
     art += props.lushPlant(60, 44, z) + props.lushPlant(-74, 46, z);
   } else if (i === 4) {
-    // 📐 Kỹ thuật — Precision QA & glTF Validation Lab
-    art += box(-58, -63, z + 8, 112, 2.5, 29, '#0f172a');
+    // 📐 Kỹ thuật — Laser QA & glTF Validation Lab
+    art += box(-58, -63, z + 8, 112, 2.5, 29, '#020617', neon);
     for (let bar = 0; bar < 4; bar++) {
-      art += box(-50 + bar * 26, -60, z + 14, 20, 0.8, 17, bar === 3 ? '#f59e0b' : '#10b981');
+      art += box(-50 + bar * 26, -60, z + 14, 20, 0.8, 17, bar === 3 ? '#f59e0b' : '#22d3ee');
     }
-    art += oval(40, -18, z + 1.5, 24, 11.5, 'none', 'stroke="#38bdf8" stroke-width="1.3" stroke-dasharray="4 3"');
-    art += hoodieShowcase(40, -18, z, '#1e293b', '#e2e8f0', true);
-    art += box(-58, -12, z, 56, 26, 15, '#cbd5e1');
-    art += box(-54, -8, z + 15, 48, 18, 1.8, '#e0f2fe', '#38bdf8');
-    art += box(-44, -3, z + 17, 26, 10, 0.8, '#334155');
-    art += box(-50, 26, z, 46, 20, 14, '#334155');
-    art += box(-44, 28, z + 14, 18, 2, 11, '#0f172a') + box(-22, 28, z + 14, 18, 2, 11, '#0f172a');
+    art += oval(40, -18, z + 1.5, 25, 12, 'none', `stroke="${neon}" stroke-width="1.6" stroke-dasharray="4 3"`);
+    art += hoodieShowcase(40, -18, z, '#0f172a', '#60a5fa', true);
+    art += box(-58, -12, z, 56, 26, 15, '#1e293b', neon);
+    art += box(-54, -8, z + 15, 48, 18, 1.8, '#0f172a', '#60a5fa');
+    art += box(-44, -3, z + 17, 26, 10, 0.8, '#22d3ee');
+    art += box(-50, 26, z, 46, 20, 14, '#0f172a', neon);
+    art += box(-44, 28, z + 14, 18, 2, 11, '#020617') + box(-22, 28, z + 14, 18, 2, 11, '#020617');
     art += props.lushPlant(60, 44, z) + props.lushPlant(-74, 44, z);
   } else if (i === 5) {
-    // 📸 Studio hình ảnh — 360° Cyclorama & WebGL Visual Studio
-    art += box(-60, -61, z, 116, 42, 2.5, '#f8fafc');
-    art += box(-60, -61, z + 2.5, 116, 5, 40, '#ffffff');
-    art += box(-60, -61, z + 2.5, 5, 42, 40, '#f1f5f9');
-    art += oval(-2, -36, z + 3, 25, 12, '#e2e8f0', 'stroke="#8b5cf6" stroke-width="1.4"');
-    art += hoodieShowcase(-2, -36, z + 2.5, '#141821', '#f8fafc', true);
-    art += props.softboxLight(-54, 2, z);
-    art += props.softboxLight(46, -4, z);
-    art += box(-2, 14, z, 3.5, 3.5, 24, '#334155') + box(-7, 10, z + 24, 13, 11, 8, '#0f172a') + box(-3, 6, z + 26, 5, 5, 5, '#38bdf8');
-    art += box(22, 24, z, 38, 20, 14, '#1e293b');
-    art += box(28, 27, z + 14, 24, 2, 14, '#0f172a') + box(30, 29.2, z + 16, 20, 0.6, 10, '#a78bfa');
+    // 📸 Studio hình ảnh — 360° Neon Cyclorama & WebGL Visual Stage
+    art += box(-60, -61, z, 116, 42, 2.5, '#1e293b', neon);
+    art += box(-60, -61, z + 2.5, 116, 5, 40, '#e2e8f0', neon);
+    art += box(-60, -61, z + 2.5, 5, 42, 40, '#cbd5e1', neon);
+    art += oval(-2, -36, z + 3, 26, 12.5, '#0f172a', 'stroke="#c084fc" stroke-width="1.8"');
+    art += hoodieShowcase(-2, -36, z + 2.5, '#141821', '#c084fc', true);
+    art += props.softboxLight(-54, 2, z, '#e0f2fe');
+    art += props.softboxLight(46, -4, z, '#fae8ff');
+    art += box(-2, 14, z, 3.5, 3.5, 24, '#334155') + box(-7, 10, z + 24, 13, 11, 8, '#0f172a', neon) + box(-3, 6, z + 26, 5, 5, 5, '#22d3ee');
+    art += box(22, 24, z, 38, 20, 14, '#0f172a', neon);
+    art += box(28, 27, z + 14, 24, 2, 14, '#020617') + box(30, 29.2, z + 16, 20, 0.6, 10, '#c084fc');
     art += props.lushPlant(-74, 44, z) + props.lushPlant(62, 44, z);
   } else if (i === 6) {
-    // ✨ Sàn trưng bày — Grand Central Catwalk Rotunda & Panoramic Runway Wall
-    art += box(-70, -50, z, 140, 100, 5, isNight ? '#1e293b' : '#f8fafc', '#38bdf8');
-    art += box(-58, -26, z + 5, 116, 52, 4.8, isNight ? '#0f172a' : '#fffbeb', '#f59e0b');
+    // ✨ Sàn trưng bày — Cyber-Couture Catwalk Rotunda & Triple Neon Spotlights
+    art += box(-70, -50, z, 140, 100, 5, isNight ? '#0f172a' : '#f8fafc', '#22d3ee');
+    art += box(-58, -26, z + 5, 116, 52, 4.8, isNight ? '#050814' : '#fffbeb', '#f472b6');
 
-    // Panoramic Runway LED Backdrop Screen at rear of Catwalk
-    art += box(-54, -56, z + 5, 108, 4, 38, '#0f172a', '#38bdf8');
-    art += box(-48, -51.8, z + 10, 96, 0.8, 28, '#1e293b');
-    art += box(-18, -51, z + 14, 36, 0.8, 20, '#38bdf8');
+    // Panoramic Runway Neon Backdrop Screen at rear of Catwalk
+    art += box(-54, -56, z + 5, 108, 4, 38, '#020617', '#22d3ee');
+    art += box(-48, -51.8, z + 10, 96, 0.8, 28, '#0f172a', '#a855f7');
+    art += box(-20, -51, z + 13, 40, 0.8, 22, '#22d3ee');
 
     for (let led = 0; led < 7; led++) {
-      art += oval(-46 + led * 15.2, -21, z + 10.2, 2.2, 1.1, '#38bdf8');
-      art += oval(-46 + led * 15.2, 21, z + 10.2, 2.2, 1.1, '#38bdf8');
+      const ledCol = led % 2 ? '#f472b6' : '#22d3ee';
+      art += oval(-46 + led * 15.2, -21, z + 10.2, 2.4, 1.2, ledCol);
+      art += oval(-46 + led * 15.2, 21, z + 10.2, 2.4, 1.2, ledCol);
     }
-    art += hoodieShowcase(0, 0, z + 9.8, '#111622', '#fef3c7', true);
-    art += dressForm(-38, -2, z + 9.8, '#e11d48');
-    art += dressForm(38, -2, z + 9.8, '#2563eb');
-    art += dressForm(-22, -34, z + 5, '#f59e0b');
-    art += dressForm(22, -34, z + 5, '#10b981');
+    art += hoodieShowcase(0, 0, z + 9.8, '#0b1020', '#22d3ee', true);
+    art += dressForm(-38, -2, z + 9.8, '#ec4899');
+    art += dressForm(38, -2, z + 9.8, '#38bdf8');
+    art += dressForm(-22, -34, z + 5, '#fbbf24');
+    art += dressForm(22, -34, z + 5, '#a855f7');
 
-    art += box(-50, 33, z + 5, 44, 10, 5.5, '#7f1d1d') + box(6, 33, z + 5, 44, 10, 5.5, '#7f1d1d');
+    art += box(-50, 33, z + 5, 44, 10, 5.5, '#7f1d1d', '#f472b6') + box(6, 33, z + 5, 44, 10, 5.5, '#7f1d1d', '#22d3ee');
 
-    // Overhead Architectural Spotlight Truss & Dual-Color Light Cones
-    art += box(-62, -28, z + 9.8, 3.2, 3.2, 54, '#475569') + box(58.8, -28, z + 9.8, 3.2, 3.2, 54, '#475569');
-    art += box(-62, 24, z + 9.8, 3.2, 3.2, 54, '#475569') + box(58.8, 24, z + 9.8, 3.2, 3.2, 54, '#475569');
-    art += box(-63, -29, z + 63, 126, 3.2, 3.2, '#334155') + box(-63, 24, z + 63, 126, 3.2, 3.2, '#334155');
-    art += box(-63, -29, z + 63, 3.2, 56, 3.2, '#334155') + box(59.8, -29, z + 63, 3.2, 56, 3.2, '#334155');
+    // Overhead Architectural Spotlight Truss & Triple-Color Volumetric Light Cones
+    art += box(-62, -28, z + 9.8, 3.2, 3.2, 54, '#334155', '#22d3ee') + box(58.8, -28, z + 9.8, 3.2, 3.2, 54, '#334155', '#f472b6');
+    art += box(-62, 24, z + 9.8, 3.2, 3.2, 54, '#334155', '#22d3ee') + box(58.8, 24, z + 9.8, 3.2, 3.2, 54, '#334155', '#f472b6');
+    art += box(-63, -29, z + 63, 126, 3.2, 3.2, '#1e293b', '#22d3ee') + box(-63, 24, z + 63, 126, 3.2, 3.2, '#1e293b', '#f472b6');
+    art += box(-63, -29, z + 63, 3.2, 56, 3.2, '#1e293b') + box(59.8, -29, z + 63, 3.2, 56, 3.2, '#1e293b');
 
-    for (const [sx, grad] of [[-36, 'url(#spotlightCyan)'], [0, 'url(#spotlightBeam)'], [36, 'url(#spotlightCyan)']]) {
+    for (const [sx, grad] of [[-36, 'url(#spotlightCyan)'], [0, 'url(#spotlightBeam)'], [36, 'url(#spotlightMagenta)']]) {
       const [topX, topY] = iso(sx, 0, z + 63);
       const [botX, botY] = iso(sx, 0, z + 10);
-      art += `<polygon points="${topX - 4},${topY} ${topX + 4},${topY} ${botX + 21},${botY} ${botX - 21},${botY}" fill="${grad}" pointer-events="none"/>`;
+      art += `<polygon points="${topX - 4},${topY} ${topX + 4},${topY} ${botX + 22},${botY} ${botX - 22},${botY}" fill="${grad}" pointer-events="none"/>`;
     }
     art += props.lushPlant(-78, 50, z) + props.lushPlant(68, 50, z);
   }
@@ -1483,27 +1580,48 @@ function buildPavilionInterior(zone, z, isNight) {
 
 function renderCharacterFigure(index, isWorking, hasToken) {
   const skinPalette = ['#eab38f', '#d49a76', '#f3c8ad', '#c58b68', '#e8b494', '#f0c4a8'];
-  const outfitPalette = ['#b45309', '#0e7490', '#3f6212', '#be123c', '#1d4ed8', '#6d28d9'];
+  const outfitPalette = ['#f59e0b', '#06b6d4', '#10b981', '#ec4899', '#3b82f6', '#a855f7'];
+  const pantsPalette = ['#1e293b', '#0f172a', '#27272a', '#1e1b4b', '#172554', '#2e1065'];
   const skin = hasToken ? skinPalette[index % 6] : '#cbd5e1';
   const outfit = hasToken ? outfitPalette[index % 6] : '#64748b';
+  const outfitShade = shade(outfit, 0.78);
+  const pants = hasToken ? pantsPalette[index % 6] : '#334155';
   const hair = ['#1e293b', '#3b2820', '#27272a', '#451a03', '#0f172a', '#312e81'][index % 6];
 
   let ring = '';
   if (!hasToken) {
     ring = `<ellipse cx="0" cy="2" rx="16" ry="7.5" fill="none" stroke="#ef4444" stroke-width="2.2" class="pulse-out"/>`;
   } else if (isWorking) {
-    ring = `<ellipse cx="0" cy="2" rx="16" ry="7.5" fill="rgba(37,99,235,0.18)" stroke="#3b82f6" stroke-width="2" class="pulse-out"/>`;
+    ring = `<ellipse cx="0" cy="2" rx="17" ry="8" fill="rgba(34,211,238,0.22)" stroke="#22d3ee" stroke-width="2.2" class="pulse-out"/>`;
   }
 
-  const armPath = isWorking ? 'M1 -23 l8 3 l8 -7' : 'M1 -23 l5 6 l5 1';
+  const idleArmAngle = isWorking ? -28 : 6;
+  const facingDir = index % 2 ? -1 : 1;
   return `${ring}
-    <ellipse rx="9" ry="3.8" fill="#0f172a" opacity="0.22"/>
-    <g transform="scale(${index % 2 ? -1.25 : 1.25} 1.25)">
-      <path d="M-3 -14 l-1 13 M2.5 -14 l2.5 13" fill="none" stroke="#1e293b" stroke-width="3.8" stroke-linecap="round"/>
-      <path d="M-5.5 -27 Q0 -30 5.5 -26 L5 -13 Q0 -11 -6 -14 Z" fill="${outfit}"/>
-      <path d="${armPath}" fill="none" stroke="${skin}" stroke-width="2.8" stroke-linecap="round"/>
-      <ellipse cy="-33.5" rx="4.6" ry="5.5" fill="${skin}"/>
-      <path d="M-4.5 -33 Q-6 -40 1 -39.5 Q6.5 -39.5 5 -34 L0 -35 Z" fill="${hair}"/>
+    <ellipse class="char-shadow" cx="0" cy="1.5" rx="9" ry="3.8" fill="#0f172a" opacity="0.26"/>
+    <g class="char-facing" transform="scale(${facingDir * 1.22} 1.22)">
+      <g class="char-body" transform="translate(0 0)">
+        <g class="char-arm-b" transform="translate(-4.4 -24.5) rotate(${-idleArmAngle * 0.4})">
+          <path d="M0 0 L-1.2 10.5" fill="none" stroke="${outfitShade}" stroke-width="2.8" stroke-linecap="round"/>
+          <circle cx="-1.3" cy="11.5" r="1.5" fill="${skin}"/>
+        </g>
+        <g class="char-leg-b" transform="translate(-2.2 -13.5) rotate(0)">
+          <path d="M0 0 L-0.4 12" fill="none" stroke="${pants}" stroke-width="3.4" stroke-linecap="round"/>
+          <ellipse cx="0.6" cy="12.6" rx="2.3" ry="1.2" fill="#020617"/>
+        </g>
+        <g class="char-leg-f" transform="translate(2.2 -13.5) rotate(0)">
+          <path d="M0 0 L0.4 12" fill="none" stroke="${pants}" stroke-width="3.4" stroke-linecap="round"/>
+          <ellipse cx="1.4" cy="12.6" rx="2.3" ry="1.2" fill="#0f172a"/>
+        </g>
+        <path d="M-5.2 -26.8 Q0 -29.5 5.2 -26.2 L4.6 -13 Q0 -11.5 -5.4 -13.5 Z" fill="${outfit}"/>
+        <path d="M-2 -27 L0 -23.5 L2 -27" fill="none" stroke="rgba(255,255,255,0.45)" stroke-width="0.9"/>
+        <ellipse cx="0" cy="-33.2" rx="4.4" ry="5.1" fill="${skin}"/>
+        <path d="M-4.4 -32.8 Q-5.6 -39.6 0.8 -39.2 Q6.1 -39.2 4.6 -33.6 L0 -34.8 Z" fill="${hair}"/>
+        <g class="char-arm-f" transform="translate(4.4 -24.5) rotate(${idleArmAngle})">
+          <path d="M0 0 L1.8 10" fill="none" stroke="${outfit}" stroke-width="2.9" stroke-linecap="round"/>
+          <circle cx="2" cy="11.2" r="1.6" fill="${skin}"/>
+        </g>
+      </g>
     </g>`;
 }
 
@@ -1511,7 +1629,7 @@ function buildPavilionPillSpecs(zone, deptSummary, tok, showCallouts) {
   const i = zone.index;
   const h = zone.h;
   const [u, v] = iso(zone.x, zone.y, 0);
-  const labelY = 66 - h;
+  const labelY = Math.round((56 - h) * PAVILION_SCALE);
   const pills = [];
 
   const titleText = i < 6 ? `${zone.icon} ${zone.label} · ${zone.staffName}` : `${zone.icon} ${zone.label}`;
@@ -1530,7 +1648,7 @@ function buildPavilionPillSpecs(zone, deptSummary, tok, showCallouts) {
   });
 
   if (i === 6) {
-    const catTxt = '✨ CATWALK TRUNG TÂM';
+    const catTxt = '✦ CATWALK TRUNG TÂM';
     const catEst = estimateSvgTextWidth(catTxt, 9.2);
     const catW = Math.max(134, catEst + 22);
     pills.push({
@@ -1561,12 +1679,12 @@ function buildPavilionPillSpecs(zone, deptSummary, tok, showCallouts) {
   }
 
   if (showCallouts && deptSummary && i < 6) {
-    const topY = -96 - h;
+    const topY = i === 5 ? Math.round((-88 - h) * PAVILION_SCALE) : Math.round((-94 - h) * PAVILION_SCALE);
     if (deptSummary.activeCount > 0) {
       const active = deptSummary.activeItems[0];
-      const snippet = cleanOneLine(`${active.id} · ${active.title}`, 28);
+      const snippet = cleanOneLine(`${active.id} · ${active.title}`, 24);
       const callEst = estimateSvgTextWidth(snippet, 9.5);
-      const callW = Math.max(176, callEst + 38);
+      const callW = Math.max(166, callEst + 38);
       pills.push({
         kind: 'callout-active',
         zoneIndex: i,
@@ -1580,9 +1698,9 @@ function buildPavilionPillSpecs(zone, deptSummary, tok, showCallouts) {
       });
     } else if (deptSummary.reviewCount > 0 || deptSummary.queuedCount > 0) {
       const nextItem = deptSummary.reviewItems[0] || deptSummary.queuedItems[0];
-      const snippet = cleanOneLine(`⏳ ${nextItem.id} · ${nextItem.title}`, 28);
+      const snippet = cleanOneLine(`⏳ ${nextItem.id} · ${nextItem.title}`, 24);
       const callEst = estimateSvgTextWidth(snippet, 9.2);
-      const callW = Math.max(166, callEst + 26);
+      const callW = Math.max(156, callEst + 26);
       pills.push({
         kind: 'callout-queued',
         zoneIndex: i,
@@ -1595,9 +1713,9 @@ function buildPavilionPillSpecs(zone, deptSummary, tok, showCallouts) {
         centerY: topY,
       });
     } else if (deptSummary.doneCount > 0) {
-      const doneTxt = `✓ ${deptSummary.doneCount} việc hoàn thành`;
+      const doneTxt = `✓ ${deptSummary.doneCount} xong`;
       const callEst = estimateSvgTextWidth(doneTxt, 9);
-      const callW = Math.max(112, callEst + 22);
+      const callW = Math.max(92, callEst + 22);
       pills.push({
         kind: 'callout-done',
         zoneIndex: i,
@@ -1655,13 +1773,15 @@ export function computeSceneBoundsAndCollisions(
     }
   }
 
-  // Include Citadel Plaza corners & Grand Staircase & Tallest Roof Spire in scene bounds check
+  // Include Octagonal Cyber-Plaza outer corners + tallest scaled Pavilion roof spire
+  const zone0U = iso(STUDIO_ZONES[0].x, STUDIO_ZONES[0].y, 0);
+  const zone0Spire = iso(-84, -69.5, STUDIO_ZONES[0].h + 59.5);
   const structuralPoints = [
-    iso(-346, -346, 0),
-    iso(-346, 346, -26),
-    iso(346, -346, -26),
-    iso(354, 354, -25),
-    iso(STUDIO_ZONES[0].x - 84, STUDIO_ZONES[0].y - 69.5, STUDIO_ZONES[0].h + 59.5),
+    iso(-505, 169, -22),
+    iso(505, -169, -22),
+    iso(-255, -505, -8),
+    iso(255, 505, -22),
+    [zone0U[0] + zone0Spire[0] * PAVILION_SCALE, zone0U[1] + zone0Spire[1] * PAVILION_SCALE],
   ];
 
   let minX = Math.min(...structuralPoints.map((p) => p[0]), ...pills.map((p) => p.x1));
@@ -1688,53 +1808,50 @@ function renderPavilion(zone, deptSummary, tok, isSelected, showCallouts, isNigh
   const i = zone.index;
   const h = zone.h;
   const z = h + 10;
+  const neon = zone.neon || '#22d3ee';
   const [u, v] = iso(zone.x, zone.y, 0);
 
   let slab = '';
-  // Monumental Fluted Support Columns with Stone Plinths rising from Citadel Plaza (-4)
+  // Neon underglow aura beneath the pavilion plinth
+  slab += oval(0, 0, -1, 118, 52, neon, `opacity="${isNight ? (deptSummary?.activeCount > 0 ? 0.34 : 0.2) : 0.11}" filter="url(#neon-halo)"`);
+
+  // Monumental Support Columns with Neon Plinths rising from Citadel Deck
   for (const [cx, cy] of [[-76, -58], [0, -58], [66, -58], [-76, 54], [66, 54]]) {
-    slab += box(cx - 2, cy - 2, -4, 14, 14, 4, isNight ? '#475569' : '#cbd5e1');
-    slab += box(cx, cy, 0, 10, 10, h + 2, isNight ? '#334155' : '#94a3b8');
+    slab += box(cx - 2, cy - 2, -2, 14, 14, 4, isNight ? '#1e293b' : '#cbd5e1', neon);
+    slab += box(cx, cy, 2, 10, 10, h, isNight ? '#1e293b' : '#94a3b8', neon);
   }
 
-  // Stepped Lower Architectural Podium + Main Pavilion Deck
-  const deckColor = isSelected ? shade(zone.color, 1.07) : zone.color;
-  slab += oval(0, 0, -3, 114, 49, '#0f172a', 'opacity="0.18" filter="url(#shadow)"');
-  slab += box(-92, -73, Math.max(0, h - 6), 184, 146, 6, shade(deckColor, 0.85));
-  slab += box(-88, -70, Math.max(0, h), 176, 140, 10, deckColor);
+  // Stepped Lower Architectural Podium + Main Pavilion Deck + Neon Cornice
+  const deckColor = isSelected ? shade(zone.color, 1.1) : zone.color;
+  slab += oval(0, 0, -2, 114, 49, '#020617', 'opacity="0.24" filter="url(#shadow)"');
+  slab += box(-92, -73, Math.max(0, h - 6), 184, 146, 6, shade(deckColor, 0.8), neon);
+  slab += box(-88, -70, Math.max(0, h), 176, 140, 10, deckColor, neon);
   if (h > 6) {
-    slab += box(-84, -66, 0, 168, 132, h - 6, shade(deckColor, 0.78));
+    slab += box(-84, -66, 0, 168, 132, h - 6, shade(deckColor, 0.72), neon);
   }
 
-  // Active Execution Rim Light + Rooftop Beacon Spire when Active!
-  if (deptSummary && deptSummary.activeCount > 0) {
-    slab += face(
-      [
-        [-89, -71, z + 0.4],
-        [89, -71, z + 0.4],
-        [89, 71, z + 0.4],
-        [-89, 71, z + 0.4],
-      ],
-      'none',
-      'stroke="#3b82f6" stroke-width="2.8"',
-    );
-    slab += `<polygon points="-10,${-52 - h} 10,${-52 - h} 22,${-92 - h} -22,${-92 - h}" fill="url(#beaconSpire)" pointer-events="none"/>`;
-  } else if (isSelected) {
-    slab += face(
-      [
-        [-89, -71, z + 0.4],
-        [89, -71, z + 0.4],
-        [89, 71, z + 0.4],
-        [-89, 71, z + 0.4],
-      ],
-      'none',
-      'stroke="#f59e0b" stroke-width="2.3"',
-    );
+  // Subtle Neon Perimeter Trim + Active Execution / Selection Rim Light + Beacon Spire
+  const isActiveDept = Boolean(deptSummary && deptSummary.activeCount > 0);
+  const rimStroke = isActiveDept ? '#22d3ee' : isSelected ? '#f472b6' : neon;
+  const rimWidth = isActiveDept ? 3 : isSelected ? 2.5 : 1.3;
+  const rimExtra = isActiveDept ? `stroke="${rimStroke}" stroke-width="${rimWidth}" filter="url(#neon-bloom)"` : `stroke="${rimStroke}" stroke-width="${rimWidth}" stroke-opacity="${isNight ? 0.88 : 0.55}"`;
+  slab += face(
+    [
+      [-89, -71, z + 0.4],
+      [89, -71, z + 0.4],
+      [89, 71, z + 0.4],
+      [-89, 71, z + 0.4],
+    ],
+    'none',
+    rimExtra,
+  );
+  if (isActiveDept) {
+    slab += `<polygon points="-10,${-52 - h} 10,${-52 - h} 24,${-94 - h} -24,${-94 - h}" fill="url(#beaconSpire)" pointer-events="none"/>`;
   }
 
   // Front Entrance Steps on Pavilion
   for (let k = 0; k < 4; k++) {
-    slab += box(16, 62 + k * 4.5, z - 4 - k * 3.5, 28, 4.5, 3.5, shade(zone.color, 0.94));
+    slab += box(16, 62 + k * 4.5, z - 4 - k * 3.5, 28, 4.5, 3.5, shade(zone.color, 0.94), neon);
   }
 
   slab += buildPavilionInterior(zone, z, isNight);
@@ -1743,16 +1860,19 @@ function renderPavilion(zone, deptSummary, tok, isSelected, showCallouts, isNigh
   if (i < 6) {
     const [offX, offY] = STAFF_AISLE_OFFSETS[i] || [8, 18];
     const [sx, sy] = iso(offX, offY, z);
-    const isWorking = (deptSummary?.activeCount || 0) > 0;
+    const isWorking = isActiveDept;
     const hasToken = tok ? tok.hasToken : true;
     const summaryAction = deptSummary?.primaryItem
       ? `${deptSummary.primaryItem.statusLabel}: ${deptSummary.primaryItem.id} ${deptSummary.primaryItem.title}`
       : 'Sẵn sàng nhận việc';
 
+    const roleTag = zone.roleShort || zone.staffName;
+    const staffTagW = Math.round(Math.max(48, estimateSvgTextWidth(roleTag, 8.6) + 14));
+
     slab += `<g class="room staff" data-index="${i}" role="button" tabindex="0" aria-label="${esc(`${zone.staffName} · ${zone.label} · ${summaryAction}`)}" transform="translate(${sx} ${sy})">
       ${renderCharacterFigure(i, isWorking, hasToken)}
-      <rect x="-24" y="-68" width="48" height="15" rx="7.5" fill="${isWorking ? '#1d4ed8' : '#0f172a'}" stroke="rgba(255,255,255,0.5)" stroke-width="0.9"/>
-      <text y="-57.5" text-anchor="middle" fill="#ffffff" font-size="9.2" font-weight="800">${esc(zone.staffName)}</text>
+      <rect x="${-staffTagW / 2}" y="-68" width="${staffTagW}" height="15" rx="7.5" fill="${isWorking ? '#0e7490' : '#0b132b'}" stroke="${isWorking ? '#22d3ee' : neon}" stroke-width="1"/>
+      <text y="-57.8" text-anchor="middle" fill="#ffffff" font-size="8.6" font-weight="800">${esc(roleTag)}</text>
     </g>`;
   }
 
@@ -1762,21 +1882,28 @@ function renderPavilion(zone, deptSummary, tok, isSelected, showCallouts, isNigh
   const subSpec = pillSpecs.find((p) => p.kind === 'subbadge');
   const calloutSpec = pillSpecs.find((p) => p.kind.startsWith('callout-'));
 
-  const nameplateFill = isSelected ? '#1e3a8a' : isNight ? '#0f172a' : '#ffffff';
-  const nameplateText = isSelected || isNight ? '#ffffff' : '#13203b';
-  const nameplateBorder = isSelected ? '#60a5fa' : deptSummary?.activeCount > 0 ? '#3b82f6' : '#cbd5e1';
+  const nameplateFill = isSelected ? (isNight ? '#0c2348' : '#1e3a8a') : isNight ? '#091128' : '#ffffff';
+  const nameplateText = isSelected || isNight ? '#f8fafc' : '#13203b';
+  const nameplateBorder = isSelected ? '#22d3ee' : isActiveDept ? '#38bdf8' : isNight ? neon : '#cbd5e1';
 
   let subBadgeSvg = '';
   if (subSpec) {
     if (i === 6) {
       subBadgeSvg = `
         <g class="token-badge-svg" transform="translate(0, ${subSpec.centerY})">
-          <rect x="${subSpec.localX}" y="-9" width="${subSpec.width}" height="18" rx="9" fill="#ecfdf5" stroke="#34d399" stroke-width="1.3"/>
-          <text text-anchor="middle" y="3.5" fill="#047857" font-size="9.2" font-weight="800">${esc(subSpec.text)}</text>
+          <rect x="${subSpec.localX}" y="-9" width="${subSpec.width}" height="18" rx="9" fill="${isNight ? '#071c2c' : '#ecfdf5'}" stroke="#22d3ee" stroke-width="1.3"/>
+          <text text-anchor="middle" y="3.5" fill="${isNight ? '#67e8f9' : '#047857'}" font-size="9.2" font-weight="800">${esc(subSpec.text)}</text>
         </g>`;
     } else if (tok) {
-      const bg =
-        tok.status === 'out'
+      const bg = isNight
+        ? tok.status === 'out'
+          ? '#3b0b18'
+          : tok.isLow
+            ? '#332006'
+            : tok.status === 'ok'
+              ? '#062c22'
+              : '#0b132b'
+        : tok.status === 'out'
           ? '#fef2f2'
           : tok.isLow
             ? '#fffbeb'
@@ -1785,14 +1912,23 @@ function renderPavilion(zone, deptSummary, tok, isSelected, showCallouts, isNigh
               : '#f8fafc';
       const border =
         tok.status === 'out'
-          ? '#ef4444'
+          ? '#fb7185'
           : tok.isLow
-            ? '#f59e0b'
+            ? '#fbbf24'
             : tok.status === 'ok'
-              ? '#22c55e'
-              : '#94a3b8';
-      const textCol =
-        tok.status === 'out'
+              ? '#34d399'
+              : isNight
+                ? '#475569'
+                : '#94a3b8';
+      const textCol = isNight
+        ? tok.status === 'out'
+          ? '#fda4af'
+          : tok.isLow
+            ? '#fde68a'
+            : tok.status === 'ok'
+              ? '#6ee7b7'
+              : '#cbd5e1'
+        : tok.status === 'out'
           ? '#b91c1c'
           : tok.isLow
             ? '#b45309'
@@ -1802,7 +1938,7 @@ function renderPavilion(zone, deptSummary, tok, isSelected, showCallouts, isNigh
 
       subBadgeSvg = `
         <g class="token-badge-svg" transform="translate(0, ${subSpec.centerY})">
-          <rect x="${subSpec.localX}" y="-9" width="${subSpec.width}" height="18" rx="9" fill="${bg}" stroke="${border}" stroke-width="1.3"/>
+          <rect x="${subSpec.localX}" y="-9" width="${subSpec.width}" height="18" rx="9" fill="${bg}" stroke="${border}" stroke-width="1.2"/>
           <text text-anchor="middle" y="3.5" fill="${textCol}" font-size="9.2" font-weight="800">${esc(subSpec.text)}</text>
         </g>`;
     }
@@ -1814,21 +1950,21 @@ function renderPavilion(zone, deptSummary, tok, isSelected, showCallouts, isNigh
       const dotX = calloutSpec.localX + 13;
       taskCalloutSvg = `
         <g class="task-callout-svg" transform="translate(0, ${calloutSpec.centerY})">
-          <rect x="${calloutSpec.localX}" y="-12" width="${calloutSpec.width}" height="24" rx="12" fill="#1d4ed8" stroke="#93c5fd" stroke-width="1.5"/>
-          <circle cx="${dotX}" cy="0" r="4" fill="#6ee7b7" class="live-beacon"/>
+          <rect x="${calloutSpec.localX}" y="-12" width="${calloutSpec.width}" height="24" rx="12" fill="#0f295c" stroke="#22d3ee" stroke-width="1.5"/>
+          <circle cx="${dotX}" cy="0" r="4" fill="#22d3ee" class="live-beacon"/>
           <text text-anchor="middle" x="7" y="3.5" fill="#ffffff" font-size="9.5" font-weight="800">${esc(calloutSpec.text)}</text>
         </g>`;
     } else if (calloutSpec.kind === 'callout-queued') {
       taskCalloutSvg = `
         <g class="task-callout-svg" transform="translate(0, ${calloutSpec.centerY})">
-          <rect x="${calloutSpec.localX}" y="-11" width="${calloutSpec.width}" height="22" rx="11" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.4"/>
-          <text text-anchor="middle" y="3" fill="#b45309" font-size="9.2" font-weight="800">${esc(calloutSpec.text)}</text>
+          <rect x="${calloutSpec.localX}" y="-11" width="${calloutSpec.width}" height="22" rx="11" fill="${isNight ? '#2b1c07' : '#fffbeb'}" stroke="#f59e0b" stroke-width="1.3"/>
+          <text text-anchor="middle" y="3" fill="${isNight ? '#fde68a' : '#b45309'}" font-size="9.2" font-weight="800">${esc(calloutSpec.text)}</text>
         </g>`;
     } else {
       taskCalloutSvg = `
         <g class="task-callout-svg" transform="translate(0, ${calloutSpec.centerY})">
-          <rect x="${calloutSpec.localX}" y="-9.5" width="${calloutSpec.width}" height="19" rx="9.5" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="1.2"/>
-          <text text-anchor="middle" y="3" fill="#047857" font-size="9" font-weight="800">${esc(calloutSpec.text)}</text>
+          <rect x="${calloutSpec.localX}" y="-9.5" width="${calloutSpec.width}" height="19" rx="9.5" fill="${isNight ? '#062620' : '#ecfdf5'}" stroke="#34d399" stroke-width="1.2"/>
+          <text text-anchor="middle" y="3" fill="${isNight ? '#6ee7b7' : '#047857'}" font-size="9" font-weight="800">${esc(calloutSpec.text)}</text>
         </g>`;
     }
   }
@@ -1837,15 +1973,15 @@ function renderPavilion(zone, deptSummary, tok, isSelected, showCallouts, isNigh
     <g class="pavilion-hud-overlay">
       ${taskCalloutSvg}
       <g transform="translate(0, ${nameplateSpec.centerY})">
-        <rect x="${nameplateSpec.localX}" y="-11" width="${nameplateSpec.width}" height="22" rx="11" fill="${nameplateFill}" stroke="${nameplateBorder}" stroke-width="1.5"/>
+        <rect x="${nameplateSpec.localX}" y="-11" width="${nameplateSpec.width}" height="22" rx="11" fill="${nameplateFill}" stroke="${nameplateBorder}" stroke-width="1.4"/>
         <text text-anchor="middle" y="4" fill="${nameplateText}" font-size="10.5" font-weight="800">${esc(nameplateSpec.text)}</text>
       </g>
       ${subBadgeSvg}
     </g>`;
 
   return {
-    pavilionSvg: `<g class="room" data-index="${i}" tabindex="0" role="button" aria-label="${esc(zone.label)}" transform="translate(${u} ${v})">${slab}</g>`,
-    overlaySvg: `<g class="room" data-index="${i}" aria-hidden="true" transform="translate(${u} ${v})">${labelOverlay}</g>`,
+    pavilionSvg: `<g class="room room-arch" data-index="${i}" tabindex="0" role="button" aria-label="${esc(zone.label)}" transform="translate(${u} ${v})"><g class="pavilion-arch" transform="scale(${PAVILION_SCALE})">${slab}</g></g>`,
+    overlaySvg: `<g class="room room-hud" data-index="${i}" aria-hidden="true" transform="translate(${u} ${v})">${labelOverlay}</g>`,
   };
 }
 
@@ -1885,16 +2021,44 @@ export function initAtelierXStudio() {
   let activeProjectId = DEFAULT_PROJECT_ID;
   let online = false;
   let activeModalFilter = 'all';
+  let activeShowcaseFilter = 'all';
+  let cachedCatalogProducts = [];
+  let activeShowcaseKey = '';
+  let activeShowcaseUrl = '';
+  let motionRafId = null;
+  let lastMotionTs = 0;
   const assignments = new Map();
 
-  // Initialize Day / Night Runway theme
-  let studioTheme = 'day';
+  // Persistent articulated walking states across sync() re-renders (strictly 6 unique staff, zero clones)
+  const staffStates = [0, 1, 2, 3, 4, 5].map((i) => {
+    const start = STAFF_PATROL_WAYPOINTS[i]?.[0] || STAFF_AISLE_OFFSETS[i] || [0, 20];
+    return {
+      index: i,
+      x: start[0],
+      y: start[1],
+      fromX: start[0],
+      fromY: start[1],
+      toX: start[0],
+      toY: start[1],
+      wpIdx: 0,
+      phase: 'pause',
+      timer: 0,
+      duration: 3.5 + i * 0.9,
+      facing: i % 2 ? -1 : 1,
+      stridePhase: i * 1.1,
+      gesturePhase: i * 0.9,
+      isWorking: false,
+      rootEl: null,
+      parts: null,
+    };
+  });
+
+  // Initialize Cyber-Neon ('night') / Light Pearl ('day') theme — Neon 3D by default
+  let studioTheme = 'night';
   try {
     const saved = localStorage.getItem('atelierx_studio_theme');
     if (saved === 'night' || saved === 'day') {
       studioTheme = saved;
-    } else if (localStorage.getItem('crewly-theme') === 'dark') {
-      studioTheme = 'night';
     }
   } catch {
     // ignore storage errors
@@ -1904,7 +2068,19 @@ export function initAtelierXStudio() {
     document.documentElement.setAttribute('data-studio-theme', studioTheme);
     const btn = document.getElementById('btn-theme-toggle');
     if (btn) {
-      btn.textContent = studioTheme === 'night' ? '☀️ Sáng' : '🌙 Đêm';
+      btn.textContent = studioTheme === 'night' ? '☀️ Sáng' : '🌙 Neon';
+    }
+    const frame = document.getElementById('showcase-frame');
+    if (frame?.contentWindow && typeof frame.contentWindow.postMessage === 'function') {
+      try {
+        const targetOrigin =
+          typeof window !== 'undefined' && window.location?.origin && window.location.origin !== 'null'
+            ? window.location.origin
+            : '*';
+        frame.contentWindow.postMessage({ type: 'atelierx-theme', theme: studioTheme }, targetOrigin);
+      } catch {
+        // ignore cross-frame messaging errors
+      }
     }
   }
   applyTheme();
@@ -1986,60 +2162,176 @@ export function initAtelierXStudio() {
       overlays.push(overlaySvg);
     }
 
-    // Corridor walker layer sits BEFORE hud-overlays so HUD badges are never occluded!
+    // Corridor walker layer kept empty (zero duplicate clones of the 6 unique staff)
     world.innerHTML =
       sceneHtml +
       `<g class="corridor-walkers"></g>` +
       `<g class="hud-overlays">${overlays.join('')}</g>`;
 
-    renderCorridorWalkers(byDept);
+    bindHumanActors(byDept);
   }
 
-  function renderCorridorWalkers(byDept) {
-    const walkerLayer = world.querySelector('.corridor-walkers');
-    if (!walkerLayer) return;
-    const ns = 'http://www.w3.org/2000/svg';
+  function extractCharacterParts(root) {
+    if (!root || typeof root.querySelector !== 'function') return null;
+    return {
+      facing: root.querySelector('.char-facing'),
+      body: root.querySelector('.char-body'),
+      legF: root.querySelector('.char-leg-f'),
+      legB: root.querySelector('.char-leg-b'),
+      armF: root.querySelector('.char-arm-f'),
+      armB: root.querySelector('.char-arm-b'),
+    };
+  }
 
-    STUDIO_ZONES.slice(1, 6).forEach((zone) => {
-      const i = zone.index;
-      const elapsed = Date.now() - (assignments.get(i)?.start || 0);
-      if (elapsed >= 20000) return;
+  function applyHumanPose(parts, { facing = 1, stridePhase = 0, walkBlend = 0, gesturePhase = 0, isWorking = false }) {
+    if (!parts) return;
+    if (parts.facing) {
+      parts.facing.setAttribute('transform', `scale(${(facing >= 0 ? 1.22 : -1.22).toFixed(2)} 1.22)`);
+    }
+    const s = walkBlend > 0.01 ? Math.sin(stridePhase) * walkBlend : 0;
+    const legAngle = s * 24;
+    const armWalk = -s * 19;
+    const idleArmF = isWorking ? -28 + Math.sin(gesturePhase * 3.1) * 9 : 6 + Math.sin(gesturePhase * 1.4) * 2.5;
+    const idleArmB = isWorking ? 12 - Math.sin(gesturePhase * 3.1) * 5 : -3 - Math.sin(gesturePhase * 1.4) * 2;
+    const armFAngle = walkBlend > 0.01 ? armWalk * walkBlend + idleArmF * (1 - walkBlend) : idleArmF;
+    const armBAngle = walkBlend > 0.01 ? -armWalk * walkBlend + idleArmB * (1 - walkBlend) : idleArmB;
+    const bobY =
+      walkBlend > 0.01
+        ? -Math.abs(Math.sin(stridePhase)) * 1.45 * walkBlend
+        : Math.sin(gesturePhase * 1.8) * 0.35;
+    const leanDeg = walkBlend * 3.5;
 
-      const deptSummary = byDept[i];
-      const tok = computeAgentTokenInfo(i, members, liveTokenUsage, liveRuntimeFallback);
-      const [offX, offY] = STAFF_AISLE_OFFSETS[i] || [8, 18];
-      const [x, y] = iso(zone.x + offX, zone.y + offY, zone.h + 10);
-      const [hx, hy] = iso(0, 0, STUDIO_ZONES[6].h + 14);
-      const [lx, ly] = iso(
-        STUDIO_ZONES[0].x + 28 + (i % 3) * 7,
-        STUDIO_ZONES[0].y + 18 + i * 3,
-        STUDIO_ZONES[0].h + 10,
-      );
+    if (parts.body) {
+      parts.body.setAttribute('transform', `translate(0 ${bobY.toFixed(2)}) rotate(${leanDeg.toFixed(1)} 0 -16)`);
+    }
+    if (parts.legF) parts.legF.setAttribute('transform', `translate(2.2 -13.5) rotate(${legAngle.toFixed(1)})`);
+    if (parts.legB) parts.legB.setAttribute('transform', `translate(-2.2 -13.5) rotate(${(-legAngle).toFixed(1)})`);
+    if (parts.armF) parts.armF.setAttribute('transform', `translate(4.4 -24.5) rotate(${armFAngle.toFixed(1)})`);
+    if (parts.armB) parts.armB.setAttribute('transform', `translate(-4.4 -24.5) rotate(${armBAngle.toFixed(1)})`);
+  }
 
-      const node = document.createElementNS(ns, 'g');
-      node.setAttribute('class', 'room courier');
-      node.dataset.index = String(i);
-      node.innerHTML = renderCharacterFigure(i, (deptSummary?.activeCount || 0) > 0, tok ? tok.hasToken : true);
-      node.setAttribute('transform', `translate(${x} ${y})`);
+  function bindHumanActors(byDept) {
+    const staffEls = world.querySelectorAll('.staff');
+    for (const el of staffEls) {
+      const idx = Number(el.dataset?.index);
+      if (!Number.isInteger(idx) || idx < 0 || idx > 5) continue;
+      const st = staffStates[idx];
+      st.rootEl = el;
+      st.isWorking = (byDept?.[idx]?.activeCount || 0) > 0;
+      st.parts = extractCharacterParts(el);
+      const z = STUDIO_ZONES[idx].h + 10;
+      const [sx, sy] = iso(st.x, st.y, z);
+      el.setAttribute('transform', `translate(${sx} ${sy})`);
+      applyHumanPose(st.parts, {
+        facing: st.facing,
+        stridePhase: st.stridePhase,
+        walkBlend: st.phase === 'walk' ? Math.sin(Math.min(1, st.timer / st.duration) * Math.PI) : 0,
+        gesturePhase: st.gesturePhase,
+        isWorking: st.isWorking,
+      });
+    }
+  }
 
-      const d = `M0 0 L${hx - x} ${hy - y} L${lx - x} ${ly - y} L${lx - x} ${ly - y} L${hx - x} ${hy - y} L0 0`;
-      const motion = document.createElementNS(ns, 'animateMotion');
-      motion.setAttribute('path', d);
-      motion.setAttribute('dur', '20s');
-      motion.setAttribute('calcMode', 'linear');
-      motion.setAttribute('keyTimes', '0;.18;.32;.68;.82;1');
-      motion.setAttribute('begin', 'indefinite');
-      node.append(motion);
-      walkerLayer.append(node);
+  function tickHumanMotion(ts) {
+    if (destroyed) return;
+    if (!lastMotionTs) lastMotionTs = ts;
+    const dt = Math.min(0.08, Math.max(0, (ts - lastMotionTs) / 1000));
+    lastMotionTs = ts;
 
-      if (
-        typeof matchMedia === 'function' &&
-        !matchMedia('(prefers-reduced-motion: reduce)').matches &&
-        typeof motion.beginElementAt === 'function'
-      ) {
-        motion.beginElementAt(-elapsed / 1000);
+    // Update calm, natural movement inside each department pavilion (zero skybridge clones)
+    for (const st of staffStates) {
+      const pts = STAFF_PATROL_WAYPOINTS[st.index];
+      const z = STUDIO_ZONES[st.index].h + 10;
+      st.gesturePhase += dt;
+
+      if (st.phase === 'pause') {
+        if (st.isWorking) {
+          const home = pts?.[0];
+          const distHome = home ? Math.hypot(home[0] - st.x, home[1] - st.y) : 0;
+          if (distHome > 1.5 && home) {
+            st.wpIdx = 0;
+            st.fromX = st.x;
+            st.fromY = st.y;
+            st.toX = home[0];
+            st.toY = home[1];
+            st.duration = Math.max(1.2, distHome / 20);
+            const screenDx = st.toX - st.fromX - (st.toY - st.fromY);
+            if (Math.abs(screenDx) > 1) st.facing = screenDx >= 0 ? 1 : -1;
+            st.phase = 'walk';
+            st.timer = 0;
+          } else {
+            st.timer = 0;
+          }
+        } else {
+          st.timer += dt;
+          if (st.timer >= st.duration && pts && pts.length > 1) {
+            st.wpIdx = (st.wpIdx + 1) % pts.length;
+            st.fromX = st.x;
+            st.fromY = st.y;
+            st.toX = pts[st.wpIdx][0];
+            st.toY = pts[st.wpIdx][1];
+            const dist = Math.hypot(st.toX - st.fromX, st.toY - st.fromY) || 20;
+            st.duration = Math.max(1.6, dist / 17);
+            const screenDx = st.toX - st.fromX - (st.toY - st.fromY);
+            if (Math.abs(screenDx) > 1) st.facing = screenDx >= 0 ? 1 : -1;
+            st.phase = 'walk';
+            st.timer = 0;
+          }
+        }
+        applyHumanPose(st.parts, {
+          facing: st.facing,
+          stridePhase: st.stridePhase,
+          walkBlend: 0,
+          gesturePhase: st.gesturePhase,
+          isWorking: st.isWorking,
+        });
+      } else {
+        st.timer += dt;
+        const raw = Math.min(1, st.timer / Math.max(0.1, st.duration));
+        const smooth = raw * raw * (3 - 2 * raw);
+        st.x = st.fromX + (st.toX - st.fromX) * smooth;
+        st.y = st.fromY + (st.toY - st.fromY) * smooth;
+        st.stridePhase += dt * 7.6;
+        const walkBlend = Math.sin(raw * Math.PI);
+
+        if (st.rootEl) {
+          const [sx, sy] = iso(st.x, st.y, z);
+          st.rootEl.setAttribute('transform', `translate(${sx} ${sy})`);
+        }
+        applyHumanPose(st.parts, {
+          facing: st.facing,
+          stridePhase: st.stridePhase,
+          walkBlend,
+          gesturePhase: st.gesturePhase,
+          isWorking: st.isWorking,
+        });
+
+        if (raw >= 1) {
+          st.x = st.toX;
+          st.y = st.toY;
+          st.phase = 'pause';
+          st.timer = 0;
+          st.duration = 5.0 + ((st.index * 7 + st.wpIdx * 3) % 5) * 0.85;
+        }
       }
-    });
+    }
+
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      motionRafId = window.requestAnimationFrame(tickHumanMotion);
+    }
+  }
+
+  function startHumanMotionLoop() {
+    if (
+      typeof window === 'undefined' ||
+      typeof window.requestAnimationFrame !== 'function' ||
+      (typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches)
+    ) {
+      return;
+    }
+    if (!motionRafId) {
+      motionRafId = window.requestAnimationFrame(tickHumanMotion);
+    }
   }
 
   function updateHeaderTelemetry(workloads) {
@@ -2047,18 +2339,21 @@ export function initAtelierXStudio() {
 
     const kpiActive = document.getElementById('kpi-active-work');
     if (kpiActive) {
-      kpiActive.innerHTML = `<span class="kpi-dot ${totals.active > 0 ? 'live-beacon' : ''}" style="background:#2563eb"></span><span>Đang làm: <strong>${totals.active}</strong></span>`;
+      kpiActive.innerHTML = `<span class="kpi-dot ${totals.active > 0 ? 'live-beacon' : ''}" style="background:#22d3ee"></span><span>Đang làm: <strong>${totals.active}</strong></span>`;
+      kpiActive.classList.toggle('is-filter-on', deptFilter === 'active');
     }
     const kpiQueued = document.getElementById('kpi-queued-work');
     if (kpiQueued) {
-      kpiQueued.innerHTML = `<span class="kpi-dot" style="background:#f59e0b"></span><span>Chờ / Duyệt: <strong>${totals.pendingAttention}</strong></span>`;
+      kpiQueued.innerHTML = `<span class="kpi-dot" style="background:#f59e0b"></span><span>Chờ: <strong>${totals.pendingAttention}</strong></span>`;
+      kpiQueued.classList.toggle('is-filter-on', deptFilter === 'queued');
     }
     const kpiDone = document.getElementById('kpi-done-work');
     if (kpiDone) {
-      kpiDone.innerHTML = `<span class="kpi-dot" style="background:#10b981"></span><span>Xong: <strong>${totals.done}/${totals.total}</strong> (${totals.completionPct}%)</span>`;
+      kpiDone.innerHTML = `<span class="kpi-dot" style="background:#10b981"></span><span>Xong: <strong>${totals.done}/${totals.total}</strong></span>`;
+      kpiDone.classList.toggle('is-filter-on', deptFilter === 'done');
     }
 
-    // Update filter tab counts
+    // Update compact filter tab counts
     const activeDeptCount = workloads.departments.filter((d) => d.activeCount > 0).length;
     const queuedDeptCount = workloads.departments.filter((d) => d.queuedCount + d.reviewCount > 0).length;
     const doneDeptCount = workloads.departments.filter((d) => d.doneCount > 0).length;
@@ -2066,34 +2361,30 @@ export function initAtelierXStudio() {
     document.querySelectorAll('[data-dept-filter]').forEach((btn) => {
       const f = btn.dataset.deptFilter;
       if (f === 'all') btn.textContent = 'Tất cả (7)';
-      else if (f === 'active') btn.textContent = `⚡ Đang làm (${activeDeptCount})`;
-      else if (f === 'queued') btn.textContent = `⏳ Chờ / Duyệt (${queuedDeptCount})`;
-      else if (f === 'done') btn.textContent = `✅ Đã xong (${doneDeptCount})`;
+      else if (f === 'active') btn.textContent = `⚡ Làm (${activeDeptCount})`;
+      else if (f === 'queued') btn.textContent = `⏳ Chờ (${queuedDeptCount})`;
+      else if (f === 'done') btn.textContent = `✓ Xong (${doneDeptCount})`;
       btn.classList.toggle('active', f === deptFilter);
     });
 
-    // Update Token & Runtime Fallback Header Summary
+    // Compact Token & Runtime Fallback Header Summary
     const allAgents = [0, 1, 2, 3, 4, 5]
       .map((idx) => computeAgentTokenInfo(idx, members, liveTokenUsage, liveRuntimeFallback))
       .filter(Boolean);
     const okCount = allAgents.filter((a) => a.status === 'ok').length;
     const fallbackCount = allAgents.filter((a) => a.status !== 'out' && a.isRunningOnFallback).length;
-    const unlimitedCount = allAgents.filter((a) => a.status === 'unlimited').length;
     const outCount = allAgents.filter((a) => a.status === 'out').length;
-    const unknownCount = allAgents.filter((a) => a.status === 'unknown').length;
 
     const summaryEl = document.querySelector('#token-summary-indicator');
     if (summaryEl) {
       if (outCount > 0) {
-        summaryEl.innerHTML = `<span style="color:#059669">🟢 ${6 - outCount} Sẵn sàng</span> · <span style="color:#dc2626">🔴 ${outCount} Hết quota</span>`;
+        summaryEl.innerHTML = `<span style="color:#fb7185">🔴 ${outCount} hết quota</span>`;
       } else if (fallbackCount > 0) {
-        summaryEl.innerHTML = `<span style="color:#d97706">🟠 ${fallbackCount} Dự phòng</span> · <span style="color:#059669">🟢 ${6 - fallbackCount} Ổn định</span>`;
+        summaryEl.innerHTML = `<span style="color:#fbbf24">🟠 ${fallbackCount} dự phòng</span>`;
       } else if (okCount > 0) {
-        summaryEl.innerHTML = `<span style="color:#059669">🟢 ${okCount}/6 Còn hạn mức</span>`;
-      } else if (unlimitedCount > 0) {
-        summaryEl.textContent = `⚡ ${unlimitedCount}/6 Agent không giới hạn`;
-      } else if (unknownCount > 0) {
-        summaryEl.textContent = `⚡ 6 Agent · Chưa đặt cap`;
+        summaryEl.innerHTML = `<span style="color:#34d399">🟢 ${okCount}/6 còn quota</span>`;
+      } else {
+        summaryEl.textContent = '⚡ Quota 6 ban';
       }
     }
   }
@@ -2104,31 +2395,21 @@ export function initAtelierXStudio() {
 
     const activeItems = workloads.activeSpotlightItems;
     if (activeItems.length === 0) {
-      spotlightEl.classList.add('idle-state');
-      const head = document.createElement('div');
-      head.className = 'spotlight-header';
-      head.innerHTML = `<span class="spotlight-title" style="color:var(--text-2)">✨ Trạng thái thực thi trực tiếp</span><span style="font-size:11px;color:var(--text-3);font-weight:700">${workloads.totals.done}/${workloads.totals.total} hoàn tất</span>`;
-      const sub = document.createElement('div');
-      sub.style.cssText = 'font-size:12px;color:var(--text-2)';
-      sub.textContent =
-        workloads.totals.pendingAttention > 0
-          ? `Hiện không có tác vụ đang chạy · Có ${workloads.totals.pendingAttention} công việc sẵn sàng hoặc chờ kiểm duyệt trong các ban bên dưới.`
-          : online
-            ? 'Tất cả phòng ban hiện đang rảnh và sẵn sàng nhận đơn thiết kế mới.'
-            : 'Đang chờ đồng bộ dữ liệu công việc trực tiếp từ máy chủ Crewly…';
-      spotlightEl.append(head, sub);
+      spotlightEl.setAttribute('hidden', '');
+      spotlightEl.hidden = true;
       return;
     }
 
-    spotlightEl.classList.remove('idle-state');
+    spotlightEl.removeAttribute?.('hidden');
+    spotlightEl.hidden = false;
+
     const head = document.createElement('div');
     head.className = 'spotlight-header';
     head.innerHTML = `
       <span class="spotlight-title">
-        <span class="kpi-dot live-beacon" style="background:#2563eb"></span>
-        ĐANG THỰC HIỆN TRONG XƯỞNG (${activeItems.length})
+        <span class="kpi-dot live-beacon" style="background:#22d3ee"></span>
+        ĐANG CHẠY (${activeItems.length})
       </span>
-      <span style="font-size:10.5px;font-weight:700;color:var(--text-2)">Bấm để tới ban</span>
     `;
     spotlightEl.append(head);
 
@@ -2140,20 +2421,14 @@ export function initAtelierXStudio() {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'spotlight-item';
-      const subProgress = item.blockerNote
-        ? `⚠️ ${cleanOneLine(item.blockerNote, 96)}`
-        : item.latestLog?.text
-          ? `💬 ${cleanOneLine(item.latestLog.text, 96)}`
-          : '';
       btn.innerHTML = `
         <div class="spotlight-item-top">
-          <span class="spotlight-dept-tag">${esc(zone.icon)} Ban ${esc(zone.label)} · ${esc(zone.staffName)}</span>
-          <span style="color:var(--active-text)">⚡ ${esc(item.statusLabel)}${item.hasBlocker ? ' · ⚠️ Nghẽn phụ thuộc' : ''}</span>
+          <span>${esc(zone.icon)} ${esc(zone.label)} · ${esc(zone.staffName)}</span>
+          <span>${item.hasBlocker ? '⚠️ Nghẽn' : '⚡'}</span>
         </div>
-        <div class="spotlight-item-main">
-          <span class="task-id-badge" style="margin-right:5px">${esc(item.id)}</span>${esc(item.title)}
+        <div class="spotlight-item-main" title="${esc(`${item.id}: ${item.title}`)}">
+          <span class="task-id-badge" style="margin-right:4px">${esc(item.id)}</span>${esc(cleanOneLine(item.title, 44))}
         </div>
-        ${subProgress ? `<div class="spotlight-item-sub">${esc(subProgress)}</div>` : ''}
       `;
       btn.addEventListener('click', () => selectDepartment(item.deptIndex, true));
       list.append(btn);
@@ -2175,91 +2450,42 @@ export function initAtelierXStudio() {
             ? 'tag-queued'
             : 'tag-done';
 
-    const tagIcon =
+    const tagText =
       item.bucket === 'active'
-        ? '⚡ '
+        ? '⚡ Đang làm'
         : item.bucket === 'review'
-          ? '⚠️ '
+          ? '⚠️ Duyệt'
           : item.bucket === 'queued'
-            ? '⏳ '
-            : '✓ ';
+            ? '⏳ Chờ'
+            : '✓';
 
-    const top = document.createElement('div');
-    top.className = 'task-card-top';
-    top.innerHTML = `
-      <span class="task-code-cluster">
+    const line = document.createElement('div');
+    line.className = 'task-card-line';
+    line.innerHTML = `
+      <span class="task-card-main">
         <span class="task-id-badge">${esc(item.id)}</span>
-        ${item.priority ? `<span class="task-priority-badge">${esc(item.priority)}</span>` : ''}
+        <span class="task-title-text ${isDetailed ? 'is-expanded' : ''}" title="${esc(item.title)}">${esc(item.title)}</span>
       </span>
-      <span class="task-status-tag ${tagClass}">${tagIcon}${esc(item.statusLabel)}</span>
+      <span class="task-status-tag ${tagClass}">${tagText}</span>
     `;
-    card.append(top);
-
-    const titleEl = document.createElement('div');
-    titleEl.className = 'task-title-text';
-    titleEl.textContent = item.title;
-    card.append(titleEl);
-
-    const showFull = isDetailed || item.bucket === 'active' || item.bucket === 'review';
-
-    if (showFull && (item.brief.goal || item.brief.outcome || item.brief.summary)) {
-      const briefBox = document.createElement('div');
-      briefBox.className = 'task-brief-box';
-      if (item.brief.goal) {
-        const line = document.createElement('div');
-        line.className = 'task-brief-line';
-        line.innerHTML = `<strong>Mục tiêu:</strong> ${esc(cleanOneLine(item.brief.goal, isDetailed ? 240 : 140))}`;
-        briefBox.append(line);
-      }
-      if (item.brief.outcome && (isDetailed || item.bucket === 'active')) {
-        const line = document.createElement('div');
-        line.className = 'task-brief-line';
-        line.innerHTML = `<strong>Đầu ra:</strong> ${esc(cleanOneLine(item.brief.outcome, isDetailed ? 220 : 130))}`;
-        briefBox.append(line);
-      }
-      if (!item.brief.goal && item.brief.summary) {
-        const line = document.createElement('div');
-        line.className = 'task-brief-line';
-        line.textContent = cleanOneLine(item.brief.summary, isDetailed ? 220 : 140);
-        briefBox.append(line);
-      }
-      if (briefBox.childElementCount > 0) {
-        card.append(briefBox);
-      }
-    }
+    card.append(line);
 
     if (item.hasBlocker && (item.blockerNote || item.liveStatusLabel)) {
       const blk = document.createElement('div');
       blk.className = 'task-blocker-note';
-      blk.textContent = item.blockerNote
-        ? `⚠️ Ghi chú thực thi: ${item.blockerNote}`
-        : `⚠️ Trạng thái WorkItem: ${item.liveStatusLabel}`;
+      const note = item.blockerNote || item.liveStatusLabel;
+      blk.title = note;
+      blk.textContent = `⚠️ ${cleanOneLine(note, isDetailed ? 140 : 64)}`;
       card.append(blk);
     }
 
-    if (showFull && (item.criteriaTotal > 0 || item.liveStatusLabel)) {
-      const meta = document.createElement('div');
-      meta.className = 'task-meta-footer';
-      const leftTxt =
-        item.criteriaTotal > 0
-          ? `📋 Nghiệm thu: ${item.criteriaDone}/${item.criteriaTotal} tiêu chí`
-          : '📋 Công việc trực tiếp';
-      const rightTxt = item.liveStatusLabel ? `Luồng chạy: ${item.liveStatusLabel}` : '';
-      meta.innerHTML = `<span>${esc(leftTxt)}</span>${rightTxt ? `<span>${esc(rightTxt)}</span>` : ''}`;
-      card.append(meta);
-    }
-
-    // Show latest progress log on ALL active tasks (when not duplicating blockerNote) and on expanded cards!
-    const shouldShowLog =
-      Boolean(item.latestLog && item.latestLog.text) &&
-      (isDetailed || (item.bucket === 'active' && !item.blockerNote));
-
-    if (shouldShowLog) {
-      const logDiv = document.createElement('div');
-      logDiv.className = 'task-log-snippet';
-      const prefix = item.latestLog.time ? `[${item.latestLog.time}] ` : '';
-      logDiv.textContent = `💬 Cập nhật mới nhất: ${prefix}${cleanOneLine(item.latestLog.text, isDetailed ? 185 : 130)}`;
-      card.append(logDiv);
+    if (isDetailed && (item.brief.goal || item.brief.summary || item.criteriaTotal > 0)) {
+      const briefBox = document.createElement('div');
+      briefBox.className = 'task-brief-box';
+      const goalTxt = item.brief.goal || item.brief.summary || '';
+      const criteriaTxt = item.criteriaTotal > 0 ? `${item.criteriaDone}/${item.criteriaTotal} ✓` : '';
+      briefBox.innerHTML = `<span>${esc(cleanOneLine(goalTxt, 95))}</span>${criteriaTxt ? `<span style="flex-shrink:0;font-weight:800">${esc(criteriaTxt)}</span>` : ''}`;
+      card.append(briefBox);
     }
 
     return card;
@@ -2304,7 +2530,7 @@ export function initAtelierXStudio() {
     if (visibleIndices.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'dept-card';
-      empty.innerHTML = `<div class="dept-empty-note">Không có phòng ban nào khớp bộ lọc hiện tại. Bấm "Tất cả (7)" để xem toàn bộ xưởng.</div>`;
+      empty.innerHTML = `<div style="font-size:11.5px;color:var(--text-3)">Không có ban nào.</div>`;
       nav.append(empty);
       return;
     }
@@ -2312,13 +2538,12 @@ export function initAtelierXStudio() {
     for (const i of visibleIndices) {
       const zone = STUDIO_ZONES[i];
       const isSelected = selected === i;
-      const isExpanded = isSelected || expandAllDepts;
 
       if (i === 6) {
-        // ✨ Sàn trưng bày — Central Catwalk & 6-Stage Pipeline Card
+        // ✨ Sàn trưng bày — Compact Catwalk & 6-Stage Switcher
         const runwayCard = document.createElement('article');
         runwayCard.className = `dept-card ${isSelected ? 'is-selected' : ''}`;
-        runwayCard.style.setProperty('--dept-color', zone.color);
+        runwayCard.style.setProperty('--dept-color', zone.neon || zone.color);
         runwayCard.dataset.deptIndex = '6';
         runwayCard.setAttribute('aria-current', isSelected ? 'true' : 'false');
 
@@ -2328,23 +2553,20 @@ export function initAtelierXStudio() {
         header.setAttribute('tabindex', '0');
         header.innerHTML = `
           <div class="dept-identity">
-            <div class="dept-emblem">${zone.icon}</div>
-            <div class="dept-titles">
-              <div class="dept-name-row">
-                <span class="dept-name">${esc(zone.label)}</span>
-              </div>
-              <div class="dept-subrole">Sàn Catwalk trung tâm &amp; Dây chuyền 6 chặng</div>
+            <span class="dept-emblem">${zone.icon}</span>
+            <div class="dept-name-row">
+              <span class="dept-name">${esc(zone.label)}</span>
             </div>
           </div>
           <div class="dept-badges">
-            <span class="mini-pill work-done">${workloads.totals.completionPct}% tiến độ</span>
+            <span class="mini-pill work-done">${workloads.totals.completionPct}%</span>
           </div>
         `;
-        header.addEventListener('click', () => selectDepartment(6, true));
+        header.addEventListener('click', () => selectDepartment(6, true, false));
         header.addEventListener('keydown', (e) => {
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
-            selectDepartment(6, true);
+            selectDepartment(6, true, false);
           }
         });
         runwayCard.append(header);
@@ -2357,27 +2579,30 @@ export function initAtelierXStudio() {
           const sz = STUDIO_ZONES[sIdx];
           const badge =
             sd.activeCount > 0
-              ? '⚡ Đang làm'
+              ? '⚡'
               : sd.reviewCount + sd.queuedCount > 0
-                ? '⏳ Chờ'
+                ? '⏳'
                 : sd.doneCount > 0
-                  ? '✅ Xong'
-                  : '○ Chờ';
+                  ? '✓'
+                  : '○';
           const step = document.createElement('button');
           step.type = 'button';
           step.className = 'pipeline-step';
           step.dataset.stageDept = String(sIdx);
-          step.innerHTML = `<span>${esc(sz.icon)} ${esc(sz.label)}</span><span style="font-size:10.5px;color:var(--text-2)">${badge}</span>`;
+          step.innerHTML = `<span>${esc(sz.icon)} ${esc(sz.label)}</span><span style="font-size:10px;color:var(--text-2)">${badge}</span>`;
           step.addEventListener('click', () => selectDepartment(sIdx, true));
           pipeGrid.append(step);
         }
         runwayCard.append(pipeGrid);
+
         const galleryButton = document.createElement('button');
         galleryButton.type = 'button';
-        galleryButton.className = 'tiny-btn';
-        galleryButton.textContent = '✦ Xem danh sách sản phẩm 3D';
-        galleryButton.style.margin = '10px 16px 16px';
-        galleryButton.addEventListener('click', () => selectDepartment(6, true));
+        galleryButton.className = 'showcase-cta-btn';
+        galleryButton.textContent = '✦ Mở Sàn 3D';
+        galleryButton.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openShowcase();
+        });
         runwayCard.append(galleryButton);
         nav.append(runwayCard);
         continue;
@@ -2392,37 +2617,35 @@ export function initAtelierXStudio() {
 
       const card = document.createElement('article');
       card.className = `dept-card ${isSelected ? 'is-selected' : ''} ${d.activeCount > 0 ? 'has-active-work' : ''}`;
-      card.style.setProperty('--dept-color', zone.color);
+      card.style.setProperty('--dept-color', zone.neon || zone.color);
       card.dataset.deptIndex = String(i);
       card.setAttribute('aria-current', isSelected ? 'true' : 'false');
 
-      let workSummaryPill = `<span class="mini-pill tok-unlimited">Chưa có việc</span>`;
+      let workSummaryPill = `<span class="mini-pill tok-unlimited">Rảnh</span>`;
       if (d.activeCount > 0) {
-        workSummaryPill = `<span class="mini-pill work-active">⚡ ${d.activeCount} đang làm${d.doneCount ? ` · ${d.doneCount} xong` : ''}</span>`;
+        workSummaryPill = `<span class="mini-pill work-active">⚡ ${d.activeCount}</span>`;
       } else if (d.reviewCount + d.queuedCount > 0) {
-        workSummaryPill = `<span class="mini-pill work-queued">⏳ ${d.reviewCount + d.queuedCount} chờ xử lý${d.doneCount ? ` · ${d.doneCount} xong` : ''}</span>`;
+        workSummaryPill = `<span class="mini-pill work-queued">⏳ ${d.reviewCount + d.queuedCount}</span>`;
       } else if (d.doneCount > 0) {
-        workSummaryPill = `<span class="mini-pill work-done">✅ ${d.doneCount} hoàn thành</span>`;
+        workSummaryPill = `<span class="mini-pill work-done">✓ ${d.doneCount}</span>`;
       }
 
-      const tokenPillHtml = tok
-        ? `<span class="mini-pill ${tok.pillClass}">${esc(tok.shortBadge)}</span>`
+      const showTokenPill = tok && (tok.status === 'out' || tok.isLow || tok.status === 'ok');
+      const tokenPillHtml = showTokenPill
+        ? `<span class="mini-pill ${tok.pillClass}">${esc(tok.status === 'out' ? '🔴 Hết' : `${tok.pctRemaining ?? '--'}%`)}</span>`
         : '';
 
       const header = document.createElement('div');
       header.className = 'dept-card-header';
       header.setAttribute('role', 'button');
       header.setAttribute('tabindex', '0');
-      header.setAttribute('aria-expanded', isExpanded ? 'true' : 'false');
+      header.setAttribute('aria-expanded', expandAllDepts ? 'true' : 'false');
       header.innerHTML = `
         <div class="dept-identity">
-          <div class="dept-emblem">${zone.icon}</div>
-          <div class="dept-titles">
-            <div class="dept-name-row">
-              <span class="dept-name">Ban ${esc(zone.label)}</span>
-              <span class="agent-state-dot ${runtime.online ? 'online' : ''}">● ${esc(zone.staffName)}</span>
-            </div>
-            <div class="dept-subrole" title="${esc(zone.memberName)}">${esc(zone.memberName)}</div>
+          <span class="dept-emblem">${zone.icon}</span>
+          <div class="dept-name-row">
+            <span class="dept-name">${esc(zone.label)}</span>
+            <span class="agent-state-dot ${runtime.online ? 'online' : ''}" title="${esc(zone.memberName || zone.staffName)}">${esc(zone.roleShort || zone.staffName)}</span>
           </div>
         </div>
         <div class="dept-badges">
@@ -2443,47 +2666,40 @@ export function initAtelierXStudio() {
         const activePct = (d.activeCount / d.totalCount) * 100;
         const pendingPct = ((d.queuedCount + d.reviewCount) / d.totalCount) * 100;
         const donePct = (d.doneCount / d.totalCount) * 100;
-        const prog = document.createElement('div');
-        prog.className = 'dept-progress-row';
-        prog.innerHTML = `
-          <div class="dept-progress-track" aria-hidden="true">
-            <div class="dept-progress-seg" style="width:${activePct}%;background:#2563eb"></div>
-            <div class="dept-progress-seg" style="width:${pendingPct}%;background:#f59e0b"></div>
-            <div class="dept-progress-seg" style="width:${donePct}%;background:#10b981"></div>
-          </div>
-          <span>${d.doneCount}/${d.totalCount} xong</span>
+        const progTrack = document.createElement('div');
+        progTrack.className = 'dept-progress-track';
+        progTrack.setAttribute('aria-hidden', 'true');
+        progTrack.innerHTML = `
+          <div class="dept-progress-seg" style="width:${activePct}%;background:#22d3ee"></div>
+          <div class="dept-progress-seg" style="width:${pendingPct}%;background:#f59e0b"></div>
+          <div class="dept-progress-seg" style="width:${donePct}%;background:#10b981"></div>
         `;
-        card.append(prog);
+        card.append(progTrack);
       }
 
-      const taskGroup = document.createElement('div');
-      taskGroup.className = 'dept-tasks-group';
+      if (d.items.length > 0) {
+        const taskGroup = document.createElement('div');
+        taskGroup.className = 'dept-tasks-group';
 
-      if (d.items.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'dept-empty-note';
-        empty.textContent = 'Chưa có công việc phát sinh cho ban này.';
-        taskGroup.append(empty);
-      } else {
         const nonDone = d.items.filter((it) => it.bucket !== 'done');
         const doneList = d.items.filter((it) => it.bucket === 'done');
 
         for (const item of nonDone) {
-          taskGroup.append(createTaskCardElement(item, isExpanded));
+          taskGroup.append(createTaskCardElement(item, expandAllDepts));
         }
 
-        const showAllDone = isExpanded || expandedDoneDepts.has(i);
+        const showAllDone = expandAllDepts || expandedDoneDepts.has(i);
         const visibleDone = showAllDone ? doneList : doneList.slice(0, nonDone.length > 0 ? 1 : 2);
 
         for (const item of visibleDone) {
-          taskGroup.append(createTaskCardElement(item, isExpanded));
+          taskGroup.append(createTaskCardElement(item, expandAllDepts));
         }
 
         if (!showAllDone && doneList.length > visibleDone.length) {
           const moreBtn = document.createElement('button');
           moreBtn.type = 'button';
           moreBtn.className = 'more-done-btn';
-          moreBtn.textContent = `+ Xem thêm ${doneList.length - visibleDone.length} việc đã hoàn thành`;
+          moreBtn.textContent = `+${doneList.length - visibleDone.length} việc xong`;
           moreBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             expandedDoneDepts.add(i);
@@ -2491,44 +2707,14 @@ export function initAtelierXStudio() {
           });
           taskGroup.append(moreBtn);
         }
-      }
-      card.append(taskGroup);
 
-      if (isSelected) {
+        card.append(taskGroup);
+      }
+
+      if (isSelected && expandAllDepts) {
         const extra = document.createElement('div');
         extra.className = 'dept-inspector-extra';
-        extra.innerHTML = `
-          <div style="font-size:11.5px;color:var(--text-2)"><strong>Chức năng ban:</strong> ${esc(zone.duty)}</div>
-          <div class="inspector-meta-grid">
-            <div class="inspector-stat">
-              <div class="inspector-stat-label">Trạng thái Agent</div>
-              <div class="inspector-stat-val">${esc(runtime.text)}</div>
-            </div>
-            <div class="inspector-stat">
-              <div class="inspector-stat-label">Model &amp; Runtime</div>
-              <div class="inspector-stat-val" title="${esc(tok?.model || 'gpt-6-luna')}">${esc(tok?.model || 'gpt-6-luna')}</div>
-            </div>
-          </div>
-        `;
-
-        if (tok && (tok.budget != null || tok.status === 'out')) {
-          const pctVal = tok.pctRemaining ?? (tok.status === 'out' ? 0 : 100);
-          const rightSummary =
-            tok.budget != null
-              ? `${tok.remaining?.toLocaleString('vi-VN') ?? 0} còn lại (${pctVal}%)`
-              : tok.noteText;
-          const tokBar = document.createElement('div');
-          tokBar.innerHTML = `
-            <div style="display:flex;justify-content:space-between;font-size:11px;font-weight:700;margin-bottom:4px">
-              <span>⚡ Hạn mức Quota &amp; Runtime</span>
-              <span style="color:${tok.statusColor}">${esc(rightSummary)}</span>
-            </div>
-            <div class="token-bar-bg">
-              <div class="token-bar-fill ${tok.barClass}" style="width:${pctVal}%"></div>
-            </div>
-          `;
-          extra.append(tokBar);
-        }
+        extra.innerHTML = `<span>${esc(runtime.text)}</span><span>${esc(tok?.model || 'gpt-6-luna')}</span>`;
         card.append(extra);
       }
 
@@ -2545,22 +2731,18 @@ export function initAtelierXStudio() {
     if (!taskFlowFooter) return;
     taskFlowFooter.replaceChildren();
     const { totals } = workloads;
-    const title = document.createElement('div');
-    title.style.cssText = 'font-weight:800;color:var(--text-1);display:flex;justify-content:space-between;align-items:center';
-    title.innerHTML = `<span>📊 Tổng kết luồng công việc AtelierX</span><span>${totals.done}/${totals.total} hoàn tất (${totals.completionPct}%)</span>`;
-    const desc = document.createElement('div');
-    desc.textContent =
-      totals.total > 0
-        ? `Phân bổ tự động vào 6 ban chuyên môn: ${totals.active} đang thực hiện · ${totals.pendingAttention} sẵn sàng / chờ duyệt · ${totals.done} đã hoàn thành.`
-        : online
-          ? 'Chưa có ticket nào trong dự án AtelierX.'
-          : 'Chế độ xem kiến trúc xưởng (sẽ tự động nạp danh sách việc theo ban khi kết nối Crewly).';
-    taskFlowFooter.append(title, desc);
+    taskFlowFooter.textContent = `${totals.done}/${totals.total}`;
   }
 
   function renderTokenModalTable(workloads) {
     const banner = document.getElementById('modal-runtime-banner');
     if (banner) {
+      const runtimeAccounts = Array.isArray(liveRuntimeFallback?.runtimeAccounts) ? liveRuntimeFallback.runtimeAccounts : [];
+      const readyAccounts = runtimeAccounts.filter((a) => a && a.signedIn);
+      const poolSummary =
+        readyAccounts.length > 0
+          ? `Pool tài khoản: ${readyAccounts.length}/${runtimeAccounts.length} account sẵn sàng (${readyAccounts.map((a) => a.target).slice(0, 4).join(', ')}${readyAccounts.length > 4 ? '…' : ''})`
+          : '';
       if (codexIdentity?.email) {
         banner.removeAttribute?.('hidden'); banner.hidden = false;
         const quota = codexIdentity.quota;
@@ -2573,18 +2755,21 @@ export function initAtelierXStudio() {
           : quota ? `Quota chưa cập nhật (số đo cuối: ${quota.fiveHourRemaining}% / ${quota.weeklyRemaining ?? '?'}%)` : 'Đang chờ số đo quota mới';
         const syncLabel = updaterFresh ? 'Đồng bộ đang chạy' : 'Đồng bộ đã dừng hoặc mất kết nối';
         const timeLabel = Number.isFinite(measuredAt) ? new Date(measuredAt).toLocaleTimeString('vi-VN') : 'chưa có';
-        banner.textContent = `Codex: ${codexIdentity.email} · ${quotaLabel} · ${codexIdentity.sessionsFresh ? 'Phiên agent đã làm mới' : 'Đang chờ làm mới phiên agent'} · ${syncLabel} · đo ${timeLabel}`;
+        banner.textContent = `Codex: ${codexIdentity.email} · ${quotaLabel} · ${codexIdentity.sessionsFresh ? 'Phiên agent đã làm mới' : 'Đang chờ làm mới phiên agent'} · ${syncLabel} · đo ${timeLabel}${poolSummary ? ` · ${poolSummary}` : ''}`;
       }
       const exhausted = Array.isArray(liveRuntimeFallback?.exhausted) ? liveRuntimeFallback.exhausted : [];
       const overrides = Array.isArray(liveRuntimeFallback?.overrides) ? liveRuntimeFallback.overrides : [];
-      if (!codexIdentity?.email && (exhausted.length > 0 || overrides.length > 0)) {
+      if (!codexIdentity?.email && (exhausted.length > 0 || overrides.length > 0 || poolSummary)) {
         const exNames = exhausted.map((e) => shortRuntimeName(e.runtime)).filter(Boolean);
         banner.removeAttribute?.('hidden');
         banner.hidden = false;
-        banner.textContent =
+        const warnText =
           exNames.length > 0
             ? `⚠️ Cảnh báo Runtime Crewly: ${exNames.join(', ')} đã chạm giới hạn quota${overrides.length > 0 ? ` · ${overrides.length} Agent đã chuyển sang Runtime dự phòng.` : '.'}`
-            : `ℹ️ Có ${overrides.length} Agent đang chạy trên Runtime dự phòng.`;
+            : overrides.length > 0
+              ? `ℹ️ Có ${overrides.length} Agent đang chạy trên Runtime dự phòng.`
+              : '';
+        banner.textContent = [warnText, poolSummary].filter(Boolean).join(' · ');
       } else if (!codexIdentity?.email) {
         banner.setAttribute('hidden', '');
         banner.hidden = true;
@@ -2662,66 +2847,239 @@ export function initAtelierXStudio() {
     }
   }
 
+  function renderShowcaseCards() {
+    const list = document.getElementById('showcase-list');
+    const frame = document.getElementById('showcase-frame');
+    const meta = document.getElementById('showcase-meta');
+    const countPill = document.getElementById('showcase-count');
+    const openTabBtn = document.getElementById('showcase-open-tab');
+    if (!list || !frame || !meta) return;
+
+    list.replaceChildren();
+    const completeCount = cachedCatalogProducts.filter((p) => p?.status === 'complete').length;
+    if (countPill) {
+      countPill.textContent = `${completeCount} hoàn thiện · ${cachedCatalogProducts.length} mẫu`;
+    }
+
+    document.querySelectorAll('[data-showcase-filter]').forEach((btn) => {
+      const f = btn.dataset.showcaseFilter || 'all';
+      btn.classList.toggle('active', f === activeShowcaseFilter);
+    });
+
+    const visibleProducts = cachedCatalogProducts.filter((product) => {
+      const viewerPath = String(product?.viewer || '');
+      if (!/^products\/ATEL-\d+\/[a-zA-Z0-9._-]+\/index\.html$/.test(viewerPath) || viewerPath.includes('..')) {
+        return false;
+      }
+      if (activeShowcaseFilter === 'complete') return product?.status === 'complete';
+      if (activeShowcaseFilter === 'preview') return product?.status !== 'complete';
+      return true;
+    });
+
+    if (!visibleProducts.length) {
+      activeShowcaseUrl = '';
+      if (openTabBtn) openTabBtn.disabled = true;
+      frame.removeAttribute('src');
+      const emptyBox = document.createElement('div');
+      emptyBox.className = 'showcase-empty';
+      emptyBox.textContent = 'Không có sản phẩm nào trong bộ lọc này.';
+      list.append(emptyBox);
+      meta.textContent = 'Chưa có sản phẩm phù hợp để hiển thị.';
+      return;
+    }
+
+    const selectProduct = (product, button) => {
+      list.querySelectorAll('.showcase-product').forEach((el) => el.classList.remove('active'));
+      button.classList.add('active');
+
+      const title = repairBrokenVietnamese(String(product.name || product.id || 'Sản phẩm'));
+      const category = repairBrokenVietnamese(String(product.category || 'Trang phục 3D'));
+      const revision = String(product.revision || '');
+      const statusText = repairBrokenVietnamese(
+        String(product.statusLabel || (product.status === 'complete' ? 'Hoàn thiện' : 'Xem thử · Đang tinh chỉnh phom')),
+      );
+      const tagline = repairBrokenVietnamese(String(product.tagline || product.description || ''));
+      const swatch = /^#[0-9a-fA-F]{3,8}$/.test(String(product.swatchHex || '')) ? product.swatchHex : '#22d3ee';
+
+      meta.replaceChildren();
+      const mainWrap = document.createElement('div');
+      mainWrap.className = 'sm-main';
+      const swatchDot = document.createElement('span');
+      swatchDot.className = 'sm-swatch';
+      swatchDot.style.background = swatch;
+      const textWrap = document.createElement('div');
+      textWrap.className = 'sm-text';
+      const titleStrong = document.createElement('strong');
+      titleStrong.textContent = title;
+      const subSpan = document.createElement('span');
+      subSpan.className = 'sm-sub';
+      subSpan.textContent = [product.id, revision, category, product.collection].filter(Boolean).join(' · ');
+      textWrap.append(titleStrong, subSpan);
+      mainWrap.append(swatchDot, textWrap);
+
+      const statusBadge = document.createElement('span');
+      statusBadge.className = `sp-status ${product.status === 'complete' ? 'is-complete' : 'is-preview'}`;
+      statusBadge.textContent = statusText;
+
+      const rightWrap = document.createElement('div');
+      rightWrap.style.cssText = 'display:flex;align-items:center;gap:10px;flex-wrap:wrap;';
+      rightWrap.append(statusBadge);
+      if (tagline) {
+        const descP = document.createElement('p');
+        descP.className = 'sm-desc';
+        descP.textContent = tagline;
+        rightWrap.append(descP);
+      }
+
+      meta.append(mainWrap, rightWrap);
+
+      const url = `/atelierx-products/${product.viewer}?revision=${encodeURIComponent(revision)}&theme=${encodeURIComponent(studioTheme)}`;
+      activeShowcaseKey = `${product.id || ''}/${revision}`;
+      activeShowcaseUrl = url;
+      if (openTabBtn) openTabBtn.disabled = false;
+      frame.src = url;
+    };
+
+    let selectedButton = null;
+    let firstButton = null;
+
+    for (const product of visibleProducts) {
+      const revision = String(product.revision || '');
+      const key = `${product.id || ''}/${revision}`;
+      const isComplete = product.status === 'complete';
+      const title = repairBrokenVietnamese(String(product.name || product.id || 'Sản phẩm'));
+      const category = repairBrokenVietnamese(String(product.category || 'Trang phục'));
+      const statusText = repairBrokenVietnamese(
+        String(product.statusLabel || (isComplete ? 'Hoàn thiện' : 'Xem thử')),
+      );
+      const tagline = repairBrokenVietnamese(String(product.tagline || product.description || ''));
+      const materialBadge = repairBrokenVietnamese(String(product.materialBadge || 'Mô phỏng 3D'));
+      const swatch = /^#[0-9a-fA-F]{3,8}$/.test(String(product.swatchHex || '')) ? product.swatchHex : '#22d3ee';
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'showcase-product';
+
+      const topRow = document.createElement('div');
+      topRow.className = 'sp-top';
+      const catEl = document.createElement('span');
+      catEl.className = 'sp-category';
+      catEl.textContent = category;
+      const statusEl = document.createElement('span');
+      statusEl.className = `sp-status ${isComplete ? 'is-complete' : 'is-preview'}`;
+      statusEl.textContent = isComplete ? '✓ Hoàn thiện' : '✦ Xem thử';
+      topRow.append(catEl, statusEl);
+
+      const titleRow = document.createElement('div');
+      titleRow.className = 'sp-title-row';
+      const sw = document.createElement('span');
+      sw.className = 'sp-swatch';
+      sw.style.background = swatch;
+      const nameEl = document.createElement('strong');
+      nameEl.className = 'sp-name';
+      nameEl.textContent = title;
+      titleRow.append(sw, nameEl);
+
+      const taglineEl = document.createElement('p');
+      taglineEl.className = 'sp-tagline';
+      taglineEl.textContent = tagline || statusText;
+
+      const footRow = document.createElement('div');
+      footRow.className = 'sp-foot';
+      const codeEl = document.createElement('span');
+      codeEl.textContent = `${product.id || ''} · ${revision}`;
+      const matEl = document.createElement('span');
+      matEl.textContent = materialBadge;
+      footRow.append(codeEl, matEl);
+
+      button.append(topRow, titleRow, taglineEl, footRow);
+      button.addEventListener('click', () => selectProduct(product, button));
+      list.append(button);
+
+      if (!firstButton) firstButton = { product, button };
+      if (key === activeShowcaseKey) selectedButton = { product, button };
+    }
+
+    const initial = selectedButton || firstButton;
+    if (initial) {
+      selectProduct(initial.product, initial.button);
+    }
+  }
+
   async function openShowcase() {
     const overlay = document.getElementById('showcase-overlay');
     const list = document.getElementById('showcase-list');
     const frame = document.getElementById('showcase-frame');
     const meta = document.getElementById('showcase-meta');
+    const countPill = document.getElementById('showcase-count');
+    const openTabBtn = document.getElementById('showcase-open-tab');
     if (!overlay || !list || !frame || !meta) return;
     overlay.classList.add('open');
     overlay.setAttribute('aria-hidden', 'false');
     list.replaceChildren();
     meta.textContent = 'Đang tải danh sách sản phẩm…';
+    if (countPill) countPill.textContent = 'Đang tải…';
+    if (openTabBtn) openTabBtn.disabled = true;
     try {
       const response = await fetch('/atelierx-products/catalog.json', { cache: 'no-store' });
       if (!response.ok) throw new Error('catalog unavailable');
       const catalog = await response.json();
-      const products = Array.isArray(catalog.products) ? [...catalog.products].sort((a, b) => {
-        const rank = product => product?.status === 'complete' ? 0 : 1;
-        return rank(a) - rank(b) || (Number(String(b?.id || '').match(/ATEL-(\d+)/)?.[1] || 0) - Number(String(a?.id || '').match(/ATEL-(\d+)/)?.[1] || 0));
-      }) : [];
-      if (!products.length) { meta.textContent = 'Chưa có sản phẩm trong Sàn trưng bày.'; frame.removeAttribute('src'); return; }
-      let first = null;
-      for (const product of products) {
-        const viewerPath = String(product?.viewer || '');
-        if (!/^products\/ATEL-\d+\/[a-zA-Z0-9._-]+\/index\.html$/.test(viewerPath) || viewerPath.includes('..')) continue;
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'showcase-product';
-        const name = document.createElement('strong');
-        name.textContent = String(product.name || product.id || 'Sản phẩm');
-        const info = document.createElement('span');
-        info.textContent = `${product.id || ''} · ${product.revision || ''} · ${product.statusLabel || product.status || ''}`;
-        button.append(name, info);
-        button.addEventListener('click', () => {
-          list.querySelectorAll('.showcase-product').forEach((el) => el.classList.remove('active'));
-          button.classList.add('active');
-          meta.textContent = `${product.name || product.id} · ${product.statusLabel || product.status || ''}. ${product.description || ''}`;
-          frame.src = `/atelierx-products/${product.viewer}?revision=${encodeURIComponent(product.revision || '')}&theme=light`;
-        });
-        list.append(button);
-        if (!first) first = button;
+      cachedCatalogProducts = Array.isArray(catalog.products)
+        ? [...catalog.products].sort((a, b) => {
+            const rank = (product) => (product?.status === 'complete' ? 0 : 1);
+            return (
+              rank(a) - rank(b) ||
+              Number(String(b?.id || '').match(/ATEL-(\d+)/)?.[1] || 0) -
+                Number(String(a?.id || '').match(/ATEL-(\d+)/)?.[1] || 0)
+            );
+          })
+        : [];
+      if (!cachedCatalogProducts.length) {
+        if (countPill) countPill.textContent = '0 mẫu';
+        meta.textContent = 'Chưa có sản phẩm trong Sàn trưng bày.';
+        frame.removeAttribute('src');
+        return;
       }
-      if (first) first.click();
-      else meta.textContent = 'Catalog chưa có sản phẩm xem được.';
+      renderShowcaseCards();
     } catch {
+      if (countPill) countPill.textContent = 'Lỗi tải';
       meta.textContent = 'Chưa tải được catalog sản phẩm. Kiểm tra thư mục AtelierX/showcase.';
     }
   }
 
   const showcaseOverlay = document.getElementById('showcase-overlay');
   const showcaseClose = document.getElementById('showcase-close');
+  const showcaseFilters = document.getElementById('showcase-filters');
+  const showcaseOpenTab = document.getElementById('showcase-open-tab');
   function closeShowcase() {
     if (!showcaseOverlay) return;
     showcaseOverlay.classList.remove('open');
     showcaseOverlay.setAttribute('aria-hidden', 'true');
     const frame = document.getElementById('showcase-frame');
     if (frame) frame.removeAttribute('src');
+    activeShowcaseUrl = '';
+    if (showcaseOpenTab) showcaseOpenTab.disabled = true;
   }
   if (showcaseClose) showcaseClose.addEventListener('click', closeShowcase);
   if (showcaseOverlay) showcaseOverlay.addEventListener('click', (e) => { if (e.target === showcaseOverlay) closeShowcase(); });
+  if (showcaseFilters) {
+    showcaseFilters.querySelectorAll('[data-showcase-filter]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        activeShowcaseFilter = btn.dataset.showcaseFilter || 'all';
+        renderShowcaseCards();
+      });
+    });
+  }
+  if (showcaseOpenTab) {
+    showcaseOpenTab.addEventListener('click', () => {
+      if (!activeShowcaseUrl) return;
+      if (typeof window !== 'undefined' && typeof window.open === 'function') {
+        window.open(activeShowcaseUrl, '_blank', 'noopener,noreferrer');
+      }
+    });
+  }
 
-  function selectDepartment(index, focusCamera = false) {
+  function selectDepartment(index, focusCamera = false, shouldOpenShowcase = false) {
     if (index < 0 || index > 6) return;
     hasAutoSelected = true;
     selected = index;
@@ -2739,12 +3097,12 @@ export function initAtelierXStudio() {
     }
     if (focusCamera) {
       const z = STUDIO_ZONES[index];
-      [cx, cy] = iso(z.x, z.y, z.h + 12);
-      scale = 1.52;
+      [cx, cy] = iso(z.x, z.y, (z.h + 12) * PAVILION_SCALE);
+      scale = 1.48;
       camera();
     }
     renderAll();
-    if (index === 6) openShowcase();
+    if (index === 6 && shouldOpenShowcase) openShowcase();
 
     const targetCard = nav.querySelector(`[data-dept-index="${index}"]`);
     if (targetCard && typeof targetCard.scrollIntoView === 'function') {
@@ -2834,8 +3192,8 @@ export function initAtelierXStudio() {
         }
         if (syncBadge) {
           const nowStr = new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-          syncBadge.textContent = `● Trực tuyến · ${nowStr}`;
-          syncBadge.style.color = '#059669';
+          syncBadge.textContent = `● ${nowStr}`;
+          syncBadge.style.color = 'var(--done-text)';
         }
 
         // Auto-select first department with active work ONCE on initial load (never hijacks manual selection)
@@ -2875,7 +3233,7 @@ export function initAtelierXStudio() {
         statusEl.textContent = 'Chế độ độc lập (Chưa kết nối Crewly)';
       }
       if (syncBadge) {
-        syncBadge.textContent = '○ Chế độ độc lập';
+        syncBadge.textContent = '○ Offline';
         syncBadge.style.color = 'var(--text-3)';
       }
     }
@@ -2951,7 +3309,8 @@ export function initAtelierXStudio() {
   world.addEventListener('click', (e) => {
     const g = e.target.closest('.room');
     if (g && g.dataset.index != null) {
-      selectDepartment(Number(g.dataset.index), true);
+      const idx = Number(g.dataset.index);
+      selectDepartment(idx, true, idx === 6);
     }
   });
   world.addEventListener('keydown', (e) => {
@@ -2959,7 +3318,8 @@ export function initAtelierXStudio() {
       const g = e.target.closest('.room');
       if (g && g.dataset.index != null) {
         e.preventDefault();
-        selectDepartment(Number(g.dataset.index), true);
+        const idx = Number(g.dataset.index);
+        selectDepartment(idx, true, idx === 6);
       }
     }
   });
@@ -2985,7 +3345,17 @@ export function initAtelierXStudio() {
       cy = DEFAULT_CY;
       scale = 1;
       camera();
-      selectDepartment(6, false);
+      closeModal();
+      closeShowcase();
+      selected = 6;
+      renderAll();
+    });
+  }
+
+  const showcaseHudBtn = document.getElementById('btn-showcase-hud');
+  if (showcaseHudBtn) {
+    showcaseHudBtn.addEventListener('click', () => {
+      openShowcase();
     });
   }
 
@@ -3005,11 +3375,35 @@ export function initAtelierXStudio() {
   }
 
   const wideBtn = document.getElementById('btn-wide-sidebar');
+  const collapseBtn = document.getElementById('btn-collapse-sidebar');
+
+  function syncSidebarButtonsState() {
+    const collapsed = document.body.classList.contains('sidebar-collapsed');
+    const wide = document.body.classList.contains('sidebar-wide');
+    if (collapseBtn) {
+      collapseBtn.classList.toggle('dock-primary', collapsed);
+      collapseBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      collapseBtn.textContent = collapsed ? '⇤ Hiện tab' : '⇥ Ẩn tab';
+    }
+    if (wideBtn) {
+      wideBtn.classList.toggle('dock-primary', wide && !collapsed);
+      wideBtn.textContent = wide && !collapsed ? '⇔ Gọn' : '⇔ Rộng';
+    }
+  }
+
   if (wideBtn) {
     wideBtn.addEventListener('click', () => {
-      const wide = document.body.classList.toggle('sidebar-wide');
-      wideBtn.classList.toggle('dock-primary', wide);
-      wideBtn.textContent = wide ? '⇔ Chuẩn' : '⇔ Rộng';
+      document.body.classList.remove('sidebar-collapsed');
+      document.body.classList.toggle('sidebar-wide');
+      syncSidebarButtonsState();
+    });
+  }
+
+  if (collapseBtn) {
+    collapseBtn.addEventListener('click', () => {
+      const collapsed = document.body.classList.toggle('sidebar-collapsed');
+      if (collapsed) document.body.classList.remove('sidebar-wide');
+      syncSidebarButtonsState();
     });
   }
 
@@ -3048,7 +3442,16 @@ export function initAtelierXStudio() {
   const syncBtn = document.getElementById('btn-sync-now');
   if (syncBtn) {
     syncBtn.addEventListener('click', () => {
-      sync();
+      syncBtn.classList.add('is-syncing');
+      syncBtn.disabled = true;
+      syncBtn.textContent = '↻ Đang tải…';
+      Promise.resolve(sync()).finally(() => {
+        if (!destroyed) {
+          syncBtn.classList.remove('is-syncing');
+          syncBtn.disabled = false;
+          syncBtn.textContent = '↻ Đồng bộ';
+        }
+      });
     });
   }
 
@@ -3057,7 +3460,7 @@ export function initAtelierXStudio() {
     sortModeBtn.addEventListener('click', () => {
       sortByActive = !sortByActive;
       sortModeBtn.classList.toggle('is-active', sortByActive);
-      sortModeBtn.textContent = sortByActive ? '⚡ Ưu tiên việc' : '🏛️ Thứ tự ban';
+      sortModeBtn.textContent = sortByActive ? '⚡ Ưu tiên' : '🏛️ Thứ tự';
       renderDepartmentsPanel(getWorkloads());
     });
   }
@@ -3067,7 +3470,7 @@ export function initAtelierXStudio() {
     expandAllBtn.addEventListener('click', () => {
       expandAllDepts = !expandAllDepts;
       expandAllBtn.classList.toggle('is-active', expandAllDepts);
-      expandAllBtn.textContent = expandAllDepts ? 'Thu gọn' : 'Mở chi tiết';
+      expandAllBtn.textContent = expandAllDepts ? 'Gọn' : 'Chi tiết';
       renderDepartmentsPanel(getWorkloads());
     });
   }
@@ -3079,11 +3482,27 @@ export function initAtelierXStudio() {
     });
   });
 
+  const kpiBindings = [
+    ['kpi-active-work', 'active'],
+    ['kpi-queued-work', 'queued'],
+    ['kpi-done-work', 'done'],
+  ];
+  for (const [id, targetFilter] of kpiBindings) {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener('click', () => {
+        deptFilter = deptFilter === targetFilter ? 'all' : targetFilter;
+        renderAll();
+      });
+    }
+  }
+
   // Token Modal Controls
   const modal = document.getElementById('token-modal');
   const openModalBtn = document.getElementById('token-summary-btn');
   const openModalBtn2 = document.getElementById('btn-open-token-modal');
   const closeModalBtn = document.getElementById('modal-close-btn');
+  const manageAccountsBtn = document.getElementById('btn-manage-accounts');
 
   function openModal() {
     if (!modal) return;
@@ -3097,14 +3516,30 @@ export function initAtelierXStudio() {
   if (openModalBtn) openModalBtn.addEventListener('click', openModal);
   if (openModalBtn2) openModalBtn2.addEventListener('click', openModal);
   if (closeModalBtn) closeModalBtn.addEventListener('click', closeModal);
+  if (manageAccountsBtn) {
+    manageAccountsBtn.addEventListener('click', () => {
+      try {
+        if (typeof window !== 'undefined' && window.top && window.top.location) {
+          window.top.location.href = '/settings?tab=runtimes';
+        } else if (typeof window !== 'undefined' && window.location) {
+          window.location.href = '/settings?tab=runtimes';
+        }
+      } catch {
+        if (typeof window !== 'undefined' && window.open) {
+          window.open('/settings?tab=runtimes', '_blank', 'noopener,noreferrer');
+        }
+      }
+    });
+  }
   if (modal) {
     modal.addEventListener('click', (e) => {
       if (e.target === modal) closeModal();
     });
   }
   const onDocKeyDown = (e) => {
-    if (e.key === 'Escape' && modal?.classList.contains('open')) {
-      closeModal();
+    if (e.key === 'Escape') {
+      if (modal?.classList.contains('open')) closeModal();
+      if (showcaseOverlay?.classList.contains('open')) closeShowcase();
     }
   };
   document.addEventListener('keydown', onDocKeyDown);
@@ -3118,9 +3553,52 @@ export function initAtelierXStudio() {
     });
   });
 
+  // Full-screen & Return-to-Tickets topbar controls
+  const backTicketsBtn = document.getElementById('btn-back-tickets');
+  if (backTicketsBtn) {
+    backTicketsBtn.addEventListener('click', () => {
+      try {
+        if (typeof window !== 'undefined' && window.parent && window.parent !== window) {
+          window.parent.postMessage({ type: 'atelierx-close-studio' }, window.location?.origin || '*');
+          return;
+        }
+      } catch {
+        // fallback below
+      }
+      if (typeof window !== 'undefined' && window.location) {
+        window.location.href = '/tickets';
+      }
+    });
+  }
+
+  let isEmbeddedFull = true;
+  const fullscreenStudioBtn = document.getElementById('btn-fullscreen-studio');
+  if (fullscreenStudioBtn) {
+    fullscreenStudioBtn.addEventListener('click', () => {
+      try {
+        if (typeof window !== 'undefined' && window.parent && window.parent !== window) {
+          isEmbeddedFull = !isEmbeddedFull;
+          fullscreenStudioBtn.textContent = isEmbeddedFull ? '⛶ Thu nhỏ' : '⛶ Toàn màn';
+          window.parent.postMessage({ type: 'atelierx-toggle-fullscreen', full: isEmbeddedFull }, window.location?.origin || '*');
+          return;
+        }
+      } catch {
+        // fallback below
+      }
+      if (typeof document !== 'undefined') {
+        if (!document.fullscreenElement && typeof document.documentElement?.requestFullscreen === 'function') {
+          void document.documentElement.requestFullscreen().catch(() => {});
+        } else if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+          void document.exitFullscreen().catch(() => {});
+        }
+      }
+    });
+  }
+
   // Initial Paint & Periodic Live Sync
   camera();
   renderAll();
+  startHumanMotionLoop();
   sync();
   const timer = setInterval(sync, 10000);
 
@@ -3130,6 +3608,9 @@ export function initAtelierXStudio() {
     destroy: () => {
       destroyed = true;
       clearInterval(timer);
+      if (motionRafId && typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') {
+        window.cancelAnimationFrame(motionRafId);
+      }
       document.removeEventListener('keydown', onDocKeyDown);
     },
   };

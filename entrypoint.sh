@@ -24,16 +24,30 @@ if [ ! -f "/home/node/.crewly/projects.json" ]; then
 fi
 
 node /home/node/seed-crewly/install-atelierx.cjs
-node /home/node/project/crewly-docker/set-codex-fresh-start.cjs
 
-# Deterministic recovery; polling uses no model tokens.
-sh /home/node/project/crewly-docker/atelierx-watchdog.sh &
+RUNTIME_DIR="/home/node/crewly-runtime"
+for cand in "/home/node/crewly-runtime" "/home/node/project/QLDAPM" "/home/node/project/crewly-docker" "/home/node/crewly-runtime-baked"; do
+  if [ -f "$cand/set-codex-fresh-start.cjs" ]; then
+    RUNTIME_DIR="$cand"
+    break
+  fi
+done
+
+node "$RUNTIME_DIR/set-codex-fresh-start.cjs"
+
+# Deterministic recovery; polling uses no model tokens. Running loop in entrypoint avoids Windows CRLF issues on bind-mounted .sh files.
+(
+  while true; do
+    node "$RUNTIME_DIR/atelierx-watchdog.cjs" >> /home/node/.crewly/atelierx-watchdog.log 2>&1 || true
+    sleep 30
+  done
+) &
 
 # Fresh Codex conversations need a team start after the API is ready.
 (
   for attempt in $(seq 1 90); do
     if curl -fsS http://127.0.0.1:8787/health >/dev/null 2>&1; then
-      node /home/node/project/crewly-docker/start-atelierx-team.cjs
+      node "$RUNTIME_DIR/start-atelierx-team.cjs"
       exit $?
     fi
     sleep 2
